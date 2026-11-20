@@ -373,6 +373,11 @@ impl Library {
                 parse_req(v).with_context(|| format!("requires {k}"))?,
             ));
         }
+        if let Some(g) = t.glsl
+            && !crate::shader::DESKTOP_VERSIONS.contains(&g)
+        {
+            bail!("glsl = {g} isn't a GLSL version shotglass offers; use 330, 410 or 430");
+        }
         Ok(Library {
             name: name.to_string(),
             canonical: t.name,

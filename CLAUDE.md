@@ -43,7 +43,7 @@ cargo fmt && cargo clippy --all-targets -- -D warnings
 | `app.rs` | egui player: transport, timeline, panels, live reload, auto scale, sound streaming |
 | `headless.rs` | hidden-window GL context for CLI commands |
 | `selftest.rs` | GPU/sound checks on fixture films written to a temp dir |
-| `glsl/transitions/` | built-in transitions (params are `#define`s with `#ifndef` defaults) |
+| `glsl/transitions/` | deprecated built-in transitions (the kit has the same ones; films use `<library>/<name>`) |
 | `movies/big-shadow/` | demo film; `templates/new/` is what `shotglass new` writes |
 
 ## Invariants (each was a real bug; most have a test)
@@ -87,13 +87,13 @@ cargo fmt && cargo clippy --all-targets -- -D warnings
 - **The engine provides a contract, not looks.** Uniforms, entry points, the transition interface
   and cue defines are the engine's API (semver). Reusable GLSL belongs in versioned libraries
   (the shotglass-kit repo, #3–#5), not embedded in the binary; the built-in transitions are
-  slated to move there. Don't add new built-in GLSL.
+  in the kit now and deprecated here. Don't add new built-in GLSL.
 
 ## Adding things
 
-- **New transition:** it belongs in the kit (#4) once libraries exist. Until then, a built-in
-  one goes in `src/glsl/transitions/<name>.glsl`, registered in `BUILTIN_TRANSITIONS`
-  (gfx.rs), added to `transition_endpoints` in selftest.rs, and listed in the README table.
+- **New transition:** it goes in the kit (shotglass-kit `transitions/`), not the engine.
+  Films use it as `type = "<library>/<name>"`. The built-ins in `src/glsl/transitions/`
+  are deprecated (loading a film that uses one warns) and only kept until removal.
 - **`movie.toml` field:** add it to the serde struct (`deny_unknown_fields`) and the resolved
   struct, validate it in `Movie::parse`, add a unit test, and update the README and
   `templates/new/movie.toml`.

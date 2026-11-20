@@ -22,13 +22,17 @@ uniforms.uHue = { keys = [[0, 0.0], [5, 0.3]], ease = "smooth" }
 id = "second"
 scene = "scenes/second.glsl"
 duration = 5.0
-# The transition *into* this shot. Built-ins: crossfade, fade, iris, dissolve, wipe.
-transition = { type = "iris", duration = 1.2, freeze = true, params = { center = [0.5, 0.5] } }
+# The transition *into* this shot, from shotglass-kit (see [libraries] below):
+# transitions/crossfade, fade, iris, dissolve, wipe. Or a file of your own: "fx/my.glsl".
+transition = { type = "transitions/iris", duration = 1.2, freeze = true, params = { center = [0.5, 0.5] } }
 # This shot's own sound: time is shot-local. sound_lead / sound_tail (seconds)
 # start it early or let it ring on; otherwise it fades with the transitions.
 sound = "sfx/chime.glsl"
 
 # Shared GLSL by name; shaders use #include <kit/file.glsl>. See README, "Libraries".
-# [libraries]
-# kit = { version = "0.1", source = "https://github.com/antonmarsden/shotglass-kit", subdir = "core" }
+# `shotglass play` fetches them with git and pins them in shotglass.lock (commit it).
+# No version: follow the kit's main branch until it has releases.
+[libraries]
+transitions = { source = "https://github.com/antonmarsden/shotglass-kit", subdir = "transitions" }
+# kit = { source = "https://github.com/antonmarsden/shotglass-kit", subdir = "core" }   # noise, colour, shapes
 # mine = { path = "lib/mine" }

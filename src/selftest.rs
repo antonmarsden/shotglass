@@ -54,7 +54,7 @@ const CHECKS: &[Check] = &[
         run: error_mapping,
     },
     Check {
-        name: "library files are included once and errors point at name/file:line",
+        name: "library files are included once, library transitions render, and errors point at name/file:line",
         run: library_errors,
     },
     Check {
@@ -796,8 +796,9 @@ fn error_mapping(gl: &Gl, dir: &Path) -> Result<String> {
 }
 
 /// A film-local library (`path = …`) under its local name `kit`: a working include
-/// renders (and only compiles if each file is included once), and an error inside the
-/// library is reported as `kit/noise.glsl:3`, not by its folder on disk.
+/// renders (and only compiles if each file is included once), `type = "kit/split"` runs
+/// the library's `split.glsl` with the film's params, and an error inside the library is
+/// reported as `kit/noise.glsl:3`, not by its folder on disk.
 fn library_errors(gl: &Gl, dir: &Path) -> Result<String> {
     write(
         dir,
@@ -817,6 +818,15 @@ fn library_errors(gl: &Gl, dir: &Path) -> Result<String> {
             (
                 "vendor/kit-core/noise.glsl",
                 "// kit noise\n// line two\nfloat kit_noise() { return notDeclaredAnywhere; }\n",
+            ),
+            (
+                "vendor/kit-core/split.glsl",
+                "#ifndef edge\n#define edge 0.5\n#endif\n\
+                 vec4 transition(vec2 uv) { return uv.x < edge ? getFromColor(uv) : getToColor(uv); }\n",
+            ),
+            (
+                "green.glsl",
+                &scene("fragColor = vec4(0.0, 1.0, 0.0, 1.0);"),
             ),
             (
                 "good.glsl",
@@ -856,6 +866,39 @@ fn library_errors(gl: &Gl, dir: &Path) -> Result<String> {
         bail!("library include rendered {p:?}, expected about [191, 0, 64]");
     }
 
+    // A library transition by name; `edge` comes from the film, overriding the default.
+    let m = movie(
+        dir,
+        &format!(
+            "{}[[shot]]\nid=\"b\"\nscene=\"green.glsl\"\nduration=1\n\
+             transition = {{ type = \"kit/split\", duration = 0.5, params = {{ edge = 0.25 }} }}\n",
+            toml("good.glsl")
+        ),
+    )?;
+    let mut r = renderer(gl, &m)?;
+    let f = shot(
+        &mut r,
+        &m,
+        At::Transition {
+            from: 0,
+            to: 1,
+            from_local: 0.75,
+            to_local: 0.25,
+            progress: 0.5,
+        },
+        1.0,
+    )?;
+    let (left, mid) = (
+        px(&f, W as usize / 8, H as usize / 2),
+        px(&f, W as usize / 2, H as usize / 2),
+    );
+    if left[0].abs_diff(191) > 2 || mid[1] < 253 || mid[0] > 2 {
+        bail!(
+            "kit/split at edge 0.25 rendered {left:?} at x = 1/8 and {mid:?} at x = 1/2, \
+             expected the first shot then green"
+        );
+    }
+
     let m = movie(dir, &toml("bad.glsl"))?;
     let mut r = Renderer::new(gl.clone())?;
     r.set_cache_dir(None);
@@ -868,7 +911,7 @@ fn library_errors(gl: &Gl, dir: &Path) -> Result<String> {
     if !text.contains(expect) {
         bail!("expected an error at {expect}, got:\n{text}");
     }
-    Ok("kit/noise.glsl:3".into())
+    Ok("kit/split, kit/noise.glsl:3".into())
 }
 
 fn keep_last_working(gl: &Gl, dir: &Path) -> Result<String> {

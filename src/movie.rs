@@ -149,7 +149,9 @@ struct MarkerFile {
 
 #[derive(Clone, Debug)]
 pub struct Transition {
-    /// Built-in name (crossfade, fade, iris, dissolve, wipe) or a path to a .glsl file.
+    /// A library transition (`transitions/iris`: `iris.glsl` in the library the film calls
+    /// `transitions`), a path to a .glsl file in the film, or a deprecated built-in name
+    /// (crossfade, fade, iris, dissolve, wipe).
     pub kind: String,
     pub duration: f32,
     /// Render the outgoing shot once (its frame at the transition start) instead of live.
@@ -287,6 +289,21 @@ impl Movie {
         let lock = library::Lock::load(&self.root)?;
         self.libraries =
             library::resolve(&self.root, &self.library_specs, &o, lock.as_ref(), cache)?;
+        let film = self
+            .glsl
+            .unwrap_or(crate::shader::Dialect::BASELINE.version);
+        for l in &self.libraries {
+            if let Some(need) = l.glsl
+                && need > film
+            {
+                bail!(
+                    "library {} needs GLSL {need}, but this film compiles as GLSL {film}; add \
+                     glsl = \"{need}\" to movie.toml if that's fine (the film then needs a \
+                     driver with GLSL {need} and won't play on the web), or use another library",
+                    l.describe()
+                );
+            }
+        }
         Ok(())
     }
 
@@ -297,9 +314,9 @@ impl Movie {
             v.push(s.scene.clone());
             v.extend(s.sound.as_ref().map(|x| x.path.clone()));
             if let Some(t) = &s.transition_in
-                && t.kind.ends_with(".glsl")
+                && let TransitionKind::File(p) = transition_kind(&t.kind)
             {
-                v.push(self.root.join(&t.kind));
+                v.push(self.root.join(p));
             }
         }
         v.sort();
@@ -340,6 +357,7 @@ impl Movie {
         let path_rule = |what: String, p: &str| -> Result<()> {
             library::check_rel_path(p).map_err(|e| anyhow!("{what}: {e}"))
         };
+        let mut deprecated: Vec<String> = vec![];
         let mut library_specs = vec![];
         for (name, d) in &f.libraries {
             library_specs.push(LibrarySpec::parse(name, d)?);
@@ -374,10 +392,39 @@ impl Movie {
             if let Some(p) = &s.sound {
                 path_rule(format!("{}: sound", ctx()), p)?;
             }
-            if let Some(t) = &s.transition
-                && t.kind.ends_with(".glsl")
-            {
-                path_rule(format!("{}: transition", ctx()), &t.kind)?;
+            if let Some(t) = &s.transition {
+                match transition_kind(&t.kind) {
+                    TransitionKind::File(p) => path_rule(format!("{}: transition", ctx()), p)?,
+                    TransitionKind::Library(lib, file) => {
+                        if !library_specs.iter().any(|l| l.name == lib) {
+                            bail!(
+                                "{}: transition \"{}\" names library \"{lib}\", but [libraries] \
+                                 has {}",
+                                ctx(),
+                                t.kind,
+                                if library_specs.is_empty() {
+                                    "none".to_string()
+                                } else {
+                                    library_specs
+                                        .iter()
+                                        .map(|l| format!("\"{}\"", l.name))
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                }
+                            );
+                        }
+                        path_rule(format!("{}: transition", ctx()), &file)?;
+                    }
+                    TransitionKind::Builtin(name) => {
+                        if !deprecated.contains(&name.to_string())
+                            && crate::gfx::BUILTIN_TRANSITIONS
+                                .iter()
+                                .any(|(n, _)| *n == name && *n != "copy")
+                        {
+                            deprecated.push(name.to_string());
+                        }
+                    }
+                }
             }
             if s.duration.is_nan() || s.duration <= 0.0 {
                 bail!("{}: duration must be > 0", ctx());
@@ -532,9 +579,12 @@ impl Movie {
                 .collect(),
             duration,
             shotglass: f.shotglass,
+            warnings: deprecated
+                .iter()
+                .map(|n| builtin_transition_warning(n, &library_specs))
+                .collect(),
             library_specs,
             libraries: vec![],
-            warnings: vec![],
         })
     }
 
@@ -666,6 +716,50 @@ impl Movie {
                 (s.start, s.end())
             }
         }
+    }
+}
+
+/// What a transition's `type` names.
+#[derive(Debug, PartialEq)]
+pub enum TransitionKind<'a> {
+    /// A .glsl file in the film (`fx/iris.glsl`).
+    File(&'a str),
+    /// A file in a library: (`transitions`, `iris.glsl`) for `transitions/iris`.
+    Library(&'a str, String),
+    /// A built-in name (`iris`), deprecated.
+    Builtin(&'a str),
+}
+
+pub fn transition_kind(kind: &str) -> TransitionKind<'_> {
+    if kind.ends_with(".glsl") {
+        TransitionKind::File(kind)
+    } else if let Some((lib, rest)) = kind.split_once('/') {
+        TransitionKind::Library(lib, format!("{rest}.glsl"))
+    } else {
+        TransitionKind::Builtin(kind)
+    }
+}
+
+/// The deprecation warning for a built-in transition, naming its kit replacement.
+fn builtin_transition_warning(name: &str, specs: &[LibrarySpec]) -> String {
+    let kit = specs.iter().find(|s| {
+        s.subdir.as_deref() == Some("transitions")
+            && s.source
+                .as_deref()
+                .is_some_and(|u| u.trim_end_matches('/').ends_with("/shotglass-kit"))
+    });
+    match kit {
+        Some(s) => format!(
+            "transition \"{name}\" is built into this shotglass and will be removed; use \
+             type = \"{}/{name}\" (same parameters) from shotglass-kit",
+            s.name
+        ),
+        None => format!(
+            "transition \"{name}\" is built into this shotglass and will be removed; use \
+             shotglass-kit's (same parameters): add transitions = {{ source = \
+             \"https://github.com/antonmarsden/shotglass-kit\", subdir = \"transitions\" }} \
+             to [libraries], then type = \"transitions/{name}\""
+        ),
     }
 }
 
@@ -1009,6 +1103,68 @@ mod tests {
     }
 
     #[test]
+    fn transition_types() {
+        assert_eq!(
+            transition_kind("fx/iris.glsl"),
+            TransitionKind::File("fx/iris.glsl")
+        );
+        assert_eq!(
+            transition_kind("transitions/iris"),
+            TransitionKind::Library("transitions", "iris.glsl".into())
+        );
+        assert_eq!(
+            transition_kind("kit/fx/wipe"),
+            TransitionKind::Library("kit", "fx/wipe.glsl".into())
+        );
+        assert_eq!(transition_kind("iris"), TransitionKind::Builtin("iris"));
+
+        let kit = "transitions = { source = \"https://github.com/antonmarsden/shotglass-kit\", \
+                   subdir = \"transitions\" }\n";
+        let film = |libs: &str, kinds: &[&str]| {
+            let mut t = format!("[libraries]\n{libs}{SHOT}");
+            for (i, k) in kinds.iter().enumerate() {
+                t += &format!(
+                    "[[shot]]\nid = \"s{i}\"\nscene = \"a.glsl\"\nduration = 1\n\
+                     transition = {{ type = \"{k}\", duration = 0.5 }}\n"
+                );
+            }
+            Movie::parse(&t, Path::new("."))
+        };
+        // Library transitions: no warning, and nothing in the film to watch for them.
+        let m = film(kit, &["transitions/iris", "transitions/fade"]).unwrap();
+        assert!(m.warnings.is_empty(), "{:?}", m.warnings);
+        assert_eq!(m.referenced_files(), vec![PathBuf::from("./a.glsl")]);
+        // The library must be declared, and the file stays inside it.
+        let e = format!("{:#}", film(kit, &["kit/iris"]).unwrap_err());
+        assert!(
+            e.contains("names library \"kit\", but [libraries] has \"transitions\""),
+            "{e}"
+        );
+        let e = format!("{:#}", film("", &["kit/iris"]).unwrap_err());
+        assert!(e.contains("[libraries] has none"), "{e}");
+        let e = format!("{:#}", film(kit, &["transitions/../x"]).unwrap_err());
+        assert!(e.contains("climbs"), "{e}");
+        // Built-ins still work, with one warning per name that names the replacement.
+        let m = film("", &["iris", "iris", "wipe"]).unwrap();
+        assert_eq!(m.warnings.len(), 2, "{:?}", m.warnings);
+        assert!(
+            m.warnings[0].contains("\"iris\" is built into this shotglass")
+                && m.warnings[0].contains("subdir = \"transitions\"")
+                && m.warnings[0].contains("type = \"transitions/iris\""),
+            "{}",
+            m.warnings[0]
+        );
+        // With the kit's transitions already declared, it names the film's own local name.
+        let fx = kit.replacen("transitions =", "fx =", 1);
+        let m = film(&fx, &["fade"]).unwrap();
+        assert!(
+            m.warnings[0].contains("type = \"fx/fade\""),
+            "{:?}",
+            m.warnings
+        );
+    }
+
+    #[test]
     fn libraries_are_declared_by_local_name() {
         let m = Movie::parse(
             &format!(
@@ -1088,6 +1244,66 @@ mod tests {
             "{:?}",
             m.warnings
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_library_needing_newer_glsl_needs_the_film_to_opt_in() {
+        let dir =
+            std::env::temp_dir().join(format!("shotglass-movie-libglsl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("lib/compute")).unwrap();
+        std::fs::write(
+            dir.join("lib/compute/library.toml"),
+            "name = \"me/compute\"
+version = \"1.0.0\"
+glsl = 430
+",
+        )
+        .unwrap();
+        let toml = |glsl: &str| {
+            std::fs::write(
+                dir.join("movie.toml"),
+                format!(
+                    "{glsl}[libraries]
+fx = {{ path = \"lib/compute\" }}
+                     [[shot]]
+id = \"a\"
+scene = \"a.glsl\"
+duration = 1
+"
+                ),
+            )
+            .unwrap();
+        };
+        for film in [
+            "",
+            "glsl = \"410\"
+",
+        ] {
+            toml(film);
+            let e = format!("{:#}", Movie::load(&dir).unwrap_err());
+            assert!(
+                e.contains("fx (me/compute 1.0.0) needs GLSL 430") && e.contains("glsl = \"430\""),
+                "{e}"
+            );
+        }
+        toml(
+            "glsl = \"430\"
+",
+        );
+        assert_eq!(Movie::load(&dir).unwrap().libraries[0].glsl, Some(430));
+        // Only versions shotglass offers.
+        std::fs::write(
+            dir.join("lib/compute/library.toml"),
+            "name = \"me/compute\"
+version = \"1.0.0\"
+glsl = 450
+",
+        )
+        .unwrap();
+        let e = format!("{:#}", Movie::load(&dir).unwrap_err());
+        assert!(e.contains("glsl = 450"), "{e}");
         std::fs::remove_dir_all(&dir).ok();
     }
 

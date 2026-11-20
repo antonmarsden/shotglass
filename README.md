@@ -8,8 +8,9 @@ headless stills. Rust + OpenGL, no browser.
 
 - **Shots are Shadertoy-style `.glsl` files.** Write `mainImage`, use `iTime` and
   `iResolution`, and declare nothing else. Most Shadertoy code pastes straight in.
-- **Transitions combine two shots.** There are built-in fades, irises, dissolves and wipes,
-  or you can write your own using the [gl-transitions](https://gl-transitions.com)
+- **Transitions combine two shots.** Fades, irises, dissolves and wipes come from
+  [shotglass-kit](https://github.com/antonmarsden/shotglass-kit), or you can write your
+  own using the [gl-transitions](https://gl-transitions.com)
   `getFromColor` / `getToColor` / `progress` convention.
 - **The sound is GLSL too.** Music runs across the cuts, each shot can have its own
   sound that fades with the transitions, and an optional mix pass adds echo, reverb
@@ -58,7 +59,6 @@ movies/big-shadow/
 │   ├── shadow.glsl
 │   ├── moon.glsl
 │   └── black.glsl
-├── fx/                 the kit's fade and iris (#include <transitions/…>)
 ├── music.glsl          vec2 mainSound(int samp, float time), movie time
 ├── sfx/                one sound per shot, shot time
 │   ├── candle.glsl
@@ -96,15 +96,15 @@ sound = "sfx/candle.glsl"     # this shot's sound
 id = "moon"
 scene = "scenes/moon.glsl"
 duration = 8.0
-# The transition *into* this shot. No transition = a hard cut.
-transition = { type = "fade", duration = 1.4, params = { hold = 0.25 } }
+# The transition *into* this shot, here shotglass-kit's fade. No transition = a hard cut.
+transition = { type = "transitions/fade", duration = 1.4, params = { hold = 0.25 } }
 
 [[shot]]
 id = "closeup"
 scene = "scenes/shadow.glsl"     # shots can reuse a scene with different uniforms
 duration = 8.0
 time_offset = 20.0               # iTime starts here (default 0); time_scale also available
-transition = { type = "iris", duration = 1.5, freeze = true, ease = "inout", params = { center = [0.72, 0.70] } }
+transition = { type = "transitions/iris", duration = 1.5, freeze = true, ease = "inout", params = { center = [0.72, 0.70] } }
 sound = "sfx/plucks.glsl"
 sound_lead = 0.6                 # start the sound before the picture (J-cut); sound_tail lets it ring on
 
@@ -149,15 +149,28 @@ shared helpers can include each other freely.
 
 ### Transitions
 
+`type` names a transition in a library, `<library>/<name>`: `transitions/iris` is
+`iris.glsl` in the library the film calls `transitions`. shotglass-kit's are:
+
+```toml
+[libraries]
+transitions = { source = "https://github.com/antonmarsden/shotglass-kit", subdir = "transitions" }
+```
+
 | type | params (defaults) |
 |---|---|
-| `crossfade` | – |
-| `fade` | `color = [0,0,0]`, `hold = 0` (fraction of the transition spent fully on the colour) |
-| `iris` | `center = [0.5,0.5]`, `softness = 0.004`, `closing = 0` (1 = shrink onto the old shot) |
-| `dissolve` | `scale = 9`, `softness = 0.08` |
-| `wipe` | `direction = [1,0]`, `softness = 0.01` |
+| `transitions/crossfade` | – |
+| `transitions/fade` | `color = [0,0,0]`, `hold = 0` (fraction of the transition spent fully on the colour) |
+| `transitions/iris` | `center = [0.5,0.5]`, `softness = 0.004`, `closing = 0` (1 = shrink onto the old shot) |
+| `transitions/dissolve` | `scale = 9`, `softness = 0.08` |
+| `transitions/wipe` | `direction = [1,0]`, `softness = 0.01` |
 
-A custom transition is a `.glsl` file referenced by path, e.g. `type = "transitions/heart.glsl"`:
+**Deprecated:** the same five are still built into shotglass as `type = "iris"` and so
+on, with the same parameters and pixels. They keep working for now, but loading a film
+that uses them prints a warning naming the kit replacement, and they will be removed
+(the engine provides the transition interface, not the looks).
+
+A custom transition is a `.glsl` file in the film, referenced by path, e.g. `type = "fx/heart.glsl"`:
 
 ```glsl
 #ifndef softness
@@ -399,6 +412,11 @@ mine = { path = "lib/mykit" }            # a library inside the film's own folde
 - **`path`** is a library inside the film folder. It may not climb above it.
 - Errors inside a library file show `kit/noise.glsl:12`. A missing include lists
   every place that was searched.
+- **Clashes are named.** If two libraries (or a library and the film) define the same
+  function or struct, a failed compile starts with "`hash21(vec2)` is defined by both
+  library "toon" (toon/outline.glsl:12) and library "kit" (kit/noise.glsl:3)" rather
+  than only the driver's "redefinition". Overloads with different parameters are fine.
+  Library functions should start with the library's own prefix (`kit_`) to avoid this.
 
 ### library.toml
 
@@ -409,7 +427,7 @@ name = "shotglass-kit/core"        # canonical name
 version = "0.4.2"
 requires_shotglass = "0.1"         # engine contract it needs (optional)
 licences = ["MIT"]                 # SPDX identifiers
-glsl = 430                         # optional: needs more than the GLSL 3.30 baseline
+glsl = 430                         # optional: needs more than the GLSL 3.30 baseline (410 or 430)
 
 [requires]                         # peer libraries: checked, not installed
 "shotglass-kit/sounds" = ">=0.3"
@@ -420,6 +438,10 @@ library, includes of *other* libraries use canonical names
 (`#include <shotglass-kit/sounds/bell.glsl>`), which shotglass maps to whatever the
 film calls them. A peer requirement means the film must list that library itself;
 shotglass checks the versions and says what's missing, but never adds anything.
+
+A library with `glsl = 430` only loads in a film that opted in to at least that version
+(`glsl = "430"` in `movie.toml`); otherwise loading the film says which library needs it.
+Such a film needs a driver with that GLSL and won't play on the web.
 
 ### Fetching and shotglass.lock
 
