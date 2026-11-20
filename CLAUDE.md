@@ -13,6 +13,8 @@ xvfb-run -a cargo run -- check movies/big-shadow --size 320x180 --frames 1
 cargo run -- check movies/big-shadow --web --no-gpu   # strict GLSL (330 + ES 3.00), no GL needed
 xvfb-run -a cargo run -- strip movies/big-shadow --count 8 --out /tmp/s.png   # look at the PNG
 cargo fmt && cargo clippy --all-targets -- -D warnings
+cargo clippy --target wasm32-unknown-unknown -- -D warnings   # web player still compiles
+trunk serve --release                  # web player at http://127.0.0.1:8080/ (needs `cargo install trunk`)
 ```
 
 - `cargo test` = unit + property tests, then `tests/gpu.rs` (harness = false) runs
@@ -30,7 +32,8 @@ cargo fmt && cargo clippy --all-targets -- -D warnings
 
 | file | what |
 |---|---|
-| `main.rs` | CLI (clap): play, still, strip, check, wav, new, selftest |
+| `main.rs` | CLI (clap): play, still, strip, check, wav, new, selftest (desktop only) |
+| `files.rs` | `FileSource`: disk vs in-memory (downloaded) files; `Preloader` finds a movie's files by following `#include`s |
 | `movie.rs` | `movie.toml` → `Movie`; timeline (`at(t)`), cue defines, sound gains/windows |
 | `anim.rs` | constants/keyframes, eases; `glsl_fn` turns keyframes into GLSL for sound shaders |
 | `shader.rs` | source assembly, `#include`, `#line 1 N` per file, driver-log → file:line; `Dialect` (fixed `330 core` / `300 es` baseline, `glsl` opt-in) |
@@ -41,6 +44,8 @@ cargo fmt && cargo clippy --all-targets -- -D warnings
 | `app.rs` | egui player: transport, timeline, panels, live reload, auto scale, sound streaming |
 | `headless.rs` | hidden-window GL context for CLI commands |
 | `selftest.rs` | GPU/sound checks on fixture films written to a temp dir |
+| `web.rs` | wasm32 entry: `?movie=` URL, download via `Preloader`, Play button (starts WebAudio), eframe on a canvas, `Blit` |
+| `web/index.html`, `Trunk.toml` | the web player page and its trunk build |
 | `glsl/transitions/` | built-in transitions (params are `#define`s with `#ifndef` defaults) |
 | `movies/big-shadow/` | demo film; `templates/new/` is what `shotglass new` writes |
 
@@ -82,6 +87,17 @@ cargo fmt && cargo clippy --all-targets -- -D warnings
   and cue defines are the engine's API (semver). Reusable GLSL belongs in versioned libraries
   (the shotglass-kit repo, #3–#5), not embedded in the binary; the built-in transitions are
   slated to move there. Don't add new built-in GLSL.
+
+## Web build (wasm32)
+
+- One codebase: `cargo check --target wasm32-unknown-unknown` must keep passing (CI).
+  Desktop-only code (CLI, cpal, notify, headless, selftest, program-binary cache) is
+  behind `#[cfg(not(target_arch = "wasm32"))]`; a new CLI command needs that attribute.
+- Read movie files only through `Movie::files` (a `FileSource`), never `std::fs`, so
+  the web player sees them. Use `web_time::Instant`, not `std::time::Instant` (it
+  panics in the browser).
+- glow panics on WebGL for program binaries, timer queries without the extension,
+  and parallel-compile status without `KHR_parallel_shader_compile`; guard such calls.
 
 ## Adding things
 

@@ -18,7 +18,7 @@ use crate::shader::{Assembled, Builder, Dialect};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Instant;
+use web_time::Instant;
 
 /// Samples per chunk (≈0.68 s at 48 kHz).
 pub const CHUNK: usize = 32768;
@@ -109,7 +109,7 @@ const SAMPLE_INDEX: &str =
 
 /// The movie-level music shader (`mainSound`, movie time).
 pub fn music_source(d: Dialect, m: &Movie, cues: &str, path: &Path) -> anyhow::Result<Assembled> {
-    Ok(Builder::new(d, &format!("{COMMON}{GLSL_EASE}{cues}"), &m.root)
+    Ok(Builder::new(d, &format!("{COMMON}{GLSL_EASE}{cues}"), &m.files, &m.root)
         .file(path)?
         .footer(&format!(
             "void main() {{\n  {SAMPLE_INDEX}\n  shotglass_out = vec4(mainSound(s, float(s) / iSampleRate), 0.0, 1.0);\n}}"
@@ -131,7 +131,7 @@ pub fn shot_sound_source(d: Dialect, m: &Movie, cues: &str, i: usize) -> anyhow:
         header += &a.glsl_fn(&format!("sg_u_{name}"));
         assign += &format!("  {name} = sg_u_{name}(t);\n");
     }
-    Ok(Builder::new(d, &header, &m.root)
+    Ok(Builder::new(d, &header, &m.files, &m.root)
         .file(&snd.path)?
         .footer(&format!(
             "void main() {{\n  {SAMPLE_INDEX}\n  float t = float(s) / iSampleRate - iShotStart;\n{assign}  shotglass_out = vec4(mainSound(s, t), 0.0, 1.0);\n}}"
@@ -142,7 +142,7 @@ pub fn shot_sound_source(d: Dialect, m: &Movie, cues: &str, i: usize) -> anyhow:
 /// The final mix shader (`mainMix`, reading `music()` and `sfx()`).
 pub fn mix_source(d: Dialect, m: &Movie, cues: &str, path: &Path) -> anyhow::Result<Assembled> {
     Ok(
-        Builder::new(d, &format!("{COMMON}{GLSL_EASE}{cues}{}", mix_helpers()), &m.root)
+        Builder::new(d, &format!("{COMMON}{GLSL_EASE}{cues}{}", mix_helpers()), &m.files, &m.root)
             .file(path)?
             .footer(&format!(
                 "void main() {{\n  {SAMPLE_INDEX}\n  shotglass_out = vec4(mainMix(s, float(s) / iSampleRate), 0.0, 1.0);\n}}"

@@ -58,18 +58,18 @@ pub fn movie_sources(m: &Movie, d: Dialect) -> Vec<Source> {
     };
     frag(
         "copy pass".into(),
-        transition_source(d, "copy", &[], &cues, &m.root),
+        transition_source(d, "copy", &[], &cues, m),
     );
     for shot in &m.shots {
         if let Some(t) = &shot.transition_in {
             frag(
                 format!("transition into \"{}\" ({})", shot.id, t.kind),
-                transition_source(d, &t.kind, &t.params, &cues, &m.root),
+                transition_source(d, &t.kind, &t.params, &cues, m),
             );
         }
         frag(
             format!("shot \"{}\" ({})", shot.id, rel(&shot.scene)),
-            scene_source(d, shot, &cues, &m.root),
+            scene_source(d, shot, &cues, m),
         );
     }
     if let Some(p) = &m.music {
@@ -102,7 +102,8 @@ pub fn validate_movie(m: &Movie, d: Dialect) -> Vec<ShaderError> {
 }
 
 /// Whether this build can validate (the `strict-glsl` feature).
-pub const AVAILABLE: bool = cfg!(feature = "strict-glsl");
+/// glslang is C++ and isn't built for the browser, so the web player never has it.
+pub const AVAILABLE: bool = cfg!(all(feature = "strict-glsl", not(target_arch = "wasm32")));
 
 /// Validate sources from [`movie_sources`]; one entry per failing shader.
 pub fn validate_sources(sources: &[Source]) -> Vec<ShaderError> {
@@ -152,7 +153,7 @@ fn explain_later_versions(src: &Assembled, stage: Stage, messages: Vec<String>) 
 
 /// Run one assembled shader through the reference front end. Err = messages mapped
 /// to file:line through the `#line` markers the assembler wrote.
-#[cfg(feature = "strict-glsl")]
+#[cfg(all(feature = "strict-glsl", not(target_arch = "wasm32")))]
 pub fn validate(src: &Assembled, stage: Stage) -> Result<(), Vec<String>> {
     use glslang::{
         Compiler, CompilerOptions, ShaderInput, ShaderMessage, ShaderSource, ShaderStage,
@@ -198,7 +199,7 @@ pub fn validate(src: &Assembled, stage: Stage) -> Result<(), Vec<String>> {
     }
 }
 
-#[cfg(not(feature = "strict-glsl"))]
+#[cfg(not(all(feature = "strict-glsl", not(target_arch = "wasm32"))))]
 pub fn validate(_src: &Assembled, _stage: Stage) -> Result<(), Vec<String>> {
     Err(vec![
         "this shotglass was built without the strict-glsl feature, so it can't validate shaders"
@@ -209,7 +210,10 @@ pub fn validate(_src: &Assembled, _stage: Stage) -> Result<(), Vec<String>> {
 /// glslang's log → `file:line: error: ...` lines. Drops its summary lines and turns
 /// "required extension not requested" (a built-in from a later version) into advice
 /// that fits the fixed-version model.
-#[cfg_attr(not(feature = "strict-glsl"), allow(dead_code))]
+#[cfg_attr(
+    not(all(feature = "strict-glsl", not(target_arch = "wasm32"))),
+    allow(dead_code)
+)]
 fn tidy_log(log: &str, src: &Assembled) -> Vec<String> {
     let mut kept: Vec<String> = vec![];
     for line in log.lines().map(str::trim).filter(|l| !l.is_empty()) {
@@ -253,11 +257,16 @@ mod tests {
 
     fn scene(d: Dialect, root: &Path, body: &str) -> Result<(), Vec<String>> {
         std::fs::write(root.join("scenes/a.glsl"), body).unwrap();
-        let src = Builder::new(d, "uniform vec3 iResolution;\nout vec4 o;\n", root)
-            .file(&root.join("scenes/a.glsl"))
-            .unwrap()
-            .footer("void main(){ vec4 c; mainImage(c, gl_FragCoord.xy); o = c; }")
-            .build();
+        let src = Builder::new(
+            d,
+            "uniform vec3 iResolution;\nout vec4 o;\n",
+            &crate::files::disk(),
+            root,
+        )
+        .file(&root.join("scenes/a.glsl"))
+        .unwrap()
+        .footer("void main(){ vec4 c; mainImage(c, gl_FragCoord.xy); o = c; }")
+        .build();
         validate(&src, Stage::Fragment)
     }
 

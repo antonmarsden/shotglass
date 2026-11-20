@@ -1,24 +1,43 @@
 //! shotglass — compose short films from GLSL shaders.
+//!
+//! On the desktop this is the CLI and player. Built for wasm32 it is the web
+//! player (`web.rs`): the CLI, headless GL and selftest are left out.
+
+// The CLI and selftest use parts of the engine the web player doesn't.
+#![cfg_attr(target_arch = "wasm32", allow(dead_code))]
 
 mod anim;
 mod app;
 mod audio;
+mod files;
 mod gfx;
+#[cfg(not(target_arch = "wasm32"))]
 mod headless;
 mod movie;
+#[cfg(not(target_arch = "wasm32"))]
 mod selftest;
 mod shader;
 mod sound;
 mod validate;
+#[cfg(target_arch = "wasm32")]
+mod web;
 
+#[cfg(not(target_arch = "wasm32"))]
 use anyhow::{Context, Result, anyhow, bail};
+#[cfg(not(target_arch = "wasm32"))]
 use clap::{Parser, Subcommand};
+#[cfg(not(target_arch = "wasm32"))]
 use gfx::{Frame, FrameInfo, Renderer};
+#[cfg(not(target_arch = "wasm32"))]
 use movie::{At, Movie};
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::{Path, PathBuf};
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
+#[cfg(not(target_arch = "wasm32"))]
 use toodee::{CopyOps, TooDeeOps, TooDeeOpsMut};
 
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Parser)]
 #[command(
     name = "shotglass",
@@ -33,6 +52,7 @@ struct Cli {
     movie: Option<PathBuf>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Subcommand)]
 enum Cmd {
     /// Open the player: scrub, loop, tweak shaders with live reload.
@@ -106,6 +126,12 @@ enum Cmd {
     },
 }
 
+#[cfg(target_arch = "wasm32")]
+fn main() {
+    web::start();
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn main() {
     if let Err(e) = real_main() {
         eprintln!("error: {e:#}");
@@ -113,6 +139,7 @@ fn main() {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn real_main() -> Result<()> {
     let cli = Cli::parse();
     let cmd = match (cli.cmd, cli.movie) {
@@ -177,6 +204,7 @@ fn real_main() -> Result<()> {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn parse_size(s: &str) -> Result<(i32, i32)> {
     let (w, h) = s
         .split_once(['x', 'X'])
@@ -189,6 +217,7 @@ fn parse_size(s: &str) -> Result<(i32, i32)> {
 }
 
 /// "3.5", "moon" (middle of the shot), "moon+1.5" (1.5 s into the shot).
+#[cfg(not(target_arch = "wasm32"))]
 fn parse_times(s: &str, m: &Movie) -> Result<Vec<f32>> {
     s.split(',')
         .map(str::trim)
@@ -215,6 +244,7 @@ fn parse_times(s: &str, m: &Movie) -> Result<Vec<f32>> {
         .collect()
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn load_renderer(gl: std::sync::Arc<eframe::glow::Context>, m: &Movie) -> Result<Renderer> {
     let mut r = Renderer::new(gl)?;
     if let Err(errors) = r.load_all(m) {
@@ -227,6 +257,7 @@ fn load_renderer(gl: std::sync::Arc<eframe::glow::Context>, m: &Movie) -> Result
     Ok(r)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn frame_info(m: &Movie, t: f32) -> FrameInfo {
     FrameInfo {
         t,
@@ -236,6 +267,7 @@ fn frame_info(m: &Movie, t: f32) -> FrameInfo {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn still(movie: &Path, at: &str, size: &str, out: &Path) -> Result<()> {
     let m = Movie::load(movie)?;
     let times = parse_times(at, &m)?;
@@ -255,6 +287,7 @@ fn still(movie: &Path, at: &str, size: &str, out: &Path) -> Result<()> {
     })
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn strip(
     movie: &Path,
     count: usize,
@@ -301,6 +334,7 @@ fn strip(
     })
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn save_png(path: &Path, frame: &Frame) -> Result<()> {
     image::save_buffer(
         path,
@@ -312,6 +346,7 @@ fn save_png(path: &Path, frame: &Frame) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn describe(m: &Movie, t: f32) -> String {
     match m.at(t) {
         At::Shot { shot, local } => format!("{} +{local:.2}s", m.shots[shot].id),
@@ -330,6 +365,7 @@ fn describe(m: &Movie, t: f32) -> String {
 /// The driver-independent part of `check`: every shader through the reference front
 /// end at the film's desktop dialect, and as GLSL ES 3.00 (errors with `web`,
 /// warnings otherwise).
+#[cfg(not(target_arch = "wasm32"))]
 fn strict_check(m: &Movie, web: bool) -> Result<()> {
     use shader::Dialect;
     if !validate::AVAILABLE {
@@ -392,6 +428,7 @@ fn strict_check(m: &Movie, web: bool) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn check(movie: &Path, size: &str, frames: usize, web: bool, no_gpu: bool) -> Result<()> {
     let m = Movie::load(movie)?;
     let (w, h) = parse_size(size)?;
@@ -493,6 +530,7 @@ fn check(movie: &Path, size: &str, frames: usize, web: bool, no_gpu: bool) -> Re
     })
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn wav(movie: &Path, out: &Path, rate: u32) -> Result<()> {
     let m = Movie::load(movie)?;
     if !m.has_sound() {
@@ -530,6 +568,7 @@ fn wav(movie: &Path, out: &Path, rate: u32) -> Result<()> {
     })
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 const TEMPLATE: &[(&str, &str)] = &[
     ("movie.toml", include_str!("../templates/new/movie.toml")),
     (
@@ -548,6 +587,7 @@ const TEMPLATE: &[(&str, &str)] = &[
 ];
 
 /// Write the `shotglass new` template into `dir`.
+#[cfg(not(target_arch = "wasm32"))]
 fn write_template(dir: &Path) -> Result<()> {
     for (name, text) in TEMPLATE {
         let p = dir.join(name);
@@ -557,6 +597,7 @@ fn write_template(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn new_movie(dir: &Path) -> Result<()> {
     if dir.exists() && std::fs::read_dir(dir)?.next().is_some() {
         bail!("{} already exists and isn't empty", dir.display());

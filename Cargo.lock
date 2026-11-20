@@ -2575,12 +2575,17 @@ dependencies = [
  "glutin",
  "glutin-winit",
  "image",
+ "js-sys",
  "notify",
  "proptest",
  "raw-window-handle",
  "serde",
  "toml",
  "toodee",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "web-time",
  "winit",
 ]
 

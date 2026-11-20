@@ -5,8 +5,10 @@
 //! driver message like `3(42) : error` or `0:42(7): error` tells us the file (N) and
 //! the line directly.
 
+use crate::files::FileSource;
 use anyhow::{Result, anyhow, bail};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// The GLSL language a shader is written in: the `#version` line the harness emits.
 ///
@@ -76,7 +78,11 @@ pub struct DriverGlsl {
 
 impl DriverGlsl {
     pub fn detect(glsl_version: &str, gl_version: &str) -> DriverGlsl {
-        let es = gl_version.contains("OpenGL ES") || glsl_version.contains("OpenGL ES");
+        // WebGL 2 reports e.g. "WebGL 2.0" / "WebGL GLSL ES 3.00" (Firefox) without "OpenGL ES".
+        let es = gl_version.contains("OpenGL ES")
+            || glsl_version.contains("OpenGL ES")
+            || glsl_version.contains("GLSL ES")
+            || gl_version.starts_with("WebGL");
         let num: String = glsl_version
             .split_whitespace()
             .find(|w| w.chars().next().is_some_and(|c| c.is_ascii_digit()))
@@ -131,11 +137,18 @@ pub struct Builder {
     dialect: Dialect,
     files: Vec<String>,
     root: PathBuf,
+    source: Arc<dyn FileSource>,
 }
 
 impl Builder {
     /// `header` is generated code (uniform declarations, defines). It is source string 0.
-    pub fn new(dialect: Dialect, header: &str, root: &Path) -> Builder {
+    /// Files (and their `#include`s) are read from `source`.
+    pub fn new(
+        dialect: Dialect,
+        header: &str,
+        source: &Arc<dyn FileSource>,
+        root: &Path,
+    ) -> Builder {
         let mut text = dialect.version_line();
         text += header;
         if !text.ends_with('\n') {
@@ -146,6 +159,7 @@ impl Builder {
             dialect,
             files: vec!["<shotglass header>".into()],
             root: root.to_path_buf(),
+            source: source.clone(),
         }
     }
 
@@ -184,7 +198,10 @@ impl Builder {
         if depth > 16 {
             bail!("#include nested too deeply at {}", path.display());
         }
-        let src = std::fs::read_to_string(path).map_err(|e| anyhow!("{}: {e}", path.display()))?;
+        let src = self
+            .source
+            .read(path)
+            .map_err(|e| anyhow!("{}: {e}", path.display()))?;
         let idx = self.new_string(display_path(path, &self.root));
         self.push_text(&src, idx, Some(path), depth)
     }
@@ -199,20 +216,14 @@ impl Builder {
         self.text += &format!("#line 1 {idx}\n");
         for (n, line) in src.lines().enumerate() {
             let trimmed = line.trim_start();
-            if let Some(rest) = trimmed.strip_prefix("#include") {
-                let name = rest
-                    .trim()
-                    .trim_matches(|c| c == '"' || c == '<' || c == '>');
+            if let Some(name) = include_name(line) {
                 let here = path
                     .and_then(Path::parent)
                     .unwrap_or(&self.root)
                     .to_path_buf();
-                let candidate = [
-                    normalize(&here.join(name)),
-                    normalize(&self.root.join(name)),
-                ]
-                .into_iter()
-                .find(|p| p.exists());
+                let candidate = include_candidates(&here, &self.root, name)
+                    .into_iter()
+                    .find(|p| self.source.exists(p));
                 let Some(inc) = candidate else {
                     bail!(
                         "{}:{}: can't find #include \"{name}\"",
@@ -237,8 +248,23 @@ impl Builder {
     }
 }
 
+/// The file named by an `#include "name"` (or `<name>`) line.
+pub fn include_name(line: &str) -> Option<&str> {
+    let rest = line.trim_start().strip_prefix("#include")?;
+    Some(
+        rest.trim()
+            .trim_matches(|c| c == '"' || c == '<' || c == '>'),
+    )
+}
+
+/// Where an `#include` is looked for, in order: next to the including file
+/// (`here`), then at the movie root.
+pub fn include_candidates(here: &Path, root: &Path, name: &str) -> [PathBuf; 2] {
+    [normalize(&here.join(name)), normalize(&root.join(name))]
+}
+
 /// Resolve `.` and `..` without touching the file system (canonicalize adds \\?\ on Windows).
-fn normalize(p: &Path) -> PathBuf {
+pub fn normalize(p: &Path) -> PathBuf {
     use std::path::Component;
     let mut out = PathBuf::new();
     for c in p.components() {
@@ -366,10 +392,15 @@ mod tests {
             "#include \"../common.glsl\"\nvoid f(){}\n",
         )
         .unwrap();
-        let a = Builder::new(Dialect::BASELINE, "uniform float iTime;", &dir)
-            .file(&dir.join("scenes/a.glsl"))
-            .unwrap()
-            .build();
+        let a = Builder::new(
+            Dialect::BASELINE,
+            "uniform float iTime;",
+            &crate::files::disk(),
+            &dir,
+        )
+        .file(&dir.join("scenes/a.glsl"))
+        .unwrap()
+        .build();
         assert_eq!(
             a.files,
             vec!["<shotglass header>", "scenes/a.glsl", "common.glsl"]
@@ -394,6 +425,8 @@ mod tests {
         );
         assert_eq!(DriverGlsl::detect("4.10", "4.1 Metal").max, 410);
         assert!(DriverGlsl::detect("OpenGL ES GLSL ES 3.00", "OpenGL ES 3.0").es);
+        // Firefox's WebGL 2 strings (Chrome adds "(OpenGL ES ...)").
+        assert!(DriverGlsl::detect("WebGL GLSL ES 3.00", "WebGL 2.0").es);
     }
 
     #[test]

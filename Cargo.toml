@@ -13,6 +13,15 @@ exclude = ["movies/*/stills", "*.wav"]
 [dependencies]
 anyhow = "1.0.104"
 arc-swap = "1.9.5"
+eframe = { version = "0.37.0", default-features = false, features = ["glow", "default_fonts"] }
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.2.1"
+toodee = "0.8"
+# std::time::Instant panics on wasm32-unknown-unknown; this is std's on the desktop.
+web-time = "1.1.0"
+
+# Desktop only: the CLI, sound card, live reload, headless GL, PNG output.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 clap = { version = "4.6.9", features = ["derive"] }
 cpal = "0.18.2"
 eframe = { version = "0.37.0", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
@@ -24,10 +33,36 @@ glutin-winit = "0.5"
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 notify = "8.2.2"
 raw-window-handle = "0.6"
-serde = { version = "1.0.229", features = ["derive"] }
-toml = "1.2.1"
-toodee = "0.8"
 winit = "0.30"
+
+# Web player (`trunk build`, see README "Web player").
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+js-sys = "0.3.107"
+wasm-bindgen = "0.2.130"
+wasm-bindgen-futures = "0.4.80"
+web-sys = { version = "0.3.107", features = [
+    "AudioBuffer",
+    "AudioContext",
+    "AudioDestinationNode",
+    "AudioNode",
+    "AudioProcessingEvent",
+    "BaseAudioContext",
+    "console",
+    "Document",
+    "Element",
+    "HtmlButtonElement",
+    "HtmlCanvasElement",
+    "HtmlElement",
+    "Location",
+    "Request",
+    "RequestInit",
+    "RequestMode",
+    "Response",
+    "ScriptProcessorNode",
+    "Url",
+    "UrlSearchParams",
+    "Window",
+] }
 
 # Dependencies are slow unoptimised; this keeps `cargo run` snappy.
 [profile.dev.package."*"]

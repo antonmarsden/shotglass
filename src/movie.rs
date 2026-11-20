@@ -1,10 +1,12 @@
 //! `movie.toml` parsing and the timeline: which shot (or transition) is on screen at time t.
 
 use crate::anim::{Anim, Ease, vector};
+use crate::files::{self, FileSource};
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 // ---------------------------------------------------------------- file format
 
@@ -140,6 +142,8 @@ pub struct Marker {
 #[derive(Clone, Debug)]
 pub struct Movie {
     pub root: PathBuf,
+    /// Where `root` and every path below are read from (disk, or downloaded files).
+    pub files: Arc<dyn FileSource>,
     pub title: String,
     pub aspect: f32,
     pub fps: f32,
@@ -182,13 +186,25 @@ impl Movie {
         } else {
             path.to_path_buf()
         };
-        let root = file.parent().map(Path::to_path_buf).unwrap_or_default();
-        let text = std::fs::read_to_string(&file)
-            .with_context(|| format!("reading {}", file.display()))?;
-        Movie::parse(&text, &root).with_context(|| format!("in {}", file.display()))
+        Movie::load_from(files::disk(), &file)
     }
 
+    /// Load the `movie.toml` at `file` from `source`; its folder is the movie root.
+    pub fn load_from(source: Arc<dyn FileSource>, file: &Path) -> Result<Movie> {
+        let root = file.parent().map(Path::to_path_buf).unwrap_or_default();
+        let text = source
+            .read(file)
+            .with_context(|| format!("reading {}", file.display()))?;
+        Movie::parse_with(&text, &root, source).with_context(|| format!("in {}", file.display()))
+    }
+
+    /// Parse `movie.toml` text whose files live on disk under `root`.
+    #[cfg(test)]
     pub fn parse(text: &str, root: &Path) -> Result<Movie> {
+        Movie::parse_with(text, root, files::disk())
+    }
+
+    pub fn parse_with(text: &str, root: &Path, source: Arc<dyn FileSource>) -> Result<Movie> {
         let f: MovieFile = toml::from_str(text)?;
         if f.shots.is_empty() {
             bail!("a movie needs at least one [[shot]]");
@@ -328,6 +344,7 @@ impl Movie {
         };
         Ok(Movie {
             root: root.to_path_buf(),
+            files: source,
             title: f.title.unwrap_or_else(|| "Untitled".into()),
             aspect,
             fps: f.fps.unwrap_or(30.0).max(1.0),
@@ -424,6 +441,34 @@ impl Movie {
         g * ((t - from) / ramp).clamp(0.0, 1.0) * ((to - t) / ramp).clamp(0.0, 1.0)
     }
 
+    /// Every file `movie.toml` names (scenes, sounds, the mix, custom transitions),
+    /// without the files they `#include`. Each appears once. (The web player
+    /// downloads these before playing.)
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    pub fn referenced_files(&self) -> Vec<PathBuf> {
+        let mut out: Vec<PathBuf> = vec![];
+        let mut add = |p: PathBuf| {
+            if !out.contains(&p) {
+                out.push(p);
+            }
+        };
+        for s in &self.shots {
+            add(s.scene.clone());
+            if let Some(t) = &s.transition_in
+                && t.kind.ends_with(".glsl")
+            {
+                add(self.root.join(&t.kind));
+            }
+            if let Some(snd) = &s.sound {
+                add(snd.path.clone());
+            }
+        }
+        for p in self.music.iter().chain(&self.mix) {
+            add(p.clone());
+        }
+        out
+    }
+
     pub fn shot_by_id(&self, id: &str) -> Option<&Shot> {
         self.shots.iter().find(|s| s.id == id)
     }
@@ -477,6 +522,48 @@ fn is_ident(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lists_referenced_files_and_loads_from_any_source() {
+        let toml = r#"
+            [sound]
+            music = "music.glsl"
+            mix = "mix.glsl"
+            [[shot]]
+            id = "a"
+            scene = "scenes/a.glsl"
+            duration = 2
+            sound = "sfx/a.glsl"
+            [[shot]]
+            id = "b"
+            scene = "scenes/a.glsl"
+            duration = 2
+            transition = { type = "fx/swirl.glsl", duration = 1 }
+            [[shot]]
+            id = "c"
+            scene = "scenes/c.glsl"
+            duration = 2
+            transition = { type = "crossfade", duration = 1 }
+        "#;
+        let mut mem = files::Memory::default();
+        mem.insert(Path::new("films/x/movie.toml"), toml.into());
+        let m = Movie::load_from(Arc::new(mem), Path::new("films/x/movie.toml")).unwrap();
+        assert_eq!(m.root, Path::new("films/x"));
+        let want: Vec<PathBuf> = [
+            "scenes/a.glsl",
+            "sfx/a.glsl",
+            "fx/swirl.glsl",
+            "scenes/c.glsl",
+            "music.glsl",
+            "mix.glsl",
+        ]
+        .iter()
+        .map(|p| Path::new("films/x").join(p))
+        .collect();
+        assert_eq!(m.referenced_files(), want);
+        assert!(m.files.exists(Path::new("films/x/movie.toml")));
+        assert!(Movie::load_from(files::disk(), Path::new("films/x/movie.toml")).is_err());
+    }
 
     const M: &str = r#"
         title = "t"

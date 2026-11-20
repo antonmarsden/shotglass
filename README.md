@@ -2,7 +2,7 @@
 
 Compose short films, cartoons and full-length episodes from GLSL shaders. Shots, transitions and
 GPU-synthesised sound sit on one scrubbable timeline, with live reload and
-headless stills. Rust + OpenGL, no browser.
+headless stills. Rust + OpenGL, with an experimental [web player](#web-player-experimental).
 
 ![Big Shadow contact sheet](docs/big-shadow-strip.png)
 
@@ -369,6 +369,58 @@ shotglass selftest [filter]                                # GPU + sound checks 
 
 `still`, `strip`, `check` and `wav` render off-screen (`check --no-gpu` doesn't need OpenGL). On a Linux machine with
 no display, run them under `xvfb-run`; Mesa's software OpenGL works.
+
+## Web player (experimental)
+
+The same player also builds for the browser (WebAssembly, WebGL 2, WebAudio). It is
+early work toward [#2](https://github.com/antonmarsden/shotglass/issues/2): it
+plays a movie from any static web server, but hasn't been tested much across
+browsers yet.
+
+Build it with [trunk](https://trunkrs.dev):
+
+```sh
+rustup target add wasm32-unknown-unknown
+cargo install --locked trunk
+trunk serve --release        # http://127.0.0.1:8080/ plays the demo film
+trunk build --release        # the site goes to dist/
+```
+
+`dist/` is a static site: `index.html`, the `.wasm` and its JavaScript glue,
+and a copy of `movies/big-shadow` as `big-shadow/`. Name the movie with
+`?movie=`, relative to the page or absolute, as a folder or its `movie.toml`:
+
+```
+https://example.com/shotglass/                                  # the bundled demo
+https://example.com/shotglass/?movie=films/my-film/
+https://example.com/shotglass/?movie=https://cdn.example.org/my-film/movie.toml
+```
+
+**Hosting.** Any static host works (GitHub Pages, S3, `python3 -m http.server`);
+`file://` doesn't, because browsers block `fetch` there. Upload the movie folder
+as it is. The player downloads `movie.toml`, then every scene, sound, mix and
+transition file it names, and every file those `#include`, before the Play
+button lights up. An include is looked up next to the including file, then at
+the movie root, as on the desktop, so the server returning 404 for the first
+try is normal. Missing files are reported in the player with file:line.
+
+**CORS.** A movie on a different origin from the player must be served with
+`Access-Control-Allow-Origin` (e.g. `*`, or the player's origin) on its files.
+Without it the browser blocks the requests and the start screen says it
+couldn't fetch the file. GitHub Pages sends `Access-Control-Allow-Origin: *`.
+
+**What's different from the desktop**
+
+- Click Play to start: browsers only allow sound after a click.
+- No live reload, no program cache, no CLI commands.
+- Shaders are compiled as GLSL ES 3.00, which is stricter than desktop GLSL
+  (no implicit int → float conversions, for one). A shader that works on the
+  desktop can fail here; the error shows file:line as usual.
+- The GPU timer is usually unavailable, so the auto scale goes by late frames.
+- Sound plays through a WebAudio `ScriptProcessorNode` on the page's main thread,
+  with a long buffer so shader compiles don't cause gaps. The clock follows the
+  sound as on the desktop, using the AudioContext's `currentTime`,
+  `playbackTime` and `outputLatency`.
 
 ## Testing
 

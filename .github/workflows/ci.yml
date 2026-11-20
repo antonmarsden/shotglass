@@ -44,6 +44,21 @@ jobs:
           name: big-shadow-strip
           path: strip.png
 
+  # The web player (README "Web player"): check that it still compiles for the
+  # browser. Building the site needs trunk; this only type-checks and lints.
+  wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: wasm32-unknown-unknown
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --target wasm32-unknown-unknown
+      - run: cargo clippy --target wasm32-unknown-unknown -- -D warnings
+
   windows:
     runs-on: windows-latest
     steps:
