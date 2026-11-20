@@ -44,6 +44,10 @@ struct Perf {
     frame_ms: VecDeque<f32>,
     gpu_ms: VecDeque<f32>,
     dropped: u32,
+    /// Dropped frames caused by compiling or sound synthesis, not by rendering.
+    stalled: u32,
+    /// This frame did blocking housekeeping work.
+    stall: bool,
     cooldown: u32,
     calm: u32,
 }
@@ -178,6 +182,8 @@ impl Player {
                 frame_ms: VecDeque::new(),
                 gpu_ms: VecDeque::new(),
                 dropped: 0,
+                stalled: 0,
+                stall: false,
                 cooldown: 0,
                 calm: 0,
             },
@@ -518,6 +524,7 @@ impl Player {
         let dt = self.perf.last.map(|l| (now - l).as_secs_f32() * 1000.0);
         self.perf.last = Some(now);
         let gpu = self.renderer.gpu_ms();
+        let stall = std::mem::take(&mut self.perf.stall);
         if !self.clock.playing() {
             self.perf.last = None;
             return;
@@ -528,9 +535,13 @@ impl Player {
             Perf::push(&mut self.perf.gpu_ms, g);
         }
         let vsync = self.perf.vsync_ms();
-        let over = dt > vsync * 1.5;
-        if over {
-            self.perf.dropped += 1;
+        let late = dt > vsync * 1.5;
+        if late {
+            if stall {
+                self.perf.stalled += 1;
+            } else {
+                self.perf.dropped += 1;
+            }
         }
         if self.scale_mode != ScaleMode::Auto || !rendered {
             return;
@@ -539,20 +550,47 @@ impl Player {
             self.perf.cooldown -= 1;
             return;
         }
-        // Prefer the GPU timer: it warns before frames actually drop.
-        let busy = gpu.map(|g| g / vsync);
-        let too_slow = over || busy.is_some_and(|b| b > 0.85);
-        if too_slow {
-            let k = busy.map_or(0.85, |b| (0.75 / b).sqrt().clamp(0.7, 0.95));
-            self.auto_scale = (self.auto_scale * k).max(0.3);
-            self.perf.cooldown = 12;
-            self.perf.calm = 0;
-        } else if busy.is_none_or(|b| b < 0.55) {
-            self.perf.calm += 1;
-            if self.perf.calm > 90 && self.auto_scale < 1.0 {
-                self.auto_scale = (self.auto_scale * 1.06).min(1.0);
-                self.perf.calm = 0;
-                self.perf.cooldown = 20;
+        // Budget: one display refresh, but never stricter than 60 fps — a 144 Hz
+        // monitor shouldn't force a 30 fps film down to a blur.
+        let budget = vsync.max(1000.0 / 60.0);
+        let scale = self.auto_scale;
+        match gpu {
+            Some(g) => {
+                // Only the GPU time decides: frame-time spikes can come from compiles,
+                // sound synthesis or the OS. Cost grows with pixels (scale²), so predict
+                // the full-resolution cost and pick the largest scale that fits 75% of the budget.
+                let full = g / (scale * scale).max(0.01);
+                let target = (0.75 * budget / full.max(1e-3)).sqrt().clamp(0.3, 1.0);
+                if target < scale * 0.97 {
+                    self.auto_scale = target; // drop at once
+                    self.perf.cooldown = 10;
+                    self.perf.calm = 0;
+                } else if target > scale * 1.05 {
+                    self.perf.calm += 1;
+                    if self.perf.calm > 30 {
+                        // climb back quickly, but in steps, in case the prediction is optimistic
+                        self.auto_scale = (scale + (target - scale) * 0.6).min(1.0);
+                        self.perf.calm = 0;
+                        self.perf.cooldown = 10;
+                    }
+                } else {
+                    self.perf.calm = 0;
+                }
+            }
+            None => {
+                // No GPU timer: go by frame times, ignoring frames we stalled ourselves.
+                if late && !stall {
+                    self.auto_scale = (scale * 0.85).max(0.3);
+                    self.perf.cooldown = 12;
+                    self.perf.calm = 0;
+                } else {
+                    self.perf.calm += 1;
+                    if self.perf.calm > 120 && scale < 1.0 {
+                        self.auto_scale = (scale * 1.08).min(1.0);
+                        self.perf.calm = 0;
+                        self.perf.cooldown = 20;
+                    }
+                }
             }
         }
     }
@@ -942,7 +980,14 @@ impl Player {
                         "gpu {}   |   dropped {}",
                         avg(&self.perf.gpu_ms).map_or("n/a".into(), |v| format!("{v:.2} ms")),
                         self.perf.dropped
-                    ));
+                    ))
+                    .on_hover_text("frames that missed the display refresh while rendering");
+                    if self.perf.stalled > 0 {
+                        ui.label(format!(
+                            "stalls {} (compiling or synthesizing sound)",
+                            self.perf.stalled
+                        ));
+                    }
                     graph(
                         ui,
                         &self.perf.frame_ms,
@@ -951,6 +996,7 @@ impl Player {
                     );
                     if ui.small_button("reset counters").clicked() {
                         self.perf.dropped = 0;
+                        self.perf.stalled = 0;
                         self.perf.frame_ms.clear();
                         self.perf.gpu_ms.clear();
                     }
@@ -1033,10 +1079,16 @@ impl eframe::App for Player {
         self.handle_keys(&ctx);
         self.advance_clock();
         self.perf_frame += 1;
+        // Housekeeping (sound synthesis, shader compiles) runs on this thread. Time it,
+        // so a slow frame caused by it isn't mistaken for the GPU being overloaded.
+        let work = Instant::now();
         self.stream_sound();
         if let Some(m) = &self.movie {
-            self.renderer.pump(m, self.clock.time(), true);
+            // Without parallel compiling, a compile blocks: don't do background ones mid-playback.
+            let background = !self.clock.playing() || self.renderer.parallel;
+            self.renderer.pump(m, self.clock.time(), background);
         }
+        self.perf.stall = work.elapsed() > Duration::from_millis(3);
 
         egui::Panel::bottom("transport").show(ui, |ui| {
             ui.add_space(4.0);
