@@ -81,7 +81,17 @@ fn run<R>(el: &ActiveEventLoop, job: Job<R>) -> Result<R> {
 pub fn with_gl<R: 'static>(
     job: impl FnOnce(Arc<glow::Context>) -> Result<R> + 'static,
 ) -> Result<R> {
-    let el = EventLoop::new().map_err(|e| anyhow!("can't open a display for OpenGL: {e}"))?;
+    // winit panics (rather than erroring) when an X11 library is missing: report it.
+    let el = std::panic::catch_unwind(EventLoop::new)
+        .map_err(|p| {
+            let msg = p
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_default();
+            anyhow!("can't open a display for OpenGL: {msg} (on Linux, install libxkbcommon-x11-0)")
+        })?
+        .map_err(|e| anyhow!("can't open a display for OpenGL: {e}"))?;
     let mut runner = Runner {
         job: Some(Box::new(job)),
         result: None,

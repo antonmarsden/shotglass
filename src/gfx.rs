@@ -154,6 +154,12 @@ pub struct Renderer {
     pub parallel: bool,
     binary_dir: Option<PathBuf>,
     frame_no: u64,
+    /// Programs loaded from the on-disk cache instead of compiled.
+    pub binary_hits: usize,
+    /// Strips a scene is drawn in (more when frames are very slow; see draw_scene).
+    tiles: u32,
+    /// GPU frame times not yet handed to `gpu_ms`.
+    gpu_samples: std::collections::VecDeque<f32>,
     /// Compiled audio programs and the float target they render into.
     audio: HashMap<u64, Program>,
     audio_target: Option<(glow::Framebuffer, glow::Texture)>,
@@ -224,6 +230,9 @@ impl Renderer {
                 parallel,
                 binary_dir,
                 frame_no: 0,
+                binary_hits: 0,
+                tiles: 1,
+                gpu_samples: Default::default(),
                 audio: HashMap::new(),
                 audio_target: None,
                 a: None,
@@ -239,6 +248,26 @@ impl Renderer {
 
     pub fn shader_cache_dir(&self) -> Option<&Path> {
         self.binary_dir.as_deref()
+    }
+
+    /// Use a different on-disk program cache (None turns it off).
+    pub fn set_cache_dir(&mut self, dir: Option<PathBuf>) {
+        if self.binary_dir.is_some() || dir.is_none() {
+            self.binary_dir = dir;
+        }
+    }
+
+    /// Force the number of strips scenes are drawn in (tests).
+    pub fn set_tiles(&mut self, n: u32) {
+        self.tiles = n.max(1);
+    }
+
+    /// Compiled (ready) programs currently held.
+    pub fn ready_count(&self) -> usize {
+        self.programs
+            .values()
+            .filter(|e| matches!(e.state, State::Ready(_)))
+            .count()
     }
 
     /// Switch to a new version of the movie. Sources are assembled now (so a missing
@@ -329,10 +358,7 @@ impl Renderer {
             .collect();
         keys.sort_unstable();
         keys.dedup();
-        let fresh = keys
-            .iter()
-            .filter(|k| matches!(self.programs[k].state, State::Idle))
-            .count();
+        let fresh = keys.iter().filter(|k| self.is_idle(**k)).count();
         // Start them all first so a parallel-compiling driver can overlap them.
         for k in &keys {
             self.start(*k);
@@ -385,7 +411,7 @@ impl Renderer {
             .collect();
         let ready = keys
             .iter()
-            .filter(|k| matches!(self.programs[k].state, State::Ready(_) | State::Failed(_)))
+            .filter(|k| matches!(self.state(**k), Some(State::Ready(_) | State::Failed(_))))
             .count();
         (ready, keys.len())
     }
@@ -401,8 +427,8 @@ impl Renderer {
             .map(|(k, _)| *k)
             .collect();
         for k in pending {
-            let done = match &self.programs[&k].state {
-                State::Pending(p) => {
+            let done = match self.state(k) {
+                Some(State::Pending(p)) => {
                     !self.parallel || unsafe { self.gl.get_program_completion_status(p.prog) }
                 }
                 _ => false,
@@ -422,7 +448,7 @@ impl Renderer {
             if *dist > LOOKAHEAD {
                 break;
             }
-            if matches!(self.programs[k].state, State::Idle) {
+            if self.is_idle(*k) {
                 if self.parallel {
                     self.start(*k);
                 } else {
@@ -438,7 +464,7 @@ impl Renderer {
                 if in_flight(self) >= 2 {
                     break;
                 }
-                if matches!(self.programs[k].state, State::Idle) {
+                if self.is_idle(*k) {
                     if self.parallel {
                         self.start(*k);
                     } else {
@@ -490,6 +516,14 @@ impl Renderer {
         v
     }
 
+    fn state(&self, k: u64) -> Option<&State> {
+        self.programs.get(&k).map(|e| &e.state)
+    }
+
+    fn is_idle(&self, k: u64) -> bool {
+        matches!(self.state(k), Some(State::Idle))
+    }
+
     fn keys_ready(&self, k: ShotKeys) -> bool {
         let ok = |k: u64| {
             matches!(
@@ -501,9 +535,16 @@ impl Renderer {
     }
 
     /// The programs to draw shot `i` with: the current version if it compiled,
-    /// otherwise the last working one. None if neither is ready.
-    fn usable(&self, i: usize, blocking: bool) -> Option<ShotKeys> {
+    /// otherwise the last working one. With `blocking`, the current version is
+    /// compiled first, so the decision is made knowing whether it works.
+    fn usable(&mut self, i: usize, blocking: bool) -> Option<ShotKeys> {
         let k = *self.wanted.get(i)?;
+        if blocking {
+            self.compile_now(k.scene);
+            if let Some(t) = k.trans {
+                self.compile_now(t);
+            }
+        }
         if self.keys_ready(k) {
             return Some(k);
         }
@@ -513,20 +554,11 @@ impl Renderer {
             .and_then(|id| self.fallback.get(id))
             .copied();
         if let Some(f) = fb.filter(|f| self.keys_ready(*f)) {
-            // Prefer the old version only while the new one is still compiling, or failed.
-            if !blocking
-                || [Some(k.scene), k.trans]
-                    .into_iter()
-                    .flatten()
-                    .any(|x| matches!(self.programs[&x].state, State::Failed(_)))
-            {
-                return Some(f);
-            }
+            return Some(f);
         }
-        if blocking {
-            return Some(k);
-        }
-        None
+        // Nothing working to show: with `blocking`, draw what we have (a failed
+        // scene shows black); otherwise wait for the compile.
+        blocking.then_some(k)
     }
 
     fn start(&mut self, k: u64) {
@@ -554,6 +586,7 @@ impl Renderer {
                 unreachable!()
             };
             let from_binary = p.from_binary;
+            self.binary_hits += from_binary as usize;
             let src = e.src.clone();
             let state = match self.finish_compile(p, &src) {
                 Ok(prog) => {
@@ -873,25 +906,35 @@ impl Renderer {
         info: &FrameInfo,
         blocking: bool,
     ) -> Option<glow::Texture> {
+        self.render_at(movie, w, h, info, movie.at(info.t), blocking)
+    }
+
+    /// Like `render`, but for an explicit timeline position (tests use this to
+    /// render a transition at an exact progress).
+    pub fn render_at(
+        &mut self,
+        movie: &Movie,
+        w: i32,
+        h: i32,
+        info: &FrameInfo,
+        at: At,
+        blocking: bool,
+    ) -> Option<glow::Texture> {
         let copy = self.copy?;
         let (w, h) = (w.max(1), h.max(1));
         let sw = ((w as f32 * info.scale).round() as i32).clamp(1, w);
         let sh = ((h as f32 * info.scale).round() as i32).clamp(1, h);
-        let at = movie.at(info.t);
+        self.poll_timer();
+        if invalid_at(movie, at) {
+            return None;
+        }
         let needed: Vec<usize> = match at {
             At::Shot { shot, .. } => vec![shot],
             At::Transition { from, to, .. } => vec![from, to],
         };
         let mut keys = vec![];
         for &i in &needed {
-            let k = self.usable(i, blocking)?;
-            if blocking {
-                self.compile_now(k.scene);
-                if let Some(t) = k.trans {
-                    self.compile_now(t);
-                }
-            }
-            keys.push(k);
+            keys.push(self.usable(i, blocking)?);
         }
         let frame_no = self.frame_no;
         for k in &keys {
@@ -928,7 +971,10 @@ impl Renderer {
                 to_local,
                 progress,
             } => {
-                let tr = movie.shots[to].transition_in.as_ref().unwrap();
+                // checked by invalid_at before any GL work
+                let Some(tr) = movie.shots[to].transition_in.as_ref() else {
+                    unreachable!()
+                };
                 let from_target = if tr.freeze {
                     let key = (to, self.generation);
                     if self.freeze_key != Some(key)
@@ -995,9 +1041,32 @@ impl Renderer {
         self.timer.is_some()
     }
 
+    /// The newest GPU frame time measured since the last call, if any.
     pub fn gpu_ms(&mut self) -> Option<f32> {
+        self.poll_timer();
+        let last = self.gpu_samples.back().copied();
+        self.gpu_samples.clear();
+        last
+    }
+
+    fn poll_timer(&mut self) {
         let gl = self.gl.clone();
-        self.timer.as_mut().and_then(|t| t.poll(&gl))
+        if let Some(ms) = self.timer.as_mut().and_then(|t| t.poll(&gl)) {
+            // Keep each strip under ~100 ms of GPU time.
+            let per_tile = ms / self.tiles as f32;
+            if per_tile > 100.0 || (self.tiles > 1 && ms < 50.0 * self.tiles as f32) {
+                self.tiles = ((ms / 100.0).ceil() as u32).clamp(1, 64);
+            }
+            self.gpu_samples.push_back(ms);
+            if self.gpu_samples.len() > 16 {
+                self.gpu_samples.pop_front();
+            }
+        }
+    }
+
+    /// True if the driver reset the GPU (a shader ran too long) or lost the context.
+    pub fn context_lost(&self) -> bool {
+        unsafe { self.gl.get_error() == glow::CONTEXT_LOST }
     }
 
     fn target(&self, w: Which) -> &Target {
@@ -1087,7 +1156,23 @@ impl Renderer {
                     set_anim(&gl, l, a, local);
                 }
             }
-            gl.draw_arrays(glow::TRIANGLES, 0, 3);
+            // A very slow frame is drawn in horizontal strips, flushed one by one, so
+            // no single GPU job runs long enough to trip the driver's watchdog
+            // (Windows resets the GPU after ~2 s).
+            let tiles = self.tiles.clamp(1, sh.max(1) as u32) as i32;
+            if tiles == 1 {
+                gl.draw_arrays(glow::TRIANGLES, 0, 3);
+            } else {
+                gl.enable(glow::SCISSOR_TEST);
+                for i in 0..tiles {
+                    let y0 = sh * i / tiles;
+                    let y1 = sh * (i + 1) / tiles;
+                    gl.scissor(0, y0, sw, y1 - y0);
+                    gl.draw_arrays(glow::TRIANGLES, 0, 3);
+                    gl.flush();
+                }
+                gl.disable(glow::SCISSOR_TEST);
+            }
         }
     }
 
@@ -1321,7 +1406,18 @@ impl Renderer {
             if let Some(l) = prog.loc("iBlockOffset") {
                 gl.uniform_1_i32(Some(l), first as i32);
             }
-            gl.draw_arrays(glow::TRIANGLES, 0, 3);
+            // Bands of a few rows, flushed one by one: a heavy mainSound on a slow GPU
+            // must not become one job long enough to trip the driver's watchdog.
+            // gl_FragCoord stays window-relative, so the sample index is unchanged.
+            const BAND: i32 = 4;
+            let mut y0 = 0;
+            while y0 < rows {
+                let h = BAND.min(rows - y0);
+                gl.viewport(0, y0, W, h);
+                gl.draw_arrays(glow::TRIANGLES, 0, 3);
+                gl.flush();
+                y0 += h;
+            }
             let mut buf = vec![0f32; (W * rows * 4) as usize];
             let bytes = std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, buf.len() * 4);
             gl.read_pixels(
@@ -1539,8 +1635,22 @@ fn hash(s: &str) -> u64 {
     h.finish()
 }
 
+fn invalid_at(movie: &Movie, at: At) -> bool {
+    match at {
+        At::Shot { shot, .. } => shot >= movie.shots.len(),
+        At::Transition { from, to, .. } => {
+            from >= movie.shots.len()
+                || to >= movie.shots.len()
+                || movie.shots[to].transition_in.is_none()
+        }
+    }
+}
+
 /// Where compiled program binaries are kept between runs.
 fn cache_dir() -> Option<PathBuf> {
+    if let Some(d) = std::env::var_os("SHOTGLASS_CACHE_DIR") {
+        return Some(PathBuf::from(d));
+    }
     let base = std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from))

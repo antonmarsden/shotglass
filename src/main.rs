@@ -6,6 +6,7 @@ mod audio;
 mod gfx;
 mod headless;
 mod movie;
+mod selftest;
 mod shader;
 mod sound;
 
@@ -89,6 +90,11 @@ enum Cmd {
     },
     /// Create a new movie folder from a template.
     New { dir: PathBuf },
+    /// Check the renderer and soundtrack on this GPU and driver with built-in test films.
+    Selftest {
+        /// Only run checks whose name contains this text.
+        filter: Option<String>,
+    },
 }
 
 fn main() {
@@ -156,6 +162,7 @@ fn real_main() -> Result<()> {
         } => check(&movie, &size, frames),
         Cmd::Wav { movie, out, rate } => wav(&movie, &out, rate),
         Cmd::New { dir } => new_movie(&dir),
+        Cmd::Selftest { filter } => selftest::run(filter),
     }
 }
 

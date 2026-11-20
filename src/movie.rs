@@ -607,6 +607,111 @@ mod tests {
     }
 
     #[test]
+    fn transition_fades_keep_constant_power() {
+        for ease in ["linear", "smooth", "inout"] {
+            let m = Movie::parse(
+                &format!(
+                    "[[shot]]\nid=\"a\"\nscene=\"a.glsl\"\nduration=3\nsound=\"a.glsl\"\n\
+                     [[shot]]\nid=\"b\"\nscene=\"b.glsl\"\nduration=3\nsound=\"b.glsl\"\n\
+                     transition = {{ type = \"crossfade\", duration = 1.5, ease = \"{ease}\" }}\n"
+                ),
+                Path::new("."),
+            )
+            .unwrap();
+            // b starts at 1.5; the crossfade runs 1.5..3.0 (away from the 5 ms edge ramps)
+            for i in 1..100 {
+                let t = 1.5 + 1.5 * i as f32 / 100.0;
+                let (ga, gb) = (m.sound_gain(0, t), m.sound_gain(1, t));
+                let power = ga * ga + gb * gb;
+                assert!((power - 1.0).abs() < 1e-4, "{ease} at {t}: {power}");
+            }
+        }
+    }
+
+    mod props {
+        use super::super::*;
+        use proptest::prelude::*;
+
+        /// A random but valid timeline: durations, optional transitions that fit.
+        fn timeline() -> impl Strategy<Value = String> {
+            prop::collection::vec((0.2f32..6.0, prop::option::of(0.05f32..1.0), any::<bool>()), 1..12).prop_map(|shots| {
+                let mut s = String::new();
+                let mut prev_in = 0.0f32;
+                let mut prev_dur = 0.0f32;
+                for (i, (dur, tr, freeze)) in shots.into_iter().enumerate() {
+                    s += &format!("[[shot]]\nid=\"s{i}\"\nscene=\"x.glsl\"\nduration={dur}\n");
+                    let mut this_in = 0.0;
+                    if let (Some(frac), true) = (tr, i > 0) {
+                        // keep it legal: fits both shots and doesn't overlap the previous one
+                        let room = (prev_dur - prev_in).min(dur);
+                        let d = frac * room * 0.95;
+                        if d > 0.01 {
+                            s += &format!("transition = {{ type = \"crossfade\", duration = {d}, freeze = {freeze} }}\n");
+                            this_in = d;
+                        }
+                    }
+                    prev_in = this_in;
+                    prev_dur = dur;
+                }
+                s
+            })
+        }
+
+        proptest! {
+            #[test]
+            fn at_is_consistent_everywhere(toml in timeline(), samples in prop::collection::vec(0.0f32..1.0, 1..60)) {
+                let m = Movie::parse(&toml, Path::new(".")).unwrap();
+                prop_assert!(m.duration > 0.0);
+                for u in samples {
+                    let t = u * m.duration;
+                    match m.at(t) {
+                        At::Shot { shot, local } => {
+                            prop_assert!(shot < m.shots.len());
+                            prop_assert!(local >= -1e-4 && local <= m.shots[shot].duration + 1e-4);
+                            prop_assert!((m.shots[shot].start + local - t).abs() < 1e-3);
+                        }
+                        At::Transition { from, to, from_local, to_local, progress } => {
+                            prop_assert_eq!(from + 1, to);
+                            prop_assert!(m.shots[to].transition_in.is_some());
+                            prop_assert!((0.0..=1.0).contains(&progress));
+                            prop_assert!(from_local <= m.shots[from].duration + 1e-3);
+                            prop_assert!(to_local >= -1e-4);
+                        }
+                    }
+                }
+            }
+
+            #[test]
+            fn shots_tile_the_movie(toml in timeline()) {
+                let m = Movie::parse(&toml, Path::new(".")).unwrap();
+                prop_assert_eq!(m.shots[0].start, 0.0);
+                for w in m.shots.windows(2) {
+                    // the next shot starts when the previous ends, minus its transition
+                    let d = w[1].transition_in.as_ref().map_or(0.0, |t| t.duration);
+                    prop_assert!((w[1].start - (w[0].end() - d)).abs() < 1e-4);
+                    prop_assert!(w[1].start >= w[0].start);
+                }
+                prop_assert!((m.duration - m.shots.last().unwrap().end()).abs() < 1e-4);
+            }
+
+            #[test]
+            fn parser_never_panics(text in "\\PC{0,300}") {
+                let _ = Movie::parse(&text, Path::new("."));
+            }
+
+            #[test]
+            fn parser_never_panics_on_near_valid_input(toml in timeline(), cut in 0usize..400, junk in "[\\[\\]{}=\",.0-9a-z_ \n-]{0,12}") {
+                let mut t = toml.clone();
+                let at = cut.min(t.len());
+                if t.is_char_boundary(at) {
+                    t.insert_str(at, &junk);
+                }
+                let _ = Movie::parse(&t, Path::new("."));
+            }
+        }
+    }
+
+    #[test]
     fn rejects_unknown_fields() {
         let bad = "[[shot]]\nid=\"a\"\nscene=\"a.glsl\"\nduration=1\nlenght=2\n";
         assert!(Movie::parse(bad, Path::new(".")).is_err());

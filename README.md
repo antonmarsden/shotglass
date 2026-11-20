@@ -298,6 +298,49 @@ shotglass new    <dir>
 `still`, `strip`, `check` and `wav` render off-screen. On a Linux machine with
 no display, run them under `xvfb-run`; Mesa's software OpenGL works.
 
+## Testing
+
+```sh
+cargo test                  # unit + property tests, then `shotglass selftest` on your GPU
+shotglass selftest          # just the GPU and sound checks (handy after a driver update)
+shotglass selftest strips   # only checks whose name contains "strips"
+```
+
+- **Unit and property tests** cover timeline maths, keyframes, error-log parsing,
+  the render-scale logic and the master clock (against a simulated sound card that
+  can lag, stall or run away). Random timelines and malformed `movie.toml` files
+  are generated too, to check the parser never panics.
+- **`selftest`** writes small fixture films to a temporary folder and checks on the
+  actual GPU and driver that:
+  - transitions start exactly on the old shot and end on the new one;
+  - live and frozen crossfades blend correctly;
+  - reduced render scale has no edge bleed, and strip-drawn frames match single draws;
+  - errors point at the right file:line, including inside `#include`s;
+  - a broken edit keeps the last working version on screen;
+  - the program cache reloads identically and survives corruption;
+  - evicted shaders come back correctly;
+  - chunked sound matches a single-pass render sample for sample, with no clicks
+    at cuts, fades or chunk edges.
+- On Linux without a display, use `xvfb-run -a cargo test` (that's what CI does).
+  Set `SHOTGLASS_SKIP_GPU_TESTS=1` to skip the selftest.
+- **Docker:** `docker build -f docker/test.Dockerfile -t shotglass-test . && docker run --rm shotglass-test`
+  runs the same suite on software OpenGL, reproducibly. It tests shotglass, not your
+  driver. GPU access from a Linux container on Docker Desktop goes through WSL2's
+  Direct3D 12 bridge (`--device /dev/dxg`, `-v /usr/lib/wsl:/usr/lib/wsl`,
+  `LD_LIBRARY_PATH=/usr/lib/wsl/lib`). That's a translation layer, so for real-driver
+  results run the tests natively.
+
+### Robustness
+
+- **Driver watchdog.** If a frame takes more than ~100 ms on the GPU, scenes are
+  drawn in horizontal strips, flushed one at a time, and sound is always
+  synthesised in small bands. No single GPU job runs long enough to trip the
+  watchdog (Windows resets the GPU after ~2 s). If the driver resets anyway, for
+  example from a shader with an infinite loop, the player stops and says so
+  instead of crashing.
+- **Bad input** in `movie.toml` is reported, never a crash (fuzzed by the
+  property tests).
+
 ## Licence
 
 Licensed under either of [Apache License 2.0](LICENSE-APACHE) or

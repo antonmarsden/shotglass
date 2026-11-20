@@ -3,7 +3,7 @@
 use crate::audio::{AudioOut, Clock};
 use crate::gfx::{FrameInfo, Renderer, ShaderError};
 use crate::movie::{At, Movie};
-use crate::sound::{CHUNK, Soundtrack};
+use crate::sound::Soundtrack;
 use eframe::egui::{self, Color32, Key, Modifiers, Pos2, Rect, RichText, Sense, Stroke, Vec2};
 use eframe::glow;
 use std::collections::VecDeque;
@@ -90,6 +90,8 @@ struct Player {
     renderer: Renderer,
     clock: Clock,
     last_synth: String,
+    /// The driver reset the GPU (usually a shader that ran for seconds).
+    gpu_lost: bool,
     /// Seconds of sound ready ahead of the playhead.
     buffered: f32,
     perf_frame: u64,
@@ -178,6 +180,7 @@ impl Player {
             renderer,
             clock,
             last_synth: String::new(),
+            gpu_lost: false,
             buffered: 0.0,
             perf_frame: 0,
             soundtrack: Soundtrack::new(),
@@ -296,9 +299,10 @@ impl Player {
             return;
         }
         let t = self.clock.time();
-        let c0 = ((t * sr) as usize / CHUNK).min(n - 1);
+        let c0 = ((t * sr) as usize / self.soundtrack.chunk_size()).min(n - 1);
         let playing = self.clock.playing();
-        let per_s = sr / CHUNK as f32;
+        let chunk = self.soundtrack.chunk_size();
+        let per_s = sr / chunk as f32;
         let ahead = if playing {
             (SOUND_AHEAD * per_s).ceil() as usize
         } else {
@@ -316,7 +320,7 @@ impl Player {
             match self.soundtrack.chunk(&mut self.renderer, c) {
                 Ok(d) => {
                     let total = (self.duration() * sr).ceil() as usize;
-                    self.clock.put_chunk(CHUNK, total, c, version, d);
+                    self.clock.put_chunk(chunk, total, c, version, d);
                 }
                 Err(e) => {
                     self.sound_errors = vec![ShaderError {
@@ -556,6 +560,9 @@ impl Player {
         if let Some(g) = gpu {
             Perf::push(&mut self.perf.gpu_ms, g);
             Perf::push(&mut self.perf.gpu_recent, g);
+            if g > 500.0 {
+                self.say(format!("a frame took {g:.0} ms on the GPU; drawing it in strips to keep the driver happy"));
+            }
         }
         let stall = self.perf.stall_since_render;
         let vsync = self.perf.vsync_ms();
@@ -619,6 +626,9 @@ impl Player {
     }
 
     fn render_view(&mut self, frame: &mut eframe::Frame, w: i32, h: i32) -> bool {
+        if self.gpu_lost {
+            return false;
+        }
         let Some(m) = &self.movie else { return false };
         let fps = m.fps;
         let playing = self.clock.playing();
@@ -649,6 +659,10 @@ impl Player {
         };
         let tex = Some(tex);
         self.rendered_key = Some(key);
+        if self.renderer.context_lost() {
+            self.gpu_lost = true;
+            self.clock.pause();
+        }
         if let Some(tex) = tex
             && self.tex.map(|(t, _)| t) != Some(tex)
         {
@@ -1151,6 +1165,15 @@ impl eframe::App for Player {
                     ui.painter().image(id, view, Rect::from_min_max(Pos2::new(0.0, 1.0), Pos2::new(1.0, 0.0)), Color32::WHITE);
                 }
             }
+            if self.gpu_lost {
+                ui.painter().text(
+                    view.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "The GPU driver reset — a shader probably ran for seconds.\nFix the shader, then restart shotglass.",
+                    egui::FontId::proportional(16.0),
+                    Color32::from_rgb(255, 160, 140),
+                );
+            }
             let errors: Vec<String> = self
                 .load_error
                 .iter()
@@ -1232,29 +1255,6 @@ fn next_scale(scale: f32, avg_gpu_ms: f32, budget_ms: f32) -> Option<f32> {
         Some((scale + (target - scale) * 0.7).min(1.0))
     } else {
         None
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::next_scale;
-
-    #[test]
-    fn stays_at_full_resolution_when_it_fits() {
-        // 30 fps film: 33 ms budget. A 20 ms close-up at 100% is fine.
-        assert_eq!(next_scale(1.0, 20.0, 33.3), None);
-        // Even 29 ms (87% of budget) doesn't trigger a drop.
-        assert_eq!(next_scale(1.0, 29.0, 33.3), None);
-    }
-
-    #[test]
-    fn drops_when_over_budget_and_recovers_fast() {
-        let s = next_scale(1.0, 50.0, 33.3).unwrap();
-        assert!((0.7..0.75).contains(&s), "{s}");
-        // At the lower scale the shot now costs 50·s² ms; a cheap shot follows (2 ms)
-        let up = next_scale(s, 2.0, 33.3).unwrap();
-        assert!(up > 0.9, "{up}");
-        assert_eq!(next_scale(1.0, 2.0, 33.3), None);
     }
 }
 
@@ -1353,4 +1353,27 @@ fn describe(m: &Movie, t: f32) -> String {
 fn clock_text(t: f32) -> String {
     let t = t.max(0.0);
     format!("{:02}:{:05.2}", (t / 60.0) as u32, t % 60.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::next_scale;
+
+    #[test]
+    fn stays_at_full_resolution_when_it_fits() {
+        // 30 fps film: 33 ms budget. A 20 ms close-up at 100% is fine.
+        assert_eq!(next_scale(1.0, 20.0, 33.3), None);
+        // Even 29 ms (87% of budget) doesn't trigger a drop.
+        assert_eq!(next_scale(1.0, 29.0, 33.3), None);
+    }
+
+    #[test]
+    fn drops_when_over_budget_and_recovers_fast() {
+        let s = next_scale(1.0, 50.0, 33.3).unwrap();
+        assert!((0.7..0.75).contains(&s), "{s}");
+        // At the lower scale the shot now costs 50·s² ms; a cheap shot follows (2 ms)
+        let up = next_scale(s, 2.0, 33.3).unwrap();
+        assert!(up > 0.9, "{up}");
+        assert_eq!(next_scale(1.0, 2.0, 33.3), None);
+    }
 }

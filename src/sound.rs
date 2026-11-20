@@ -21,7 +21,6 @@ use std::sync::Arc;
 
 /// Samples per chunk (≈0.68 s at 48 kHz).
 pub const CHUNK: usize = 32768;
-const _: () = assert!(CHUNK <= AUDIO_BLOCK);
 
 const COMMON: &str = "\
 uniform float iSampleRate;
@@ -90,6 +89,8 @@ struct Plan {
 
 pub struct Soundtrack {
     plan: Option<Plan>,
+    /// Samples per chunk (CHUNK by default; tests vary it).
+    chunk_size: usize,
     /// (track or bus key, chunk index) → interleaved stereo for that chunk.
     chunks: HashMap<(u64, usize), Arc<Vec<f32>>>,
     /// Names of tracks synthesised since the last call to `take_rendered`.
@@ -104,11 +105,22 @@ impl Default for Soundtrack {
 
 impl Soundtrack {
     pub fn new() -> Soundtrack {
+        Self::with_chunk(CHUNK)
+    }
+
+    /// A soundtrack synthesised in chunks of `chunk` samples (≤ AUDIO_BLOCK).
+    pub fn with_chunk(chunk: usize) -> Soundtrack {
+        assert!(chunk > 0 && chunk <= AUDIO_BLOCK);
         Soundtrack {
             plan: None,
+            chunk_size: chunk,
             chunks: HashMap::new(),
             rendered: vec![],
         }
+    }
+
+    pub fn chunk_size(&self) -> usize {
+        self.chunk_size
     }
 
     /// Identifies the audible result; changes whenever anything that affects it does.
@@ -117,7 +129,9 @@ impl Soundtrack {
     }
 
     pub fn total_chunks(&self) -> usize {
-        self.plan.as_ref().map_or(0, |p| p.total.div_ceil(CHUNK))
+        self.plan
+            .as_ref()
+            .map_or(0, |p| p.total.div_ceil(self.chunk_size))
     }
 
     /// Tracks synthesised since last asked (for status messages).
@@ -281,15 +295,15 @@ impl Soundtrack {
         Ok(())
     }
 
-    /// The final output for chunk `c` (interleaved stereo, ≤ CHUNK frames).
+    /// The final output for chunk `c` (interleaved stereo, ≤ chunk_size frames).
     pub fn chunk(&mut self, r: &mut Renderer, c: usize) -> Result<Arc<Vec<f32>>, String> {
         let p = self.plan.as_ref().ok_or("no soundtrack")?;
         let key = (p.out_key, c);
         if let Some(d) = self.chunks.get(&key) {
             return Ok(d.clone());
         }
-        let lo = c * CHUNK;
-        let hi = ((c + 1) * CHUNK).min(p.total);
+        let lo = c * self.chunk_size;
+        let hi = ((c + 1) * self.chunk_size).min(p.total);
         if lo >= hi {
             return Ok(Arc::new(vec![]));
         }
@@ -355,11 +369,11 @@ impl Soundtrack {
         mut chunk: impl FnMut(&mut Self, usize) -> Result<Arc<Vec<f32>>, String>,
     ) -> Result<Vec<f32>, String> {
         let mut out = Vec::with_capacity((hi - lo) * 2);
-        let mut c = lo / CHUNK;
-        while c * CHUNK < hi {
+        let mut c = lo / self.chunk_size;
+        while c * self.chunk_size < hi {
             let d = chunk(self, c)?;
-            let a = lo.max(c * CHUNK) - c * CHUNK;
-            let b = hi.min((c + 1) * CHUNK) - c * CHUNK;
+            let a = lo.max(c * self.chunk_size) - c * self.chunk_size;
+            let b = hi.min((c + 1) * self.chunk_size) - c * self.chunk_size;
             out.extend_from_slice(&d[a * 2..b * 2]);
             c += 1;
         }
@@ -378,8 +392,8 @@ impl Soundtrack {
         }
         let p = self.plan.as_ref().unwrap();
         let (sr, total) = (p.sr, p.total);
-        let lo = c * CHUNK;
-        let n = ((c + 1) * CHUNK).min(total).saturating_sub(lo);
+        let lo = c * self.chunk_size;
+        let n = ((c + 1) * self.chunk_size).min(total).saturating_sub(lo);
         let mut out = vec![0f32; n * 2];
         let a = lo.max(t.first);
         let b = (lo + n).min(t.first + t.count);
@@ -399,8 +413,8 @@ impl Soundtrack {
             return Ok(d.clone());
         }
         let (sr, total, sfx_key) = (p.sr, p.total, p.sfx_key);
-        let lo = c * CHUNK;
-        let n = ((c + 1) * CHUNK).min(total).saturating_sub(lo);
+        let lo = c * self.chunk_size;
+        let n = ((c + 1) * self.chunk_size).min(total).saturating_sub(lo);
         let shots = p.shots.clone();
         let mut out = vec![0f32; n * 2];
         for (i, t) in shots {
@@ -447,7 +461,7 @@ impl Soundtrack {
         let back = self
             .plan
             .as_ref()
-            .map_or(0, |p| p.lookback.div_ceil(CHUNK) + 1);
+            .map_or(0, |p| p.lookback.div_ceil(self.chunk_size) + 1);
         for c in 0..n {
             let d = self.chunk(r, c)?;
             sink(&d);

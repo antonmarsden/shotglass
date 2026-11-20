@@ -28,3 +28,12 @@ winit = "0.30"
 # Dependencies are slow unoptimised; this keeps `cargo run` snappy.
 [profile.dev.package."*"]
 opt-level = 2
+
+# GPU + sound checks on fixture films; plain `main`, so it runs on the main thread
+# (OpenGL windows need it).
+[[test]]
+name = "gpu"
+harness = false
+
+[dev-dependencies]
+proptest = "1.12.0"

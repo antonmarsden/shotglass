@@ -40,7 +40,7 @@ pub struct AudioOut {
     shared: Arc<Shared>,
     pub sample_rate: u32,
     pub device_name: String,
-    _stream: cpal::Stream,
+    _stream: Option<cpal::Stream>,
 }
 
 impl AudioOut {
@@ -79,8 +79,51 @@ impl AudioOut {
             shared,
             sample_rate,
             device_name,
-            _stream: stream,
+            _stream: Some(stream),
         })
+    }
+
+    /// An output with no real device, driven by calling `FakeDevice::callback` (tests).
+    #[cfg(test)]
+    pub fn fake(sample_rate: u32) -> (AudioOut, FakeDevice) {
+        let shared = Arc::new(Shared {
+            store: ArcSwap::from_pointee(ChunkStore::default()),
+            underruns: AtomicU64::new(0),
+            pos: AtomicU64::new(0),
+            playing: AtomicBool::new(false),
+            rate: AtomicU32::new(1f32.to_bits()),
+            gain: AtomicU32::new(1f32.to_bits()),
+            last: Mutex::new(None),
+        });
+        let dev = FakeDevice {
+            shared: shared.clone(),
+        };
+        (
+            AudioOut {
+                shared,
+                sample_rate,
+                device_name: "fake".into(),
+                _stream: None,
+            },
+            dev,
+        )
+    }
+}
+
+/// Plays the role of the sound card's callback thread in tests.
+#[cfg(test)]
+#[derive(Clone)]
+pub struct FakeDevice {
+    shared: Arc<Shared>,
+}
+
+#[cfg(test)]
+impl FakeDevice {
+    /// Ask for `frames` stereo frames, as a sound card would, with this output latency.
+    pub fn callback(&self, frames: usize, latency: Duration) -> Vec<f32> {
+        let mut out = vec![0f32; frames * 2];
+        fill(&self.shared, &mut out, 2, latency);
+        out
     }
 }
 
@@ -94,75 +137,85 @@ fn build<T: SizedSample + FromSample<f32>>(
         cfg,
         move |data: &mut [T], info: &cpal::OutputCallbackInfo| {
             let ts = info.timestamp();
-            let latency = ts.playback - ts.callback;
-            let playing = sh.playing.load(Ordering::Acquire);
-            let start = sh.pos.load(Ordering::Acquire);
-            let mut pos = start;
-            if let Ok(mut l) = sh.last.try_lock() {
-                *l = if playing {
-                    Some((pos, Instant::now(), latency))
-                } else {
-                    None
-                };
-            }
-            if !playing {
-                data.iter_mut().for_each(|s| *s = T::from_sample(0.0f32));
-                return;
-            }
-            let store = sh.store.load();
-            let mut cur: Option<(usize, &Arc<Vec<f32>>)> = None;
-            let mut missing = 0u64;
-            let rate = f32::from_bits(sh.rate.load(Ordering::Relaxed)) as f64;
-            let gain = f32::from_bits(sh.gain.load(Ordering::Relaxed));
-            let step = (rate * FRAC) as u64;
-            for frame in data.chunks_mut(channels) {
-                let i = (pos >> 32) as usize;
-                let (l, r) = if store.chunk > 0 && i < store.total {
-                    let c = i / store.chunk;
-                    if cur.is_none_or(|(cc, _)| cc != c) {
-                        cur = store.chunks.get(&c).map(|(_, d)| (c, d));
-                    }
-                    match cur {
-                        Some((_, d)) => {
-                            let j = (i - c * store.chunk) * 2;
-                            if j + 1 < d.len() {
-                                (d[j] * gain, d[j + 1] * gain)
-                            } else {
-                                (0.0, 0.0)
-                            }
-                        }
-                        None => {
-                            missing += 1;
-                            (0.0, 0.0)
-                        }
-                    }
-                } else {
-                    (0.0, 0.0)
-                };
-                for (c, s) in frame.iter_mut().enumerate() {
-                    *s = T::from_sample(match c {
-                        0 => l,
-                        1 => r,
-                        _ => 0.0,
-                    });
-                }
-                if channels == 1 {
-                    frame[0] = T::from_sample((l + r) * 0.5);
-                }
-                pos += step;
-            }
-            if missing > 0 {
-                sh.underruns.fetch_add(missing, Ordering::Relaxed);
-            }
-            // Only advance if nobody seeked meanwhile (a seek wins).
-            let _ = sh
-                .pos
-                .compare_exchange(start, pos, Ordering::AcqRel, Ordering::Relaxed);
+            fill(&sh, data, channels, ts.playback - ts.callback);
         },
         |e| eprintln!("audio: {e}"),
         None,
     )?;
     Ok(stream)
+}
+
+/// The audio callback: copy the chunks under the play position into `data` and
+/// advance it. Lock-free apart from a `try_lock` that never waits.
+fn fill<T: SizedSample + FromSample<f32>>(
+    sh: &Shared,
+    data: &mut [T],
+    channels: usize,
+    latency: Duration,
+) {
+    let playing = sh.playing.load(Ordering::Acquire);
+    let start = sh.pos.load(Ordering::Acquire);
+    let mut pos = start;
+    if let Ok(mut l) = sh.last.try_lock() {
+        *l = if playing {
+            Some((pos, Instant::now(), latency))
+        } else {
+            None
+        };
+    }
+    if !playing {
+        data.iter_mut().for_each(|s| *s = T::from_sample(0.0f32));
+        return;
+    }
+    let store = sh.store.load();
+    let mut cur: Option<(usize, &Arc<Vec<f32>>)> = None;
+    let mut missing = 0u64;
+    let rate = f32::from_bits(sh.rate.load(Ordering::Relaxed)) as f64;
+    let gain = f32::from_bits(sh.gain.load(Ordering::Relaxed));
+    let step = (rate * FRAC) as u64;
+    for frame in data.chunks_mut(channels) {
+        let i = (pos >> 32) as usize;
+        let (l, r) = if store.chunk > 0 && i < store.total {
+            let c = i / store.chunk;
+            if cur.is_none_or(|(cc, _)| cc != c) {
+                cur = store.chunks.get(&c).map(|(_, d)| (c, d));
+            }
+            match cur {
+                Some((_, d)) => {
+                    let j = (i - c * store.chunk) * 2;
+                    if j + 1 < d.len() {
+                        (d[j] * gain, d[j + 1] * gain)
+                    } else {
+                        (0.0, 0.0)
+                    }
+                }
+                None => {
+                    missing += 1;
+                    (0.0, 0.0)
+                }
+            }
+        } else {
+            (0.0, 0.0)
+        };
+        for (c, s) in frame.iter_mut().enumerate() {
+            *s = T::from_sample(match c {
+                0 => l,
+                1 => r,
+                _ => 0.0,
+            });
+        }
+        if channels == 1 {
+            frame[0] = T::from_sample((l + r) * 0.5);
+        }
+        pos += step;
+    }
+    if missing > 0 {
+        sh.underruns.fetch_add(missing, Ordering::Relaxed);
+    }
+    // Only advance if nobody seeked meanwhile (a seek wins).
+    let _ = sh
+        .pos
+        .compare_exchange(start, pos, Ordering::AcqRel, Ordering::Relaxed);
 }
 
 pub struct Clock {
@@ -173,6 +226,9 @@ pub struct Clock {
     floor: f32,
     /// When the last play/seek happened.
     since: Instant,
+    /// The last time handed out while playing: time never runs backwards, even when
+    /// the source switches between the sound card and the system timer.
+    reported: std::cell::Cell<f32>,
 }
 
 impl Clock {
@@ -183,6 +239,7 @@ impl Clock {
             rate: 1.0,
             floor: 0.0,
             since: Instant::now(),
+            reported: std::cell::Cell::new(0.0),
         }
     }
 
@@ -258,11 +315,17 @@ impl Clock {
         self.rate
     }
 
-    /// The movie time being *heard* right now.
+    /// The movie time being *heard* right now. Never decreases while playing.
     pub fn time(&self) -> f32 {
         if !self.playing {
             return self.floor;
         }
+        let t = self.source_time().max(self.reported.get());
+        self.reported.set(t);
+        t
+    }
+
+    fn source_time(&self) -> f32 {
         let wall = self.floor + self.since.elapsed().as_secs_f32() * self.rate;
         let Some(a) = &self.audio else { return wall };
         let last = *a.shared.last.lock().unwrap();
@@ -335,6 +398,7 @@ impl Clock {
     fn start_at(&mut self, t: f32) {
         self.floor = t;
         self.since = Instant::now();
+        self.reported.set(t);
         if let Some(a) = &self.audio {
             *a.shared.last.lock().unwrap() = None;
             a.shared.pos.store(
@@ -404,5 +468,174 @@ impl WavWriter {
     pub fn finish(mut self) -> std::io::Result<()> {
         use std::io::Write;
         self.f.flush()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::thread::sleep;
+
+    const SR: u32 = 48000;
+    const LATENCY: Duration = Duration::from_millis(20);
+
+    /// Drive a fake device like a real one: every few ms it asks for as many frames
+    /// as have elapsed (times `speed`), until `stop` is set. Pacing by elapsed time
+    /// keeps it real-time even where sleep is coarse (Windows: ~15 ms).
+    fn run_device(
+        dev: FakeDevice,
+        speed: f64,
+        stop: Arc<AtomicBool>,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let mut last = Instant::now();
+            while !stop.load(Ordering::Relaxed) {
+                sleep(Duration::from_millis(5));
+                let now = Instant::now();
+                let frames = ((now - last).as_secs_f64() * SR as f64 * speed).round() as usize;
+                last = now;
+                dev.callback(frames.max(1), LATENCY);
+            }
+        })
+    }
+
+    fn sample_for(clock: &Clock, dur: Duration) -> Vec<f32> {
+        let end = Instant::now() + dur;
+        let mut v = vec![];
+        while Instant::now() < end {
+            v.push(clock.time());
+            sleep(Duration::from_millis(1));
+        }
+        v
+    }
+
+    fn monotonic(v: &[f32]) -> bool {
+        v.windows(2).all(|w| w[1] >= w[0])
+    }
+
+    #[test]
+    fn paused_clock_holds_and_seeks() {
+        let mut c = Clock::new(None);
+        assert_eq!(c.time(), 0.0);
+        c.seek(3.5);
+        sleep(Duration::from_millis(20));
+        assert_eq!(c.time(), 3.5);
+        c.seek(-1.0);
+        assert_eq!(c.time(), 0.0);
+    }
+
+    #[test]
+    fn no_device_follows_the_system_timer() {
+        let mut c = Clock::new(None);
+        c.play();
+        sleep(Duration::from_millis(100));
+        let t = c.time();
+        assert!((0.08..0.2).contains(&t), "{t}");
+        c.pause();
+        let held = c.time();
+        sleep(Duration::from_millis(30));
+        assert_eq!(c.time(), held);
+    }
+
+    #[test]
+    fn realistic_device_locks_and_never_runs_backwards() {
+        let (out, dev) = AudioOut::fake(SR);
+        let mut c = Clock::new(Some(out));
+        let stop = Arc::new(AtomicBool::new(false));
+        let h = run_device(dev, 1.0, stop.clone());
+        c.seek(10.0);
+        c.play();
+        let v = sample_for(&c, Duration::from_millis(300));
+        let locked = c.audio_locked();
+        stop.store(true, Ordering::Relaxed);
+        h.join().unwrap();
+        assert!(monotonic(&v), "time went backwards");
+        assert!(locked, "never locked to the device");
+        let last = *v.last().unwrap();
+        // ≈ 0.3 s of playback, minus the 20 ms the sound card hasn't played yet
+        assert!((10.2..10.36).contains(&last), "{last}");
+        assert!(v[0] >= 10.0);
+    }
+
+    #[test]
+    fn stalled_device_falls_back_to_the_timer() {
+        let (out, dev) = AudioOut::fake(SR);
+        let mut c = Clock::new(Some(out));
+        c.play();
+        dev.callback(480, LATENCY); // one callback, then silence
+        let v = sample_for(&c, Duration::from_millis(400));
+        assert!(monotonic(&v));
+        let last = *v.last().unwrap();
+        assert!((0.33..0.5).contains(&last), "{last}");
+        assert!(!c.audio_locked());
+    }
+
+    #[test]
+    fn runaway_device_is_ignored() {
+        // Like ALSA's null device: consumes audio 100× faster than real time.
+        let (out, dev) = AudioOut::fake(SR);
+        let mut c = Clock::new(Some(out));
+        let stop = Arc::new(AtomicBool::new(false));
+        let h = run_device(dev, 100.0, stop.clone());
+        c.play();
+        let v = sample_for(&c, Duration::from_millis(200));
+        stop.store(true, Ordering::Relaxed);
+        h.join().unwrap();
+        assert!(monotonic(&v));
+        let last = *v.last().unwrap();
+        assert!((0.15..0.3).contains(&last), "{last}");
+    }
+
+    #[test]
+    fn seeking_while_playing_lands_on_the_target() {
+        let (out, dev) = AudioOut::fake(SR);
+        let mut c = Clock::new(Some(out));
+        let stop = Arc::new(AtomicBool::new(false));
+        let h = run_device(dev, 1.0, stop.clone());
+        c.play();
+        sleep(Duration::from_millis(100));
+        for target in [5.0, 2.0, 7.5] {
+            c.seek(target);
+            let t = c.time();
+            assert!((target..target + 0.02).contains(&t), "seek {target}: {t}");
+            let v = sample_for(&c, Duration::from_millis(80));
+            assert!(monotonic(&v));
+            assert!(
+                v.iter().all(|x| *x >= target && *x < target + 0.2),
+                "after seek {target}: {:?}",
+                (v[0], v[v.len() - 1])
+            );
+        }
+        stop.store(true, Ordering::Relaxed);
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn half_speed_runs_at_half_speed() {
+        let mut c = Clock::new(None);
+        c.set_rate(0.5);
+        c.play();
+        sleep(Duration::from_millis(200));
+        let t = c.time();
+        assert!((0.08..0.15).contains(&t), "{t}");
+    }
+
+    #[test]
+    fn callback_plays_chunks_and_counts_underruns() {
+        let (out, dev) = AudioOut::fake(SR);
+        let mut c = Clock::new(Some(out));
+        // chunk 0 holds a ramp; chunk 1 is missing
+        let ramp: Vec<f32> = (0..100)
+            .flat_map(|i| [i as f32 / 100.0, -(i as f32) / 100.0])
+            .collect();
+        c.put_chunk(100, 200, 0, 1, Arc::new(ramp));
+        c.play();
+        let a = dev.callback(100, LATENCY);
+        assert_eq!(a[2], 0.01);
+        assert_eq!(a[3], -0.01);
+        assert_eq!(c.underruns(), 0);
+        let b = dev.callback(50, LATENCY);
+        assert!(b.iter().all(|x| *x == 0.0));
+        assert_eq!(c.underruns(), 50);
     }
 }
