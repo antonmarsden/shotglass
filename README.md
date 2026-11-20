@@ -316,6 +316,12 @@ To scrub, click or drag on the timeline. Hatched blocks are transitions;
   supports `KHR_parallel_shader_compile`, and get one tiny warm-up draw each. While
   playing, the player never waits for a compile: if a shot isn't ready, the previous
   frame stays up. When paused or scrubbing, it compiles on the spot.
+- **Sound never makes a frame wait for the GPU.** While playing, each frame queues
+  a block or two of sound synthesis on the GPU and collects the blocks that have
+  finished (a pixel buffer readback behind a fence), so the player never waits for
+  the GPU to finish the scene before the sound. When paused or scrubbing, the chunk
+  under the playhead is made on the spot. Right after a seek during playback the
+  sound can start a frame or two late.
 - **Frozen transitions** render only one scene.
 - `shotglass check` times every shot and transition, so you can see which ones
   are over budget.
@@ -334,8 +340,8 @@ soundtrack (`shotglass wav`) in 4 s:
   Windows, `~/.cache/shotglass/programs` elsewhere). Reopening a film, or coming
   back to an evicted shot, skips the compile. Set `SHOTGLASS_NO_CACHE=1` to turn
   this off, or `SHOTGLASS_CACHE_DIR` to move it.
-- **Sound.** Chunks are synthesised up to 6 s ahead of the playhead within a
-  few milliseconds per frame, and chunks more than a few seconds away are
+- **Sound.** Chunks are synthesised up to 6 s ahead of the playhead, a few
+  blocks per frame without waiting for the GPU, and chunks more than a few seconds away are
   forgotten. Memory stays at a few MB whatever the length. `wav` and `check`
   stream chunk by chunk too.
 - The Sound panel shows how much sound is buffered ahead and any underruns.
@@ -384,7 +390,9 @@ shotglass selftest strips   # only checks whose name contains "strips"
   - the program cache reloads identically and survives corruption;
   - evicted shaders come back correctly;
   - chunked sound matches a single-pass render sample for sample, with no clicks
-    at cuts, fades or chunk edges.
+    at cuts, fades or chunk edges;
+  - streamed sound (as during playback) never waits for the GPU and matches the
+    blocking render bit for bit.
 - On Linux without a display, use `xvfb-run -a cargo test` (that's what CI does).
   Set `SHOTGLASS_SKIP_GPU_TESTS=1` to skip the selftest.
 - **Docker:** `docker build -f docker/test.Dockerfile -t shotglass-test . && docker run --rm shotglass-test`

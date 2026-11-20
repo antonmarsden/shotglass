@@ -35,8 +35,8 @@ cargo fmt && cargo clippy --all-targets -- -D warnings
 | `anim.rs` | constants/keyframes, eases; `glsl_fn` turns keyframes into GLSL for sound shaders |
 | `shader.rs` | source assembly, `#include`, `#line 1 N` per file, driver-log → file:line; `Dialect` (fixed `330 core` / `300 es` baseline, `glsl` opt-in) |
 | `validate.rs` | strict, driver-independent check (glslang) of every assembled shader; `validate_movie(m, dialect)` is the API `check`/`check --web` and the web player use |
-| `gfx.rs` | `Renderer`: lazy prioritised compiles, program cache (disk + LRU), off-screen targets, transitions/freeze, strips, GPU timer, audio rendering |
-| `sound.rs` | `Soundtrack`: music / per-shot / mix tracks synthesised in cached chunks |
+| `gfx.rs` | `Renderer`: lazy prioritised compiles, program cache (disk + LRU), off-screen targets, transitions/freeze, strips, GPU timer, audio blocks (submit → PBO + fence → poll/wait) |
+| `sound.rs` | `Soundtrack`: music / per-shot / mix tracks synthesised in cached chunks; `chunk` blocks, `stream` never does |
 | `audio.rs` | cpal output, lock-free `fill` callback, chunk store, master `Clock`, WAV writer |
 | `app.rs` | egui player: transport, timeline, panels, live reload, auto scale, sound streaming |
 | `headless.rs` | hidden-window GL context for CLI commands |
@@ -53,14 +53,17 @@ cargo fmt && cargo clippy --all-targets -- -D warnings
   synthesis) are "stalls", not drops, and must not lower the scale.
 - **No per-frame GPU→CPU syncs on the render path.** `glGetError` stalls NVIDIA's threaded
   driver; `context_lost()` is rate-limited (selftest checks this). Same for `read_pixels`,
-  `finish` and query results that aren't ready.
+  `finish` and query results that aren't ready. Sound is no exception: while playing it goes
+  through `Soundtrack::stream` (`submit_audio` → PBO + fence, `poll_audio` with
+  `glClientWaitSync(.., 0)`), never `wait_audio`. Selftest counts `blocking_audio_reads`.
+  Paused/scrubbing may block for the chunk under the playhead; headless commands block.
 - **The audio callback (`fill`) never blocks or allocates.** Only atomics, `ArcSwap` and `try_lock`.
 - **`Clock::time()` never decreases while playing.** Use the sound card position only when it
   agrees with the system timer (within 0.25 s).
 - **A broken edit keeps the last working version on screen** (per shot id fallback). Missing
   files (assembly errors) refuse the whole new version.
 - **Sound is identical whatever the chunk size,** and banded vs single draws give the same
-  output. The mix may read at most `mix_lookback` back and 50 ms ahead.
+  output, and streamed (async) vs blocking synthesis agree bit for bit. The mix may read at most `mix_lookback` back and 50 ms ahead.
 - **Deterministic frames:** a frame depends only on (movie, t, size, scale), so playback,
   `still` and a future export agree.
 - **Shaders compile as `#version 330 core` (or `300 es`) whatever the driver offers**, unless the

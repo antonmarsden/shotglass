@@ -78,6 +78,10 @@ const CHECKS: &[Check] = &[
         run: sound_banding,
     },
     Check {
+        name: "streamed sound never waits for the GPU and matches the blocking render",
+        run: sound_streaming,
+    },
+    Check {
         name: "sound has no clicks at cuts, fades and chunk edges",
         run: sound_no_clicks,
     },
@@ -1008,6 +1012,86 @@ fn sound_banding(gl: &Gl, dir: &Path) -> Result<String> {
         bail!("banded synthesis differs by {d}");
     }
     Ok(String::new())
+}
+
+/// Playback-style synthesis: `Soundtrack::stream` once per "frame", as the player
+/// does, must never wait on a readback, and must produce the blocking render exactly.
+fn sound_streaming(gl: &Gl, dir: &Path) -> Result<String> {
+    let m = sound_fixture(dir)?;
+    let mut notes = vec![];
+    for chunk in [32768, 7919] {
+        let blocking = render_sound(gl, &m, chunk)?;
+        let mut r = Renderer::new(gl.clone())?;
+        let mut st = Soundtrack::with_chunk(chunk);
+        st.set_movie(&mut r, &m, 48000)
+            .map_err(|e| anyhow!("{e:?}"))?;
+        let n = st.total_chunks();
+        let mut got: Vec<Option<Arc<Vec<f32>>>> = vec![None; n];
+        let mut frames = 0;
+        let mut max_in_flight = 0;
+        let start = Instant::now();
+        while got.iter().any(|c| c.is_none()) {
+            if start.elapsed().as_secs() > 60 {
+                bail!("chunk {chunk}: streaming didn't finish in 60 s ({frames} frames)");
+            }
+            let wanted: Vec<usize> = (0..n).filter(|&c| got[c].is_none()).collect();
+            let deadline = Instant::now() + std::time::Duration::from_millis(4);
+            for (c, d) in st
+                .stream(&mut r, &wanted, 2, deadline)
+                .map_err(|e| anyhow!(e))?
+            {
+                got[c] = Some(d);
+            }
+            max_in_flight = max_in_flight.max(r.audio_in_flight());
+            frames += 1;
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        if r.blocking_audio_reads != 0 {
+            bail!(
+                "chunk {chunk}: streaming waited for the GPU {} time(s)",
+                r.blocking_audio_reads
+            );
+        }
+        if st.in_flight() != 0 || r.audio_in_flight() != 0 {
+            bail!("chunk {chunk}: blocks left in flight after the last chunk");
+        }
+        if max_in_flight == 0 {
+            bail!("chunk {chunk}: nothing was ever queued asynchronously");
+        }
+        let streamed: Vec<f32> = got.into_iter().flat_map(|c| c.unwrap().to_vec()).collect();
+        if streamed.len() != blocking.len() {
+            bail!(
+                "chunk {chunk}: {} samples streamed, {} blocking",
+                streamed.len(),
+                blocking.len()
+            );
+        }
+        if let Some(i) = streamed
+            .iter()
+            .zip(&blocking)
+            .position(|(a, b)| a.to_bits() != b.to_bits())
+        {
+            bail!(
+                "chunk {chunk}: streamed sound differs at {:.4}s ({} vs {})",
+                (i / 2) as f32 / 48000.0,
+                streamed[i],
+                blocking[i]
+            );
+        }
+        notes.push(format!(
+            "{chunk}: {frames} frames, ≤{max_in_flight} blocks queued"
+        ));
+    }
+    // The blocking path does count its waits, so the zero above means something.
+    let mut r = Renderer::new(gl.clone())?;
+    let mut st = Soundtrack::new();
+    st.set_movie(&mut r, &m, 48000)
+        .map_err(|e| anyhow!("{e:?}"))?;
+    st.chunk(&mut r, 0).map_err(|e| anyhow!(e))?;
+    if r.blocking_audio_reads == 0 {
+        bail!("a blocking chunk wasn't counted as a blocking readback");
+    }
+    Ok(notes.join("; "))
 }
 
 fn sound_no_clicks(gl: &Gl, dir: &Path) -> Result<String> {

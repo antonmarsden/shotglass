@@ -268,6 +268,7 @@ impl Player {
     /// needs them (see `stream_sound`); until then the old version keeps playing.
     fn update_sound(&mut self, m: &Movie) -> Option<String> {
         if !m.has_sound() {
+            self.soundtrack.cancel_all(&mut self.renderer);
             self.soundtrack = Soundtrack::new();
             self.clock.clear_chunks();
             return None;
@@ -285,7 +286,8 @@ impl Player {
     }
 
     /// Synthesise sound chunks around the playhead, nearest first, within a small
-    /// time budget per frame, and forget chunks far from it.
+    /// time budget per frame, and forget chunks far from it. While playing this never
+    /// waits for the GPU (see `Soundtrack::stream`).
     fn stream_sound(&mut self) {
         let Some(version) = self.soundtrack.version() else {
             return;
@@ -308,27 +310,43 @@ impl Player {
         } else {
             1
         };
-        let deadline = Instant::now() + Duration::from_millis(if playing { 4 } else { 12 });
-        for c in c0..(c0 + ahead + 1).min(n) {
-            if self.clock.chunk_version(c) == Some(version) {
-                continue;
-            }
-            // The chunk under the playhead is always made; the rest only within budget.
-            if c != c0 && Instant::now() > deadline {
-                break;
-            }
-            match self.soundtrack.chunk(&mut self.renderer, c) {
-                Ok(d) => {
-                    let total = (self.duration() * sr).ceil() as usize;
-                    self.clock.put_chunk(chunk, total, c, version, d);
-                }
+        let total = (self.duration() * sr).ceil() as usize;
+        // Paused or scrubbing, the chunk under the playhead is made at once (this may
+        // wait for the GPU, like a blocking compile). While playing, nothing waits:
+        // blocks are queued on the GPU and collected on later frames.
+        if !playing && self.clock.chunk_version(c0) != Some(version) {
+            match self.soundtrack.chunk(&mut self.renderer, c0) {
+                Ok(d) => self.clock.put_chunk(chunk, total, c0, version, d),
                 Err(e) => {
                     self.sound_errors = vec![ShaderError {
                         what: "sound".into(),
                         messages: vec![e],
                     }];
-                    break;
+                    return;
                 }
+            }
+        }
+        let wanted: Vec<usize> = (c0..(c0 + ahead + 1).min(n))
+            .filter(|&c| self.clock.chunk_version(c) != Some(version))
+            .collect();
+        // A block or two per frame; more right after a seek, when the playhead's
+        // chunk is missing.
+        let blocks = if wanted.first() == Some(&c0) { 4 } else { 2 };
+        let deadline = Instant::now() + Duration::from_millis(4);
+        match self
+            .soundtrack
+            .stream(&mut self.renderer, &wanted, blocks, deadline)
+        {
+            Ok(done) => {
+                for (c, d) in done {
+                    self.clock.put_chunk(chunk, total, c, version, d);
+                }
+            }
+            Err(e) => {
+                self.sound_errors = vec![ShaderError {
+                    what: "sound".into(),
+                    messages: vec![e],
+                }];
             }
         }
         let made = self.soundtrack.take_rendered();

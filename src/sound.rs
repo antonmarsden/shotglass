@@ -12,15 +12,63 @@
 //! re-synthesises the chunks it touches.
 
 use crate::anim::GLSL_EASE;
-use crate::gfx::{AUDIO_BLOCK, Renderer, ShaderError, TRACK_WIDTH};
+use crate::gfx::{AUDIO_BLOCK, AudioTicket, Renderer, ShaderError, TRACK_WIDTH};
 use crate::movie::Movie;
 use crate::shader::{Assembled, Builder, Dialect};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
 
 /// Samples per chunk (≈0.68 s at 48 kHz).
 pub const CHUNK: usize = 32768;
+
+/// Interleaved stereo samples of one chunk, shared with the audio callback.
+pub type Chunk = Arc<Vec<f32>>;
+
+/// Most sound blocks queued on the GPU at once while streaming.
+const MAX_IN_FLIGHT: usize = 6;
+
+/// How synthesis may treat the GPU.
+enum Mode {
+    /// Wait for each block (headless, or the chunk under a paused playhead).
+    Blocking,
+    /// Never wait; queue at most this many more blocks.
+    Async { max_submits: usize },
+}
+
+/// Where a finished block goes.
+enum Place {
+    /// Samples a.. of the track chunk starting at global sample lo, n samples long.
+    Track { lo: usize, n: usize, a: usize },
+    /// The final output: scale by the movie volume.
+    Mix { volume: f32 },
+}
+
+/// A block queued on the GPU, waiting to be collected.
+struct InFlight {
+    ticket: AudioTicket,
+    name: String,
+    place: Place,
+}
+
+impl InFlight {
+    fn new(ticket: AudioTicket, name: String, place: Place) -> InFlight {
+        InFlight {
+            ticket,
+            name,
+            place,
+        }
+    }
+}
+
+/// The movie volume, then clamped to the output range.
+fn finish_out(mut out: Vec<f32>, volume: f32) -> Vec<f32> {
+    for x in &mut out {
+        *x = (*x * volume).clamp(-1.0, 1.0);
+    }
+    out
+}
 
 const COMMON: &str = "\
 uniform float iSampleRate;
@@ -139,6 +187,8 @@ pub struct Soundtrack {
     chunks: HashMap<(u64, usize), Arc<Vec<f32>>>,
     /// Names of tracks synthesised since the last call to `take_rendered`.
     rendered: Vec<String>,
+    /// Blocks queued on the GPU by `stream`, keyed like `chunks`.
+    in_flight: HashMap<(u64, usize), InFlight>,
 }
 
 impl Default for Soundtrack {
@@ -160,6 +210,7 @@ impl Soundtrack {
             chunk_size: chunk,
             chunks: HashMap::new(),
             rendered: vec![],
+            in_flight: HashMap::new(),
         }
     }
 
@@ -316,20 +367,150 @@ impl Soundtrack {
             out_key,
         });
         self.forget_stale();
+        // Blocks queued for the old version that this one doesn't share.
+        let live = self.live_keys();
+        let stale: Vec<_> = self
+            .in_flight
+            .keys()
+            .filter(|(k, _)| !live.contains(k))
+            .copied()
+            .collect();
+        for key in stale {
+            r.cancel_audio(self.in_flight.remove(&key).unwrap().ticket);
+        }
         Ok(())
     }
 
-    /// The final output for chunk `c` (interleaved stereo, ≤ chunk_size frames).
+    /// The final output for chunk `c` (interleaved stereo, ≤ chunk_size frames), made
+    /// now: waits for the GPU (headless use, or the chunk under a paused playhead).
     pub fn chunk(&mut self, r: &mut Renderer, c: usize) -> Result<Arc<Vec<f32>>, String> {
+        Ok(self
+            .out_chunk(r, c, &mut Mode::Blocking)?
+            .expect("blocking synthesis always finishes"))
+    }
+
+    /// Advance synthesis of the output chunks `wanted` (most urgent first) without ever
+    /// waiting for the GPU: collect blocks the GPU has finished, then queue at most
+    /// `max_submits` new ones (and never more than MAX_IN_FLIGHT at once). Stops early
+    /// at `deadline` (CPU work: fades, sums). Returns the chunks that are now complete.
+    /// Called once per frame while playing; the output is identical to `chunk`'s.
+    pub fn stream(
+        &mut self,
+        r: &mut Renderer,
+        wanted: &[usize],
+        max_submits: usize,
+        deadline: Instant,
+    ) -> Result<Vec<(usize, Chunk)>, String> {
+        self.collect(r)?;
+        let mut mode = Mode::Async { max_submits };
+        let mut done = vec![];
+        for &c in wanted {
+            if let Some(d) = self.out_chunk(r, c, &mut mode)? {
+                done.push((c, d));
+            }
+            if Instant::now() > deadline {
+                break;
+            }
+        }
+        Ok(done)
+    }
+
+    /// Sound blocks queued on the GPU and not yet collected.
+    pub fn in_flight(&self) -> usize {
+        self.in_flight.len()
+    }
+
+    /// Drop every queued block (before replacing this soundtrack).
+    pub fn cancel_all(&mut self, r: &mut Renderer) {
+        for (_, j) in self.in_flight.drain() {
+            r.cancel_audio(j.ticket);
+        }
+    }
+
+    /// Store the blocks the GPU has finished. Never waits.
+    fn collect(&mut self, r: &mut Renderer) -> Result<(), String> {
+        let keys: Vec<(u64, usize)> = self.in_flight.keys().copied().collect();
+        for key in keys {
+            let ticket = self.in_flight[&key].ticket;
+            if let Some(res) = r.poll_audio(ticket) {
+                let job = self.in_flight.remove(&key).unwrap();
+                self.store(key, job, res?);
+            }
+        }
+        Ok(())
+    }
+
+    /// Turn a finished block into its cached chunk.
+    fn store(&mut self, key: (u64, usize), job: InFlight, d: Vec<f32>) -> Arc<Vec<f32>> {
+        self.rendered.push(job.name);
+        let out = match job.place {
+            Place::Track { lo, n, a } => {
+                let mut out = vec![0f32; n * 2];
+                out[(a - lo) * 2..(a - lo) * 2 + d.len()].copy_from_slice(&d);
+                out
+            }
+            Place::Mix { volume } => finish_out(d, volume),
+        };
+        let d = Arc::new(out);
+        self.chunks.insert(key, d.clone());
+        d
+    }
+
+    /// The result of the block for cache entry `key`: cached, collected now, or (if
+    /// the mode allows) queued with `job`. None = not ready yet.
+    fn block(
+        &mut self,
+        r: &mut Renderer,
+        key: (u64, usize),
+        mode: &mut Mode,
+        job: impl FnOnce(&mut Renderer) -> Result<InFlight, String>,
+    ) -> Result<Option<Arc<Vec<f32>>>, String> {
+        if let Some(d) = self.chunks.get(&key) {
+            return Ok(Some(d.clone()));
+        }
+        if let Some(f) = self.in_flight.get(&key) {
+            let res = match mode {
+                Mode::Blocking => r.wait_audio(f.ticket),
+                Mode::Async { .. } => match r.poll_audio(f.ticket) {
+                    Some(res) => res,
+                    None => return Ok(None),
+                },
+            };
+            let f = self.in_flight.remove(&key).unwrap();
+            return Ok(Some(self.store(key, f, res?)));
+        }
+        match mode {
+            Mode::Blocking => {
+                let f = job(r)?;
+                let d = r.wait_audio(f.ticket)?;
+                Ok(Some(self.store(key, f, d)))
+            }
+            Mode::Async { max_submits } => {
+                if *max_submits > 0 && self.in_flight.len() < MAX_IN_FLIGHT {
+                    *max_submits -= 1;
+                    let f = job(r)?;
+                    self.in_flight.insert(key, f);
+                }
+                Ok(None)
+            }
+        }
+    }
+
+    fn out_chunk(
+        &mut self,
+        r: &mut Renderer,
+        c: usize,
+        mode: &mut Mode,
+    ) -> Result<Option<Arc<Vec<f32>>>, String> {
         let p = self.plan.as_ref().ok_or("no soundtrack")?;
         let key = (p.out_key, c);
         if let Some(d) = self.chunks.get(&key) {
-            return Ok(d.clone());
+            return Ok(Some(d.clone()));
         }
         let lo = c * self.chunk_size;
         let hi = ((c + 1) * self.chunk_size).min(p.total);
         if lo >= hi {
-            return Ok(Arc::new(vec![]));
+            return Ok(Some(Arc::new(vec![])));
         }
         let (mix, lookback, lookahead, total, volume, sr, dur) = (
             p.mix.clone(),
@@ -340,68 +521,95 @@ impl Soundtrack {
             p.sr,
             p.movie.duration,
         );
-        let mut out = match mix {
+        match mix {
             Some(mix) => {
-                let in_lo = lo.saturating_sub(lookback);
-                let in_hi = (hi + lookahead).min(total);
-                let music = self.music_range(r, in_lo, in_hi)?;
-                let sfx = self.sfx_range(r, in_lo, in_hi)?;
-                self.rendered.push(mix.name.clone());
-                r.render_audio(
-                    mix.prog,
-                    lo,
-                    hi - lo,
-                    sr,
-                    (0.0, dur),
-                    Some((&music, &sfx, in_lo as i64)),
-                )?
+                // A mix block can only be queued once its inputs have arrived; until
+                // then this just keeps them coming.
+                if !self.in_flight.contains_key(&key) {
+                    let in_lo = lo.saturating_sub(lookback);
+                    let in_hi = (hi + lookahead).min(total);
+                    let music = self.music_range(r, in_lo, in_hi, mode)?;
+                    let sfx = self.sfx_range(r, in_lo, in_hi, mode)?;
+                    let (Some(music), Some(sfx)) = (music, sfx) else {
+                        return Ok(None);
+                    };
+                    return self.block(r, key, mode, |r| {
+                        let t = r.submit_audio(
+                            mix.prog,
+                            lo,
+                            hi - lo,
+                            sr,
+                            (0.0, dur),
+                            Some((&music, &sfx, in_lo as i64)),
+                        )?;
+                        Ok(InFlight::new(t, mix.name, Place::Mix { volume }))
+                    });
+                }
+                self.block(r, key, mode, |_| unreachable!("already queued"))
             }
             None => {
-                let mut o = self.music_range(r, lo, hi)?;
-                let sfx = self.sfx_range(r, lo, hi)?;
+                let music = self.music_range(r, lo, hi, mode)?;
+                let sfx = self.sfx_range(r, lo, hi, mode)?;
+                let (Some(mut o), Some(sfx)) = (music, sfx) else {
+                    return Ok(None);
+                };
                 for (a, b) in o.iter_mut().zip(&sfx) {
                     *a += b;
                 }
-                o
+                let d = Arc::new(finish_out(o, volume));
+                self.chunks.insert(key, d.clone());
+                Ok(Some(d))
             }
-        };
-        for x in &mut out {
-            *x = (*x * volume).clamp(-1.0, 1.0);
         }
-        let d = Arc::new(out);
-        self.chunks.insert(key, d.clone());
-        Ok(d)
     }
 
     /// Music for global samples lo..hi.
-    fn music_range(&mut self, r: &mut Renderer, lo: usize, hi: usize) -> Result<Vec<f32>, String> {
+    fn music_range(
+        &mut self,
+        r: &mut Renderer,
+        lo: usize,
+        hi: usize,
+        mode: &mut Mode,
+    ) -> Result<Option<Vec<f32>>, String> {
         let Some(t) = self.plan.as_ref().and_then(|p| p.music.clone()) else {
-            return Ok(vec![0.0; (hi - lo) * 2]);
+            return Ok(Some(vec![0.0; (hi - lo) * 2]));
         };
-        self.range(lo, hi, |s, c| s.track_chunk(r, &t, c))
+        self.range(lo, hi, |s, c| s.track_chunk(r, &t, c, mode))
     }
 
     /// The sfx bus (all shot sounds × their fades) for global samples lo..hi.
-    fn sfx_range(&mut self, r: &mut Renderer, lo: usize, hi: usize) -> Result<Vec<f32>, String> {
-        self.range(lo, hi, |s, c| s.sfx_chunk(r, c))
+    fn sfx_range(
+        &mut self,
+        r: &mut Renderer,
+        lo: usize,
+        hi: usize,
+        mode: &mut Mode,
+    ) -> Result<Option<Vec<f32>>, String> {
+        self.range(lo, hi, |s, c| s.sfx_chunk(r, c, mode))
     }
 
+    /// Samples lo..hi from the chunks `chunk` makes. Asks for every chunk (so the
+    /// missing ones are all queued) before saying None.
     fn range(
         &mut self,
         lo: usize,
         hi: usize,
-        mut chunk: impl FnMut(&mut Self, usize) -> Result<Arc<Vec<f32>>, String>,
-    ) -> Result<Vec<f32>, String> {
-        let mut out = Vec::with_capacity((hi - lo) * 2);
+        mut chunk: impl FnMut(&mut Self, usize) -> Result<Option<Arc<Vec<f32>>>, String>,
+    ) -> Result<Option<Vec<f32>>, String> {
+        let mut parts = vec![];
         let mut c = lo / self.chunk_size;
         while c * self.chunk_size < hi {
-            let d = chunk(self, c)?;
+            parts.push((c, chunk(self, c)?));
+            c += 1;
+        }
+        let mut out = Vec::with_capacity((hi - lo) * 2);
+        for (c, d) in parts {
+            let Some(d) = d else { return Ok(None) };
             let a = lo.max(c * self.chunk_size) - c * self.chunk_size;
             let b = hi.min((c + 1) * self.chunk_size) - c * self.chunk_size;
             out.extend_from_slice(&d[a * 2..b * 2]);
-            c += 1;
         }
-        Ok(out)
+        Ok(Some(out))
     }
 
     /// One chunk of one track; zero outside the track's window.
@@ -410,43 +618,57 @@ impl Soundtrack {
         r: &mut Renderer,
         t: &TrackDef,
         c: usize,
-    ) -> Result<Arc<Vec<f32>>, String> {
-        if let Some(d) = self.chunks.get(&(t.key, c)) {
-            return Ok(d.clone());
-        }
+        mode: &mut Mode,
+    ) -> Result<Option<Arc<Vec<f32>>>, String> {
         let p = self.plan.as_ref().unwrap();
         let (sr, total) = (p.sr, p.total);
         let lo = c * self.chunk_size;
         let n = ((c + 1) * self.chunk_size).min(total).saturating_sub(lo);
-        let mut out = vec![0f32; n * 2];
         let a = lo.max(t.first);
         let b = (lo + n).min(t.first + t.count);
-        if a < b {
-            let d = r.render_audio(t.prog, a, b - a, sr, t.shot, None)?;
-            out[(a - lo) * 2..(b - lo) * 2].copy_from_slice(&d);
-            self.rendered.push(t.name.clone());
+        if a >= b {
+            if let Some(d) = self.chunks.get(&(t.key, c)) {
+                return Ok(Some(d.clone()));
+            }
+            let d = Arc::new(vec![0f32; n * 2]);
+            self.chunks.insert((t.key, c), d.clone());
+            return Ok(Some(d));
         }
-        let d = Arc::new(out);
-        self.chunks.insert((t.key, c), d.clone());
-        Ok(d)
+        self.block(r, (t.key, c), mode, |r| {
+            let tk = r.submit_audio(t.prog, a, b - a, sr, t.shot, None)?;
+            Ok(InFlight::new(tk, t.name.clone(), Place::Track { lo, n, a }))
+        })
     }
 
-    fn sfx_chunk(&mut self, r: &mut Renderer, c: usize) -> Result<Arc<Vec<f32>>, String> {
+    fn sfx_chunk(
+        &mut self,
+        r: &mut Renderer,
+        c: usize,
+        mode: &mut Mode,
+    ) -> Result<Option<Arc<Vec<f32>>>, String> {
         let p = self.plan.as_ref().unwrap();
         if let Some(d) = self.chunks.get(&(p.sfx_key, c)) {
-            return Ok(d.clone());
+            return Ok(Some(d.clone()));
         }
         let (sr, total, sfx_key) = (p.sr, p.total, p.sfx_key);
         let lo = c * self.chunk_size;
         let n = ((c + 1) * self.chunk_size).min(total).saturating_sub(lo);
         let shots = p.shots.clone();
-        let mut out = vec![0f32; n * 2];
+        // Ask for every shot's block first, so they're all queued together.
+        let mut parts = vec![];
         for (i, t) in shots {
             if lo + n <= t.first || lo >= t.first + t.count {
                 continue;
             }
-            let d = self.track_chunk(r, &t, c)?;
-            let m = &self.plan.as_ref().unwrap().movie;
+            parts.push((i, self.track_chunk(r, &t, c, mode)?));
+        }
+        if parts.iter().any(|(_, d)| d.is_none()) {
+            return Ok(None);
+        }
+        let mut out = vec![0f32; n * 2];
+        let m = &self.plan.as_ref().unwrap().movie;
+        for (i, d) in parts {
+            let d = d.unwrap();
             for k in 0..n {
                 let g = m.sound_gain(i, (lo + k) as f32 / sr as f32);
                 if g != 0.0 {
@@ -457,7 +679,7 @@ impl Soundtrack {
         }
         let d = Arc::new(out);
         self.chunks.insert((sfx_key, c), d.clone());
-        Ok(d)
+        Ok(Some(d))
     }
 
     /// Drop cached chunks outside `keep` (chunk indices), plus any from old versions.
@@ -467,11 +689,19 @@ impl Soundtrack {
     }
 
     fn forget_stale(&mut self) {
-        let Some(p) = &self.plan else { return };
+        let live = self.live_keys();
+        self.chunks.retain(|(k, _), _| live.contains(k));
+    }
+
+    /// Cache keys of the current version.
+    fn live_keys(&self) -> HashSet<u64> {
+        let Some(p) = &self.plan else {
+            return HashSet::new();
+        };
         let mut live: HashSet<u64> = [p.out_key, p.sfx_key].into();
         live.extend(p.music.iter().chain(p.mix.iter()).map(|t| t.key));
         live.extend(p.shots.iter().map(|(_, t)| t.key));
-        self.chunks.retain(|(k, _), _| live.contains(k));
+        live
     }
 
     /// Synthesise the whole soundtrack chunk by chunk, handing each to `sink`.
