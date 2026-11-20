@@ -150,6 +150,22 @@ fn is_name(s: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
+/// A branch name we're willing to hand to git: no options, whitespace, `..` or ref syntax.
+fn is_branch_name(s: &str) -> bool {
+    !s.is_empty()
+        && !s.starts_with(['-', '/'])
+        && !s.ends_with(['/', '.'])
+        && !s.contains("..")
+        && !s.contains("//")
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_./".contains(c))
+}
+
+/// A full git commit id (sha1 or sha256), lowercase hex.
+fn is_commit_id(s: &str) -> bool {
+    (s.len() == 40 || s.len() == 64) && s.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f'))
+}
+
 /// A canonical name: one or more name segments joined by `/` (`shotglass-kit/core`).
 fn is_canonical(s: &str) -> bool {
     !s.is_empty() && s.split('/').all(is_name)
@@ -165,6 +181,8 @@ pub struct LibraryDecl {
     pub version: Option<String>,
     /// https URL of a git repository.
     pub source: Option<String>,
+    /// Branch to follow when there's no version (default: the repository's default branch).
+    pub branch: Option<String>,
     /// Folder of the source that is the library root.
     pub subdir: Option<String>,
     /// A library inside the film's own folder (relative, may not climb out).
@@ -178,8 +196,27 @@ pub struct LibrarySpec {
     pub name: String,
     pub version: Option<VersionReq>,
     pub source: Option<String>,
+    /// Set (with a source) only when there's no version: the branch to follow, `None` for
+    /// the default branch. Fetching pins the branch's newest commit.
+    pub branch: Option<String>,
     pub subdir: Option<String>,
     pub path: Option<String>,
+}
+
+impl LibrarySpec {
+    /// Follows a branch (no version range) rather than tagged releases?
+    pub fn tracks_branch(&self) -> bool {
+        self.source.is_some() && self.version.is_none()
+    }
+
+    /// The ref a branch-following spec resolves: `HEAD` (the default branch) or
+    /// `refs/heads/<branch>`.
+    fn branch_ref(&self) -> String {
+        match &self.branch {
+            Some(b) => format!("refs/heads/{b}"),
+            None => "HEAD".to_string(),
+        }
+    }
 }
 
 impl LibrarySpec {
@@ -205,8 +242,16 @@ impl LibrarySpec {
                 {
                     bail!("{}: source must be an https URL, got \"{src}\"", ctx());
                 }
-                if version.is_none() {
-                    bail!("{}: a source needs a version range, e.g. \"0.4\"", ctx());
+                if let Some(b) = &d.branch {
+                    if version.is_some() {
+                        bail!(
+                            "{}: give either version (tagged releases) or branch, not both",
+                            ctx()
+                        );
+                    }
+                    if !is_branch_name(b) {
+                        bail!("{}: \"{b}\" is not a usable branch name", ctx());
+                    }
                 }
             }
             (None, Some(p)) => {
@@ -216,6 +261,9 @@ impl LibrarySpec {
                         "{}: subdir only goes with source; put the folder in path",
                         ctx()
                     );
+                }
+                if d.branch.is_some() {
+                    bail!("{}: branch only goes with source", ctx());
                 }
             }
         }
@@ -229,6 +277,7 @@ impl LibrarySpec {
             name: name.to_string(),
             version,
             source: d.source.clone(),
+            branch: d.branch.clone(),
             subdir: d
                 .subdir
                 .as_ref()
@@ -421,11 +470,15 @@ pub struct Lock {
 pub struct LockEntry {
     /// Local name from movie.toml.
     pub name: String,
-    /// Exact version.
+    /// Exact version (for a followed branch: what its `library.toml` said when pinned).
     pub version: String,
-    /// The git URL; together with `tag` this is the resolved location.
+    /// The git URL; together with `tag` (or `rev`) this is the resolved location.
     pub source: String,
+    /// The release tag, or for a followed branch the ref: `HEAD` or `refs/heads/<branch>`.
     pub tag: String,
+    /// The pinned commit when following a branch instead of tagged releases.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rev: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subdir: Option<String>,
     /// sha256 of the library root's files (see `hash_dir`).
@@ -449,6 +502,16 @@ impl Lock {
                 "lock file version {} is not supported by this shotglass",
                 l.version
             );
+        }
+        for e in &l.libraries {
+            if let Some(r) = &e.rev
+                && !is_commit_id(r)
+            {
+                bail!(
+                    "library \"{}\": rev \"{r}\" is not a full commit id",
+                    e.name
+                );
+            }
         }
         Ok(l)
     }
@@ -484,10 +547,29 @@ impl LockEntry {
     fn fits(&self, s: &LibrarySpec) -> bool {
         s.source.as_deref() == Some(self.source.as_str())
             && s.subdir == self.subdir
-            && match (&s.version, Version::parse(&self.version)) {
-                (Some(r), Ok(v)) => r.matches(&v),
+            && match (&s.version, &self.rev) {
+                (Some(r), None) => Version::parse(&self.version).is_ok_and(|v| r.matches(&v)),
+                (None, Some(_)) => self.tag == s.branch_ref(),
                 _ => false,
             }
+    }
+
+    /// The cache folder name under the source: the version, or the commit.
+    fn cache_key(&self) -> &str {
+        self.rev.as_deref().unwrap_or(&self.version)
+    }
+
+    /// For messages: `0.4.2`, or `main@1a2b3c4 (0.1.0)`.
+    pub fn pin(&self) -> String {
+        match &self.rev {
+            Some(r) => format!(
+                "{}@{} ({})",
+                self.tag.strip_prefix("refs/heads/").unwrap_or(&self.tag),
+                &r[..7],
+                self.version
+            ),
+            None => self.version.clone(),
+        }
     }
 }
 
@@ -619,10 +701,10 @@ pub fn resolve(
                      run `shotglass update` on the film",
                     s.name,
                     e.source,
-                    e.version
+                    e.pin()
                 );
             }
-            let dir = cache_path(cache, &e.source, &e.version);
+            let dir = cache_path(cache, &e.source, e.cache_key());
             let root = match &e.subdir {
                 Some(sub) => dir.join(sub),
                 None => dir.clone(),
@@ -631,7 +713,7 @@ pub fn resolve(
                 bail!(
                     "library \"{}\" {} isn't downloaded on this machine; {fetch}",
                     s.name,
-                    e.version
+                    e.pin()
                 );
             }
             let got = hash_dir(&root)?;
@@ -640,7 +722,7 @@ pub fn resolve(
                     "library \"{}\" {}: files in {} don't match {LOCK_FILE} (sha256 {got}, \
                      locked {}); the cache was edited or the tag moved",
                     s.name,
-                    e.version,
+                    e.pin(),
                     root.display(),
                     e.sha256
                 );
@@ -717,6 +799,10 @@ pub trait Fetcher {
     fn tags(&self, source: &str) -> Result<Vec<String>>;
     /// Put the files of `tag` into `dest`, which doesn't exist yet.
     fn download(&self, source: &str, tag: &str, dest: &Path) -> Result<()>;
+    /// The commit `refname` (`HEAD` or `refs/heads/<branch>`) points at now.
+    fn head(&self, source: &str, refname: &str) -> Result<String>;
+    /// Put the files of commit `rev` into `dest`, which doesn't exist yet.
+    fn download_rev(&self, source: &str, rev: &str, dest: &Path) -> Result<()>;
 }
 
 /// `v1.2.3` or `1.2.3`.
@@ -768,10 +854,6 @@ pub fn fetch(
             ));
             continue;
         };
-        let req = s
-            .version
-            .as_ref()
-            .expect("validated: source needs a version");
         let prev = old.and_then(|l| l.get(&s.name)).filter(|e| e.fits(s));
         let refresh = match mode {
             FetchMode::Missing { skip } => {
@@ -788,10 +870,10 @@ pub fn fetch(
         };
         let entry = match prev {
             Some(e) if !refresh => {
-                let dir = cache_path(cache, &e.source, &e.version);
+                let dir = cache_path(cache, &e.source, e.cache_key());
                 let fresh = !dir.exists();
                 if fresh {
-                    download(fetcher, source, &e.tag, &dir)?;
+                    download(fetcher, source, &e.tag, e.rev.as_deref(), &dir)?;
                 }
                 let root = lib_root(&dir, &e.subdir, &s.name)?;
                 let got = hash_dir(&root)?;
@@ -800,9 +882,9 @@ pub fn fetch(
                         "library \"{}\" {} ({} tag {}): sha256 {got} doesn't match {LOCK_FILE} \
                          ({}); {}",
                         s.name,
-                        e.version,
+                        e.pin(),
                         e.source,
-                        e.tag,
+                        e.rev.as_deref().unwrap_or(&e.tag),
                         e.sha256,
                         if fresh {
                             "the tag was moved or re-published. Check the source, then \
@@ -815,13 +897,46 @@ pub fn fetch(
                 log.push(format!(
                     "{}: {} {}{}",
                     s.name,
-                    e.version,
+                    e.pin(),
                     if fresh { "downloaded" } else { "cached" },
                     " (locked)"
                 ));
                 e.clone()
             }
+            _ if s.tracks_branch() => {
+                let refname = s.branch_ref();
+                let rev = fetcher.head(source, &refname).with_context(|| {
+                    format!("library \"{}\": looking up {refname} of {source}", s.name)
+                })?;
+                if !is_commit_id(&rev) {
+                    bail!(
+                        "library \"{}\": {source} {refname} gave \"{rev}\", not a commit id",
+                        s.name
+                    );
+                }
+                let dir = cache_path(cache, source, &rev);
+                if !dir.exists() {
+                    download(fetcher, source, &refname, Some(&rev), &dir)?;
+                }
+                let root = lib_root(&dir, &s.subdir, &s.name)?;
+                let lib = Library::read(&s.name, &root, Origin::Locked)?;
+                let e = LockEntry {
+                    name: s.name.clone(),
+                    version: lib.version.to_string(),
+                    source: source.clone(),
+                    tag: refname,
+                    rev: Some(rev),
+                    subdir: s.subdir.clone(),
+                    sha256: hash_dir(&root)?,
+                };
+                log.push(pin_change(&s.name, prev, &e));
+                e
+            }
             _ => {
+                let req = s
+                    .version
+                    .as_ref()
+                    .expect("validated: a source without a version follows a branch");
                 let tags = fetcher
                     .tags(source)
                     .with_context(|| format!("library \"{}\": listing tags of {source}", s.name))?;
@@ -843,7 +958,7 @@ pub fn fetch(
                 })?;
                 let dir = cache_path(cache, source, &v.to_string());
                 if !dir.exists() {
-                    download(fetcher, source, &tag, &dir)?;
+                    download(fetcher, source, &tag, None, &dir)?;
                 }
                 let root = lib_root(&dir, &s.subdir, &s.name)?;
                 let e = LockEntry {
@@ -851,21 +966,26 @@ pub fn fetch(
                     version: v.to_string(),
                     source: source.clone(),
                     tag,
+                    rev: None,
                     subdir: s.subdir.clone(),
                     sha256: hash_dir(&root)?,
                 };
-                let was = prev.map(|p| p.version.as_str());
-                log.push(match was {
-                    Some(w) if w != e.version => format!("{}: {w} → {}", s.name, e.version),
-                    Some(_) => format!("{}: {} (up to date)", s.name, e.version),
-                    None => format!("{}: {} (new)", s.name, e.version),
-                });
+                log.push(pin_change(&s.name, prev, &e));
                 e
             }
         };
         lock.libraries.push(entry);
     }
     Ok((lock, log))
+}
+
+/// A log line for a (re-)resolved pin.
+fn pin_change(name: &str, prev: Option<&LockEntry>, e: &LockEntry) -> String {
+    match prev {
+        Some(p) if p.pin() != e.pin() => format!("{name}: {} → {}", p.pin(), e.pin()),
+        Some(_) => format!("{name}: {} (up to date)", e.pin()),
+        None => format!("{name}: {} (new)", e.pin()),
+    }
 }
 
 fn lib_root(dir: &Path, subdir: &Option<String>, name: &str) -> Result<PathBuf> {
@@ -889,7 +1009,13 @@ fn lib_root(dir: &Path, subdir: &Option<String>, name: &str) -> Result<PathBuf> 
 
 /// Download into a temporary sibling, then rename, so a half-finished download never looks
 /// like a cached release.
-fn download(fetcher: &dyn Fetcher, source: &str, tag: &str, dir: &Path) -> Result<()> {
+fn download(
+    fetcher: &dyn Fetcher,
+    source: &str,
+    tag: &str,
+    rev: Option<&str>,
+    dir: &Path,
+) -> Result<()> {
     let parent = dir.parent().expect("cache path has a parent");
     std::fs::create_dir_all(parent)?;
     let tmp = parent.join(format!(
@@ -898,9 +1024,14 @@ fn download(fetcher: &dyn Fetcher, source: &str, tag: &str, dir: &Path) -> Resul
         dir.file_name().unwrap().to_string_lossy()
     ));
     let _ = std::fs::remove_dir_all(&tmp);
-    fetcher
-        .download(source, tag, &tmp)
-        .with_context(|| format!("downloading {source} {tag}"))?;
+    match rev {
+        Some(r) => fetcher
+            .download_rev(source, r, &tmp)
+            .with_context(|| format!("downloading {source} {tag} at {r}")),
+        None => fetcher
+            .download(source, tag, &tmp)
+            .with_context(|| format!("downloading {source} {tag}")),
+    }?;
     if let Err(e) = std::fs::rename(&tmp, dir) {
         let _ = std::fs::remove_dir_all(&tmp);
         if !dir.exists() {
@@ -958,6 +1089,47 @@ impl Fetcher for Git {
             "--",
             source,
             &d,
+        ])?;
+        std::fs::remove_dir_all(dest.join(".git"))?;
+        Ok(())
+    }
+
+    fn head(&self, source: &str, refname: &str) -> Result<String> {
+        let out = Git::run(&["ls-remote", source, refname])?;
+        out.lines()
+            .filter_map(|l| l.split_once('\t'))
+            .find(|(_, r)| *r == refname)
+            .map(|(sha, _)| sha.to_string())
+            .ok_or_else(|| anyhow!("{source} has no {refname}"))
+    }
+
+    fn download_rev(&self, source: &str, rev: &str, dest: &Path) -> Result<()> {
+        if !is_commit_id(rev) {
+            bail!("\"{rev}\" is not a full commit id");
+        }
+        let d = dest.to_string_lossy();
+        Git::run(&["init", "--quiet", "--", &d])?;
+        let in_dest = |args: &[&str]| {
+            let mut a = vec!["-C", &*d, "-c", "core.autocrlf=false"];
+            a.extend_from_slice(args);
+            Git::run(&a)
+        };
+        // Servers (GitHub included) hand out a reachable commit by id; fall back to all
+        // branches for ones that don't.
+        if in_dest(&["fetch", "--quiet", "--depth", "1", source, rev]).is_err() {
+            in_dest(&[
+                "fetch",
+                "--quiet",
+                source,
+                "+refs/heads/*:refs/remotes/src/*",
+            ])?;
+        }
+        in_dest(&[
+            "-c",
+            "advice.detachedHead=false",
+            "checkout",
+            "--quiet",
+            rev,
         ])?;
         std::fs::remove_dir_all(dest.join(".git"))?;
         Ok(())
@@ -1062,11 +1234,32 @@ mod tests {
         assert_eq!(s.subdir.as_deref(), Some("core"));
         assert!(s.version.unwrap().matches(&Version::new(0, 4, 9)));
         assert!(spec("mine", r#"path = "lib/mykit""#).is_ok());
+        // No version: follow the default branch, or the one named.
+        let s = spec("kit", r#"source = "https://x.org/k""#).unwrap();
+        assert!(s.tracks_branch());
+        assert_eq!(s.branch_ref(), "HEAD");
+        let s = spec("kit", r#"source = "https://x.org/k", branch = "dev/next""#).unwrap();
+        assert_eq!(s.branch_ref(), "refs/heads/dev/next");
 
         for (name, src, why) in [
             ("kit", r#"path = "lib", source = "https://x""#, "either"),
             ("kit", r#"version = "1""#, "needs a source"),
-            ("kit", r#"source = "https://x.org/k""#, "version range"),
+            (
+                "kit",
+                r#"source = "https://x.org/k", version = "1", branch = "main""#,
+                "not both",
+            ),
+            (
+                "kit",
+                r#"source = "https://x.org/k", branch = "--upload-pack=x""#,
+                "branch name",
+            ),
+            (
+                "kit",
+                r#"source = "https://x.org/k", branch = "a..b""#,
+                "branch name",
+            ),
+            ("kit", r#"path = "lib", branch = "main""#, "branch only"),
             (
                 "kit",
                 r#"source = "http://x.org/k", version = "1""#,
@@ -1211,10 +1404,20 @@ mod tests {
             version: 1,
             libraries: vec![
                 LockEntry {
+                    name: "kit".into(),
+                    version: "0.1.0".into(),
+                    source: "https://github.com/antonmarsden/shotglass-kit".into(),
+                    tag: "HEAD".into(),
+                    rev: Some("e".repeat(40)),
+                    subdir: Some("core".into()),
+                    sha256: "ef".repeat(32),
+                },
+                LockEntry {
                     name: "sfx".into(),
                     version: "0.3.1".into(),
                     source: "https://github.com/antonmarsden/shotglass-kit".into(),
                     tag: "v0.3.1".into(),
+                    rev: None,
                     subdir: Some("sounds".into()),
                     sha256: "ab".repeat(32),
                 },
@@ -1223,6 +1426,7 @@ mod tests {
                     version: "1.2.0".into(),
                     source: "https://github.com/someone/toon-kit".into(),
                     tag: "1.2.0".into(),
+                    rev: None,
                     subdir: None,
                     sha256: "cd".repeat(32),
                 },
@@ -1233,6 +1437,8 @@ mod tests {
         assert_eq!(Lock::parse(&text).unwrap(), l);
         assert!(Lock::parse("version = 2\n").is_err());
         assert!(Lock::parse("version = 1\n[[library]]\nname = \"x\"\n").is_err());
+        let bad_rev = text.replace(&"e".repeat(40), "--upload-pack=x");
+        assert!(format!("{:#}", Lock::parse(&bad_rev).unwrap_err()).contains("commit id"));
     }
 
     #[test]
@@ -1287,6 +1493,8 @@ mod tests {
     #[derive(Default)]
     struct Fake {
         repos: RefCell<BTreeMap<String, Releases>>,
+        /// (source, ref) → commit; commits are stored in `repos` like tags.
+        heads: RefCell<BTreeMap<(String, String), String>>,
         downloads: RefCell<usize>,
     }
 
@@ -1304,9 +1512,27 @@ mod tests {
                         .collect(),
                 );
         }
+
+        /// A new commit on `refname` (`HEAD` or `refs/heads/…`).
+        fn push(&self, source: &str, refname: &str, rev: &str, files: &[(&str, &str)]) {
+            self.publish(source, rev, files);
+            self.heads
+                .borrow_mut()
+                .insert((source.into(), refname.into()), rev.into());
+        }
     }
 
     impl Fetcher for Fake {
+        fn head(&self, source: &str, refname: &str) -> Result<String> {
+            self.heads
+                .borrow()
+                .get(&(source.to_string(), refname.to_string()))
+                .cloned()
+                .ok_or_else(|| anyhow!("no {refname}"))
+        }
+        fn download_rev(&self, source: &str, rev: &str, dest: &Path) -> Result<()> {
+            self.download(source, rev, dest)
+        }
         fn tags(&self, source: &str) -> Result<Vec<String>> {
             Ok(self
                 .repos
@@ -1600,6 +1826,96 @@ mod tests {
     }
 
     #[test]
+    fn a_source_without_version_follows_a_branch() {
+        let cache = tmp("branch-cache");
+        let film = tmp("branch-film");
+        let f = Fake::default();
+        let (c1, c2) = ("1".repeat(40), "2".repeat(40));
+        let core = |v: &str, body: &str| {
+            vec![
+                (
+                    "core/library.toml".to_string(),
+                    libtoml("shotglass-kit/core", v, ""),
+                ),
+                ("core/noise.glsl".to_string(), body.to_string()),
+            ]
+        };
+        let push = |r: &str, c: &str, files: Vec<(String, String)>| {
+            let v: Vec<(&str, &str)> = files
+                .iter()
+                .map(|(a, b)| (a.as_str(), b.as_str()))
+                .collect();
+            f.push(KIT, r, c, &v);
+        };
+        push("HEAD", &c1, core("0.1.0", "float n1();\n"));
+        let sp = specs(&format!(
+            "kit = {{ source = \"{KIT}\", subdir = \"core\" }}\n"
+        ));
+        let missing = FetchMode::Missing {
+            skip: BTreeSet::new(),
+        };
+        let (lock, log) = fetch(&sp, None, &f, &cache, &missing).unwrap();
+        let e = lock.get("kit").unwrap();
+        assert_eq!(e.rev.as_deref(), Some(c1.as_str()));
+        assert_eq!((e.tag.as_str(), e.version.as_str()), ("HEAD", "0.1.0"));
+        assert!(
+            log.iter().any(|l| l.contains("HEAD@1111111 (0.1.0) (new)")),
+            "{log:?}"
+        );
+        let text = lock.to_text();
+        assert!(text.contains(&format!("rev = \"{c1}\"")), "{text}");
+        assert_eq!(Lock::parse(&text).unwrap(), lock);
+
+        let libs = resolve(&film, &sp, &BTreeMap::new(), Some(&lock), &cache).unwrap();
+        assert!(libs[0].root.ends_with(format!("shotglass-kit/{c1}/core")));
+
+        // New commits don't move the pin until `update`, which takes the newest one.
+        push("HEAD", &c2, core("0.2.0", "float n2();\n"));
+        let (same, _) = fetch(&sp, Some(&lock), &f, &cache, &missing).unwrap();
+        assert_eq!(same, lock);
+        let (newer, log) = fetch(&sp, Some(&lock), &f, &cache, &FetchMode::Update(vec![])).unwrap();
+        assert_eq!(newer.get("kit").unwrap().rev.as_deref(), Some(c2.as_str()));
+        assert!(
+            log.iter()
+                .any(|l| l.contains("HEAD@1111111 (0.1.0) → HEAD@2222222 (0.2.0)")),
+            "{log:?}"
+        );
+
+        // Naming a branch, or adding a version, no longer fits the pin.
+        let named = specs(&format!(
+            "kit = {{ source = \"{KIT}\", subdir = \"core\", branch = \"next\" }}\n"
+        ));
+        let e = format!(
+            "{:#}",
+            resolve(&film, &named, &BTreeMap::new(), Some(&lock), &cache).unwrap_err()
+        );
+        assert!(e.contains("shotglass update"), "{e}");
+        let versioned = specs(&format!(
+            "kit = {{ version = \"0.1\", source = \"{KIT}\", subdir = \"core\" }}\n"
+        ));
+        assert!(resolve(&film, &versioned, &BTreeMap::new(), Some(&lock), &cache).is_err());
+        push("refs/heads/next", &c2, core("0.2.0", "float n2();\n"));
+        let (l2, _) = fetch(&named, Some(&lock), &f, &cache, &missing).unwrap();
+        assert_eq!(l2.get("kit").unwrap().tag, "refs/heads/next");
+        assert!(l2.get("kit").unwrap().pin().starts_with("next@2222222"));
+
+        // A fresh machine downloads the pinned commit, not the branch's newest.
+        let cache2 = tmp("branch-cache2");
+        let n = *f.downloads.borrow();
+        let (again, log) = fetch(&sp, Some(&lock), &f, &cache2, &missing).unwrap();
+        assert_eq!(again, lock);
+        assert_eq!(*f.downloads.borrow(), n + 1);
+        assert!(
+            log.iter()
+                .any(|l| l.contains("1111111") && l.contains("downloaded")),
+            "{log:?}"
+        );
+        for d in [cache, cache2, film] {
+            std::fs::remove_dir_all(d).ok();
+        }
+    }
+
+    #[test]
     fn git_fetcher_reads_tags_and_downloads() {
         let git = |dir: &Path, args: &[&str]| {
             std::process::Command::new("git")
@@ -1647,7 +1963,26 @@ mod tests {
             hash_dir(&dest.join("core")).unwrap(),
             hash_dir(&repo.join("core")).unwrap()
         );
+
+        // Following a branch: the pinned commit stays downloadable after the branch moves.
+        let first = Git.head(&url, "HEAD").unwrap();
+        assert!(is_commit_id(&first), "{first}");
+        write(&repo, &[("core/x.glsl", "float x2();\n")]);
+        assert!(git(&repo, &["commit", "-q", "-a", "-m", "two"]));
+        let second = Git.head(&url, "HEAD").unwrap();
+        assert_ne!(first, second);
+        assert!(Git.head(&url, "refs/heads/nope").is_err());
+        let old = tmp("git-dest-rev").join("out");
+        Git.download_rev(&url, &first, &old).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(old.join("core/x.glsl")).unwrap(),
+            "float x();\n"
+        );
+        assert!(!old.join(".git").exists());
+        assert!(Git.download_rev(&url, "--upload-pack=x", &old).is_err());
+
         std::fs::remove_dir_all(&repo).ok();
         std::fs::remove_dir_all(dest.parent().unwrap()).ok();
+        std::fs::remove_dir_all(old.parent().unwrap()).ok();
     }
 }

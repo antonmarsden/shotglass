@@ -388,14 +388,35 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// The demo uses shotglass-kit, pinned by its shotglass.lock: this downloads the pinned
+    /// commit into the user cache once (git and network), as `shotglass fetch` would.
     #[test]
     fn demo_movie_passes_everywhere() {
-        let m = Movie::load(
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("movies/big-shadow")
-                .as_path(),
-        )
-        .unwrap();
+        use crate::library;
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("movies/big-shadow");
+        let m = Movie::read(&root).unwrap();
+        let lock = library::Lock::load(&root).unwrap();
+        assert!(lock.is_some(), "the demo's shotglass.lock is committed");
+        let missing = library::FetchMode::Missing {
+            skip: Default::default(),
+        };
+        let fetched = library::fetch(
+            &m.library_specs,
+            lock.as_ref(),
+            &library::Git,
+            &library::cache_dir(),
+            &missing,
+        );
+        match fetched {
+            Ok((l, _)) => assert_eq!(Some(l), lock, "fetching must not move the demo's pins"),
+            // Offline, the strict check of the demo is left to CI (which has a network).
+            Err(e) if std::env::var_os("CI").is_none() => {
+                eprintln!("skipping the demo check: can't fetch its libraries ({e:#})");
+                return;
+            }
+            Err(e) => panic!("fetching the demo's libraries: {e:#}"),
+        }
+        let m = Movie::load(&root).unwrap();
         for d in all_dialects() {
             expect_clean(&m, d);
         }

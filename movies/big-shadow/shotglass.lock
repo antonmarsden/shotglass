@@ -1,0 +1,20 @@
+# Written by `shotglass fetch`/`update`. Commit it with the film.
+version = 1
+
+[[library]]
+name = "kit"
+version = "0.1.0"
+source = "https://github.com/antonmarsden/shotglass-kit"
+tag = "HEAD"
+rev = "ee98e6bc03a138ee3ed179d78371bb29cc279c8a"
+subdir = "core"
+sha256 = "4c33c1f00096d13938eff830530942cc688a799f1013c9f52e9267a3d8b50131"
+
+[[library]]
+name = "transitions"
+version = "0.1.0"
+source = "https://github.com/antonmarsden/shotglass-kit"
+tag = "HEAD"
+rev = "ee98e6bc03a138ee3ed179d78371bb29cc279c8a"
+subdir = "transitions"
+sha256 = "0c0c3357e317f31103ec1053c56a84b1b006203e63365893ef27ad9663b0e9b6"
