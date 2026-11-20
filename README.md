@@ -326,7 +326,9 @@ To scrub, click or drag on the timeline. Hatched blocks are transitions;
   sound buffers stay mapped, so reading results and writing mix inputs need no
   driver call at all (`SHOTGLASS_NO_PERSISTENT=1` turns this off). The Performance
   panel splits stalls into sound and compiling, and shows where the worst sound
-  stall's time went, down to the GL call.
+  stall's time went, down to the GL call. Ticks under its frame graph mark the
+  frames that rendered a film frame, queued or collected sound, or compiled;
+  hover a frame for its numbers.
 - **Frozen transitions** render only one scene.
 - `shotglass check` times every shot and transition, so you can see which ones
   are over budget.
@@ -414,7 +416,8 @@ shotglass selftest strips   # only checks whose name contains "strips"
   synthesised in small bands. No single GPU job runs long enough to trip the
   watchdog (Windows resets the GPU after ~2 s). If the driver resets anyway, for
   example from a shader with an infinite loop, the player stops and says so
-  instead of crashing.
+  instead of crashing. (While playing it only asks the driver after a frame that
+  took over half a second, since asking costs a frame on some drivers.)
 - **Bad input** in `movie.toml` is reported, never a crash (fuzzed by the
   property tests).
 
