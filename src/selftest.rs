@@ -42,7 +42,7 @@ const CHECKS: &[Check] = &[
         run: tiled_drawing,
     },
     Check {
-        name: "playback doesn't stall on driver error checks every frame",
+        name: "playback doesn't stall on driver error checks",
         run: error_check_rate,
     },
     Check {
@@ -595,22 +595,48 @@ fn error_check_rate(gl: &Gl, dir: &Path) -> Result<String> {
     )?;
     let m = movie(dir, "[[shot]]\nid=\"a\"\nscene=\"s.glsl\"\nduration=4\n")?;
     let mut r = renderer(gl, &m)?;
-    let start = Instant::now();
+    // Playing: never, unless there's a sign of trouble (even a once-a-second check
+    // shows as a regular hitch in the frame graph).
     for i in 0..120 {
         r.render(&m, W, H, &info(i as f32 / 60.0, 1.0), true);
-        if r.context_lost() {
+        if r.context_lost(false, false) {
             bail!("reported a lost context on a healthy GPU");
         }
     }
-    let secs = start.elapsed().as_secs_f32();
-    let allowed = 1 + secs.ceil() as usize;
-    if r.error_checks > allowed {
+    if r.error_checks != 0 {
         bail!(
-            "{} driver error checks in 120 frames ({secs:.1} s); expected at most {allowed}",
+            "{} driver error checks in 120 frames of playback; expected none",
             r.error_checks
         );
     }
-    Ok(format!("{} check(s) in 120 frames", r.error_checks))
+    // A sign of trouble (a long frame gap) does ask, so a reset is still noticed.
+    if r.context_lost(false, true) || r.error_checks != 1 {
+        bail!("a suspicious frame didn't ask the driver (or got a lost context)");
+    }
+    // Paused: about once a second (so a reset while paused is still noticed).
+    let start = Instant::now();
+    let before = r.error_checks;
+    let mut frames = 0;
+    while start.elapsed().as_secs_f32() < 1.3 {
+        r.render(&m, W, H, &info(frames as f32 / 60.0, 1.0), true);
+        if r.context_lost(true, false) {
+            bail!("reported a lost context on a healthy GPU");
+        }
+        frames += 1;
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let secs = start.elapsed().as_secs_f32();
+    let paused = r.error_checks - before;
+    let allowed = 1 + secs.ceil() as usize;
+    if paused == 0 || paused > allowed {
+        bail!(
+            "{paused} driver error checks in {frames} paused frames ({secs:.1} s); \
+             expected 1 to {allowed}"
+        );
+    }
+    Ok(format!(
+        "none while playing, {paused} in {secs:.1} s paused"
+    ))
 }
 
 fn error_mapping(gl: &Gl, dir: &Path) -> Result<String> {

@@ -52,7 +52,8 @@ cargo fmt && cargo clippy --all-targets -- -D warnings
   and it is driven by GPU time only. Frames slowed by housekeeping (compiles, sound
   synthesis) are "stalls", not drops, and must not lower the scale.
 - **No per-frame GPU→CPU syncs on the render path.** `glGetError` stalls NVIDIA's threaded
-  driver; `context_lost()` is rate-limited (selftest checks this). Same for `read_pixels`,
+  driver for up to a refresh; `context_lost()` asks only on evidence while playing (a frame gap
+  > 0.5 s or a GPU frame > 500 ms) and once a second when paused (selftest checks this). Same for `read_pixels`,
   `finish` and query results that aren't ready. Sound is no exception: while playing it goes
   through `Soundtrack::stream` (`submit_audio` → PBO + fence, `poll_audio` with
   `glClientWaitSync(.., 0)`), never `wait_audio`. Selftest counts `blocking_audio_reads`.

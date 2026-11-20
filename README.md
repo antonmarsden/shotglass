@@ -416,7 +416,8 @@ shotglass selftest strips   # only checks whose name contains "strips"
   synthesised in small bands. No single GPU job runs long enough to trip the
   watchdog (Windows resets the GPU after ~2 s). If the driver resets anyway, for
   example from a shader with an infinite loop, the player stops and says so
-  instead of crashing.
+  instead of crashing. (While playing it only asks the driver after a frame that
+  took over half a second, since asking costs a frame on some drivers.)
 - **Bad input** in `movie.toml` is reported, never a crash (fuzzed by the
   property tests).
 

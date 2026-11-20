@@ -133,6 +133,8 @@ struct Player {
     last_synth: String,
     /// The driver reset the GPU (usually a shader that ran for seconds).
     gpu_lost: bool,
+    /// When the last frame started (a long gap hints at a driver reset).
+    last_ui: Option<Instant>,
     /// Seconds of sound ready ahead of the playhead.
     buffered: f32,
     perf_frame: u64,
@@ -222,6 +224,7 @@ impl Player {
             clock,
             last_synth: String::new(),
             gpu_lost: false,
+            last_ui: None,
             buffered: 0.0,
             perf_frame: 0,
             soundtrack: Soundtrack::new(),
@@ -708,6 +711,24 @@ impl Player {
         }
     }
 
+    /// Has the GPU driver reset (a shader ran too long)? Asking is a driver round trip
+    /// that can cost a whole refresh, so while playing it's only asked after a long
+    /// gap between frames (or a very slow GPU frame); paused, about once a second.
+    /// Runs at the end of the frame, after the render and sound are queued.
+    fn check_gpu(&mut self, gap: Option<Duration>) {
+        if self.gpu_lost || self.movie.is_none() {
+            return;
+        }
+        let suspicious = gap.is_some_and(|g| g > Duration::from_millis(500));
+        if self
+            .renderer
+            .context_lost(!self.clock.playing(), suspicious)
+        {
+            self.gpu_lost = true;
+            self.clock.pause();
+        }
+    }
+
     fn render_view(&mut self, frame: &mut eframe::Frame, w: i32, h: i32) -> bool {
         if self.gpu_lost {
             return false;
@@ -742,10 +763,6 @@ impl Player {
         };
         let tex = Some(tex);
         self.rendered_key = Some(key);
-        if self.renderer.context_lost() {
-            self.gpu_lost = true;
-            self.clock.pause();
-        }
         if let Some(tex) = tex
             && self.tex.map(|(t, _)| t) != Some(tex)
         {
@@ -1219,6 +1236,11 @@ impl Player {
 impl eframe::App for Player {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        // A long gap since the last frame is how a driver reset shows up (the GPU
+        // hangs for seconds first): the cue to ask the driver (see `check_gpu`).
+        let now = Instant::now();
+        let gap = self.last_ui.map(|t| now - t);
+        self.last_ui = Some(now);
         // Debounced live reload: editors often write a file in several steps.
         while self.rx.try_recv().is_ok() {
             self.reload_at = Some(Instant::now() + Duration::from_millis(120));
@@ -1365,6 +1387,7 @@ impl eframe::App for Player {
             compile_ms: 0.0,
             sound: self.soundtrack.stats(),
         });
+        self.check_gpu(gap);
         let (ready, total) = self.renderer.progress();
         if self.clock.playing() || ready < total {
             ctx.request_repaint();

@@ -1119,14 +1119,18 @@ impl Renderer {
     /// True if the driver reset the GPU (a shader ran too long) or lost the context.
     ///
     /// `glGetError` makes the CPU wait for drivers that run GL on their own thread
-    /// (NVIDIA's "threaded optimization"), so this only really asks the driver about
-    /// once a second, or straight after a suspiciously slow frame.
-    pub fn context_lost(&mut self) -> bool {
-        let suspicious = self.gpu_samples.back().is_some_and(|ms| *ms > 500.0);
-        let due = self
-            .last_error_check
-            .is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(1));
-        if !suspicious && !due {
+    /// (NVIDIA's "threaded optimization"), often for a whole display refresh, so it is
+    /// only asked when there's a reason: `suspicious` (the caller saw a long frame
+    /// gap: a driver reset hangs the GPU for seconds first), a frame that took over
+    /// 500 ms on the GPU, or, if `periodic` (not playing, where a hitch is harmless),
+    /// about once a second.
+    pub fn context_lost(&mut self, periodic: bool, suspicious: bool) -> bool {
+        let slow_gpu = self.gpu_samples.back().is_some_and(|ms| *ms > 500.0);
+        let due = periodic
+            && self
+                .last_error_check
+                .is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(1));
+        if !suspicious && !slow_gpu && !due {
             return false;
         }
         self.last_error_check = Some(std::time::Instant::now());
