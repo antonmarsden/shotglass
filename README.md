@@ -326,7 +326,9 @@ To scrub, click or drag on the timeline. Hatched blocks are transitions;
   sound buffers stay mapped, so reading results and writing mix inputs need no
   driver call at all (`SHOTGLASS_NO_PERSISTENT=1` turns this off). The Performance
   panel splits stalls into sound and compiling, and shows where the worst sound
-  stall's time went, down to the GL call.
+  stall's time went, down to the GL call. Ticks under its frame graph mark the
+  frames that rendered a film frame, queued or collected sound, or compiled;
+  hover a frame for its numbers.
 - **Frozen transitions** render only one scene.
 - `shotglass check` times every shot and transition, so you can see which ones
   are over budget.

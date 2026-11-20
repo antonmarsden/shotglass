@@ -60,9 +60,25 @@ impl Stall {
     }
 }
 
+/// What a frame did besides drawing the UI, for the frame graph. Sound work runs
+/// after a frame's render, so it lands in the next frame's interval, and is
+/// recorded there.
+#[derive(Clone, Copy, Default)]
+struct Marks {
+    rendered: bool,
+    gpu_ms: Option<f32>,
+    compile_ms: f32,
+    sound_ms: f32,
+    sound: crate::sound::StreamStats,
+}
+
 struct Perf {
     last: Option<Instant>,
     frame_ms: VecDeque<f32>,
+    /// What happened in each frame of `frame_ms` (same length, same order).
+    marks: VecDeque<Marks>,
+    /// Work since the last measured frame, pushed with its frame time.
+    pending: Marks,
     gpu_ms: VecDeque<f32>,
     dropped: u32,
     /// Dropped frames caused by compiling or sound synthesis, not by rendering.
@@ -223,6 +239,8 @@ impl Player {
             perf: Perf {
                 last: None,
                 frame_ms: VecDeque::new(),
+                marks: VecDeque::new(),
+                pending: Marks::default(),
                 gpu_ms: VecDeque::new(),
                 dropped: 0,
                 stalled: 0,
@@ -598,12 +616,20 @@ impl Player {
             Stall::worse(self.perf.stall_since_render, self.perf.stall.take());
         if !self.clock.playing() {
             self.perf.last = None;
+            self.perf.pending = Marks::default();
             self.perf.last_render = None;
             self.perf.stall_since_render = None;
             return;
         }
         let Some(dt) = dt else { return };
         Perf::push(&mut self.perf.frame_ms, dt);
+        let mut mk = std::mem::take(&mut self.perf.pending);
+        mk.rendered = rendered;
+        mk.gpu_ms = gpu;
+        if self.perf.marks.len() >= 240 {
+            self.perf.marks.pop_front();
+        }
+        self.perf.marks.push_back(mk);
         if let Some(g) = gpu {
             Perf::push(&mut self.perf.gpu_ms, g);
             Perf::push(&mut self.perf.gpu_recent, g);
@@ -1113,6 +1139,7 @@ impl Player {
                         ui,
                         &self.perf.frame_ms,
                         &self.perf.gpu_ms,
+                        &self.perf.marks,
                         self.perf.vsync_ms(),
                     );
                     if ui.small_button("reset counters").clicked() {
@@ -1121,6 +1148,7 @@ impl Player {
                         self.perf.stalled_sound = 0;
                         self.perf.worst_sound = None;
                         self.perf.frame_ms.clear();
+                        self.perf.marks.clear();
                         self.perf.gpu_ms.clear();
                     }
                 });
@@ -1212,6 +1240,7 @@ impl eframe::App for Player {
             self.renderer.pump(m, self.clock.time(), background);
         }
         let compile_ms = work.elapsed().as_secs_f32() * 1000.0;
+        self.perf.pending.compile_ms += compile_ms;
         self.perf.stall = Stall::worse(
             self.perf.stall.take(),
             (compile_ms > 3.0).then_some(Stall {
@@ -1327,6 +1356,10 @@ impl eframe::App for Player {
         let work = Instant::now();
         self.stream_sound();
         let sound_ms = work.elapsed().as_secs_f32() * 1000.0;
+        self.perf.pending.sound_ms += sound_ms;
+        let st = self.soundtrack.stats();
+        self.perf.pending.sound.submitted += st.submitted;
+        self.perf.pending.sound.collected += st.collected;
         self.perf.stall = (sound_ms > 3.0).then(|| Stall {
             sound_ms,
             compile_ms: 0.0,
@@ -1381,12 +1414,35 @@ fn uniforms(ui: &mut egui::Ui, s: &crate::movie::Shot, local: f32) {
         });
 }
 
-fn graph(ui: &mut egui::Ui, frame: &VecDeque<f32>, gpu: &VecDeque<f32>, vsync: f32) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 70.0), Sense::hover());
-    let p = ui.painter_at(rect);
+const MARK_RENDER: Color32 = Color32::from_rgb(110, 110, 110);
+const MARK_QUEUED: Color32 = Color32::from_rgb(190, 120, 255);
+const MARK_COLLECTED: Color32 = Color32::from_rgb(90, 220, 220);
+const MARK_COMPILE: Color32 = Color32::from_rgb(255, 150, 60);
+
+/// Frame times (and scene GPU times), with ticks under each frame for what it did:
+/// rendered a film frame, queued sound blocks, collected sound blocks, compiled.
+/// Hover a frame for its numbers.
+fn graph(
+    ui: &mut egui::Ui,
+    frame: &VecDeque<f32>,
+    gpu: &VecDeque<f32>,
+    marks: &VecDeque<Marks>,
+    vsync: f32,
+) {
+    const N: f32 = 240.0;
+    const TICKS: f32 = 4.0 * 3.0; // four rows of 3 px
+    const LEGEND: f32 = 13.0;
+    let (full, resp) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), 70.0 + TICKS + LEGEND),
+        Sense::hover(),
+    );
+    let rect = Rect::from_min_max(full.min, Pos2::new(full.right(), full.bottom() - LEGEND));
+    let p = ui.painter_at(full);
     p.rect_filled(rect, 3.0, Color32::from_gray(18));
+    let plot = Rect::from_min_max(rect.min, Pos2::new(rect.right(), rect.bottom() - TICKS));
     let top = (vsync * 3.0).max(20.0);
-    let y = |ms: f32| rect.bottom() - (ms / top).min(1.0) * rect.height();
+    let y = |ms: f32| plot.bottom() - (ms / top).min(1.0) * plot.height();
+    let x = |len: usize, i: usize| rect.right() - (len - 1 - i) as f32 * rect.width() / N;
     for (ms, c) in [
         (vsync, Color32::from_rgb(90, 160, 90)),
         (vsync * 2.0, Color32::from_rgb(160, 90, 70)),
@@ -1399,39 +1455,89 @@ fn graph(ui: &mut egui::Ui, frame: &VecDeque<f32>, gpu: &VecDeque<f32>, vsync: f
             Stroke::new(1.0, c),
         );
     }
+    for (i, m) in marks.iter().enumerate() {
+        let px = x(marks.len(), i);
+        for (row, on, c) in [
+            (0, m.rendered, MARK_RENDER),
+            (1, m.sound.submitted > 0, MARK_QUEUED),
+            (2, m.sound.collected > 0, MARK_COLLECTED),
+            (3, m.compile_ms > 0.5, MARK_COMPILE),
+        ] {
+            if on {
+                let y0 = plot.bottom() + row as f32 * 3.0;
+                p.line_segment(
+                    [Pos2::new(px, y0), Pos2::new(px, y0 + 2.5)],
+                    Stroke::new(1.5, c),
+                );
+            }
+        }
+    }
     let line = |q: &VecDeque<f32>, c: Color32| {
         if q.len() < 2 {
             return;
         }
-        let n = 240.0;
         let pts: Vec<Pos2> = q
             .iter()
             .enumerate()
-            .map(|(i, v)| {
-                Pos2::new(
-                    rect.right() - (q.len() - 1 - i) as f32 * rect.width() / n,
-                    y(*v),
-                )
-            })
+            .map(|(i, v)| Pos2::new(x(q.len(), i), y(*v)))
             .collect();
         p.add(egui::Shape::line(pts, Stroke::new(1.0, c)));
     };
     line(gpu, Color32::from_rgb(120, 180, 255));
     line(frame, Color32::from_rgb(255, 220, 140));
-    p.text(
-        rect.left_top() + Vec2::new(4.0, 2.0),
-        egui::Align2::LEFT_TOP,
-        "frame",
-        egui::FontId::proportional(10.0),
-        Color32::from_rgb(255, 220, 140),
-    );
-    p.text(
-        rect.left_top() + Vec2::new(40.0, 2.0),
-        egui::Align2::LEFT_TOP,
-        "gpu",
-        egui::FontId::proportional(10.0),
-        Color32::from_rgb(120, 180, 255),
-    );
+    let mut lx = rect.left() + 4.0;
+    for (label, c) in [
+        ("frame", Color32::from_rgb(255, 220, 140)),
+        ("gpu", Color32::from_rgb(120, 180, 255)),
+        ("render", MARK_RENDER),
+        ("sound queued", MARK_QUEUED),
+        ("collected", MARK_COLLECTED),
+        ("compile", MARK_COMPILE),
+    ] {
+        let r = p.text(
+            Pos2::new(lx, rect.bottom() + 1.0),
+            egui::Align2::LEFT_TOP,
+            label,
+            egui::FontId::proportional(10.0),
+            c,
+        );
+        lx = r.right() + 6.0;
+    }
+    // Hover: the frame under the pointer.
+    if let Some(pos) = resp.hover_pos()
+        && !frame.is_empty()
+    {
+        let back = ((rect.right() - pos.x) * N / rect.width()).round() as usize;
+        if back < frame.len() {
+            let i = frame.len() - 1 - back;
+            p.line_segment(
+                [
+                    Pos2::new(x(frame.len(), i), rect.top()),
+                    Pos2::new(x(frame.len(), i), rect.bottom()),
+                ],
+                Stroke::new(1.0, Color32::from_white_alpha(60)),
+            );
+            let mut text = format!("frame {:.1} ms", frame[i]);
+            if let Some(m) = marks.get(i) {
+                if let Some(g) = m.gpu_ms {
+                    text += &format!(", scene gpu {g:.1} ms");
+                }
+                text += &format!(
+                    "\n{}sound {:.1} ms (queued {}, collected {}), compile {:.1} ms",
+                    if m.rendered {
+                        "rendered a film frame\n"
+                    } else {
+                        ""
+                    },
+                    m.sound_ms,
+                    m.sound.submitted,
+                    m.sound.collected,
+                    m.compile_ms
+                );
+            }
+            resp.on_hover_text(text);
+        }
+    }
 }
 
 fn describe(m: &Movie, t: f32) -> String {
