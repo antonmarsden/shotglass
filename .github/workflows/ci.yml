@@ -4,13 +4,19 @@ on:
   push:
   pull_request:
 
+# Rust is pinned so a new release (with new clippy lints) can't turn CI red on its
+# own. To upgrade: bump this, fix any new warnings locally, commit both together.
+env:
+  RUST_TOOLCHAIN: "1.100.0"
+
 jobs:
   linux:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
       - name: System packages
@@ -33,7 +39,9 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@v2
       # GitHub's Windows machines have no usable OpenGL, so the GPU selftest is
       # skipped here; run `cargo test` on a real Windows machine for that.
