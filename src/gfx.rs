@@ -158,6 +158,11 @@ pub struct Renderer {
     pub binary_hits: usize,
     /// Strips a scene is drawn in (more when frames are very slow; see draw_scene).
     tiles: u32,
+    /// When `context_lost` last asked the driver, and how often it has (tests).
+    last_error_check: Option<std::time::Instant>,
+    pub error_checks: usize,
+    /// The last audio block was slow: draw the next ones in flushed bands.
+    audio_banded: bool,
     /// GPU frame times not yet handed to `gpu_ms`.
     gpu_samples: std::collections::VecDeque<f32>,
     /// Compiled audio programs and the float target they render into.
@@ -232,6 +237,9 @@ impl Renderer {
                 frame_no: 0,
                 binary_hits: 0,
                 tiles: 1,
+                last_error_check: None,
+                error_checks: 0,
+                audio_banded: false,
                 gpu_samples: Default::default(),
                 audio: HashMap::new(),
                 audio_target: None,
@@ -255,6 +263,11 @@ impl Renderer {
         if self.binary_dir.is_some() || dir.is_none() {
             self.binary_dir = dir;
         }
+    }
+
+    /// Force audio blocks to be drawn in flushed bands, or not (tests).
+    pub fn set_audio_banded(&mut self, on: bool) {
+        self.audio_banded = on;
     }
 
     /// Force the number of strips scenes are drawn in (tests).
@@ -1065,7 +1078,20 @@ impl Renderer {
     }
 
     /// True if the driver reset the GPU (a shader ran too long) or lost the context.
-    pub fn context_lost(&self) -> bool {
+    ///
+    /// `glGetError` makes the CPU wait for drivers that run GL on their own thread
+    /// (NVIDIA's "threaded optimization"), so this only really asks the driver about
+    /// once a second, or straight after a suspiciously slow frame.
+    pub fn context_lost(&mut self) -> bool {
+        let suspicious = self.gpu_samples.back().is_some_and(|ms| *ms > 500.0);
+        let due = self
+            .last_error_check
+            .is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(1));
+        if !suspicious && !due {
+            return false;
+        }
+        self.last_error_check = Some(std::time::Instant::now());
+        self.error_checks += 1;
         unsafe { self.gl.get_error() == glow::CONTEXT_LOST }
     }
 
@@ -1406,16 +1432,21 @@ impl Renderer {
             if let Some(l) = prog.loc("iBlockOffset") {
                 gl.uniform_1_i32(Some(l), first as i32);
             }
-            // Bands of a few rows, flushed one by one: a heavy mainSound on a slow GPU
-            // must not become one job long enough to trip the driver's watchdog.
-            // gl_FragCoord stays window-relative, so the sample index is unchanged.
-            const BAND: i32 = 4;
+            // Normally one draw. If the last block was slow (a heavy mainSound on a
+            // slow GPU), draw in bands of a few rows, flushed one by one, so no single
+            // job runs long enough to trip the driver's watchdog. Flushing costs
+            // batching, so it's only done when needed. gl_FragCoord stays
+            // window-relative, so the sample index is the same either way.
+            let started = std::time::Instant::now();
+            let band = if self.audio_banded { 4 } else { rows };
             let mut y0 = 0;
             while y0 < rows {
-                let h = BAND.min(rows - y0);
+                let h = band.min(rows - y0);
                 gl.viewport(0, y0, W, h);
                 gl.draw_arrays(glow::TRIANGLES, 0, 3);
-                gl.flush();
+                if self.audio_banded {
+                    gl.flush();
+                }
                 y0 += h;
             }
             let mut buf = vec![0f32; (W * rows * 4) as usize];
@@ -1438,6 +1469,13 @@ impl Renderer {
             gl.active_texture(glow::TEXTURE0);
             gl.use_program(None);
             gl.bind_vertex_array(None);
+            // read_pixels waited for the GPU, so this is roughly the block's GPU time.
+            let ms = started.elapsed().as_secs_f32() * 1000.0;
+            self.audio_banded = if self.audio_banded {
+                ms > 20.0
+            } else {
+                ms > 50.0
+            };
             let mut out = Vec::with_capacity(count * 2);
             for i in 0..count {
                 out.push(sanitize(buf[i * 4]));

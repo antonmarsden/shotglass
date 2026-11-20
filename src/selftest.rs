@@ -40,6 +40,10 @@ const CHECKS: &[Check] = &[
         run: tiled_drawing,
     },
     Check {
+        name: "playback doesn't stall on driver error checks every frame",
+        run: error_check_rate,
+    },
+    Check {
         name: "compile errors point at the right file and line",
         run: error_mapping,
     },
@@ -62,6 +66,10 @@ const CHECKS: &[Check] = &[
     Check {
         name: "chunked sound matches a single-pass render",
         run: sound_chunk_equivalence,
+    },
+    Check {
+        name: "banded sound blocks match single draws",
+        run: sound_banding,
     },
     Check {
         name: "sound has no clicks at cuts, fades and chunk edges",
@@ -453,6 +461,33 @@ fn tiled_drawing(gl: &Gl, dir: &Path) -> Result<String> {
     Ok(String::new())
 }
 
+fn error_check_rate(gl: &Gl, dir: &Path) -> Result<String> {
+    // glGetError makes the CPU wait for threaded drivers (NVIDIA): the player must
+    // not call it every frame. 120 frames (~2 s of 60 Hz playback) → at most a few.
+    write(
+        dir,
+        &[("s.glsl", &scene("fragColor = vec4(uv, 0.3, 1.0);"))],
+    )?;
+    let m = movie(dir, "[[shot]]\nid=\"a\"\nscene=\"s.glsl\"\nduration=4\n")?;
+    let mut r = renderer(gl, &m)?;
+    let start = Instant::now();
+    for i in 0..120 {
+        r.render(&m, W, H, &info(i as f32 / 60.0, 1.0), true);
+        if r.context_lost() {
+            bail!("reported a lost context on a healthy GPU");
+        }
+    }
+    let secs = start.elapsed().as_secs_f32();
+    let allowed = 1 + secs.ceil() as usize;
+    if r.error_checks > allowed {
+        bail!(
+            "{} driver error checks in 120 frames ({secs:.1} s); expected at most {allowed}",
+            r.error_checks
+        );
+    }
+    Ok(format!("{} check(s) in 120 frames", r.error_checks))
+}
+
 fn error_mapping(gl: &Gl, dir: &Path) -> Result<String> {
     write(
         dir,
@@ -821,6 +856,35 @@ fn sound_chunk_equivalence(gl: &Gl, dir: &Path) -> Result<String> {
         bail!("the fixture rendered silence");
     }
     Ok(format!("chunks of {} samples", notes.join(" and ")))
+}
+
+fn sound_banding(gl: &Gl, dir: &Path) -> Result<String> {
+    let m = sound_fixture(dir)?;
+    let render = |banded: bool| -> Result<Vec<f32>> {
+        let mut r = Renderer::new(gl.clone())?;
+        let mut st = Soundtrack::with_chunk(32768);
+        st.set_movie(&mut r, &m, 48000)
+            .map_err(|e| anyhow!("{e:?}"))?;
+        let mut out = vec![];
+        r.set_audio_banded(banded);
+        let n = st.total_chunks();
+        for c in 0..n {
+            r.set_audio_banded(banded); // the renderer adapts after each block; pin it
+            out.extend_from_slice(&st.chunk(&mut r, c).map_err(|e| anyhow!(e))?);
+        }
+        Ok(out)
+    };
+    let plain = render(false)?;
+    let banded = render(true)?;
+    let d = plain
+        .iter()
+        .zip(&banded)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    if plain.len() != banded.len() || d > 1e-6 {
+        bail!("banded synthesis differs by {d}");
+    }
+    Ok(String::new())
 }
 
 fn sound_no_clicks(gl: &Gl, dir: &Path) -> Result<String> {
