@@ -61,7 +61,9 @@ cargo fmt && cargo clippy --all-targets -- -D warnings
   output. The mix may read at most `mix_lookback` back and 50 ms ahead.
 - **Deterministic frames:** a frame depends only on (movie, t, size, scale), so playback,
   `still` and a future export agree.
-- Shaders should stay GLSL-ES-compatible so a future web player can run them (issue #2).
+- Shaders should stay portable: GLSL 3.30 features only, and GLSL-ES-compatible so a future
+  web player can run them (#2, #6). The dev GPU (NVIDIA) accepts some invalid GLSL that
+  other drivers reject, so passing locally isn't proof.
 - **The engine provides a contract, not looks.** Uniforms, entry points, the transition interface
   and cue defines are the engine's API (semver). Reusable GLSL belongs in versioned libraries
   (the shotglass-kit repo, #3–#5), not embedded in the binary; the built-in transitions are
@@ -78,7 +80,8 @@ cargo fmt && cargo clippy --all-targets -- -D warnings
 - **Renderer behaviour:** add a selftest check. Mutation-check it: break the code and make sure
   the check fails.
 - Keep user-facing docs in README.md. Open work is in GitHub issues: #1 export, #2 web player,
-  #3 libraries by name and version, #4 kit core/transitions, #5 the shotglass-kit repo.
+  #3 libraries by name and version, #4 kit core/transitions, #5 the shotglass-kit repo,
+  #6 portable GLSL (fixed `330 core` baseline + strict validation in `check`).
 
 ## Commits
 
