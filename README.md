@@ -1,6 +1,6 @@
 # shotglass
 
-Compose short films and cartoons from GLSL shaders. Shots, transitions and
+Compose short films, cartoons and full-length episodes from GLSL shaders. Shots, transitions and
 GPU-synthesised sound sit on one scrubbable timeline, with live reload and
 headless stills. Rust + OpenGL, no browser.
 
@@ -19,6 +19,9 @@ headless stills. Rust + OpenGL, no browser.
 - **Live reload.** Save a shader or `movie.toml` and the player reloads in place
   at the same moment. A broken shader shows its errors (with correct file:line)
   while the last working version keeps playing.
+- **Long films too.** Shaders compile just ahead of the playhead and sound is
+  synthesised in small chunks, so a long, many-shot episode opens straight away
+  and memory doesn't grow with its length (see [Long films](#long-films)).
 
 ## Quick start
 
@@ -268,7 +271,9 @@ To scrub, click or drag on the timeline. Hatched blocks are transitions;
 ### Long films
 
 Nothing is loaded all at once, so a 20-minute episode costs about the same as a
-20-second short:
+20-second short. In a test, a 9-minute, 80-shot film opened at once, compiled its
+remaining shaders in the background in a few seconds, and synthesised its whole
+soundtrack (`shotglass wav`) in 4 s:
 
 - **Pictures.** Shaders compile nearest the playhead first, everything within
   10 s ahead, and the rest in the background so errors still show up early. At
@@ -276,7 +281,7 @@ Nothing is loaded all at once, so a 20-minute episode costs about the same as a
   Compiled programs are also saved to disk (`%LOCALAPPDATA%\shotglass\programs` on
   Windows, `~/.cache/shotglass/programs` elsewhere). Reopening a film, or coming
   back to an evicted shot, skips the compile. Set `SHOTGLASS_NO_CACHE=1` to turn
-  this off.
+  this off, or `SHOTGLASS_CACHE_DIR` to move it.
 - **Sound.** Chunks are synthesised up to 6 s ahead of the playhead within a
   few milliseconds per frame, and chunks more than a few seconds away are
   forgotten. Memory stays at a few MB whatever the length. `wav` and `check`
@@ -293,6 +298,7 @@ shotglass strip  <movie> [--count 12 | --at ...] [--size 384x216] [--cols 4] [--
 shotglass check  <movie> [--size 1280x720] [--frames 8]   # validate, compile, synth, time
 shotglass wav    <movie> [--out sound.wav] [--rate 48000]
 shotglass new    <dir>
+shotglass selftest [filter]                                # GPU + sound checks on this machine
 ```
 
 `still`, `strip`, `check` and `wav` render off-screen. On a Linux machine with
