@@ -60,21 +60,63 @@ jobs:
 
   windows:
     runs-on: windows-latest
+    env:
+      # Mesa's software OpenGL (below) uses llvmpipe; say so in case another driver is found.
+      GALLIUM_DRIVER: llvmpipe
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
-      # GitHub's Windows machines have no usable OpenGL, so the GPU selftest and the
-      # golden images are skipped here; run `cargo test` on a real Windows machine for that.
-      - run: cargo test
-        env:
-          SHOTGLASS_SKIP_GPU_TESTS: "1"
+      # GitHub's Windows machines have no usable OpenGL of their own: install Mesa's
+      # (mesa-dist-win, llvmpipe), the same software renderer the Linux job uses.
+      - uses: ssciwr/setup-mesa-dist-win@v2
+      - run: cargo clippy -- -D warnings
+      - name: Unit tests, GPU selftest, golden images and soundtracks (software OpenGL)
+        run: cargo test
+      - name: Upload the actual and diff images / WAVs of failed golden tests
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: golden-image-failures-windows
+          path: |
+            target/tmp/golden/*.png
+            target/tmp/golden/*.wav
+          if-no-files-found: ignore
       - run: cargo build --release
-      # Needs no OpenGL, so it runs here too (and proves glslang builds with MSVC).
+      # Needs no OpenGL (and proves glslang builds with MSVC).
       - name: Strict GLSL check on the demo movie and the template
         shell: bash
+        run: |
+          ./target/release/shotglass check movies/big-shadow --web --no-gpu
+          ./target/release/shotglass new "$RUNNER_TEMP/template"
+          ./target/release/shotglass check "$RUNNER_TEMP/template" --web --no-gpu
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy -- -D warnings
+      - name: Unit tests, GPU selftest, golden images and soundtracks
+        run: cargo test
+      - name: Upload the actual and diff images / WAVs of failed golden tests
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: golden-image-failures-macos
+          path: |
+            target/tmp/golden/*.png
+            target/tmp/golden/*.wav
+          if-no-files-found: ignore
+      - run: cargo build --release
+      - name: Strict GLSL check on the demo movie and the template
         run: |
           ./target/release/shotglass check movies/big-shadow --web --no-gpu
           ./target/release/shotglass new "$RUNNER_TEMP/template"
