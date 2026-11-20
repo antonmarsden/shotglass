@@ -17,13 +17,14 @@ cargo fmt && cargo clippy --all-targets -- -D warnings
 
 - `cargo test` = unit + property tests, then `tests/gpu.rs` (harness = false) runs
   `shotglass selftest` on the main thread (OpenGL windows need it), then
-  `tests/golden.rs` compares strips of the demo and the template with
-  `tests/golden/*.png`. `SHOTGLASS_SKIP_GPU_TESTS=1` skips both.
-- **Golden images:** if a change alters what the demo or the template looks like on
-  purpose, re-bless in the same commit: `SHOTGLASS_BLESS=1 xvfb-run -a cargo test --test golden`
+  `tests/golden.rs` compares strips and soundtracks (8 kHz WAVs) of the demo and the
+  template with `tests/golden/*.png` / `*.wav`. `SHOTGLASS_SKIP_GPU_TESTS=1` skips both.
+- **Golden images and sound:** if a change alters what the demo or the template looks
+  or sounds like on purpose, re-bless in the same commit: `SHOTGLASS_BLESS=1 xvfb-run -a cargo test --test golden`
   (references are llvmpipe renders, as in CI; Docker recipe in CONTRIBUTING.md), then
   look at the new PNGs. Never bless to make an unexplained diff go away. A failing run
-  leaves the actual strip and `<name>.diff.png` (magenta = differs) in
+  leaves the actual strip and `<name>.diff.png` (magenta = differs), or the actual WAV
+  and `<name>.diff.wav` (with the first differing time in the message), in
   `target/tmp/golden/`; CI uploads them as `golden-image-failures`. The library pins
   come from `movies/big-shadow/shotglass.lock` (the template test reuses its
   `transitions` pin), so moving that pin can need a re-bless too.
@@ -40,7 +41,7 @@ cargo fmt && cargo clippy --all-targets -- -D warnings
 | file | what |
 |---|---|
 | `main.rs` | CLI (clap): play, still, strip, check, wav, export, new, selftest |
-| `golden.rs` | `strip --compare/--bless`: golden-image comparison (per-pixel tolerance, pixel budget, mean limit), diff image |
+| `golden.rs` | `strip`/`wav --compare/--bless`: golden-image comparison (per-pixel tolerance, pixel budget, mean limit, diff image); soundtrack comparison (RMS/peak of the difference per 50 ms window, first differing time), WAV reader |
 | `export.rs` | offline export: frame n at `frame_time(n)`, raw RGBA piped to ffmpeg (or PNGs), WAV muxed in |
 | `movie.rs` | `movie.toml` → `Movie`; timeline (`at(t)`), rational fps (`frame_time`/`frame_at`), cue defines, sound gains/windows |
 | `anim.rs` | constants/keyframes, eases; `glsl_fn` turns keyframes into GLSL for sound shaders |
@@ -53,7 +54,7 @@ cargo fmt && cargo clippy --all-targets -- -D warnings
 | `app.rs` | egui player: transport, timeline, panels, live reload, auto scale, sound streaming |
 | `headless.rs` | hidden-window GL context for CLI commands |
 | `selftest.rs` | GPU/sound checks on fixture films written to a temp dir |
-| `tests/golden.rs`, `tests/golden/` | golden-image tests: 8-frame 320x180 strips of the demo and the template vs reference PNGs |
+| `tests/golden.rs`, `tests/golden/` | golden tests: 8-frame 320x180 strips and 8 kHz soundtracks of the demo and the template vs reference PNGs / WAVs |
 | `glsl/transitions/` | deprecated built-in transitions (the kit has the same ones; films use `<library>/<name>`) |
 | `movies/big-shadow/` | demo film; `templates/new/` is what `shotglass new` writes |
 

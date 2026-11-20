@@ -13,24 +13,28 @@ cargo run -- check movies/big-shadow --web --no-gpu
 ```
 
 `cargo test` runs the unit and property tests, `shotglass selftest` on your GPU
-(tests/gpu.rs) and the golden-image tests (tests/golden.rs). On a machine without
+(tests/gpu.rs) and the golden-image and soundtrack tests (tests/golden.rs). On a machine without
 OpenGL, `SHOTGLASS_SKIP_GPU_TESTS=1` skips the last two; CI still runs them on
 software OpenGL.
 
 ## Golden images
 
-CI catches "compiles but looks wrong": tests/golden.rs renders a contact sheet
-(`shotglass strip`, 8 frames at 320x180) of the demo film and of the `shotglass new`
-template and compares each with a reference PNG in `tests/golden/`.
+CI catches "compiles but looks wrong" (or sounds wrong): tests/golden.rs renders a
+contact sheet (`shotglass strip`, 8 frames at 320x180) and the soundtrack
+(`shotglass wav`, at 8 kHz) of the demo film and of the `shotglass new` template, and
+compares them with reference PNGs and WAVs in `tests/golden/`.
 
 - A strip matches when few pixels differ by more than a small per-pixel tolerance
   and the average difference stays small (`strip --compare`'s defaults). Software
   OpenGL (llvmpipe, as in CI) and real GPUs round a little differently; that's what
   the tolerance is for.
+- A soundtrack matches when, in every 50 ms window, the RMS and the peak of the
+  difference from the reference stay small (`wav --compare`'s defaults). A failure
+  names the first time that differs, and the worst.
 - On a mismatch the test fails and writes the actual strip and a diff image
-  (differences in magenta) to `target/tmp/golden/`. CI uploads them as the
-  `golden-image-failures` artifact.
-- **If the change in the picture is intended**, update the references in the same
+  (differences in magenta), or the actual WAV and the difference as `<name>.diff.wav`,
+  to `target/tmp/golden/`. CI uploads them as the `golden-image-failures` artifact.
+- **If the change in the picture or the sound is intended**, update the references in the same
   commit as the change, and look at them before committing:
 
   ```sh
@@ -54,6 +58,7 @@ You can compare any film against a reference of your own the same way:
 ```sh
 shotglass strip movies/my-film --size 320x180 --count 8 --compare ref.png --bless   # once
 shotglass strip movies/my-film --size 320x180 --count 8 --compare ref.png           # later
+shotglass wav   movies/my-film --compare ref.wav --bless                            # sound
 ```
 
 ## Adding things

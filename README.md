@@ -508,6 +508,8 @@ shotglass strip  <movie> [--count 12 | --at ...] [--size 384x216] [--cols 4] [--
 shotglass check  <movie> [--web] [--no-gpu] [--size 1280x720] [--frames 8]
                  # validate movie.toml and the GLSL (strictly), compile, synth, time
 shotglass wav    <movie> [--out sound.wav] [--rate 48000]
+                 [--compare ref.wav [--bless] [--max-rms 0.0015] [--max-peak 0.01]]
+                 # --compare: fail if the sound differs from ref.wav (writes sound.diff.wav)
 shotglass export <movie> --out film.webm [--size 1920x1080] [--format webm|av1|ffv1|png|ffmpeg] [--rate 48000]
 shotglass new    <dir>
 shotglass fetch  <movie>                                   # download libraries, write shotglass.lock
@@ -616,8 +618,11 @@ shotglass selftest strips   # only checks whose name contains "strips"
   a change that compiles but looks wrong fails the tests. A small per-pixel
   tolerance absorbs the differences between software OpenGL and real GPUs. To
   update the references on purpose, see [CONTRIBUTING.md](CONTRIBUTING.md#golden-images).
+- **Golden soundtracks** (same file): the soundtracks of both films are compared with
+  reference WAVs, window by window (RMS and peak of the difference), and a failure
+  names the first time that differs.
 - On Linux without a display, use `xvfb-run -a cargo test` (that's what CI does).
-  Set `SHOTGLASS_SKIP_GPU_TESTS=1` to skip the selftest and the golden images.
+  Set `SHOTGLASS_SKIP_GPU_TESTS=1` to skip the selftest and the golden tests.
 - **Docker:** `docker build -f docker/test.Dockerfile -t shotglass-test . && docker run --rm shotglass-test`
   runs the same suite on software OpenGL, reproducibly. It tests shotglass, not your
   driver. GPU access from a Linux container on Docker Desktop goes through WSL2's
