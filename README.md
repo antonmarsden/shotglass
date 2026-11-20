@@ -33,6 +33,9 @@ cd shotglass
 cargo run --release -- play movies/big-shadow
 ```
 
+The demo uses [shotglass-kit](https://github.com/antonmarsden/shotglass-kit), so the
+first run downloads it with `git` (see [Libraries](#libraries)).
+
 To start your own film:
 
 ```sh
@@ -48,12 +51,14 @@ A movie is a folder:
 
 ```
 movies/big-shadow/
-├── movie.toml          the edit: shots, timings, uniforms, transitions
-├── common.glsl         shared helpers (#include "../common.glsl")
+├── movie.toml          the edit: shots, timings, uniforms, transitions, libraries
+├── shotglass.lock      the exact library versions (written by `shotglass fetch`)
+├── common.glsl         shared helpers (#include "../common.glsl"), built on the kit
 ├── scenes/
 │   ├── shadow.glsl
 │   ├── moon.glsl
 │   └── black.glsl
+├── fx/                 the kit's fade and iris (#include <transitions/…>)
 ├── music.glsl          vec2 mainSound(int samp, float time), movie time
 ├── sfx/                one sound per shot, shot time
 │   ├── candle.glsl
@@ -371,6 +376,7 @@ shotglass = "0.1"        # engine contract this film needs; other engines refuse
 kit  = { version = "0.4", source = "https://github.com/antonmarsden/shotglass-kit", subdir = "core" }
 sfx  = { version = "0.3", source = "https://github.com/antonmarsden/shotglass-kit", subdir = "sounds" }
 toon = { version = "1.2", source = "https://github.com/someone/toon-kit" }
+edge = { source = "https://github.com/someone/fx-kit" }   # no version: follow the default branch
 mine = { path = "lib/mykit" }            # a library inside the film's own folder
 ```
 
@@ -383,6 +389,10 @@ mine = { path = "lib/mykit" }            # a library inside the film's own folde
   `[libraries]`, so two publishers' libraries can both be called "kit" without clashing.
 - **`version`** is a semver range (`"0.4"` means `>=0.4.0, <0.5.0`, as in Cargo),
   matched against the source's git tags (`v0.4.2` or `0.4.2`).
+- **No `version`** follows a branch instead of releases: the repository's default
+  branch, or `branch = "name"`. Fetching pins the branch's newest commit in
+  `shotglass.lock`, so the film still doesn't change until `shotglass update`. Handy
+  for a library that has no releases yet; prefer a version once it does.
 - **`source`** is the https URL of a git repository. **`subdir`** picks a folder of
   it as the library root, so one repository can publish several libraries that a film
   pins separately. Every folder shares the repository's tags.
@@ -415,13 +425,13 @@ shotglass checks the versions and says what's missing, but never adds anything.
 
 ```sh
 shotglass fetch  <movie>           # download what's missing, write shotglass.lock
-shotglass update <movie> [name..]  # move pins to the newest version in range
+shotglass update <movie> [name..]  # move pins to the newest version in range (or commit)
 ```
 
 `fetch` (also run automatically by `play`, `still`, `strip`, `check` and `wav` when
 something isn't downloaded yet) resolves each library to an exact version and writes
 `shotglass.lock` next to `movie.toml`: version, source, tag, `subdir`, and a sha256
-of the library's files. **Commit it with the film.** A new library release never
+of the library's files (for a followed branch, `tag` is the ref and `rev` the commit). **Commit it with the film.** A new library release never
 changes a finished film; only `update` moves a pin. If the files don't match the lock
 (a moved tag, an edited cache), that's an error. Loading a film (including live
 reload) only reads the lock and the cache and never touches the network.

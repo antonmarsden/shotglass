@@ -3,6 +3,13 @@
 title = "Big Shadow"
 aspect = [16, 9]
 fps = 30
+shotglass = "0.1"
+
+# Shared GLSL from shotglass-kit. No version: follow the kit's main branch, pinned to
+# one commit in shotglass.lock (`shotglass update movies/big-shadow` moves the pin).
+[libraries]
+kit = { source = "https://github.com/antonmarsden/shotglass-kit", subdir = "core" }
+transitions = { source = "https://github.com/antonmarsden/shotglass-kit", subdir = "transitions" }
 
 [sound]
 music = "music.glsl"      # runs across the cuts; time = movie time
@@ -29,7 +36,7 @@ sound = "sfx/candle.glsl"   # sees uLight and uDist, so it dies with the flame
 id = "moon"
 scene = "scenes/moon.glsl"
 duration = 8.0
-transition = { type = "fade", duration = 1.4, ease = "smooth", params = { hold = 0.25 } }
+transition = { type = "fx/fade.glsl", duration = 1.4, ease = "smooth", params = { hold = 0.25 } }
 uniforms.uMoon = [0.72, 0.70]
 uniforms.uWind = 0.03
 
@@ -40,7 +47,7 @@ id = "closeup"
 scene = "scenes/shadow.glsl"
 duration = 8.0
 time_offset = 20.0
-transition = { type = "iris", duration = 1.5, freeze = true, ease = "inout", params = { center = [0.72, 0.70], softness = 0.006 } }
+transition = { type = "fx/iris.glsl", duration = 1.5, freeze = true, ease = "inout", params = { center = [0.72, 0.70], softness = 0.006 } }
 uniforms.uDist    = 0.22
 uniforms.uRadius  = 0.003
 uniforms.uFlicker = 1.0
@@ -55,7 +62,7 @@ sound_lead = 0.6            # J-cut: we hear the mouse before the iris opens
 id = "end"
 scene = "scenes/black.glsl"
 duration = 2.5
-transition = { type = "iris", duration = 1.4, ease = "in", params = { center = [0.57, 0.47], closing = 1.0, softness = 0.004 } }
+transition = { type = "fx/iris.glsl", duration = 1.4, ease = "in", params = { center = [0.57, 0.47], closing = 1.0, softness = 0.004 } }
 sound = "sfx/thump.glsl"
 
 [[marker]]

@@ -30,5 +30,5 @@ sound = "sfx/chime.glsl"
 
 # Shared GLSL by name; shaders use #include <kit/file.glsl>. See README, "Libraries".
 # [libraries]
-# kit = { version = "0.4", source = "https://github.com/antonmarsden/shotglass-kit", subdir = "core" }
+# kit = { version = "0.1", source = "https://github.com/antonmarsden/shotglass-kit", subdir = "core" }
 # mine = { path = "lib/mine" }
