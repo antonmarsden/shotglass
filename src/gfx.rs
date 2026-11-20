@@ -170,6 +170,22 @@ pub struct Renderer {
     pub error_checks: usize,
     /// The last audio block was slow: draw the next ones in flushed bands.
     audio_banded: bool,
+    /// Submitted sound blocks (see `submit_audio`), keyed by ticket.
+    audio_jobs: HashMap<u64, AudioJob>,
+    audio_ticket: u64,
+    /// Idle readback and staging buffers for sound blocks.
+    audio_pbos: Vec<GpuBuf>,
+    audio_staging: Vec<GpuBuf>,
+    /// Reused mix input textures (texture, rows), persistent path only.
+    audio_inputs: [Option<(glow::Texture, usize)>; 2],
+    /// GL 4.4 / ARB_buffer_storage: buffers can stay mapped (and are, unless turned off).
+    can_persist: bool,
+    persistent: bool,
+    /// Where sound streaming's GL calls spent their time (the caller resets it).
+    pub audio_timing: AudioTiming,
+    /// Sound readbacks that waited for the GPU (`wait_audio`): playback must do none.
+    pub blocking_audio_reads: usize,
+    max_texture_size: usize,
     /// GPU frame times not yet handed to `gpu_ms`.
     gpu_samples: std::collections::VecDeque<f32>,
     /// Compiled audio programs and the float target they render into.
@@ -182,6 +198,50 @@ pub struct Renderer {
     freeze_key: Option<(usize, u64)>,
     generation: u64,
     timer: Option<GpuTimer>,
+}
+
+/// A sound block submitted with `Renderer::submit_audio`, not yet collected.
+/// Tickets order like submissions, and fences pass in that order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct AudioTicket(u64);
+
+struct AudioJob {
+    pbo: GpuBuf,
+    /// Mix inputs written for the GPU to copy from (persistent buffers only).
+    staging: Option<GpuBuf>,
+    fence: glow::Fence,
+    count: usize,
+    submitted: std::time::Instant,
+}
+
+/// A pixel pack (readback) or unpack (staging) buffer for sound blocks. With
+/// persistent mapping (`ptr` non-null) it stays mapped for its whole life, so reading
+/// or writing it needs no GL call at all; it's only touched while no GPU command that
+/// uses it is pending (its block's fence has passed, or it was just taken from the pool).
+#[derive(Clone, Copy)]
+struct GpuBuf {
+    buf: glow::Buffer,
+    bytes: i32,
+    ptr: *mut u8,
+}
+
+/// Where the GL calls of sound streaming spent their time (reset by the caller).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AudioTiming {
+    /// glClientWaitSync(.., 0) polls.
+    pub poll_ms: f32,
+    /// Reading finished blocks (a map, or plain memory when persistently mapped).
+    pub read_ms: f32,
+    /// Mix input uploads.
+    pub upload_ms: f32,
+    /// Draws and the readback into a buffer.
+    pub draw_ms: f32,
+    /// glFenceSync + glFlush.
+    pub fence_ms: f32,
+}
+
+fn ms_since(t: std::time::Instant) -> f32 {
+    t.elapsed().as_secs_f32() * 1000.0
 }
 
 /// Inputs for one frame.
@@ -223,6 +283,12 @@ impl Renderer {
                 gl.max_shader_compiler_threads(0xFFFF_FFFF);
             }
             let formats = gl.get_parameter_i32(glow::NUM_PROGRAM_BINARY_FORMATS);
+            let v = gl.version();
+            let can_persist = !driver.es
+                && ((v.major, v.minor) >= (4, 4) || ext.contains("GL_ARB_buffer_storage"))
+                && std::env::var_os("SHOTGLASS_NO_PERSISTENT").is_none();
+            // Asked once: on threaded drivers every glGet is a round trip.
+            let max_texture_size = gl.get_parameter_i32(glow::MAX_TEXTURE_SIZE) as usize;
             let gl_info = format!("{renderer} · OpenGL {version} · GLSL {glsl}");
             let binary_dir = if formats > 0 && std::env::var_os("SHOTGLASS_NO_CACHE").is_none() {
                 cache_dir().map(|d| d.join(format!("{:016x}", hash(&gl_info))))
@@ -249,6 +315,16 @@ impl Renderer {
                 last_error_check: None,
                 error_checks: 0,
                 audio_banded: false,
+                audio_jobs: HashMap::new(),
+                audio_ticket: 0,
+                audio_pbos: vec![],
+                audio_staging: vec![],
+                audio_inputs: [None, None],
+                can_persist,
+                persistent: can_persist,
+                audio_timing: AudioTiming::default(),
+                blocking_audio_reads: 0,
+                max_texture_size,
                 gpu_samples: Default::default(),
                 audio: HashMap::new(),
                 audio_target: None,
@@ -1285,10 +1361,14 @@ impl Renderer {
         }
     }
 
-    /// Run audio program `key` for global samples `first .. first + count`
+    /// Queue audio program `key` for global samples `first .. first + count`
     /// (count ≤ AUDIO_BLOCK). `inputs` = (music, sfx, global index of their first sample),
     /// bound for the mix pass as `sg_music` / `sg_sfx`.
-    pub fn render_audio(
+    ///
+    /// Never waits for the GPU: the block is drawn, read back into a pixel pack buffer
+    /// and fenced. Collect it with `poll_audio` (never blocks) or `wait_audio` (blocks).
+    /// Only WebGL 2 features are used (fences, PBOs), so a web build can do the same.
+    pub fn submit_audio(
         &mut self,
         key: u64,
         first: usize,
@@ -1296,7 +1376,7 @@ impl Renderer {
         sample_rate: u32,
         shot: (f32, f32),
         inputs: Option<(&[f32], &[f32], i64)>,
-    ) -> std::result::Result<Vec<f32>, String> {
+    ) -> std::result::Result<AudioTicket, String> {
         const W: i32 = 1024;
         assert!(count <= AUDIO_BLOCK);
         let rows = (count as i32 + W - 1) / W;
@@ -1355,19 +1435,92 @@ impl Renderer {
             let (fbo, _) = self.audio_target.unwrap();
             gl.use_program(Some(prog.prog));
             let mut input_tex = vec![];
+            let mut staging = None;
+            let t_upload = std::time::Instant::now();
             if let Some((music, sfx, base)) = inputs {
-                for (unit, (name, data)) in [("sg_music", music), ("sg_sfx", sfx)]
-                    .into_iter()
-                    .enumerate()
-                {
-                    // select the unit first: upload_track binds the new texture to it
-                    gl.active_texture(glow::TEXTURE0 + unit as u32);
-                    let tex = upload_track(&gl, data)?;
-                    gl.bind_texture(glow::TEXTURE_2D, Some(tex));
-                    if let Some(l) = prog.loc(name) {
-                        gl.uniform_1_i32(Some(l), unit as i32);
+                let rows = (music.len() / 2).max(1).div_ceil(TRACK_WIDTH);
+                if rows > self.max_texture_size {
+                    return Err(format!(
+                        "the soundtrack is too long for one texture ({rows} rows, GPU max {})",
+                        self.max_texture_size
+                    ));
+                }
+                if self.persistent {
+                    // Write the inputs into mapped memory and copy them into textures
+                    // on the GPU: the driver never reads our memory, so nothing waits.
+                    let row = TRACK_WIDTH * 8;
+                    let st = take_buf(
+                        &gl,
+                        &mut self.audio_staging,
+                        self.persistent,
+                        false,
+                        (2 * rows * row) as i32,
+                    )?;
+                    for (k, data) in [music, sfx].into_iter().enumerate() {
+                        let bytes =
+                            std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4);
+                        let off = k * rows * row;
+                        if st.ptr.is_null() {
+                            let mut padded = vec![0u8; rows * row];
+                            padded[..bytes.len()].copy_from_slice(bytes);
+                            gl.bind_buffer(glow::PIXEL_UNPACK_BUFFER, Some(st.buf));
+                            gl.buffer_sub_data_u8_slice(
+                                glow::PIXEL_UNPACK_BUFFER,
+                                off as i32,
+                                &padded,
+                            );
+                        } else {
+                            let dst = std::slice::from_raw_parts_mut(st.ptr.add(off), rows * row);
+                            dst[..bytes.len()].copy_from_slice(bytes);
+                            dst[bytes.len()..].fill(0);
+                        }
                     }
-                    input_tex.push(tex);
+                    gl.bind_buffer(glow::PIXEL_UNPACK_BUFFER, Some(st.buf));
+                    for (unit, name) in ["sg_music", "sg_sfx"].into_iter().enumerate() {
+                        gl.active_texture(glow::TEXTURE0 + unit as u32);
+                        let tex = match self.audio_inputs[unit] {
+                            Some((t, r)) if r >= rows => t,
+                            old => {
+                                if let Some((t, _)) = old {
+                                    gl.delete_texture(t);
+                                }
+                                let t = new_track_texture(&gl, rows)?;
+                                self.audio_inputs[unit] = Some((t, rows));
+                                t
+                            }
+                        };
+                        gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+                        gl.tex_sub_image_2d(
+                            glow::TEXTURE_2D,
+                            0,
+                            0,
+                            0,
+                            TRACK_WIDTH as i32,
+                            rows as i32,
+                            glow::RG,
+                            glow::FLOAT,
+                            glow::PixelUnpackData::BufferOffset((unit * rows * row) as u32),
+                        );
+                        if let Some(l) = prog.loc(name) {
+                            gl.uniform_1_i32(Some(l), unit as i32);
+                        }
+                    }
+                    gl.bind_buffer(glow::PIXEL_UNPACK_BUFFER, None);
+                    staging = Some(st);
+                } else {
+                    for (unit, (name, data)) in [("sg_music", music), ("sg_sfx", sfx)]
+                        .into_iter()
+                        .enumerate()
+                    {
+                        // select the unit first: upload_track binds the new texture to it
+                        gl.active_texture(glow::TEXTURE0 + unit as u32);
+                        let tex = upload_track(&gl, data, self.max_texture_size)?;
+                        gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+                        if let Some(l) = prog.loc(name) {
+                            gl.uniform_1_i32(Some(l), unit as i32);
+                        }
+                        input_tex.push(tex);
+                    }
                 }
                 if let Some(l) = prog.loc("sg_len") {
                     gl.uniform_1_i32(Some(l), (music.len() / 2) as i32);
@@ -1376,6 +1529,8 @@ impl Renderer {
                     gl.uniform_1_i32(Some(l), base as i32);
                 }
             }
+            self.audio_timing.upload_ms += ms_since(t_upload);
+            let t_draw = std::time::Instant::now();
             gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
             gl.viewport(0, 0, W, rows);
             gl.disable(glow::BLEND);
@@ -1399,7 +1554,7 @@ impl Renderer {
             // job runs long enough to trip the driver's watchdog. Flushing costs
             // batching, so it's only done when needed. gl_FragCoord stays
             // window-relative, so the sample index is the same either way.
-            let started = std::time::Instant::now();
+            let submitted = std::time::Instant::now();
             let band = if self.audio_banded { 4 } else { rows };
             let mut y0 = 0;
             while y0 < rows {
@@ -1411,8 +1566,15 @@ impl Renderer {
                 }
                 y0 += h;
             }
-            let mut buf = vec![0f32; (W * rows * 4) as usize];
-            let bytes = std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, buf.len() * 4);
+            // Read back into a buffer on the GPU: queued like a draw, no wait.
+            let pbo = take_buf(
+                &gl,
+                &mut self.audio_pbos,
+                self.persistent,
+                true,
+                W * rows * 16,
+            )?;
+            gl.bind_buffer(glow::PIXEL_PACK_BUFFER, Some(pbo.buf));
             gl.read_pixels(
                 0,
                 0,
@@ -1420,31 +1582,184 @@ impl Renderer {
                 rows,
                 glow::RGBA,
                 glow::FLOAT,
-                glow::PixelPackData::Slice(Some(bytes)),
+                glow::PixelPackData::BufferOffset(0),
             );
+            gl.bind_buffer(glow::PIXEL_PACK_BUFFER, None);
+            self.audio_timing.draw_ms += ms_since(t_draw);
+            let t_fence = std::time::Instant::now();
+            let fence = gl.fence_sync(glow::SYNC_GPU_COMMANDS_COMPLETE, 0)?;
+            // Make sure the fence reaches the GPU without anyone waiting on it.
+            gl.flush();
+            self.audio_timing.fence_ms += ms_since(t_fence);
             gl.bind_framebuffer(glow::FRAMEBUFFER, None);
             for (unit, t) in input_tex.iter().enumerate() {
                 gl.active_texture(glow::TEXTURE0 + unit as u32);
                 gl.bind_texture(glow::TEXTURE_2D, None);
-                gl.delete_texture(*t);
+                gl.delete_texture(*t); // deletion waits for the draw that uses it
             }
             gl.active_texture(glow::TEXTURE0);
             gl.use_program(None);
             gl.bind_vertex_array(None);
-            // read_pixels waited for the GPU, so this is roughly the block's GPU time.
-            let ms = started.elapsed().as_secs_f32() * 1000.0;
-            self.audio_banded = if self.audio_banded {
-                ms > 20.0
-            } else {
-                ms > 50.0
-            };
-            let mut out = Vec::with_capacity(count * 2);
-            for i in 0..count {
-                out.push(sanitize(buf[i * 4]));
-                out.push(sanitize(buf[i * 4 + 1]));
-            }
-            Ok(out)
+            self.audio_ticket += 1;
+            self.audio_jobs.insert(
+                self.audio_ticket,
+                AudioJob {
+                    pbo,
+                    staging,
+                    fence,
+                    count,
+                    submitted,
+                },
+            );
+            Ok(AudioTicket(self.audio_ticket))
         }
+    }
+
+    /// The samples of a submitted block if the GPU has finished it, without waiting.
+    /// None = not yet; the ticket stays valid. Some = done; the ticket is used up.
+    pub fn poll_audio(&mut self, t: AudioTicket) -> Option<std::result::Result<Vec<f32>, String>> {
+        let Some(job) = self.audio_jobs.get(&t.0) else {
+            return Some(Err("unknown sound block".into()));
+        };
+        let t_poll = std::time::Instant::now();
+        let status = unsafe { self.gl.client_wait_sync(job.fence, 0, 0) };
+        self.audio_timing.poll_ms += ms_since(t_poll);
+        match status {
+            glow::ALREADY_SIGNALED | glow::CONDITION_SATISFIED => {}
+            glow::WAIT_FAILED => {
+                self.cancel_audio(t);
+                return Some(Err("waiting for a sound block failed".into()));
+            }
+            _ => return None,
+        }
+        let job = self.audio_jobs.remove(&t.0).unwrap();
+        Some(Ok(self.finish_audio(job, false)))
+    }
+
+    /// The samples of a submitted block, waiting for the GPU if needed. This is a
+    /// GPU→CPU sync (counted in `blocking_audio_reads`): only for headless use, or
+    /// for the chunk under a paused playhead.
+    pub fn wait_audio(&mut self, t: AudioTicket) -> std::result::Result<Vec<f32>, String> {
+        let job = self.audio_jobs.remove(&t.0).ok_or("unknown sound block")?;
+        self.blocking_audio_reads += 1;
+        loop {
+            match unsafe {
+                self.gl
+                    .client_wait_sync(job.fence, glow::SYNC_FLUSH_COMMANDS_BIT, 100_000_000)
+            } {
+                glow::ALREADY_SIGNALED | glow::CONDITION_SATISFIED => break,
+                glow::WAIT_FAILED => {
+                    self.release_audio(job);
+                    return Err("waiting for a sound block failed".into());
+                }
+                _ => {}
+            }
+        }
+        Ok(self.finish_audio(job, true))
+    }
+
+    /// Forget a submitted block (its result is no longer wanted).
+    pub fn cancel_audio(&mut self, t: AudioTicket) {
+        if let Some(job) = self.audio_jobs.remove(&t.0) {
+            self.release_audio(job);
+        }
+    }
+
+    /// Read a finished block's samples and recycle its buffer, fence and query.
+    fn finish_audio(&mut self, job: AudioJob, waited: bool) -> Vec<f32> {
+        let gl = self.gl.clone();
+        let n = job.count;
+        let mut out = Vec::with_capacity(n * 2);
+        let t_read = std::time::Instant::now();
+        unsafe {
+            let mapped = !job.pbo.ptr.is_null();
+            let p = if mapped {
+                // Persistent and coherent: once the fence has passed the samples are
+                // simply there. No GL call, so nothing can wait for the driver.
+                job.pbo.ptr
+            } else {
+                // The fence has passed, so mapping doesn't wait for the GPU (it is still
+                // a driver round trip). WebGL 2 would use getBufferSubData here.
+                gl.bind_buffer(glow::PIXEL_PACK_BUFFER, Some(job.pbo.buf));
+                gl.map_buffer_range(
+                    glow::PIXEL_PACK_BUFFER,
+                    0,
+                    (n * 16) as i32,
+                    glow::MAP_READ_BIT,
+                )
+            };
+            if p.is_null() {
+                out.resize(n * 2, 0.0);
+            } else {
+                // RGBA32F texels. Mappings are aligned (GL guarantees ≥ 64 bytes), but
+                // don't bet on it.
+                if (p as usize).is_multiple_of(std::mem::align_of::<f32>()) {
+                    let px = std::slice::from_raw_parts(p as *const [f32; 4], n);
+                    for t in px {
+                        out.push(sanitize(t[0]));
+                        out.push(sanitize(t[1]));
+                    }
+                } else {
+                    let px = std::slice::from_raw_parts(p as *const [u8; 16], n);
+                    for t in px {
+                        let f = |i: usize| f32::from_ne_bytes(t[i..i + 4].try_into().unwrap());
+                        out.push(sanitize(f(0)));
+                        out.push(sanitize(f(4)));
+                    }
+                }
+                if !mapped {
+                    gl.unmap_buffer(glow::PIXEL_PACK_BUFFER);
+                }
+            }
+            if !mapped {
+                gl.bind_buffer(glow::PIXEL_PACK_BUFFER, None);
+            }
+        }
+        self.audio_timing.read_ms += ms_since(t_read);
+        // Normally one draw per block; after a slow one (a heavy mainSound on a slow
+        // GPU), bands (see submit_audio). Judged by the time from submit to result, with
+        // no timer queries (each would be another driver round trip). A blocking wait
+        // measures the block itself, as before. A polled block's time also includes the
+        // frames until it was polled and the scene queued ahead of it, so the
+        // thresholds are looser: only a clearly heavy mainSound switches banding on.
+        let ms = job.submitted.elapsed().as_secs_f32() * 1000.0;
+        let (on, off) = if waited { (50.0, 20.0) } else { (250.0, 100.0) };
+        self.audio_banded = if self.audio_banded { ms > off } else { ms > on };
+        self.release_audio(job);
+        out
+    }
+
+    fn release_audio(&mut self, job: AudioJob) {
+        unsafe { self.gl.delete_sync(job.fence) };
+        for (pool, b) in [(true, Some(job.pbo)), (false, job.staging)] {
+            let Some(b) = b else { continue };
+            let pool = if pool {
+                &mut self.audio_pbos
+            } else {
+                &mut self.audio_staging
+            };
+            if pool.len() < 8 {
+                pool.push(b);
+            } else {
+                unsafe { self.gl.delete_buffer(b.buf) };
+            }
+        }
+    }
+
+    /// Use persistently mapped buffers for sound streaming (the default where the
+    /// driver has GL 4.4 / ARB_buffer_storage), or not (tests). Returns whether they're on.
+    pub fn set_persistent_buffers(&mut self, on: bool) -> bool {
+        self.persistent = on && self.can_persist;
+        self.persistent
+    }
+
+    pub fn persistent_buffers(&self) -> bool {
+        self.persistent
+    }
+
+    /// Sound blocks submitted and not yet collected.
+    pub fn audio_in_flight(&self) -> usize {
+        self.audio_jobs.len()
     }
 
     /// The language `m`'s shaders compile in on this driver: the portable baseline,
@@ -1515,14 +1830,86 @@ pub fn vertex_source(dialect: Dialect) -> String {
     format!("{}{VERTEX}", dialect.version_line())
 }
 
+/// A readback (`pack`) or staging buffer of at least `bytes`, from the pool or new.
+/// New ones are persistently mapped when the driver can.
+unsafe fn take_buf(
+    gl: &glow::Context,
+    pool: &mut Vec<GpuBuf>,
+    persistent: bool,
+    pack: bool,
+    bytes: i32,
+) -> std::result::Result<GpuBuf, String> {
+    if let Some(i) = pool
+        .iter()
+        .position(|b| b.bytes >= bytes && b.ptr.is_null() != persistent)
+    {
+        return Ok(pool.swap_remove(i));
+    }
+    let target = if pack {
+        glow::PIXEL_PACK_BUFFER
+    } else {
+        glow::PIXEL_UNPACK_BUFFER
+    };
+    unsafe {
+        let buf = gl.create_buffer()?;
+        gl.bind_buffer(target, Some(buf));
+        let mut ptr = std::ptr::null_mut();
+        if persistent {
+            let access = if pack {
+                glow::MAP_READ_BIT
+            } else {
+                glow::MAP_WRITE_BIT
+            };
+            let flags = access | glow::MAP_PERSISTENT_BIT | glow::MAP_COHERENT_BIT;
+            gl.buffer_storage(target, bytes, None, flags);
+            ptr = gl.map_buffer_range(target, 0, bytes, flags);
+        } else {
+            let usage = if pack {
+                glow::STREAM_READ
+            } else {
+                glow::STREAM_DRAW
+            };
+            gl.buffer_data_size(target, bytes, usage);
+        }
+        gl.bind_buffer(target, None);
+        Ok(GpuBuf { buf, bytes, ptr })
+    }
+}
+
+/// An empty RG32F track texture of `rows` rows (filled with tex_sub_image_2d).
+unsafe fn new_track_texture(
+    gl: &glow::Context,
+    rows: usize,
+) -> std::result::Result<glow::Texture, String> {
+    unsafe {
+        let tex = gl.create_texture()?;
+        gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+        gl.tex_image_2d(
+            glow::TEXTURE_2D,
+            0,
+            glow::RG32F as i32,
+            TRACK_WIDTH as i32,
+            rows as i32,
+            0,
+            glow::RG,
+            glow::FLOAT,
+            glow::PixelUnpackData::Slice(None),
+        );
+        for p in [glow::TEXTURE_MIN_FILTER, glow::TEXTURE_MAG_FILTER] {
+            gl.tex_parameter_i32(glow::TEXTURE_2D, p, glow::NEAREST as i32);
+        }
+        Ok(tex)
+    }
+}
+
 /// Upload interleaved stereo as an RG32F texture, `TRACK_WIDTH` samples per row.
 unsafe fn upload_track(
     gl: &glow::Context,
     data: &[f32],
+    max: usize,
 ) -> std::result::Result<glow::Texture, String> {
     let n = (data.len() / 2).max(1);
     let rows = n.div_ceil(TRACK_WIDTH);
-    let max = unsafe { gl.get_parameter_i32(glow::MAX_TEXTURE_SIZE) } as usize;
     if rows > max {
         return Err(format!(
             "the soundtrack is too long for one texture ({rows} rows, GPU max {max})"
@@ -1573,6 +1960,18 @@ impl Drop for Renderer {
             }
             for (_, p) in std::mem::take(&mut self.audio) {
                 self.gl.delete_program(p.prog);
+            }
+            for (_, j) in std::mem::take(&mut self.audio_jobs) {
+                self.release_audio(j);
+            }
+            for b in std::mem::take(&mut self.audio_pbos)
+                .into_iter()
+                .chain(std::mem::take(&mut self.audio_staging))
+            {
+                self.gl.delete_buffer(b.buf);
+            }
+            for (t, _) in self.audio_inputs.iter().flatten() {
+                self.gl.delete_texture(*t);
             }
             if let Some((fbo, tex)) = self.audio_target.take() {
                 self.gl.delete_framebuffer(fbo);
