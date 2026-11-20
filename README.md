@@ -319,7 +319,8 @@ To scrub, click or drag on the timeline. Hatched blocks are transitions;
 - **Sound never makes a frame wait for the GPU.** While playing, each frame queues
   a block or two of sound synthesis on the GPU and collects the blocks that have
   finished (a pixel buffer readback behind a fence), so the player never waits for
-  the GPU to finish the scene before the sound. When paused or scrubbing, the chunk
+  the GPU to finish the scene before the sound. Sound work runs after the frame's
+  picture has been queued, so even a slow driver call can't delay the picture. When paused or scrubbing, the chunk
   under the playhead is made on the spot. Right after a seek during playback the
   sound can start a frame or two late. The Performance panel splits stalls into sound and
   compiling, and shows where the worst sound stall's time went.

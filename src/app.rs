@@ -1198,22 +1198,24 @@ impl eframe::App for Player {
         self.handle_keys(&ctx);
         self.advance_clock();
         self.perf_frame += 1;
-        // Housekeeping (sound synthesis, shader compiles) runs on this thread. Time it,
-        // so a slow frame caused by it isn't mistaken for the GPU being overloaded.
+        // Housekeeping (shader compiles here, sound after the render) runs on this
+        // thread. Time it, so a slow frame caused by it isn't mistaken for the GPU
+        // being overloaded.
         let work = Instant::now();
-        self.stream_sound();
-        let sound_ms = work.elapsed().as_secs_f32() * 1000.0;
         if let Some(m) = &self.movie {
             // Without parallel compiling, a compile blocks: don't do background ones mid-playback.
             let background = !self.clock.playing() || self.renderer.parallel;
             self.renderer.pump(m, self.clock.time(), background);
         }
-        let total_ms = work.elapsed().as_secs_f32() * 1000.0;
-        self.perf.stall = (total_ms > 3.0).then(|| Stall {
-            sound_ms,
-            compile_ms: total_ms - sound_ms,
-            sound: self.soundtrack.stats(),
-        });
+        let compile_ms = work.elapsed().as_secs_f32() * 1000.0;
+        self.perf.stall = Stall::worse(
+            self.perf.stall.take(),
+            (compile_ms > 3.0).then_some(Stall {
+                sound_ms: 0.0,
+                compile_ms,
+                sound: Default::default(),
+            }),
+        );
 
         egui::Panel::bottom("transport").show(ui, |ui| {
             ui.add_space(4.0);
@@ -1312,6 +1314,20 @@ impl eframe::App for Player {
             }
         });
         self.measure(rendered);
+        // Sound goes after the frame's render is queued. Polling a fence or reading a
+        // block back is a driver round trip, and on threaded drivers (NVIDIA) that
+        // waits for the driver thread, which may be blocked in the previous frame's
+        // present until vsync: a whole refresh. Before the render, that delayed it;
+        // here it overlaps the wait for the swap. A slow one still excuses the next
+        // frame's lateness (as a stall), so the counters stay honest.
+        let work = Instant::now();
+        self.stream_sound();
+        let sound_ms = work.elapsed().as_secs_f32() * 1000.0;
+        self.perf.stall = (sound_ms > 3.0).then(|| Stall {
+            sound_ms,
+            compile_ms: 0.0,
+            sound: self.soundtrack.stats(),
+        });
         let (ready, total) = self.renderer.progress();
         if self.clock.playing() || ready < total {
             ctx.request_repaint();
