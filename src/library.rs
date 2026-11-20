@@ -1023,10 +1023,14 @@ fn download(
 ) -> Result<()> {
     let parent = dir.parent().expect("cache path has a parent");
     std::fs::create_dir_all(parent)?;
+    // Unique per download, not just per process: two threads (or two films loading at
+    // once) may fetch the same release, and the first rename wins. Kept short: git's
+    // object paths inside it must stay under Windows' 260-character limit.
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let tmp = parent.join(format!(
         ".tmp-{}-{}",
         std::process::id(),
-        dir.file_name().unwrap().to_string_lossy()
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
     ));
     let _ = std::fs::remove_dir_all(&tmp);
     match rev {
@@ -1052,6 +1056,8 @@ pub struct Git;
 impl Git {
     fn run(args: &[&str]) -> Result<String> {
         let out = std::process::Command::new("git")
+            // Paths past 260 characters on Windows (deep caches); ignored elsewhere.
+            .args(["-c", "core.longpaths=true"])
             .args(args)
             .env("GIT_TERMINAL_PROMPT", "0")
             .output()
@@ -1828,6 +1834,51 @@ mod tests {
         assert!(e.contains("needs a library.toml"), "{e}");
         std::fs::remove_dir_all(&film).ok();
         std::fs::remove_dir_all(&dev).ok();
+    }
+
+    /// Two downloads of the same release at once (the demo and template tests both fetch
+    /// the kit into an empty cache on CI) must not share a temporary folder.
+    #[test]
+    fn concurrent_downloads_of_one_release_dont_collide() {
+        struct Slow;
+        impl Fetcher for Slow {
+            fn tags(&self, _: &str) -> Result<Vec<String>> {
+                Ok(vec![])
+            }
+            fn download(&self, _: &str, _: &str, dest: &Path) -> Result<()> {
+                std::fs::create_dir(dest)?; // fails if another download already made it
+                for i in 0..20 {
+                    std::fs::write(dest.join(format!("{i}.glsl")), "float x();\n")?;
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Ok(())
+            }
+            fn head(&self, _: &str, _: &str) -> Result<String> {
+                unreachable!()
+            }
+            fn download_rev(&self, s: &str, _: &str, dest: &Path) -> Result<()> {
+                self.download(s, "", dest)
+            }
+        }
+        let cache = tmp("concurrent");
+        let dir = cache_path(&cache, KIT, &"a".repeat(40));
+        let rev = "a".repeat(40);
+        std::thread::scope(|sc| {
+            let runs: Vec<_> = (0..4)
+                .map(|_| sc.spawn(|| download(&Slow, KIT, "HEAD", Some(&rev), &dir)))
+                .collect();
+            for r in runs {
+                r.join().unwrap().unwrap();
+            }
+        });
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 20);
+        let leftovers: Vec<_> = std::fs::read_dir(dir.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+        std::fs::remove_dir_all(&cache).ok();
     }
 
     #[test]
