@@ -83,6 +83,12 @@ cargo fmt && cargo clippy --all-targets -- -D warnings
   #3 libraries by name and version, #4 kit core/transitions, #5 the shotglass-kit repo,
   #6 portable GLSL (fixed `330 core` baseline + strict validation in `check`).
 
+## Conventions
+
+- 2D data (images, grids) uses the owner's `toodee` crate: `gfx::Frame` is
+  `TooDee<[u8; 4]>` (RGBA, top row first); use views and `CopyOps`/`TranslateOps`
+  rather than hand-rolled row loops. Don't force it where data isn't really 2D.
+
 ## Commits
 
 End commit messages with the Co-Authored-By / Claude-Session lines given in the session.

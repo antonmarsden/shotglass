@@ -4,13 +4,14 @@
 //! `cargo test` runs it too (tests/gpu.rs), so CI exercises it on software OpenGL
 //! and you can run it on a real GPU after a driver update.
 
-use crate::gfx::{FrameInfo, Renderer};
+use crate::gfx::{Frame, FrameInfo, Renderer};
 use crate::movie::{At, Movie};
 use crate::sound::Soundtrack;
 use anyhow::{Result, anyhow, bail};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
+use toodee::{TooDeeOps, TooDeeOpsMut};
 
 const W: i32 = 160;
 const H: i32 = 90;
@@ -180,29 +181,35 @@ fn renderer(gl: &Gl, m: &Movie) -> Result<Renderer> {
 }
 
 /// Render and read back RGBA8, top row first.
-fn shot(r: &mut Renderer, m: &Movie, at: At, scale: f32) -> Result<Vec<u8>> {
+fn shot(r: &mut Renderer, m: &Movie, at: At, scale: f32) -> Result<Frame> {
     let t = match at {
         At::Shot { shot, local } => m.shots[shot].start + local,
         At::Transition { to, to_local, .. } => m.shots[to].start + to_local,
     };
     r.render_at(m, W, H, &info(t, scale), at, true)
         .ok_or_else(|| anyhow!("nothing rendered"))?;
-    Ok(r.read_output().ok_or_else(|| anyhow!("no output"))?.2)
+    r.read_output().ok_or_else(|| anyhow!("no output"))
 }
 
 /// (largest channel difference, fraction of pixels differing by more than `tol`).
-fn diff(a: &[u8], b: &[u8], tol: u8) -> (u8, f32) {
+fn diff(a: &Frame, b: &Frame, tol: u8) -> (u8, f32) {
+    assert_eq!(a.size(), b.size());
     let mut max = 0u8;
     let mut over = 0usize;
-    for (pa, pb) in a.as_chunks::<4>().0.iter().zip(b.as_chunks::<4>().0) {
+    for (pa, pb) in a.cells().zip(b.cells()) {
         let d = (0..3).map(|i| pa[i].abs_diff(pb[i])).max().unwrap();
         max = max.max(d);
         over += (d > tol) as usize;
     }
-    (max, over as f32 / (a.len() / 4) as f32)
+    (max, over as f32 / a.data().len() as f32)
 }
 
-fn expect_same(what: &str, a: &[u8], b: &[u8], tol: u8, frac: f32) -> Result<()> {
+/// One pixel as [r, g, b, a].
+fn px(f: &Frame, col: usize, row: usize) -> [u8; 4] {
+    f[(col, row)]
+}
+
+fn expect_same(what: &str, a: &Frame, b: &Frame, tol: u8, frac: f32) -> Result<()> {
     let (max, over) = diff(a, b, tol);
     if over > frac {
         bail!(
@@ -327,11 +334,12 @@ fn crossfade_and_freeze(gl: &Gl, dir: &Path) -> Result<String> {
             1.0,
         )?;
         let got = shot(&mut r, &m, m.at(2.5), 1.0)?;
-        let expected: Vec<u8> = a
-            .iter()
-            .zip(&b)
-            .map(|(x, y)| ((*x as f32 + *y as f32) * 0.5).round() as u8)
-            .collect();
+        let mut expected = a.clone();
+        for (e, y) in expected.cells_mut().zip(b.cells()) {
+            for c in 0..4 {
+                e[c] = ((e[c] as f32 + y[c] as f32) * 0.5).round() as u8;
+            }
+        }
         expect_same(
             if freeze {
                 "frozen crossfade"
@@ -361,17 +369,9 @@ fn render_scale_edges(gl: &Gl, dir: &Path) -> Result<String> {
          transition = { type = \"crossfade\", duration = 1, ease = \"linear\" }\n",
     )?;
     let mut r = renderer(gl, &m)?;
-    let solid = |c: [f32; 3]| -> Vec<u8> {
-        (0..W * H)
-            .flat_map(|_| {
-                [
-                    (c[0] * 255.0).round() as u8,
-                    (c[1] * 255.0).round() as u8,
-                    (c[2] * 255.0).round() as u8,
-                    255,
-                ]
-            })
-            .collect()
+    let solid = |c: [f32; 3]| -> Frame {
+        let q = |x: f32| (x * 255.0).round() as u8;
+        Frame::init(W as usize, H as usize, [q(c[0]), q(c[1]), q(c[2]), 255])
     };
     for scale in [0.77, 0.5, 0.35] {
         let a = shot(
@@ -547,7 +547,7 @@ fn keep_last_working(gl: &Gl, dir: &Path) -> Result<String> {
         },
         1.0,
     )?;
-    if red[0] < 250 || red[1] > 5 {
+    if px(&red, 0, 0)[0] < 250 || px(&red, 0, 0)[1] > 5 {
         bail!("first version didn't render red");
     }
     write(
@@ -585,7 +585,7 @@ fn keep_last_working(gl: &Gl, dir: &Path) -> Result<String> {
         },
         1.0,
     )?;
-    if green[1] < 250 || green[0] > 5 {
+    if px(&green, 0, 0)[1] < 250 || px(&green, 0, 0)[0] > 5 {
         bail!("the fixed version didn't replace the old one");
     }
     if !r.errors().is_empty() {
@@ -698,10 +698,11 @@ fn eviction(gl: &Gl, dir: &Path) -> Result<String> {
     r.set_movie(&m).map_err(|e| anyhow!("{e:?}"))?;
     let check = |r: &mut Renderer, i: usize| -> Result<()> {
         let at = m.at(m.shots[i].start + 0.5);
-        let px = shot(r, &m, at, 1.0)?;
+        let frame = shot(r, &m, at, 1.0)?;
         let want = (i as f32 / 100.0 * 255.0).round() as i32;
-        if (px[0] as i32 - want).abs() > 1 {
-            bail!("transition into shot {i}: red {} (wanted {want})", px[0]);
+        let red = px(&frame, 0, 0)[0];
+        if (red as i32 - want).abs() > 1 {
+            bail!("transition into shot {i}: red {red} (wanted {want})");
         }
         Ok(())
     };
@@ -734,7 +735,7 @@ fn lazy_compile(gl: &Gl, dir: &Path) -> Result<String> {
     let mut frames = 0;
     let got = loop {
         if let Some(_t) = r.render(&m, W, H, &info(0.5, 1.0), false) {
-            break r.read_output().unwrap().2;
+            break r.read_output().unwrap();
         }
         frames += 1;
         if frames > 2000 {

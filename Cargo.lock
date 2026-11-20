@@ -2551,6 +2551,7 @@ dependencies = [
  "raw-window-handle",
  "serde",
  "toml",
+ "toodee",
  "winit",
 ]
 
@@ -2832,6 +2833,15 @@ name = "toml_writer"
 version = "1.2.0+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "009dbb7700f11c55ef83aebbe4c0e9cf1f1ac0844bd8d6f00dc38f302026e13a"
+
+[[package]]
+name = "toodee"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c29d58dcbe40d2e0bdba6ea6eb9d507eeff7ef7bfae29b747c05894c9fd42d0c"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "tracing"

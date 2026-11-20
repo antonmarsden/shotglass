@@ -12,6 +12,7 @@ use eframe::glow::{self, HasContext};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use toodee::TranslateOps;
 
 pub const BUILTIN_TRANSITIONS: &[(&str, &str)] = &[
     ("copy", include_str!("glsl/transitions/copy.glsl")),
@@ -65,6 +66,9 @@ vec4 getToColor(vec2 uv) { return texture(uTo, min(clamp(uv, 0.0, 1.0) * uToScal
 
 const TRANSITION_FOOTER: &str =
     "void main(){ shotglass_out = vec4(transition(gl_FragCoord.xy / uOutRes).rgb, 1.0); }";
+
+/// An RGBA8 image, one `[r, g, b, a]` cell per pixel, top row first.
+pub type Frame = toodee::TooDee<[u8; 4]>;
 
 /// A shader that failed to compile, with messages mapped to file:line.
 #[derive(Clone, Debug)]
@@ -1261,10 +1265,12 @@ impl Renderer {
     }
 
     /// Read the output texture as tightly packed RGBA8, top row first.
-    pub fn read_output(&self) -> Option<(i32, i32, Vec<u8>)> {
+    /// Read the output texture as an RGBA8 frame, top row first.
+    pub fn read_output(&self) -> Option<Frame> {
         let t = self.out.as_ref()?;
         let (w, h) = t.alloc;
-        let mut buf = vec![0u8; (w * h * 4) as usize];
+        let mut frame = Frame::init(w as usize, h as usize, [0; 4]);
+        let buf = frame.data_mut().as_flattened_mut();
         unsafe {
             self.gl.bind_framebuffer(glow::FRAMEBUFFER, Some(t.fbo));
             self.gl.pixel_store_i32(glow::PACK_ALIGNMENT, 1);
@@ -1275,16 +1281,13 @@ impl Renderer {
                 h,
                 glow::RGBA,
                 glow::UNSIGNED_BYTE,
-                glow::PixelPackData::Slice(Some(&mut buf)),
+                glow::PixelPackData::Slice(Some(buf)),
             );
             self.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
         }
-        let row = (w * 4) as usize;
-        let mut flipped = Vec::with_capacity(buf.len());
-        for y in (0..h as usize).rev() {
-            flipped.extend_from_slice(&buf[y * row..(y + 1) * row]);
-        }
-        Some((w, h, flipped))
+        // OpenGL returns the bottom row first.
+        frame.flip_rows();
+        Some(frame)
     }
 
     pub fn finish(&self) {

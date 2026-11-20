@@ -12,10 +12,11 @@ mod sound;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
-use gfx::{FrameInfo, Renderer};
+use gfx::{Frame, FrameInfo, Renderer};
 use movie::{At, Movie};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+use toodee::{CopyOps, TooDeeOps, TooDeeOpsMut};
 
 #[derive(Parser)]
 #[command(
@@ -235,9 +236,9 @@ fn still(movie: &Path, at: &str, size: &str, out: &Path) -> Result<()> {
         let mut r = load_renderer(gl, &m)?;
         for t in times {
             r.render(&m, w, h, &frame_info(&m, t), true);
-            let (w, h, px) = r.read_output().ok_or_else(|| anyhow!("nothing rendered"))?;
+            let frame = r.read_output().ok_or_else(|| anyhow!("nothing rendered"))?;
             let path = out.join(format!("t{:08.3}.png", t));
-            image::save_buffer(&path, &px, w as u32, h as u32, image::ColorType::Rgba8)?;
+            save_png(&path, &frame)?;
             println!("{}  {}", path.display(), describe(&m, t));
         }
         Ok(())
@@ -265,30 +266,40 @@ fn strip(
     let (w, h) = parse_size(size)?;
     let cols = cols.clamp(1, times.len().max(1));
     let rows = times.len().div_ceil(cols);
-    let gap = 4u32;
+    let gap = 4usize;
     let out = out.to_path_buf();
     headless::with_gl(move |gl| {
         let mut r = load_renderer(gl, &m)?;
-        let (sw, sh) = (
-            cols as u32 * (w as u32 + gap) + gap,
-            rows as u32 * (h as u32 + gap) + gap,
+        let (w, h) = (w as usize, h as usize);
+        let mut sheet = Frame::init(
+            cols * (w + gap) + gap,
+            rows * (h + gap) + gap,
+            [24, 24, 24, 255],
         );
-        let mut sheet = image::RgbaImage::from_pixel(sw, sh, image::Rgba([24, 24, 24, 255]));
         for (i, t) in times.iter().enumerate() {
-            r.render(&m, w, h, &frame_info(&m, *t), true);
-            let (fw, fh, px) = r.read_output().ok_or_else(|| anyhow!("nothing rendered"))?;
-            let img = image::RgbaImage::from_raw(fw as u32, fh as u32, px).unwrap();
-            let (x, y) = (
-                (i % cols) as u32 * (w as u32 + gap) + gap,
-                (i / cols) as u32 * (h as u32 + gap) + gap,
-            );
-            image::imageops::overlay(&mut sheet, &img, x as i64, y as i64);
+            r.render(&m, w as i32, h as i32, &frame_info(&m, *t), true);
+            let frame = r.read_output().ok_or_else(|| anyhow!("nothing rendered"))?;
+            let (x, y) = ((i % cols) * (w + gap) + gap, (i / cols) * (h + gap) + gap);
+            sheet
+                .view_mut((x, y), (x + w, y + h))
+                .copy_from_toodee(&frame);
             println!("#{i:<3} {:>7.2}s  {}", t, describe(&m, *t));
         }
-        sheet.save(&out)?;
+        save_png(&out, &sheet)?;
         println!("wrote {}", out.display());
         Ok(())
     })
+}
+
+fn save_png(path: &Path, frame: &Frame) -> Result<()> {
+    image::save_buffer(
+        path,
+        frame.data().as_flattened(),
+        frame.num_cols() as u32,
+        frame.num_rows() as u32,
+        image::ColorType::Rgba8,
+    )?;
+    Ok(())
 }
 
 fn describe(m: &Movie, t: f32) -> String {
