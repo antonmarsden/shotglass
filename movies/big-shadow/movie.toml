@@ -1,0 +1,58 @@
+# Big Shadow — a tiny mouse, a tealight, and a lot of wall.
+# Run:  shotglass play movies/big-shadow
+title = "Big Shadow"
+aspect = [16, 9]
+fps = 30
+
+[sound]
+shader = "sound.glsl"
+volume = 0.9
+
+# 1. The candle creeps closer and the mouse's shadow grows huge on the wall,
+#    then the flame gutters out.
+[[shot]]
+id = "wall"
+scene = "scenes/shadow.glsl"
+duration = 9.0
+uniforms.uDist    = { keys = [[0, 0.95], [6.0, 0.22]], ease = "smoother" }
+uniforms.uRadius  = 0.003
+uniforms.uFlicker = 1.0
+uniforms.uLight   = { keys = [[0, 1.0], [6.4, 1.0], [8.2, 0.0, "in"]] }
+uniforms.uOrbit   = [0.0, 0.0]
+uniforms.uZoom    = { keys = [[0, 1.0], [9, 1.15]] }
+
+# 2. Darkness gives way to moonlight over the rooftops. A live fade (no freeze),
+#    so we still see the last of the flame dying.
+[[shot]]
+id = "moon"
+scene = "scenes/moon.glsl"
+duration = 8.0
+transition = { type = "fade", duration = 1.4, ease = "smooth", params = { hold = 0.25 } }
+uniforms.uMoon = [0.72, 0.70]
+uniforms.uWind = 0.03
+
+# 3. Match cut: an iris opens out of the moon onto the mouse, close up.
+#    The moon shot is frozen during the iris, so only one scene renders.
+[[shot]]
+id = "closeup"
+scene = "scenes/shadow.glsl"
+duration = 8.0
+time_offset = 20.0
+transition = { type = "iris", duration = 1.5, freeze = true, ease = "inout", params = { center = [0.72, 0.70], softness = 0.006 } }
+uniforms.uDist    = 0.22
+uniforms.uRadius  = 0.003
+uniforms.uFlicker = 1.0
+uniforms.uLight   = 1.0
+uniforms.uOrbit   = { keys = [[0, [-0.55, 0.06]], [8, [-0.35, 0.10]]] }
+uniforms.uZoom    = { keys = [[0, 4.2], [8, 5.2]] }
+
+# 4. "That's all, folks": a closing iris on the mouse.
+[[shot]]
+id = "end"
+scene = "scenes/black.glsl"
+duration = 2.5
+transition = { type = "iris", duration = 1.4, ease = "in", params = { center = [0.57, 0.47], closing = 1.0, softness = 0.004 } }
+
+[[marker]]
+t = 6.4
+label = "flame gutters"

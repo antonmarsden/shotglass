@@ -1,0 +1,22 @@
+# A new shotglass movie. Save any file while `shotglass play` is open and it reloads.
+title = "My short"
+aspect = [16, 9]
+fps = 30
+
+[sound]
+shader = "sound.glsl"     # vec2 mainSound(int samp, float time) — time is movie time
+volume = 0.8
+
+[[shot]]
+id = "first"
+scene = "scenes/first.glsl"
+duration = 5.0
+# Uniforms are declared for you. Constants, vectors, or keyframes in shot-local seconds.
+uniforms.uHue = { keys = [[0, 0.0], [5, 0.3]], ease = "smooth" }
+
+[[shot]]
+id = "second"
+scene = "scenes/second.glsl"
+duration = 5.0
+# The transition *into* this shot. Built-ins: crossfade, fade, iris, dissolve, wipe.
+transition = { type = "iris", duration = 1.2, freeze = true, params = { center = [0.5, 0.5] } }
