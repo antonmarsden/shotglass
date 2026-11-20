@@ -62,18 +62,23 @@ cargo fmt && cargo clippy --all-targets -- -D warnings
 - **Deterministic frames:** a frame depends only on (movie, t, size, scale), so playback,
   `still` and a future export agree.
 - Shaders should stay GLSL-ES-compatible so a future web player can run them (issue #2).
+- **The engine provides a contract, not looks.** Uniforms, entry points, the transition interface
+  and cue defines are the engine's API (semver). Reusable GLSL belongs in versioned libraries
+  (the shotglass-kit repo, #3–#5), not embedded in the binary; the built-in transitions are
+  slated to move there. Don't add new built-in GLSL.
 
 ## Adding things
 
-- **Built-in transition:** add `src/glsl/transitions/<name>.glsl`, register it in
-  `BUILTIN_TRANSITIONS` (gfx.rs), add it to `transition_endpoints` in selftest.rs, and
-  document it in the README table.
+- **New transition:** it belongs in the kit (#4) once libraries exist. Until then, a built-in
+  one goes in `src/glsl/transitions/<name>.glsl`, registered in `BUILTIN_TRANSITIONS`
+  (gfx.rs), added to `transition_endpoints` in selftest.rs, and listed in the README table.
 - **`movie.toml` field:** add it to the serde struct (`deny_unknown_fields`) and the resolved
   struct, validate it in `Movie::parse`, add a unit test, and update the README and
   `templates/new/movie.toml`.
 - **Renderer behaviour:** add a selftest check. Mutation-check it: break the code and make sure
   the check fails.
-- Keep user-facing docs in README.md. Open work is in GitHub issues (#1 export, #2 web player).
+- Keep user-facing docs in README.md. Open work is in GitHub issues: #1 export, #2 web player,
+  #3 libraries by name and version, #4 kit core/transitions, #5 the shotglass-kit repo.
 
 ## Commits
 
