@@ -3,13 +3,16 @@
 use crate::audio::{AudioOut, Clock};
 use crate::gfx::{FrameInfo, Renderer, ShaderError};
 use crate::movie::{At, Movie};
-use crate::sound::Soundtrack;
+use crate::sound::{CHUNK, Soundtrack};
 use eframe::egui::{self, Color32, Key, Modifiers, Pos2, Rect, RichText, Sense, Stroke, Vec2};
 use eframe::glow;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
+
+/// Seconds of sound synthesised ahead of the playhead while playing.
+const SOUND_AHEAD: f32 = 6.0;
 
 pub fn run(path: PathBuf, start: f32) -> anyhow::Result<()> {
     let options = eframe::NativeOptions {
@@ -67,10 +70,15 @@ struct Player {
     path: PathBuf,
     movie: Option<Movie>,
     load_error: Option<String>,
+    /// Errors assembling sources (missing files): the movie isn't switched.
     shader_errors: Vec<ShaderError>,
+    sound_errors: Vec<ShaderError>,
     renderer: Renderer,
     clock: Clock,
-    sound_key: Option<u64>,
+    last_synth: String,
+    /// Seconds of sound ready ahead of the playhead.
+    buffered: f32,
+    perf_frame: u64,
     soundtrack: Soundtrack,
     sound_info: String,
     _watcher: Option<notify::RecommendedWatcher>,
@@ -147,9 +155,12 @@ impl Player {
             movie: None,
             load_error: None,
             shader_errors: vec![],
+            sound_errors: vec![],
             renderer,
             clock,
-            sound_key: None,
+            last_synth: String::new(),
+            buffered: 0.0,
+            perf_frame: 0,
             soundtrack: Soundtrack::new(),
             sound_info,
             _watcher: watcher,
@@ -194,15 +205,17 @@ impl Player {
             }
         };
         self.load_error = None;
-        let t0 = Instant::now();
-        match self.renderer.load(&m) {
-            Ok(n) => {
+        match self.renderer.set_movie(&m) {
+            Ok(()) => {
                 self.shader_errors.clear();
-                let pic_ms = t0.elapsed().as_secs_f32() * 1000.0;
+                self.sound_errors.clear();
+                // Compile what's on screen right now; the rest follows in the background.
+                let t = self.clock.time();
+                self.renderer.pump(&m, t, false);
                 let snd = self.update_sound(&m);
                 self.reloads += 1;
                 if self.reloads > 1 {
-                    let mut msg = format!("reloaded | {n} shader(s) compiled in {pic_ms:.0} ms");
+                    let mut msg = "reloaded".to_string();
                     if let Some(s) = snd {
                         msg += &format!(" | {s}");
                     }
@@ -223,34 +236,85 @@ impl Player {
     }
 
     /// Rebuild the soundtrack (cached per track). Returns a note about what was re-synthesized.
+    /// Prepare the new soundtrack version. Chunks are synthesised as the playhead
+    /// needs them (see `stream_sound`); until then the old version keeps playing.
     fn update_sound(&mut self, m: &Movie) -> Option<String> {
         if !m.has_sound() {
-            self.sound_key = None;
-            self.clock.set_samples(vec![]);
+            self.soundtrack = Soundtrack::new();
+            self.clock.clear_chunks();
             return None;
         }
-        let t0 = Instant::now();
         match self
             .soundtrack
-            .build(&mut self.renderer, m, self.clock.sample_rate())
+            .set_movie(&mut self.renderer, m, self.clock.sample_rate())
         {
-            Ok(built) => {
-                if self.sound_key != Some(built.key) {
-                    self.clock.set_samples(built.samples);
-                    self.sound_key = Some(built.key);
-                }
-                (!built.rendered.is_empty()).then(|| {
-                    format!(
-                        "sound: {} in {:.0} ms",
-                        built.rendered.join(", "),
-                        t0.elapsed().as_secs_f32() * 1000.0
-                    )
-                })
-            }
+            Ok(()) => None,
             Err(errors) => {
-                self.shader_errors.extend(errors);
+                self.sound_errors = errors;
                 None
             }
+        }
+    }
+
+    /// Synthesise sound chunks around the playhead, nearest first, within a small
+    /// time budget per frame, and forget chunks far from it.
+    fn stream_sound(&mut self) {
+        let Some(version) = self.soundtrack.version() else {
+            return;
+        };
+        if !self.clock.has_audio() {
+            return;
+        }
+        let sr = self.clock.sample_rate() as f32;
+        let n = self.soundtrack.total_chunks();
+        if n == 0 {
+            return;
+        }
+        let t = self.clock.time();
+        let c0 = ((t * sr) as usize / CHUNK).min(n - 1);
+        let playing = self.clock.playing();
+        let per_s = sr / CHUNK as f32;
+        let ahead = if playing {
+            (SOUND_AHEAD * per_s).ceil() as usize
+        } else {
+            1
+        };
+        let deadline = Instant::now() + Duration::from_millis(if playing { 4 } else { 12 });
+        for c in c0..(c0 + ahead + 1).min(n) {
+            if self.clock.chunk_version(c) == Some(version) {
+                continue;
+            }
+            // The chunk under the playhead is always made; the rest only within budget.
+            if c != c0 && Instant::now() > deadline {
+                break;
+            }
+            match self.soundtrack.chunk(&mut self.renderer, c) {
+                Ok(d) => {
+                    let total = (self.duration() * sr).ceil() as usize;
+                    self.clock.put_chunk(CHUNK, total, c, version, d);
+                }
+                Err(e) => {
+                    self.sound_errors = vec![ShaderError {
+                        what: "sound".into(),
+                        messages: vec![e],
+                    }];
+                    break;
+                }
+            }
+        }
+        let made = self.soundtrack.take_rendered();
+        if !made.is_empty() {
+            self.last_synth = made.join(", ");
+        }
+        self.buffered = (c0..n)
+            .take_while(|c| self.clock.chunk_version(*c) == Some(version))
+            .count() as f32
+            / per_s;
+        if self.perf_frame.is_multiple_of(30) {
+            let keep = c0.saturating_sub((3.0 * per_s).ceil() as usize)
+                ..(c0 + ahead + (4.0 * per_s).ceil() as usize);
+            self.soundtrack.evict(keep.clone());
+            self.clock.drop_chunks_outside(keep);
         }
     }
 
@@ -508,7 +572,13 @@ impl Player {
             frame: (t * fps) as i32,
             scale,
         };
-        let tex = self.renderer.render(m, w, h, &info);
+        // Paused or scrubbing: compile on the spot if needed. Playing: never stall,
+        // keep the previous frame up until the shot's program is ready.
+        let blocking = !self.clock.playing();
+        let Some(tex) = self.renderer.render(m, w, h, &info, blocking) else {
+            return false;
+        };
+        let tex = Some(tex);
         self.rendered_key = Some(key);
         if let Some(tex) = tex
             && self.tex.map(|(t, _)| t) != Some(tex)
@@ -646,6 +716,10 @@ impl Player {
             let c = palette[shot.index % palette.len()];
             p.rect_filled(r.shrink2(Vec2::new(0.5, 0.0)), 3.0, c);
             let label_x = x_of(shot.settled()) + 4.0;
+            // Skip labels that wouldn't fit (long films have narrow blocks).
+            if x_of(shot.end()) - label_x < 7.0 * shot.id.len() as f32 + 4.0 {
+                continue;
+            }
             p.text(
                 Pos2::new(label_x, y0 + 4.0),
                 egui::Align2::LEFT_TOP,
@@ -691,6 +765,18 @@ impl Player {
                 } else {
                     tr.kind.clone()
                 };
+                let spacing = m
+                    .shots
+                    .iter()
+                    .filter(|s| s.transition_in.is_some())
+                    .map(|s| x_of(s.start))
+                    .collect::<Vec<_>>()
+                    .windows(2)
+                    .map(|w| w[1] - w[0])
+                    .fold(f32::MAX, f32::min);
+                if spacing < 6.5 * label.len() as f32 {
+                    continue;
+                }
                 p.text(
                     Pos2::new(r.center().x, y1 + 6.0),
                     egui::Align2::CENTER_TOP,
@@ -888,6 +974,18 @@ impl Player {
                             if m.mix.is_some() { "mix.glsl" } else { "sum" }
                         ));
                     }
+                    ui.label(format!(
+                        "buffered ahead {:.1} s  |  underruns {}",
+                        self.buffered,
+                        self.clock.underruns()
+                    ));
+                    if !self.last_synth.is_empty() {
+                        ui.label(
+                            RichText::new(format!("last synthesized: {}", self.last_synth))
+                                .small()
+                                .weak(),
+                        );
+                    }
                 });
             egui::CollapsingHeader::new("System")
                 .default_open(false)
@@ -934,6 +1032,11 @@ impl eframe::App for Player {
         }
         self.handle_keys(&ctx);
         self.advance_clock();
+        self.perf_frame += 1;
+        self.stream_sound();
+        if let Some(m) = &self.movie {
+            self.renderer.pump(m, self.clock.time(), true);
+        }
 
         egui::Panel::bottom("transport").show(ui, |ui| {
             ui.add_space(4.0);
@@ -970,6 +1073,8 @@ impl eframe::App for Player {
                 .iter()
                 .cloned()
                 .chain(self.shader_errors.iter().map(|e| e.to_string()))
+                .chain(self.renderer.errors().iter().map(|e| e.to_string()))
+                .chain(self.sound_errors.iter().map(|e| e.to_string()))
                 .collect();
             if !errors.is_empty() {
                 let r = Rect::from_min_max(
@@ -1006,12 +1111,23 @@ impl eframe::App for Player {
                         Color32::from_white_alpha(200),
                     );
                 }
+            let (ready, total) = self.renderer.progress();
+            if ready < total {
+                ui.painter().text(
+                    view.right_top() + Vec2::new(-10.0, 10.0),
+                    egui::Align2::RIGHT_TOP,
+                    format!("compiling shaders {ready}/{total}"),
+                    egui::FontId::proportional(12.0),
+                    Color32::from_white_alpha(160),
+                );
+            }
             if self.movie.is_none() && self.load_error.is_none() && self.shader_errors.is_empty() {
                 ui.label("loading...");
             }
         });
         self.measure(rendered);
-        if self.clock.playing() {
+        let (ready, total) = self.renderer.progress();
+        if self.clock.playing() || ready < total {
             ctx.request_repaint();
         } else {
             ctx.request_repaint_after(Duration::from_millis(120));

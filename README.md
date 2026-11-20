@@ -69,6 +69,7 @@ fps = 30                      # for frame stepping and iFrame; playback follows 
 [sound]
 music = "music.glsl"          # optional
 mix = "mix.glsl"              # optional; without it, music and shot sounds are summed
+mix_lookback = 1.0            # how far back (s) the mix may read music()/sfx(); default 1
 volume = 0.9
 
 [[shot]]
@@ -211,9 +212,14 @@ vec2 mainMix(int samp, float time) {
 }
 ```
 
-Each track is cached by its source and timing. Editing one shot's sound
-re-synthesises only that shot (and the mix), and picture-only edits don't touch
-the sound. Recursive filters (resonant sweeps, feedback reverb) are the main
+The mix can read up to `mix_lookback` seconds back (default 1) and 50 ms ahead.
+Reads outside that range return silence.
+
+Sound is synthesised in chunks of about 0.7 s, just ahead of the playhead (see
+[Long films](#long-films)). Each chunk of each track is cached by its source and
+timing. Editing one shot's sound re-synthesises only that shot (and the mix), and
+picture-only edits don't touch the sound. Until the new chunks are ready, the
+previous version keeps playing. Recursive filters (resonant sweeps, feedback reverb) are the main
 thing GLSL sound can't do cheaply. Multi-tap delays in the mix get you most of
 the way.
 
@@ -246,11 +252,32 @@ To scrub, click or drag on the timeline. Hatched blocks are transitions;
   and lowers the shot render scale before frames start missing the display
   refresh, then raises it again when there's headroom. When you pause, it renders
   at full quality.
-- **Shaders compile and warm up at load**, with one tiny draw each, so a shot's
-  first frame doesn't stall the playback.
+- **Shaders compile ahead of the playhead**, on driver threads where the GPU
+  supports `KHR_parallel_shader_compile`, and get one tiny warm-up draw each. While
+  playing, the player never waits for a compile: if a shot isn't ready, the previous
+  frame stays up. When paused or scrubbing, it compiles on the spot.
 - **Frozen transitions** render only one scene.
 - `shotglass check` times every shot and transition, so you can see which ones
   are over budget.
+
+### Long films
+
+Nothing is loaded all at once, so a 20-minute episode costs about the same as a
+20-second short:
+
+- **Pictures.** Shaders compile nearest the playhead first, everything within
+  10 s ahead, and the rest in the background so errors still show up early. At
+  most 64 compiled programs are kept; the least recently used are dropped.
+  Compiled programs are also saved to disk (`%LOCALAPPDATA%\shotglass\programs` on
+  Windows, `~/.cache/shotglass/programs` elsewhere). Reopening a film, or coming
+  back to an evicted shot, skips the compile. Set `SHOTGLASS_NO_CACHE=1` to turn
+  this off.
+- **Sound.** Chunks are synthesised up to 6 s ahead of the playhead within a
+  few milliseconds per frame, and chunks more than a few seconds away are
+  forgotten. Memory stays at a few MB whatever the length. `wav` and `check`
+  stream chunk by chunk too.
+- The Sound panel shows how much sound is buffered ahead and any underruns.
+  The overlay shows shaders still compiling.
 
 ## Command line
 

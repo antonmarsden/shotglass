@@ -180,7 +180,7 @@ fn parse_times(s: &str, m: &Movie) -> Result<Vec<f32>> {
 
 fn load_renderer(gl: std::sync::Arc<eframe::glow::Context>, m: &Movie) -> Result<Renderer> {
     let mut r = Renderer::new(gl)?;
-    if let Err(errors) = r.load(m) {
+    if let Err(errors) = r.load_all(m) {
         let mut s = String::new();
         for e in errors {
             s += &e.to_string();
@@ -208,7 +208,7 @@ fn still(movie: &Path, at: &str, size: &str, out: &Path) -> Result<()> {
     headless::with_gl(move |gl| {
         let mut r = load_renderer(gl, &m)?;
         for t in times {
-            r.render(&m, w, h, &frame_info(&m, t));
+            r.render(&m, w, h, &frame_info(&m, t), true);
             let (w, h, px) = r.read_output().ok_or_else(|| anyhow!("nothing rendered"))?;
             let path = out.join(format!("t{:08.3}.png", t));
             image::save_buffer(&path, &px, w as u32, h as u32, image::ColorType::Rgba8)?;
@@ -249,7 +249,7 @@ fn strip(
         );
         let mut sheet = image::RgbaImage::from_pixel(sw, sh, image::Rgba([24, 24, 24, 255]));
         for (i, t) in times.iter().enumerate() {
-            r.render(&m, w, h, &frame_info(&m, *t));
+            r.render(&m, w, h, &frame_info(&m, *t), true);
             let (fw, fh, px) = r.read_output().ok_or_else(|| anyhow!("nothing rendered"))?;
             let img = image::RgbaImage::from_raw(fw as u32, fh as u32, px).unwrap();
             let (x, y) = (
@@ -288,7 +288,13 @@ fn check(movie: &Path, size: &str, frames: usize) -> Result<()> {
         let t0 = Instant::now();
         let mut r = Renderer::new(gl)?;
         println!("GPU: {}", r.gl_info);
-        let compiled = match r.load(&m) {
+        println!(
+            "parallel shader compile: {}  |  program cache: {}",
+            if r.parallel { "yes" } else { "no" },
+            r.shader_cache_dir()
+                .map_or("off".into(), |d| d.display().to_string())
+        );
+        let compiled = match r.load_all(&m) {
             Ok(n) => n,
             Err(errors) => {
                 for e in &errors {
@@ -303,22 +309,28 @@ fn check(movie: &Path, size: &str, frames: usize) -> Result<()> {
         );
         if m.has_sound() {
             let t = Instant::now();
-            let built = match sound::Soundtrack::new().build(&mut r, &m, 48000) {
-                Ok(b) => b,
-                Err(errors) => {
-                    for e in &errors {
-                        eprint!("{e}");
-                    }
-                    bail!("{} sound shader(s) failed", errors.len());
+            let mut st = sound::Soundtrack::new();
+            if let Err(errors) = st.set_movie(&mut r, &m, 48000) {
+                for e in &errors {
+                    eprint!("{e}");
                 }
-            };
-            println!("sound tracks: {}", built.rendered.join(", "));
-            let s = built.samples;
-            let peak = s.iter().fold(0f32, |a, x| a.max(x.abs()));
-            let rms = (s.iter().map(|x| x * x).sum::<f32>() / s.len().max(1) as f32).sqrt();
+                bail!("{} sound shader(s) failed", errors.len());
+            }
+            // Stream: keep only running stats, not the whole soundtrack.
+            let (mut peak, mut sum_sq, mut n) = (0f32, 0f64, 0usize);
+            st.render_all(&mut r, |d| {
+                for x in d {
+                    peak = peak.max(x.abs());
+                    sum_sq += (*x as f64) * (*x as f64);
+                }
+                n += d.len();
+            })
+            .map_err(|e| anyhow!(e))?;
+            println!("sound tracks: {}", st.take_rendered().join(", "));
+            let rms = (sum_sq / n.max(1) as f64).sqrt();
             println!(
                 "sound: {:.1}s synthesized in {:.0} ms, peak {:.2}{}, rms {:.3}",
-                s.len() as f32 / 2.0 / 48000.0,
+                n as f32 / 2.0 / 48000.0,
                 t.elapsed().as_secs_f32() * 1000.0,
                 peak,
                 if peak >= 0.999 { " (clipping!)" } else { "" },
@@ -342,11 +354,11 @@ fn check(movie: &Path, size: &str, frames: usize) -> Result<()> {
             ));
         }
         for (name, t) in probes {
-            r.render(&m, w, h, &frame_info(&m, t));
+            r.render(&m, w, h, &frame_info(&m, t), true);
             r.finish();
             let start = Instant::now();
             for i in 0..frames {
-                r.render(&m, w, h, &frame_info(&m, t + i as f32 / m.fps));
+                r.render(&m, w, h, &frame_info(&m, t + i as f32 / m.fps), true);
             }
             r.finish();
             let ms = start.elapsed().as_secs_f32() * 1000.0 / frames as f32;
@@ -370,18 +382,30 @@ fn wav(movie: &Path, out: &Path, rate: u32) -> Result<()> {
     let out = out.to_path_buf();
     headless::with_gl(move |gl| {
         let mut r = Renderer::new(gl)?;
-        let s = match sound::Soundtrack::new().build(&mut r, &m, rate) {
-            Ok(b) => b.samples,
-            Err(errors) => bail!(
+        let mut st = sound::Soundtrack::new();
+        st.set_movie(&mut r, &m, rate).map_err(|errors| {
+            anyhow!(
                 "{}",
                 errors.iter().map(|e| e.to_string()).collect::<String>()
-            ),
-        };
-        audio::write_wav(&out, &s, rate)?;
+            )
+        })?;
+        let frames = (m.duration * rate as f32).ceil() as usize;
+        let mut w = audio::WavWriter::create(&out, frames, rate)?;
+        let mut err = None;
+        st.render_all(&mut r, |d| {
+            if let Err(e) = w.write(d) {
+                err.get_or_insert(e);
+            }
+        })
+        .map_err(|e| anyhow!(e))?;
+        if let Some(e) = err {
+            return Err(e.into());
+        }
+        w.finish()?;
         println!(
             "wrote {} ({:.1}s at {rate} Hz)",
             out.display(),
-            s.len() as f32 / 2.0 / rate as f32
+            frames as f32 / rate as f32
         );
         Ok(())
     })

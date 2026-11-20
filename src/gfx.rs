@@ -10,7 +10,7 @@ use crate::shader::{Assembled, Builder, Dialect, remap_log};
 use anyhow::{Result, anyhow};
 use eframe::glow::{self, HasContext};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub const BUILTIN_TRANSITIONS: &[(&str, &str)] = &[
@@ -103,17 +103,38 @@ struct Target {
     used: (i32, i32),
 }
 
-struct ShotPrograms {
-    scene: usize,
-    transition_in: Option<usize>,
+/// A program's compile state. Programs compile lazily, nearest the playhead first.
+enum State {
+    Idle,
+    Pending(Pending),
+    Ready(Program),
+    Failed(Vec<String>),
 }
 
-/// Compiled programs for one version of a movie.
-struct Set {
-    programs: Vec<usize>, // indices into the cache
-    shots: Vec<ShotPrograms>,
-    copy: usize,
+struct Pending {
+    prog: glow::Program,
+    shaders: Vec<glow::Shader>,
+    from_binary: bool,
 }
+
+struct Entry {
+    src: Assembled,
+    what: String,
+    state: State,
+    last_used: u64,
+}
+
+/// Program keys for one shot: its scene and the transition into it.
+#[derive(Clone, Copy, PartialEq)]
+struct ShotKeys {
+    scene: u64,
+    trans: Option<u64>,
+}
+
+/// How far ahead of the playhead programs are compiled.
+pub const LOOKAHEAD: f32 = 10.0;
+/// Compiled programs kept before the least recently used ones are dropped.
+const MAX_READY: usize = 64;
 
 pub struct Renderer {
     gl: Arc<glow::Context>,
@@ -121,9 +142,21 @@ pub struct Renderer {
     pub gl_info: String,
     vao: glow::VertexArray,
     dummy: glow::Texture,
-    /// Compiled programs keyed by their full source text; reused across reloads.
-    cache: Vec<(u64, Program)>,
-    set: Option<Set>,
+    /// Every program source we know about, keyed by a hash of its full text.
+    programs: HashMap<u64, Entry>,
+    copy: Option<u64>,
+    /// Programs for each shot of the current movie version.
+    wanted: Vec<ShotKeys>,
+    wanted_ids: Vec<String>,
+    /// Last working programs per shot id, shown while a new version compiles or fails.
+    fallback: HashMap<String, ShotKeys>,
+    /// KHR_parallel_shader_compile: compiles run on driver threads.
+    pub parallel: bool,
+    binary_dir: Option<PathBuf>,
+    frame_no: u64,
+    /// Compiled audio programs and the float target they render into.
+    audio: HashMap<u64, Program>,
+    audio_target: Option<(glow::Framebuffer, glow::Texture)>,
     a: Option<Target>,
     b: Option<Target>,
     freeze: Option<Target>,
@@ -164,14 +197,35 @@ impl Renderer {
             );
             gl.bind_texture(glow::TEXTURE_2D, None);
             let timer = if dialect.es { None } else { GpuTimer::new(&gl) };
+            let ext = gl.supported_extensions();
+            let parallel = ext.contains("GL_KHR_parallel_shader_compile")
+                || ext.contains("GL_ARB_parallel_shader_compile");
+            if parallel {
+                gl.max_shader_compiler_threads(0xFFFF_FFFF);
+            }
+            let formats = gl.get_parameter_i32(glow::NUM_PROGRAM_BINARY_FORMATS);
+            let gl_info = format!("{renderer} · OpenGL {version} · GLSL {}", dialect.version);
+            let binary_dir = if formats > 0 && std::env::var_os("SHOTGLASS_NO_CACHE").is_none() {
+                cache_dir().map(|d| d.join(format!("{:016x}", hash(&gl_info))))
+            } else {
+                None
+            };
             Ok(Renderer {
-                gl_info: format!("{renderer} · OpenGL {version} · GLSL {}", dialect.version),
+                gl_info,
                 gl,
                 dialect,
                 vao,
                 dummy,
-                cache: vec![],
-                set: None,
+                programs: HashMap::new(),
+                copy: None,
+                wanted: vec![],
+                wanted_ids: vec![],
+                fallback: HashMap::new(),
+                parallel,
+                binary_dir,
+                frame_no: 0,
+                audio: HashMap::new(),
+                audio_target: None,
                 a: None,
                 b: None,
                 freeze: None,
@@ -183,84 +237,415 @@ impl Renderer {
         }
     }
 
-    /// Compile everything for `movie`. On any error the previous programs stay active.
-    pub fn load(&mut self, movie: &Movie) -> std::result::Result<usize, Vec<ShaderError>> {
-        let mut errors = vec![];
-        let mut used = vec![];
-        let mut shots = vec![];
+    pub fn shader_cache_dir(&self) -> Option<&Path> {
+        self.binary_dir.as_deref()
+    }
+
+    /// Switch to a new version of the movie. Sources are assembled now (so a missing
+    /// file is reported at once); compiling happens later, nearest the playhead first.
+    /// On error nothing changes.
+    pub fn set_movie(&mut self, movie: &Movie) -> std::result::Result<(), Vec<ShaderError>> {
         let cues = movie.cue_defines();
-        let mut compiled = 0;
-        let mut get = |r: &mut Renderer,
-                       what: String,
-                       src: Result<Assembled>,
-                       errors: &mut Vec<ShaderError>|
-         -> Option<usize> {
-            let src = match src {
-                Ok(s) => s,
+        let mut errors = vec![];
+        let mut add = |r: &mut Renderer, what: String, src: Result<Assembled>| -> Option<u64> {
+            match src {
+                Ok(src) => {
+                    let k = hash(&src.text);
+                    r.programs.entry(k).or_insert(Entry {
+                        src,
+                        what,
+                        state: State::Idle,
+                        last_used: 0,
+                    });
+                    Some(k)
+                }
                 Err(e) => {
                     errors.push(ShaderError {
                         what,
                         messages: vec![format!("{e:#}")],
                     });
-                    return None;
-                }
-            };
-            match r.program_for(&src) {
-                Ok((i, fresh)) => {
-                    compiled += fresh as usize;
-                    used.push(i);
-                    Some(i)
-                }
-                Err(messages) => {
-                    errors.push(ShaderError { what, messages });
                     None
                 }
             }
         };
         let src = self.transition_source("copy", &[], &cues, &movie.root);
-        let copy = get(self, "copy pass".into(), src, &mut errors);
+        let copy = add(self, "copy pass".into(), src);
+        let mut wanted = vec![];
         for shot in &movie.shots {
             let src = self.scene_source(shot, &cues, &movie.root);
-            let scene = get(
+            let scene = add(
                 self,
                 format!("shot \"{}\" ({})", shot.id, rel(&shot.scene, &movie.root)),
                 src,
-                &mut errors,
             );
-            let transition_in = match &shot.transition_in {
+            let trans = match &shot.transition_in {
                 Some(t) => {
                     let src = self.transition_source(&t.kind, &t.params, &cues, &movie.root);
-                    get(
+                    add(
                         self,
                         format!("transition into \"{}\" ({})", shot.id, t.kind),
                         src,
-                        &mut errors,
                     )
+                    .map(Some)
                 }
-                None => None,
+                None => Some(None),
             };
-            shots.push((scene, transition_in, shot.transition_in.is_some()));
+            if let (Some(scene), Some(trans)) = (scene, trans) {
+                wanted.push(ShotKeys { scene, trans });
+            }
         }
         if !errors.is_empty() {
+            self.collect_garbage();
             return Err(errors);
         }
-        let shots = shots
-            .into_iter()
-            .map(|(s, t, _)| ShotPrograms {
-                scene: s.unwrap(),
-                transition_in: t,
-            })
-            .collect();
-        self.set = Some(Set {
-            programs: used,
-            shots,
-            copy: copy.unwrap(),
-        });
+        // Remember what currently works, per shot id, for while the new version compiles.
+        for (id, k) in self.wanted_ids.clone().iter().zip(self.wanted.clone()) {
+            if self.keys_ready(k) {
+                self.fallback.insert(id.clone(), k);
+            }
+        }
+        self.wanted = wanted;
+        self.wanted_ids = movie.shots.iter().map(|s| s.id.clone()).collect();
+        self.fallback
+            .retain(|id, _| movie.shots.iter().any(|s| &s.id == id));
+        self.copy = copy;
+        if let Some(c) = copy {
+            self.compile_now(c);
+        }
         self.generation += 1;
         self.freeze_key = None;
-        self.evict_unused();
-        self.warm_up();
-        Ok(compiled)
+        self.collect_garbage();
+        Ok(())
+    }
+
+    /// Compile everything now (for headless commands). Returns compile errors.
+    pub fn load_all(&mut self, movie: &Movie) -> std::result::Result<usize, Vec<ShaderError>> {
+        self.set_movie(movie)?;
+        let mut keys: Vec<u64> = self
+            .wanted
+            .iter()
+            .flat_map(|k| [Some(k.scene), k.trans])
+            .flatten()
+            .collect();
+        keys.sort_unstable();
+        keys.dedup();
+        let fresh = keys
+            .iter()
+            .filter(|k| matches!(self.programs[k].state, State::Idle))
+            .count();
+        // Start them all first so a parallel-compiling driver can overlap them.
+        for k in &keys {
+            self.start(*k);
+        }
+        for k in &keys {
+            self.compile_now(*k);
+        }
+        let errors = self.errors();
+        if errors.is_empty() {
+            Ok(fresh)
+        } else {
+            Err(errors)
+        }
+    }
+
+    /// Errors of the current version's programs.
+    pub fn errors(&self) -> Vec<ShaderError> {
+        let mut seen = std::collections::HashSet::new();
+        let mut out = vec![];
+        for k in self
+            .wanted
+            .iter()
+            .flat_map(|k| [Some(k.scene), k.trans])
+            .flatten()
+            .chain(self.copy)
+        {
+            if let Some(Entry {
+                state: State::Failed(m),
+                what,
+                ..
+            }) = self.programs.get(&k)
+                && seen.insert(k)
+            {
+                out.push(ShaderError {
+                    what: what.clone(),
+                    messages: m.clone(),
+                });
+            }
+        }
+        out
+    }
+
+    /// (ready, total) programs for the current version.
+    pub fn progress(&self) -> (usize, usize) {
+        let keys: std::collections::HashSet<u64> = self
+            .wanted
+            .iter()
+            .flat_map(|k| [Some(k.scene), k.trans])
+            .flatten()
+            .collect();
+        let ready = keys
+            .iter()
+            .filter(|k| matches!(self.programs[k].state, State::Ready(_) | State::Failed(_)))
+            .count();
+        (ready, keys.len())
+    }
+
+    /// Per-frame housekeeping: finish compiles that are done, start the ones the
+    /// playhead will need next, compile the rest in the background, evict old ones.
+    pub fn pump(&mut self, movie: &Movie, t: f32, background: bool) {
+        self.frame_no += 1;
+        let pending: Vec<u64> = self
+            .programs
+            .iter()
+            .filter(|(_, e)| matches!(e.state, State::Pending(_)))
+            .map(|(k, _)| *k)
+            .collect();
+        for k in pending {
+            let done = match &self.programs[&k].state {
+                State::Pending(p) => {
+                    !self.parallel || unsafe { self.gl.get_program_completion_status(p.prog) }
+                }
+                _ => false,
+            };
+            if done {
+                self.compile_now(k);
+            }
+        }
+        let order = self.priority(movie, t);
+        let in_flight = |r: &Renderer| {
+            r.programs
+                .values()
+                .filter(|e| matches!(e.state, State::Pending(_)))
+                .count()
+        };
+        for (k, dist) in &order {
+            if *dist > LOOKAHEAD {
+                break;
+            }
+            if matches!(self.programs[k].state, State::Idle) {
+                if self.parallel {
+                    self.start(*k);
+                } else {
+                    // Without parallel compiling a compile blocks: do one per frame.
+                    self.compile_now(*k);
+                    return;
+                }
+            }
+        }
+        if background {
+            // Everything else, so errors show up early. Few at a time.
+            for (k, _) in &order {
+                if in_flight(self) >= 2 {
+                    break;
+                }
+                if matches!(self.programs[k].state, State::Idle) {
+                    if self.parallel {
+                        self.start(*k);
+                    } else {
+                        self.compile_now(*k);
+                        break;
+                    }
+                }
+            }
+        }
+        // Drop fallbacks once their replacement works.
+        let ready_ids: Vec<String> = self
+            .wanted_ids
+            .iter()
+            .zip(&self.wanted)
+            .filter(|(_, k)| self.keys_ready(**k))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in ready_ids {
+            self.fallback.remove(&id);
+        }
+        if self.frame_no.is_multiple_of(30) {
+            self.collect_garbage();
+            self.evict(&order);
+        }
+    }
+
+    /// Program keys sorted by how soon the playhead needs them (seconds).
+    fn priority(&self, movie: &Movie, t: f32) -> Vec<(u64, f32)> {
+        let mut v: Vec<(u64, f32)> = vec![];
+        for (i, shot) in movie.shots.iter().enumerate() {
+            let Some(k) = self.wanted.get(i) else {
+                continue;
+            };
+            let d = if t < shot.start {
+                shot.start - t
+            } else if t > shot.end() {
+                (t - shot.end()) * 2.0 // behind the playhead: only needed when scrubbing back
+            } else {
+                0.0
+            };
+            v.push((k.scene, d));
+            if let Some(tr) = k.trans {
+                v.push((tr, d));
+            }
+        }
+        v.sort_by(|a, b| a.1.total_cmp(&b.1));
+        let mut seen = std::collections::HashSet::new();
+        v.retain(|(k, _)| seen.insert(*k));
+        v
+    }
+
+    fn keys_ready(&self, k: ShotKeys) -> bool {
+        let ok = |k: u64| {
+            matches!(
+                self.programs.get(&k).map(|e| &e.state),
+                Some(State::Ready(_))
+            )
+        };
+        ok(k.scene) && k.trans.is_none_or(ok)
+    }
+
+    /// The programs to draw shot `i` with: the current version if it compiled,
+    /// otherwise the last working one. None if neither is ready.
+    fn usable(&self, i: usize, blocking: bool) -> Option<ShotKeys> {
+        let k = *self.wanted.get(i)?;
+        if self.keys_ready(k) {
+            return Some(k);
+        }
+        let fb = self
+            .wanted_ids
+            .get(i)
+            .and_then(|id| self.fallback.get(id))
+            .copied();
+        if let Some(f) = fb.filter(|f| self.keys_ready(*f)) {
+            // Prefer the old version only while the new one is still compiling, or failed.
+            if !blocking
+                || [Some(k.scene), k.trans]
+                    .into_iter()
+                    .flatten()
+                    .any(|x| matches!(self.programs[&x].state, State::Failed(_)))
+            {
+                return Some(f);
+            }
+        }
+        if blocking {
+            return Some(k);
+        }
+        None
+    }
+
+    fn start(&mut self, k: u64) {
+        let Some(e) = self.programs.get(&k) else {
+            return;
+        };
+        if !matches!(e.state, State::Idle) {
+            return;
+        }
+        let state = match self.begin_compile(&e.src) {
+            Ok(p) => State::Pending(p),
+            Err(m) => State::Failed(m),
+        };
+        self.programs.get_mut(&k).unwrap().state = state;
+    }
+
+    /// Make program `k` ready (or failed) now, blocking if needed.
+    fn compile_now(&mut self, k: u64) {
+        self.start(k);
+        let Some(e) = self.programs.get_mut(&k) else {
+            return;
+        };
+        if let State::Pending(_) = e.state {
+            let State::Pending(p) = std::mem::replace(&mut e.state, State::Idle) else {
+                unreachable!()
+            };
+            let from_binary = p.from_binary;
+            let src = e.src.clone();
+            let state = match self.finish_compile(p, &src) {
+                Ok(prog) => {
+                    if !from_binary {
+                        self.save_binary(&prog, &src);
+                    }
+                    self.warm_up(&prog);
+                    State::Ready(prog)
+                }
+                Err(m) => State::Failed(m),
+            };
+            self.programs.get_mut(&k).unwrap().state = state;
+        }
+    }
+
+    fn collect_garbage(&mut self) {
+        let mut keep: std::collections::HashSet<u64> = self.copy.into_iter().collect();
+        for k in self.wanted.iter().chain(self.fallback.values()) {
+            keep.insert(k.scene);
+            if let Some(t) = k.trans {
+                keep.insert(t);
+            }
+        }
+        let drop: Vec<u64> = self
+            .programs
+            .keys()
+            .filter(|k| !keep.contains(k))
+            .copied()
+            .collect();
+        for k in drop {
+            if let Some(e) = self.programs.remove(&k) {
+                self.delete_state(e.state);
+            }
+        }
+    }
+
+    /// Keep at most MAX_READY compiled programs: drop the least recently used ones
+    /// that the playhead won't need soon. They recompile (or reload from the
+    /// on-disk cache) when needed again.
+    fn evict(&mut self, order: &[(u64, f32)]) {
+        let ready: Vec<(u64, u64)> = self
+            .programs
+            .iter()
+            .filter(|(_, e)| matches!(e.state, State::Ready(_)))
+            .map(|(k, e)| (*k, e.last_used))
+            .collect();
+        if ready.len() <= MAX_READY {
+            return;
+        }
+        let near: std::collections::HashSet<u64> = order
+            .iter()
+            .filter(|(_, d)| *d <= LOOKAHEAD * 1.5)
+            .map(|(k, _)| *k)
+            .collect();
+        let mut candidates: Vec<(u64, u64)> = ready
+            .into_iter()
+            .filter(|(k, _)| {
+                !near.contains(k)
+                    && Some(*k) != self.copy
+                    && !self
+                        .fallback
+                        .values()
+                        .any(|f| f.scene == *k || f.trans == Some(*k))
+            })
+            .collect();
+        candidates.sort_by_key(|(_, used)| *used);
+        let excess = self
+            .programs
+            .values()
+            .filter(|e| matches!(e.state, State::Ready(_)))
+            .count()
+            - MAX_READY;
+        for (k, _) in candidates.into_iter().take(excess) {
+            let e = self.programs.get_mut(&k).unwrap();
+            let old = std::mem::replace(&mut e.state, State::Idle);
+            self.delete_state(old);
+        }
+    }
+
+    fn delete_state(&self, s: State) {
+        unsafe {
+            match s {
+                State::Ready(p) => self.gl.delete_program(p.prog),
+                State::Pending(p) => {
+                    for sh in p.shaders {
+                        self.gl.delete_shader(sh);
+                    }
+                    self.gl.delete_program(p.prog);
+                }
+                _ => {}
+            }
+        }
     }
 
     fn scene_source(&self, shot: &Shot, cues: &str, root: &Path) -> Result<Assembled> {
@@ -316,103 +701,138 @@ impl Renderer {
         Ok(b.footer(TRANSITION_FOOTER).build())
     }
 
-    /// Returns (cache index, newly compiled?).
-    fn program_for(&mut self, src: &Assembled) -> std::result::Result<(usize, bool), Vec<String>> {
-        let h = hash(&src.text);
-        if let Some(i) = self.cache.iter().position(|(k, _)| *k == h) {
-            return Ok((i, false));
-        }
-        let p = self.compile(src)?;
-        self.cache.push((h, p));
-        Ok((self.cache.len() - 1, true))
+    fn binary_path(&self, src: &Assembled) -> Option<PathBuf> {
+        self.binary_dir
+            .as_ref()
+            .map(|d| d.join(format!("{:016x}.bin", hash(&src.text))))
     }
 
-    fn compile(&self, src: &Assembled) -> std::result::Result<Program, Vec<String>> {
+    fn save_binary(&self, p: &Program, src: &Assembled) {
+        let Some(path) = self.binary_path(src) else {
+            return;
+        };
+        if let Some(b) = unsafe { self.gl.get_program_binary(p.prog) }
+            && !b.buffer.is_empty()
+        {
+            let _ = std::fs::create_dir_all(path.parent().unwrap());
+            let mut bytes = b.format.to_le_bytes().to_vec();
+            bytes.extend_from_slice(&b.buffer);
+            let _ = std::fs::write(path, bytes);
+        }
+    }
+
+    /// Kick off a compile: from the on-disk binary cache if possible, otherwise from
+    /// source. With KHR_parallel_shader_compile this returns before the driver is done.
+    fn begin_compile(&self, src: &Assembled) -> std::result::Result<Pending, Vec<String>> {
         let gl = &self.gl;
         unsafe {
+            if let Some(bytes) = self.binary_path(src).and_then(|p| std::fs::read(p).ok())
+                && bytes.len() > 4
+            {
+                let format = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                let prog = gl.create_program().map_err(|e| vec![e])?;
+                gl.program_binary(
+                    prog,
+                    &glow::ProgramBinary {
+                        buffer: bytes[4..].to_vec(),
+                        format,
+                    },
+                );
+                if gl.get_program_link_status(prog) {
+                    return Ok(Pending {
+                        prog,
+                        shaders: vec![],
+                        from_binary: true,
+                    });
+                }
+                gl.delete_program(prog); // stale (driver update): compile from source
+            }
             let vs_src = format!("{}{VERTEX}", self.dialect.version_line());
             let vs = gl.create_shader(glow::VERTEX_SHADER).map_err(|e| vec![e])?;
             gl.shader_source(vs, &vs_src);
             gl.compile_shader(vs);
-            if !gl.get_shader_compile_status(vs) {
-                let log = gl.get_shader_info_log(vs);
-                gl.delete_shader(vs);
-                return Err(vec![format!("vertex shader: {log}")]);
-            }
             let fs = gl
                 .create_shader(glow::FRAGMENT_SHADER)
                 .map_err(|e| vec![e])?;
             gl.shader_source(fs, &src.text);
             gl.compile_shader(fs);
-            if !gl.get_shader_compile_status(fs) {
-                let log = gl.get_shader_info_log(fs);
-                gl.delete_shader(vs);
-                gl.delete_shader(fs);
-                let mut m = remap_log(&log, &src.files);
-                if m.is_empty() {
-                    m.push("compile failed (driver gave no log)".into());
-                }
-                return Err(m);
-            }
             let prog = gl.create_program().map_err(|e| vec![e])?;
             gl.attach_shader(prog, vs);
             gl.attach_shader(prog, fs);
+            if self.binary_dir.is_some() {
+                gl.program_binary_retrievable_hint(prog, true);
+            }
             gl.link_program(prog);
-            gl.detach_shader(prog, vs);
-            gl.detach_shader(prog, fs);
-            gl.delete_shader(vs);
-            gl.delete_shader(fs);
-            if !gl.get_program_link_status(prog) {
-                let log = gl.get_program_info_log(prog);
-                gl.delete_program(prog);
-                return Err(remap_log(&format!("link: {log}"), &src.files));
+            Ok(Pending {
+                prog,
+                shaders: vec![vs, fs],
+                from_binary: false,
+            })
+        }
+    }
+
+    /// Wait for a compile to finish and collect errors and uniform locations.
+    fn finish_compile(
+        &self,
+        p: Pending,
+        src: &Assembled,
+    ) -> std::result::Result<Program, Vec<String>> {
+        let gl = &self.gl;
+        unsafe {
+            let linked = gl.get_program_link_status(p.prog);
+            let mut errors = vec![];
+            if !linked {
+                for (i, sh) in p.shaders.iter().enumerate() {
+                    if !gl.get_shader_compile_status(*sh) {
+                        let log = gl.get_shader_info_log(*sh);
+                        if i == 0 {
+                            errors.push(format!("vertex shader: {log}"));
+                        } else {
+                            errors.extend(remap_log(&log, &src.files));
+                        }
+                    }
+                }
+                if errors.is_empty() {
+                    errors = remap_log(
+                        &format!("link: {}", gl.get_program_info_log(p.prog)),
+                        &src.files,
+                    );
+                }
+                if errors.is_empty() {
+                    errors.push("compile failed (driver gave no log)".into());
+                }
+            }
+            for sh in &p.shaders {
+                gl.detach_shader(p.prog, *sh);
+                gl.delete_shader(*sh);
+            }
+            if !linked {
+                gl.delete_program(p.prog);
+                return Err(errors);
             }
             let mut locs = HashMap::new();
-            let n = gl.get_active_uniforms(prog);
+            let n = gl.get_active_uniforms(p.prog);
             for i in 0..n {
-                if let Some(u) = gl.get_active_uniform(prog, i) {
+                if let Some(u) = gl.get_active_uniform(p.prog, i) {
                     let name = u.name.trim_end_matches("[0]").to_string();
-                    if let Some(l) = gl.get_uniform_location(prog, &name) {
+                    if let Some(l) = gl.get_uniform_location(p.prog, &name) {
                         locs.insert(name, l);
                     }
                 }
             }
-            Ok(Program { prog, locs })
+            Ok(Program { prog: p.prog, locs })
         }
     }
 
-    fn evict_unused(&mut self) {
-        // Keep the cache small: drop programs not used by the current set, but keep
-        // indices stable by only trimming when nothing references them.
-        let Some(set) = &self.set else { return };
-        if self.cache.len() <= set.programs.len() + 16 {
-            return;
-        }
-        let keep: std::collections::HashSet<usize> = set.programs.iter().copied().collect();
-        let mut remap = HashMap::new();
-        let old = std::mem::take(&mut self.cache);
-        for (i, (h, p)) in old.into_iter().enumerate() {
-            if keep.contains(&i) {
-                remap.insert(i, self.cache.len());
-                self.cache.push((h, p));
-            } else {
-                unsafe { self.gl.delete_program(p.prog) };
-            }
-        }
-        let set = self.set.as_mut().unwrap();
-        set.programs = set.programs.iter().map(|i| remap[i]).collect();
-        set.copy = remap[&set.copy];
-        for s in &mut set.shots {
-            s.scene = remap[&s.scene];
-            s.transition_in = s.transition_in.map(|i| remap[&i]);
-        }
+    /// Compile synchronously (sound shaders, which run once).
+    fn compile(&self, src: &Assembled) -> std::result::Result<Program, Vec<String>> {
+        let p = self.begin_compile(src)?;
+        self.finish_compile(p, src)
     }
 
-    /// Draw every program once into a tiny viewport so drivers finish compiling now,
-    /// not on the first frame a shot appears.
-    fn warm_up(&mut self) {
-        let Some(set) = &self.set else { return };
-        let progs: Vec<usize> = set.programs.clone();
+    /// Draw a program once into a tiny viewport so the driver finishes any lazy work
+    /// now, not on the first frame the shot appears.
+    fn warm_up(&mut self, p: &Program) {
         if self.a.is_none() {
             ensure_target(&self.gl, &mut self.a, 8, 8);
         }
@@ -421,48 +841,76 @@ impl Renderer {
             self.gl.bind_framebuffer(glow::FRAMEBUFFER, Some(t.fbo));
             self.gl.viewport(0, 0, 4, 4);
             self.gl.bind_vertex_array(Some(self.vao));
-            for i in progs {
-                let p = &self.cache[i].1;
-                self.gl.use_program(Some(p.prog));
-                if let Some(l) = p.loc("iResolution") {
-                    self.gl.uniform_3_f32(Some(l), 4.0, 4.0, 1.0);
-                }
-                if let Some(l) = p.loc("uOutRes") {
-                    self.gl.uniform_2_f32(Some(l), 4.0, 4.0);
-                }
-                self.gl.draw_arrays(glow::TRIANGLES, 0, 3);
+            self.gl.use_program(Some(p.prog));
+            if let Some(l) = p.loc("iResolution") {
+                self.gl.uniform_3_f32(Some(l), 4.0, 4.0, 1.0);
             }
-            self.gl.finish();
+            if let Some(l) = p.loc("uOutRes") {
+                self.gl.uniform_2_f32(Some(l), 4.0, 4.0);
+            }
+            self.gl.draw_arrays(glow::TRIANGLES, 0, 3);
             self.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            self.gl.use_program(None);
+            self.gl.bind_vertex_array(None);
         }
     }
 
-    /// Render the movie at `info.t` into the output texture (w × h). Returns the texture.
+    fn prog(&self, k: u64) -> Option<&Program> {
+        match &self.programs.get(&k)?.state {
+            State::Ready(p) => Some(p),
+            _ => None,
+        }
+    }
+
+    /// Render the movie at `info.t` into the output texture (w × h).
+    /// With `blocking = false` it returns None when a shot's program isn't compiled
+    /// yet (keep showing the previous frame); with `true` it compiles on the spot.
     pub fn render(
         &mut self,
         movie: &Movie,
         w: i32,
         h: i32,
         info: &FrameInfo,
+        blocking: bool,
     ) -> Option<glow::Texture> {
-        let set = self.set.as_ref()?;
+        let copy = self.copy?;
         let (w, h) = (w.max(1), h.max(1));
         let sw = ((w as f32 * info.scale).round() as i32).clamp(1, w);
         let sh = ((h as f32 * info.scale).round() as i32).clamp(1, h);
         let at = movie.at(info.t);
+        let needed: Vec<usize> = match at {
+            At::Shot { shot, .. } => vec![shot],
+            At::Transition { from, to, .. } => vec![from, to],
+        };
+        let mut keys = vec![];
+        for &i in &needed {
+            let k = self.usable(i, blocking)?;
+            if blocking {
+                self.compile_now(k.scene);
+                if let Some(t) = k.trans {
+                    self.compile_now(t);
+                }
+            }
+            keys.push(k);
+        }
+        let frame_no = self.frame_no;
+        for k in &keys {
+            for x in [Some(k.scene), k.trans].into_iter().flatten() {
+                if let Some(e) = self.programs.get_mut(&x) {
+                    e.last_used = frame_no;
+                }
+            }
+        }
         if let Some(timer) = &mut self.timer {
             timer.begin(&self.gl);
         }
-        let (copy, scenes): (usize, Vec<usize>) =
-            (set.copy, set.shots.iter().map(|s| s.scene).collect());
-        let trans: Vec<Option<usize>> = set.shots.iter().map(|s| s.transition_in).collect();
         ensure_target(&self.gl, &mut self.a, w, h);
         ensure_target(&self.gl, &mut self.b, w, h);
         ensure_target(&self.gl, &mut self.out, w, h);
         match at {
             At::Shot { shot, local } => {
                 self.draw_scene(
-                    scenes[shot],
+                    keys[0].scene,
                     &movie.shots[shot],
                     local,
                     Which::A,
@@ -489,7 +937,7 @@ impl Renderer {
                         ensure_target(&self.gl, &mut self.freeze, w, h);
                         let freeze_local = movie.shots[to].start - movie.shots[from].start;
                         self.draw_scene(
-                            scenes[from],
+                            keys[0].scene,
                             &movie.shots[from],
                             freeze_local,
                             Which::Freeze,
@@ -503,7 +951,7 @@ impl Renderer {
                     Which::Freeze
                 } else {
                     self.draw_scene(
-                        scenes[from],
+                        keys[0].scene,
                         &movie.shots[from],
                         from_local,
                         Which::A,
@@ -515,7 +963,7 @@ impl Renderer {
                     Which::A
                 };
                 self.draw_scene(
-                    scenes[to],
+                    keys[1].scene,
                     &movie.shots[to],
                     to_local,
                     Which::B,
@@ -525,14 +973,11 @@ impl Renderer {
                     movie,
                 );
                 let eased = tr.ease.apply(progress);
-                self.composite(
-                    trans[to].unwrap_or(copy),
-                    from_target,
-                    Which::B,
-                    eased,
-                    w,
-                    h,
-                );
+                let tp = keys[1]
+                    .trans
+                    .filter(|k| self.prog(*k).is_some())
+                    .unwrap_or(copy);
+                self.composite(tp, from_target, Which::B, eased, w, h);
             }
         }
         if let Some(timer) = &mut self.timer {
@@ -562,7 +1007,7 @@ impl Renderer {
     #[allow(clippy::too_many_arguments)]
     fn draw_scene(
         &mut self,
-        prog: usize,
+        prog: u64,
         shot: &Shot,
         local: f32,
         into: Which,
@@ -579,7 +1024,16 @@ impl Renderer {
         };
         t.used = (sw, sh);
         let fbo = t.fbo;
-        let p = &self.cache[prog].1;
+        let Some(p) = self.prog(prog) else {
+            // failed with no working version: show black
+            unsafe {
+                gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+                gl.viewport(0, 0, sw, sh);
+                gl.clear_color(0.0, 0.0, 0.0, 1.0);
+                gl.clear(glow::COLOR_BUFFER_BIT);
+            }
+            return;
+        };
         unsafe {
             gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
             gl.viewport(0, 0, sw, sh);
@@ -633,7 +1087,7 @@ impl Renderer {
         }
     }
 
-    fn composite(&mut self, prog: usize, from: Which, to: Which, progress: f32, w: i32, h: i32) {
+    fn composite(&mut self, prog: u64, from: Which, to: Which, progress: f32, w: i32, h: i32) {
         let gl = self.gl.clone();
         let (ft, tt) = (self.target(from), self.target(to));
         let scale = |t: &Target| {
@@ -651,7 +1105,7 @@ impl Renderer {
         let (fs, fm, ftex) = (scale(ft), maxv(ft), ft.tex);
         let (ts, tm, ttex) = (scale(tt), maxv(tt), tt.tex);
         let out = self.out.as_ref().unwrap().fbo;
-        let p = &self.cache[prog].1;
+        let Some(p) = self.prog(prog) else { return };
         unsafe {
             gl.bind_framebuffer(glow::FRAMEBUFFER, Some(out));
             gl.viewport(0, 0, w, h);
@@ -722,43 +1176,117 @@ impl Renderer {
         unsafe { self.gl.finish() };
     }
 
-    /// Run an audio shader for samples `first .. first + count`. The shader's footer
-    /// writes the stereo sample for global index `iBlockOffset + pixel` into RG.
-    /// `inputs` are whole-movie stereo buses bound as `sg_music` / `sg_sfx`.
-    #[allow(clippy::too_many_arguments)]
-    pub fn render_audio(
+    /// Compile (or reuse) an audio program. Returns its key for `render_audio`.
+    pub fn audio_program(
         &mut self,
         src: &Assembled,
         what: &str,
+    ) -> std::result::Result<u64, ShaderError> {
+        let k = hash(&src.text);
+        if !self.audio.contains_key(&k) {
+            let p = self.compile(src).map_err(|m| ShaderError {
+                what: what.into(),
+                messages: m,
+            })?;
+            self.audio.insert(k, p);
+        }
+        Ok(k)
+    }
+
+    /// Delete audio programs that aren't in `keep`.
+    pub fn retain_audio(&mut self, keep: &[u64]) {
+        let drop: Vec<u64> = self
+            .audio
+            .keys()
+            .filter(|k| !keep.contains(k))
+            .copied()
+            .collect();
+        for k in drop {
+            if let Some(p) = self.audio.remove(&k) {
+                unsafe { self.gl.delete_program(p.prog) };
+            }
+        }
+    }
+
+    /// Run audio program `key` for global samples `first .. first + count`
+    /// (count ≤ AUDIO_BLOCK). `inputs` = (music, sfx, global index of their first sample),
+    /// bound for the mix pass as `sg_music` / `sg_sfx`.
+    pub fn render_audio(
+        &mut self,
+        key: u64,
         first: usize,
         count: usize,
         sample_rate: u32,
         shot: (f32, f32),
-        inputs: Option<(&[f32], &[f32])>,
-    ) -> std::result::Result<Vec<f32>, ShaderError> {
-        let prog = self.compile(src).map_err(|m| ShaderError {
-            what: what.into(),
-            messages: m,
-        })?;
-        let fail = |m: String| ShaderError {
-            what: what.into(),
-            messages: vec![m],
-        };
-        let gl = self.gl.clone();
+        inputs: Option<(&[f32], &[f32], i64)>,
+    ) -> std::result::Result<Vec<f32>, String> {
         const W: i32 = 1024;
-        const H: i32 = 128;
-        let mut out = Vec::with_capacity(count * 2);
+        assert!(count <= AUDIO_BLOCK);
+        let rows = (count as i32 + W - 1) / W;
+        let gl = self.gl.clone();
+        let Some(prog) = self.audio.get(&key) else {
+            return Err("audio program not compiled".into());
+        };
         unsafe {
+            if self.audio_target.is_none() {
+                let tex = gl.create_texture()?;
+                gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+                gl.tex_image_2d(
+                    glow::TEXTURE_2D,
+                    0,
+                    glow::RGBA32F as i32,
+                    W,
+                    (AUDIO_BLOCK as i32) / W,
+                    0,
+                    glow::RGBA,
+                    glow::FLOAT,
+                    glow::PixelUnpackData::Slice(None),
+                );
+                gl.tex_parameter_i32(
+                    glow::TEXTURE_2D,
+                    glow::TEXTURE_MIN_FILTER,
+                    glow::NEAREST as i32,
+                );
+                gl.tex_parameter_i32(
+                    glow::TEXTURE_2D,
+                    glow::TEXTURE_MAG_FILTER,
+                    glow::NEAREST as i32,
+                );
+                gl.bind_texture(glow::TEXTURE_2D, None);
+                let fbo = gl.create_framebuffer()?;
+                gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+                gl.framebuffer_texture_2d(
+                    glow::FRAMEBUFFER,
+                    glow::COLOR_ATTACHMENT0,
+                    glow::TEXTURE_2D,
+                    Some(tex),
+                    0,
+                );
+                let ok =
+                    gl.check_framebuffer_status(glow::FRAMEBUFFER) == glow::FRAMEBUFFER_COMPLETE;
+                gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+                if !ok {
+                    gl.delete_framebuffer(fbo);
+                    gl.delete_texture(tex);
+                    return Err(
+                        "this GPU can't render to float textures, so GLSL sound is unavailable"
+                            .into(),
+                    );
+                }
+                self.audio_target = Some((fbo, tex));
+            }
+            let (fbo, _) = self.audio_target.unwrap();
+            gl.use_program(Some(prog.prog));
             let mut input_tex = vec![];
-            if let Some((music, sfx)) = inputs {
+            if let Some((music, sfx, base)) = inputs {
                 for (unit, (name, data)) in [("sg_music", music), ("sg_sfx", sfx)]
                     .into_iter()
                     .enumerate()
                 {
-                    let tex = upload_track(&gl, data).map_err(fail)?;
+                    // select the unit first: upload_track binds the new texture to it
                     gl.active_texture(glow::TEXTURE0 + unit as u32);
+                    let tex = upload_track(&gl, data)?;
                     gl.bind_texture(glow::TEXTURE_2D, Some(tex));
-                    gl.use_program(Some(prog.prog));
                     if let Some(l) = prog.loc(name) {
                         gl.uniform_1_i32(Some(l), unit as i32);
                     }
@@ -767,74 +1295,14 @@ impl Renderer {
                 if let Some(l) = prog.loc("sg_len") {
                     gl.uniform_1_i32(Some(l), (music.len() / 2) as i32);
                 }
-            }
-            gl.active_texture(glow::TEXTURE0);
-            let tex = gl.create_texture().map_err(fail)?;
-            gl.bind_texture(glow::TEXTURE_2D, Some(tex));
-            gl.tex_image_2d(
-                glow::TEXTURE_2D,
-                0,
-                glow::RGBA32F as i32,
-                W,
-                H,
-                0,
-                glow::RGBA,
-                glow::FLOAT,
-                glow::PixelUnpackData::Slice(None),
-            );
-            gl.tex_parameter_i32(
-                glow::TEXTURE_2D,
-                glow::TEXTURE_MIN_FILTER,
-                glow::NEAREST as i32,
-            );
-            gl.tex_parameter_i32(
-                glow::TEXTURE_2D,
-                glow::TEXTURE_MAG_FILTER,
-                glow::NEAREST as i32,
-            );
-            gl.bind_texture(glow::TEXTURE_2D, None);
-            if let Some((_, _)) = inputs {
-                // rebind inputs: the output texture must not be bound while rendering into it
-                for (unit, t) in input_tex.iter().enumerate() {
-                    gl.active_texture(glow::TEXTURE0 + unit as u32);
-                    gl.bind_texture(glow::TEXTURE_2D, Some(*t));
+                if let Some(l) = prog.loc("sg_base") {
+                    gl.uniform_1_i32(Some(l), base as i32);
                 }
-                gl.active_texture(glow::TEXTURE0);
             }
-            let fbo = gl.create_framebuffer().map_err(fail)?;
             gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
-            gl.framebuffer_texture_2d(
-                glow::FRAMEBUFFER,
-                glow::COLOR_ATTACHMENT0,
-                glow::TEXTURE_2D,
-                Some(tex),
-                0,
-            );
-            let cleanup = |gl: &glow::Context| {
-                gl.bind_framebuffer(glow::FRAMEBUFFER, None);
-                gl.delete_framebuffer(fbo);
-                gl.delete_texture(tex);
-                for t in &input_tex {
-                    gl.delete_texture(*t);
-                }
-                gl.delete_program(prog.prog);
-                gl.use_program(None);
-                gl.bind_vertex_array(None);
-                gl.active_texture(glow::TEXTURE1);
-                gl.bind_texture(glow::TEXTURE_2D, None);
-                gl.active_texture(glow::TEXTURE0);
-                gl.bind_texture(glow::TEXTURE_2D, None);
-            };
-            if gl.check_framebuffer_status(glow::FRAMEBUFFER) != glow::FRAMEBUFFER_COMPLETE {
-                cleanup(&gl);
-                return Err(fail(
-                    "this GPU can't render to float textures, so GLSL sound is unavailable".into(),
-                ));
-            }
-            gl.viewport(0, 0, W, H);
+            gl.viewport(0, 0, W, rows);
             gl.disable(glow::BLEND);
             gl.bind_vertex_array(Some(self.vao));
-            gl.use_program(Some(prog.prog));
             let f1 = |n: &str, v: f32| {
                 if let Some(l) = prog.loc(n) {
                     gl.uniform_1_f32(Some(l), v)
@@ -846,34 +1314,37 @@ impl Renderer {
             if let Some(l) = prog.loc("iBlockWidth") {
                 gl.uniform_1_i32(Some(l), W);
             }
-            let mut buf = vec![0f32; (W * H * 4) as usize];
-            let mut offset = 0usize;
-            while offset < count {
-                if let Some(l) = prog.loc("iBlockOffset") {
-                    gl.uniform_1_i32(Some(l), (first + offset) as i32);
-                }
-                gl.draw_arrays(glow::TRIANGLES, 0, 3);
-                let bytes =
-                    std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, buf.len() * 4);
-                gl.read_pixels(
-                    0,
-                    0,
-                    W,
-                    H,
-                    glow::RGBA,
-                    glow::FLOAT,
-                    glow::PixelPackData::Slice(Some(bytes)),
-                );
-                let n = (count - offset).min((W * H) as usize);
-                for i in 0..n {
-                    out.push(sanitize(buf[i * 4]));
-                    out.push(sanitize(buf[i * 4 + 1]));
-                }
-                offset += n;
+            if let Some(l) = prog.loc("iBlockOffset") {
+                gl.uniform_1_i32(Some(l), first as i32);
             }
-            cleanup(&gl);
+            gl.draw_arrays(glow::TRIANGLES, 0, 3);
+            let mut buf = vec![0f32; (W * rows * 4) as usize];
+            let bytes = std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, buf.len() * 4);
+            gl.read_pixels(
+                0,
+                0,
+                W,
+                rows,
+                glow::RGBA,
+                glow::FLOAT,
+                glow::PixelPackData::Slice(Some(bytes)),
+            );
+            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            for (unit, t) in input_tex.iter().enumerate() {
+                gl.active_texture(glow::TEXTURE0 + unit as u32);
+                gl.bind_texture(glow::TEXTURE_2D, None);
+                gl.delete_texture(*t);
+            }
+            gl.active_texture(glow::TEXTURE0);
+            gl.use_program(None);
+            gl.bind_vertex_array(None);
+            let mut out = Vec::with_capacity(count * 2);
+            for i in 0..count {
+                out.push(sanitize(buf[i * 4]));
+                out.push(sanitize(buf[i * 4 + 1]));
+            }
+            Ok(out)
         }
-        Ok(out)
     }
 
     pub fn dialect(&self) -> Dialect {
@@ -928,12 +1399,21 @@ unsafe fn upload_track(
 
 /// Samples per row of a track texture (must match `sg_fetch` in sound.rs).
 pub const TRACK_WIDTH: usize = 4096;
+/// Most samples one `render_audio` call can produce.
+pub const AUDIO_BLOCK: usize = 1024 * 128;
 
 impl Drop for Renderer {
     fn drop(&mut self) {
         unsafe {
-            for (_, p) in self.cache.drain(..) {
+            for (_, e) in std::mem::take(&mut self.programs) {
+                self.delete_state(e.state);
+            }
+            for (_, p) in std::mem::take(&mut self.audio) {
                 self.gl.delete_program(p.prog);
+            }
+            if let Some((fbo, tex)) = self.audio_target.take() {
+                self.gl.delete_framebuffer(fbo);
+                self.gl.delete_texture(tex);
             }
             for t in [
                 self.a.take(),
@@ -1053,6 +1533,15 @@ fn hash(s: &str) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     s.hash(&mut h);
     h.finish()
+}
+
+/// Where compiled program binaries are kept between runs.
+fn cache_dir() -> Option<PathBuf> {
+    let base = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from))
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?;
+    Some(base.join("shotglass").join("programs"))
 }
 
 fn rel(p: &Path, root: &Path) -> String {

@@ -1,5 +1,5 @@
 //! The soundtrack: a movie-level music track, one sound per shot, and an optional
-//! mix pass — all GLSL, all synthesised on the GPU.
+//! mix pass — all GLSL, synthesised on the GPU in chunks as the playhead needs them.
 //!
 //! ```text
 //! music.glsl  (movie time) ───────────────────────────► music bus ─┐
@@ -7,16 +7,21 @@
 //!                                                                  └─► (or music + sfx)
 //! ```
 //!
-//! Every track is cached by its full source text and sample range, so editing one
-//! shot's sound only re-synthesises that shot.
+//! Everything is computed per CHUNK of samples and cached by content, so memory stays
+//! bounded whatever the film's length, and editing one shot's sound only
+//! re-synthesises the chunks it touches.
 
 use crate::anim::GLSL_EASE;
-use crate::gfx::{Renderer, ShaderError, TRACK_WIDTH};
+use crate::gfx::{AUDIO_BLOCK, Renderer, ShaderError, TRACK_WIDTH};
 use crate::movie::Movie;
 use crate::shader::{Assembled, Builder};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
+
+/// Samples per chunk (≈0.68 s at 48 kHz).
+pub const CHUNK: usize = 32768;
+const _: () = assert!(CHUNK <= AUDIO_BLOCK);
 
 const COMMON: &str = "\
 uniform float iSampleRate;
@@ -33,12 +38,15 @@ fn mix_helpers() -> String {
         "\
 uniform sampler2D sg_music;
 uniform sampler2D sg_sfx;
+uniform int sg_base;
 uniform int sg_len;
 vec2 sg_fetch(sampler2D t, int i) {{
+  i -= sg_base;
   if (i < 0 || i >= sg_len) return vec2(0.0);
   return texelFetch(t, ivec2(i % {w}, i / {w}), 0).rg;
 }}
 // The music track and the sum of all shot sounds (already faded for transitions).
+// Readable up to [sound] mix_lookback seconds back and 50 ms ahead.
 vec2 music(int samp) {{ return sg_fetch(sg_music, samp); }}
 vec2 sfx(int samp) {{ return sg_fetch(sg_sfx, samp); }}
 // Peak level of the sfx bus around samp (30 ms back, 10 ms ahead): for ducking.
@@ -56,17 +64,36 @@ float sfxLevel(int samp) {{
     )
 }
 
-pub struct Soundtrack {
-    cache: HashMap<u64, Arc<Vec<f32>>>,
+/// One synthesised track: a program run over a window of global samples.
+#[derive(Clone)]
+struct TrackDef {
+    name: String,
+    prog: u64,
+    first: usize,
+    count: usize,
+    shot: (f32, f32),
+    key: u64,
 }
 
-pub struct Built {
-    /// Interleaved stereo for the whole movie.
-    pub samples: Vec<f32>,
-    /// Changes whenever the audible result could have changed.
-    pub key: u64,
-    /// Tracks that had to be synthesised (the rest came from the cache).
-    pub rendered: Vec<String>,
+struct Plan {
+    movie: Movie,
+    sr: u32,
+    total: usize,
+    music: Option<TrackDef>,
+    shots: Vec<(usize, TrackDef)>,
+    mix: Option<TrackDef>,
+    lookback: usize,
+    lookahead: usize,
+    sfx_key: u64,
+    out_key: u64,
+}
+
+pub struct Soundtrack {
+    plan: Option<Plan>,
+    /// (track or bus key, chunk index) → interleaved stereo for that chunk.
+    chunks: HashMap<(u64, usize), Arc<Vec<f32>>>,
+    /// Names of tracks synthesised since the last call to `take_rendered`.
+    rendered: Vec<String>,
 }
 
 impl Default for Soundtrack {
@@ -78,58 +105,92 @@ impl Default for Soundtrack {
 impl Soundtrack {
     pub fn new() -> Soundtrack {
         Soundtrack {
-            cache: HashMap::new(),
+            plan: None,
+            chunks: HashMap::new(),
+            rendered: vec![],
         }
     }
 
-    pub fn build(
+    /// Identifies the audible result; changes whenever anything that affects it does.
+    pub fn version(&self) -> Option<u64> {
+        self.plan.as_ref().map(|p| p.out_key)
+    }
+
+    pub fn total_chunks(&self) -> usize {
+        self.plan.as_ref().map_or(0, |p| p.total.div_ceil(CHUNK))
+    }
+
+    /// Tracks synthesised since last asked (for status messages).
+    pub fn take_rendered(&mut self) -> Vec<String> {
+        let mut v = std::mem::take(&mut self.rendered);
+        let mut seen = HashSet::new();
+        v.retain(|n| seen.insert(n.clone()));
+        v
+    }
+
+    /// Prepare a movie version: assemble and compile its sound shaders. On error the
+    /// previous version stays. Synthesis happens later, chunk by chunk.
+    pub fn set_movie(
         &mut self,
         r: &mut Renderer,
         m: &Movie,
         sr: u32,
-    ) -> Result<Built, Vec<ShaderError>> {
+    ) -> Result<(), Vec<ShaderError>> {
         let total = (m.duration * sr as f32).ceil() as usize;
         let cues = m.cue_defines();
         let mut errors = vec![];
-        let mut rendered = vec![];
-        let mut used = vec![];
-        let mut key_parts: Vec<u64> = vec![sr as u64, total as u64];
+        let mut progs = vec![];
+        let mut compile =
+            |r: &mut Renderer, what: String, src: anyhow::Result<Assembled>| -> Option<u64> {
+                let src = match src {
+                    Ok(s) => s,
+                    Err(e) => {
+                        errors.push(ShaderError {
+                            what,
+                            messages: vec![format!("{e:#}")],
+                        });
+                        return None;
+                    }
+                };
+                match r.audio_program(&src, &what) {
+                    Ok(k) => {
+                        progs.push(k);
+                        Some(k)
+                    }
+                    Err(e) => {
+                        errors.push(e);
+                        None
+                    }
+                }
+            };
+        let track =
+            |name: &str, prog: u64, first: usize, count: usize, shot: (f32, f32)| TrackDef {
+                name: name.to_string(),
+                prog,
+                first,
+                count,
+                shot,
+                key: hash(&format!("{prog} {first} {count} {sr} {shot:?}")),
+            };
 
-        // ---- music
-        let music = match &m.music {
-            None => None,
-            Some(path) => {
-                let what = format!("music ({})", rel(path, &m.root));
-                let src = Builder::new(r.dialect(), &format!("{COMMON}{GLSL_EASE}{cues}"), &m.root)
-                    .file(path)
-                    .map(|b| b.footer(&format!("void main() {{\n  {SAMPLE_INDEX}\n  shotglass_out = vec4(mainSound(s, float(s) / iSampleRate), 0.0, 1.0);\n}}")).build());
-                self.track(
-                    r,
-                    src,
-                    &what,
-                    0,
-                    total,
-                    sr,
-                    (0.0, m.duration),
-                    &mut used,
-                    &mut rendered,
-                    &mut errors,
-                    &mut key_parts,
-                )
-            }
-        };
+        let music = m.music.as_ref().and_then(|path| {
+            let what = format!("music ({})", rel(path, &m.root));
+            let src = Builder::new(r.dialect(), &format!("{COMMON}{GLSL_EASE}{cues}"), &m.root).file(path).map(|b| {
+                b.footer(&format!(
+                    "void main() {{\n  {SAMPLE_INDEX}\n  shotglass_out = vec4(mainSound(s, float(s) / iSampleRate), 0.0, 1.0);\n}}"
+                ))
+                .build()
+            });
+            compile(r, what, src).map(|k| track("music", k, 0, total, (0.0, m.duration)))
+        });
 
-        // ---- per-shot sounds, faded to follow the picture, summed into the sfx bus
-        let mut sfx = vec![0f32; total * 2];
+        let mut shots = vec![];
         for (i, shot) in m.shots.iter().enumerate() {
             let (Some(snd), Some((from, to))) = (&shot.sound, m.sound_window(i)) else {
                 continue;
             };
             let first = (from * sr as f32).floor() as usize;
             let last = ((to * sr as f32).ceil() as usize).min(total);
-            if last <= first {
-                continue;
-            }
             let mut header = format!(
                 "{COMMON}{GLSL_EASE}uniform float iShotStart;\nuniform float iShotDuration;\n{cues}"
             );
@@ -146,168 +207,253 @@ impl Soundtrack {
                 ))
                 .build()
             });
-            key_parts.push(hash(&format!(
-                "{} {} {} {}",
-                snd.gain, snd.lead, snd.tail, shot.index
-            )));
-            if let Some(data) = self.track(
-                r,
-                src,
-                &what,
-                first,
-                last - first,
-                sr,
-                (shot.start, shot.duration),
-                &mut used,
-                &mut rendered,
-                &mut errors,
-                &mut key_parts,
-            ) {
-                for (k, frame) in data.chunks_exact(2).enumerate() {
-                    let idx = first + k;
-                    let g = m.sound_gain(i, idx as f32 / sr as f32);
-                    if g != 0.0 {
-                        sfx[idx * 2] += frame[0] * g;
-                        sfx[idx * 2 + 1] += frame[1] * g;
-                    }
-                }
-            }
-        }
-        // Transition timing changes the fades even when no shader changed.
-        key_parts.push(hash(&cues));
-        for s in &m.shots {
-            if let Some(t) = &s.transition_in {
-                key_parts.push(hash(&format!("{} {:?}", t.duration, t.ease)));
+            if let Some(k) = compile(r, what, src) {
+                let name = format!("sound for \"{}\"", shot.id);
+                shots.push((
+                    i,
+                    track(
+                        &name,
+                        k,
+                        first,
+                        last.saturating_sub(first),
+                        (shot.start, shot.duration),
+                    ),
+                ));
             }
         }
 
-        // ---- mix
-        let mut out = match &m.mix {
-            Some(path) => {
-                let what = format!("mix ({})", rel(path, &m.root));
-                let src = Builder::new(r.dialect(), &format!("{COMMON}{GLSL_EASE}{cues}{}", mix_helpers()), &m.root)
-                    .file(path)
-                    .map(|b| b.footer(&format!("void main() {{\n  {SAMPLE_INDEX}\n  shotglass_out = vec4(mainMix(s, float(s) / iSampleRate), 0.0, 1.0);\n}}")).build());
-                match src {
-                    Err(e) => {
-                        errors.push(ShaderError {
-                            what,
-                            messages: vec![format!("{e:#}")],
-                        });
-                        vec![]
-                    }
-                    Ok(src) => {
-                        let zeros;
-                        let music_ref: &[f32] = match &music {
-                            Some(mu) => mu,
-                            None => {
-                                zeros = vec![0f32; total * 2];
-                                &zeros
-                            }
-                        };
-                        let input_key = hash(&format!("{:?}", key_parts));
-                        let k = hash(&format!("mix {} {input_key}", src.text));
-                        used.push(k);
-                        match self.cache.get(&k) {
-                            Some(d) => d.as_ref().clone(),
-                            None => match errors.is_empty().then(|| {
-                                r.render_audio(
-                                    &src,
-                                    &what,
-                                    0,
-                                    total,
-                                    sr,
-                                    (0.0, m.duration),
-                                    Some((music_ref, &sfx)),
-                                )
-                            }) {
-                                Some(Ok(d)) => {
-                                    rendered.push("mix".to_string());
-                                    self.cache.insert(k, Arc::new(d.clone()));
-                                    d
-                                }
-                                Some(Err(e)) => {
-                                    errors.push(e);
-                                    vec![]
-                                }
-                                None => vec![],
-                            },
-                        }
-                    }
-                }
+        let mix = m.mix.as_ref().and_then(|path| {
+            let what = format!("mix ({})", rel(path, &m.root));
+            let src = Builder::new(r.dialect(), &format!("{COMMON}{GLSL_EASE}{cues}{}", mix_helpers()), &m.root)
+                .file(path)
+                .map(|b| {
+                    b.footer(&format!(
+                        "void main() {{\n  {SAMPLE_INDEX}\n  shotglass_out = vec4(mainMix(s, float(s) / iSampleRate), 0.0, 1.0);\n}}"
+                    ))
+                    .build()
+                });
+            compile(r, what, src).map(|k| track("mix", k, 0, total, (0.0, m.duration)))
+        });
+
+        if !errors.is_empty() {
+            return Err(errors);
+        }
+        // The sfx bus depends on each shot track and on the fades (transition timing).
+        let mut sfx_parts = vec![hash(&cues)];
+        for (i, t) in &shots {
+            let snd = m.shots[*i].sound.as_ref().unwrap();
+            sfx_parts.push(t.key);
+            sfx_parts.push(hash(&format!(
+                "{} {} {} {}",
+                snd.gain, snd.lead, snd.tail, i
+            )));
+        }
+        for s in &m.shots {
+            if let Some(t) = &s.transition_in {
+                sfx_parts.push(hash(&format!("{} {:?}", t.duration, t.ease)));
+            }
+        }
+        let sfx_key = hash(&format!("sfx {sfx_parts:?}"));
+        let lookback = (m.mix_lookback.max(0.0) * sr as f32).ceil() as usize;
+        let lookahead = (0.05 * sr as f32).ceil() as usize;
+        let out_key = hash(&format!(
+            "out {:?} {sfx_key} {:?} {} {lookback} {total}",
+            music.as_ref().map(|t| t.key),
+            mix.as_ref().map(|t| t.key),
+            m.volume
+        ));
+        progs.sort();
+        progs.dedup();
+        r.retain_audio(&progs);
+        self.plan = Some(Plan {
+            movie: m.clone(),
+            sr,
+            total,
+            music,
+            shots,
+            mix,
+            lookback,
+            lookahead,
+            sfx_key,
+            out_key,
+        });
+        self.forget_stale();
+        Ok(())
+    }
+
+    /// The final output for chunk `c` (interleaved stereo, ≤ CHUNK frames).
+    pub fn chunk(&mut self, r: &mut Renderer, c: usize) -> Result<Arc<Vec<f32>>, String> {
+        let p = self.plan.as_ref().ok_or("no soundtrack")?;
+        let key = (p.out_key, c);
+        if let Some(d) = self.chunks.get(&key) {
+            return Ok(d.clone());
+        }
+        let lo = c * CHUNK;
+        let hi = ((c + 1) * CHUNK).min(p.total);
+        if lo >= hi {
+            return Ok(Arc::new(vec![]));
+        }
+        let (mix, lookback, lookahead, total, volume, sr, dur) = (
+            p.mix.clone(),
+            p.lookback,
+            p.lookahead,
+            p.total,
+            p.movie.volume,
+            p.sr,
+            p.movie.duration,
+        );
+        let mut out = match mix {
+            Some(mix) => {
+                let in_lo = lo.saturating_sub(lookback);
+                let in_hi = (hi + lookahead).min(total);
+                let music = self.music_range(r, in_lo, in_hi)?;
+                let sfx = self.sfx_range(r, in_lo, in_hi)?;
+                self.rendered.push(mix.name.clone());
+                r.render_audio(
+                    mix.prog,
+                    lo,
+                    hi - lo,
+                    sr,
+                    (0.0, dur),
+                    Some((&music, &sfx, in_lo as i64)),
+                )?
             }
             None => {
-                let mut o = sfx;
-                if let Some(mu) = &music {
-                    for (a, b) in o.iter_mut().zip(mu.iter()) {
-                        *a += b;
-                    }
+                let mut o = self.music_range(r, lo, hi)?;
+                let sfx = self.sfx_range(r, lo, hi)?;
+                for (a, b) in o.iter_mut().zip(&sfx) {
+                    *a += b;
                 }
                 o
             }
         };
-        if !errors.is_empty() {
-            return Err(errors);
-        }
-        if let Some(p) = &m.mix {
-            key_parts.push(hash(&p.to_string_lossy()));
-        }
         for x in &mut out {
-            *x = (*x * m.volume).clamp(-1.0, 1.0);
+            *x = (*x * volume).clamp(-1.0, 1.0);
         }
-        key_parts.push(m.volume.to_bits() as u64);
-        // Forget tracks this version no longer uses.
-        self.cache.retain(|k, _| used.contains(k));
-        Ok(Built {
-            samples: out,
-            key: hash(&format!("{key_parts:?}")),
-            rendered,
-        })
+        let d = Arc::new(out);
+        self.chunks.insert(key, d.clone());
+        Ok(d)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn track(
+    /// Music for global samples lo..hi.
+    fn music_range(&mut self, r: &mut Renderer, lo: usize, hi: usize) -> Result<Vec<f32>, String> {
+        let Some(t) = self.plan.as_ref().and_then(|p| p.music.clone()) else {
+            return Ok(vec![0.0; (hi - lo) * 2]);
+        };
+        self.range(lo, hi, |s, c| s.track_chunk(r, &t, c))
+    }
+
+    /// The sfx bus (all shot sounds × their fades) for global samples lo..hi.
+    fn sfx_range(&mut self, r: &mut Renderer, lo: usize, hi: usize) -> Result<Vec<f32>, String> {
+        self.range(lo, hi, |s, c| s.sfx_chunk(r, c))
+    }
+
+    fn range(
+        &mut self,
+        lo: usize,
+        hi: usize,
+        mut chunk: impl FnMut(&mut Self, usize) -> Result<Arc<Vec<f32>>, String>,
+    ) -> Result<Vec<f32>, String> {
+        let mut out = Vec::with_capacity((hi - lo) * 2);
+        let mut c = lo / CHUNK;
+        while c * CHUNK < hi {
+            let d = chunk(self, c)?;
+            let a = lo.max(c * CHUNK) - c * CHUNK;
+            let b = hi.min((c + 1) * CHUNK) - c * CHUNK;
+            out.extend_from_slice(&d[a * 2..b * 2]);
+            c += 1;
+        }
+        Ok(out)
+    }
+
+    /// One chunk of one track; zero outside the track's window.
+    fn track_chunk(
         &mut self,
         r: &mut Renderer,
-        src: anyhow::Result<Assembled>,
-        what: &str,
-        first: usize,
-        count: usize,
-        sr: u32,
-        shot: (f32, f32),
-        used: &mut Vec<u64>,
-        rendered: &mut Vec<String>,
-        errors: &mut Vec<ShaderError>,
-        key_parts: &mut Vec<u64>,
-    ) -> Option<Arc<Vec<f32>>> {
-        let src = match src {
-            Ok(s) => s,
-            Err(e) => {
-                errors.push(ShaderError {
-                    what: what.into(),
-                    messages: vec![format!("{e:#}")],
-                });
-                return None;
-            }
-        };
-        let k = hash(&format!("{} {first} {count} {sr} {:?}", src.text, shot));
-        used.push(k);
-        key_parts.push(k);
-        if let Some(d) = self.cache.get(&k) {
-            return Some(d.clone());
+        t: &TrackDef,
+        c: usize,
+    ) -> Result<Arc<Vec<f32>>, String> {
+        if let Some(d) = self.chunks.get(&(t.key, c)) {
+            return Ok(d.clone());
         }
-        match r.render_audio(&src, what, first, count, sr, shot, None) {
-            Ok(d) => {
-                let d = Arc::new(d);
-                self.cache.insert(k, d.clone());
-                rendered.push(what.split(" (").next().unwrap_or(what).to_string());
-                Some(d)
+        let p = self.plan.as_ref().unwrap();
+        let (sr, total) = (p.sr, p.total);
+        let lo = c * CHUNK;
+        let n = ((c + 1) * CHUNK).min(total).saturating_sub(lo);
+        let mut out = vec![0f32; n * 2];
+        let a = lo.max(t.first);
+        let b = (lo + n).min(t.first + t.count);
+        if a < b {
+            let d = r.render_audio(t.prog, a, b - a, sr, t.shot, None)?;
+            out[(a - lo) * 2..(b - lo) * 2].copy_from_slice(&d);
+            self.rendered.push(t.name.clone());
+        }
+        let d = Arc::new(out);
+        self.chunks.insert((t.key, c), d.clone());
+        Ok(d)
+    }
+
+    fn sfx_chunk(&mut self, r: &mut Renderer, c: usize) -> Result<Arc<Vec<f32>>, String> {
+        let p = self.plan.as_ref().unwrap();
+        if let Some(d) = self.chunks.get(&(p.sfx_key, c)) {
+            return Ok(d.clone());
+        }
+        let (sr, total, sfx_key) = (p.sr, p.total, p.sfx_key);
+        let lo = c * CHUNK;
+        let n = ((c + 1) * CHUNK).min(total).saturating_sub(lo);
+        let shots = p.shots.clone();
+        let mut out = vec![0f32; n * 2];
+        for (i, t) in shots {
+            if lo + n <= t.first || lo >= t.first + t.count {
+                continue;
             }
-            Err(e) => {
-                errors.push(e);
-                None
+            let d = self.track_chunk(r, &t, c)?;
+            let m = &self.plan.as_ref().unwrap().movie;
+            for k in 0..n {
+                let g = m.sound_gain(i, (lo + k) as f32 / sr as f32);
+                if g != 0.0 {
+                    out[k * 2] += d[k * 2] * g;
+                    out[k * 2 + 1] += d[k * 2 + 1] * g;
+                }
             }
         }
+        let d = Arc::new(out);
+        self.chunks.insert((sfx_key, c), d.clone());
+        Ok(d)
+    }
+
+    /// Drop cached chunks outside `keep` (chunk indices), plus any from old versions.
+    pub fn evict(&mut self, keep: std::ops::Range<usize>) {
+        self.chunks.retain(|(_, c), _| keep.contains(c));
+        self.forget_stale();
+    }
+
+    fn forget_stale(&mut self) {
+        let Some(p) = &self.plan else { return };
+        let mut live: HashSet<u64> = [p.out_key, p.sfx_key].into();
+        live.extend(p.music.iter().chain(p.mix.iter()).map(|t| t.key));
+        live.extend(p.shots.iter().map(|(_, t)| t.key));
+        self.chunks.retain(|(k, _), _| live.contains(k));
+    }
+
+    /// Synthesise the whole soundtrack chunk by chunk, handing each to `sink`.
+    /// Memory stays bounded: chunks behind the mix's lookback are dropped as it goes.
+    pub fn render_all(
+        &mut self,
+        r: &mut Renderer,
+        mut sink: impl FnMut(&[f32]),
+    ) -> Result<(), String> {
+        let n = self.total_chunks();
+        let back = self
+            .plan
+            .as_ref()
+            .map_or(0, |p| p.lookback.div_ceil(CHUNK) + 1);
+        for c in 0..n {
+            let d = self.chunk(r, c)?;
+            sink(&d);
+            self.evict(c.saturating_sub(back)..n);
+        }
+        Ok(())
     }
 }
 

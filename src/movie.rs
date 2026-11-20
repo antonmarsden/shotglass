@@ -31,6 +31,8 @@ struct SoundFile {
     music: Option<String>,
     /// GLSL file with `vec2 mainMix(int samp, float time)`, reading music() and sfx().
     mix: Option<String>,
+    /// How far back (seconds) the mix may read music()/sfx() (default 1).
+    mix_lookback: Option<f32>,
     volume: Option<f32>,
 }
 
@@ -143,6 +145,7 @@ pub struct Movie {
     pub music: Option<PathBuf>,
     /// Final mix pass (`mainMix`).
     pub mix: Option<PathBuf>,
+    pub mix_lookback: f32,
     pub volume: f32,
     pub shots: Vec<Shot>,
     pub markers: Vec<Marker>,
@@ -325,6 +328,7 @@ impl Movie {
                 .as_ref()
                 .and_then(|s| s.mix.as_ref())
                 .map(|p| root.join(p)),
+            mix_lookback: f.sound.as_ref().and_then(|s| s.mix_lookback).unwrap_or(1.0),
             shots,
             markers: f
                 .markers
