@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 /// Seconds of sound synthesised ahead of the playhead while playing.
 const SOUND_AHEAD: f32 = 6.0;
 
-pub fn run(path: PathBuf, start: f32) -> anyhow::Result<()> {
+pub fn run(path: PathBuf, start: f32, scale: Option<f32>) -> anyhow::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1360.0, 860.0])
@@ -26,7 +26,7 @@ pub fn run(path: PathBuf, start: f32) -> anyhow::Result<()> {
         "shotglass",
         options,
         Box::new(move |cc| {
-            let app = Player::new(cc, path, start).map_err(|e| format!("{e:#}"))?;
+            let app = Player::new(cc, path, start, scale).map_err(|e| format!("{e:#}"))?;
             Ok(Box::new(app))
         }),
     )
@@ -48,6 +48,11 @@ struct Perf {
     stalled: u32,
     /// This frame did blocking housekeeping work.
     stall: bool,
+    last_render: Option<Instant>,
+    stall_since_render: bool,
+    /// GPU times since the last scale change (for the scaler).
+    gpu_recent: VecDeque<f32>,
+    misses: u32,
     cooldown: u32,
     calm: u32,
 }
@@ -59,6 +64,11 @@ impl Perf {
         }
         q.push_back(v);
     }
+    fn since_render_ms(&self) -> f32 {
+        self.last_render
+            .map_or(0.0, |t| t.elapsed().as_secs_f32() * 1000.0)
+    }
+
     /// Estimated display refresh interval: a low percentile of recent frame times.
     fn vsync_ms(&self) -> f32 {
         if self.frame_ms.len() < 20 {
@@ -106,7 +116,12 @@ struct Player {
 }
 
 impl Player {
-    fn new(cc: &eframe::CreationContext<'_>, path: PathBuf, start: f32) -> anyhow::Result<Player> {
+    fn new(
+        cc: &eframe::CreationContext<'_>,
+        path: PathBuf,
+        start: f32,
+        scale: Option<f32>,
+    ) -> anyhow::Result<Player> {
         let gl = cc
             .gl
             .clone()
@@ -175,7 +190,7 @@ impl Player {
             tex: None,
             rendered_key: None,
             generation: 0,
-            scale_mode: ScaleMode::Auto,
+            scale_mode: scale.map_or(ScaleMode::Auto, ScaleMode::Fixed),
             auto_scale: 1.0,
             perf: Perf {
                 last: None,
@@ -184,6 +199,10 @@ impl Player {
                 dropped: 0,
                 stalled: 0,
                 stall: false,
+                last_render: None,
+                stall_since_render: false,
+                gpu_recent: VecDeque::new(),
+                misses: 0,
                 cooldown: 0,
                 calm: 0,
             },
@@ -524,18 +543,29 @@ impl Player {
         let dt = self.perf.last.map(|l| (now - l).as_secs_f32() * 1000.0);
         self.perf.last = Some(now);
         let gpu = self.renderer.gpu_ms();
-        let stall = std::mem::take(&mut self.perf.stall);
+        // Any housekeeping stall since the last rendered frame excuses its lateness.
+        self.perf.stall_since_render |= std::mem::take(&mut self.perf.stall);
         if !self.clock.playing() {
             self.perf.last = None;
+            self.perf.last_render = None;
+            self.perf.stall_since_render = false;
             return;
         }
         let Some(dt) = dt else { return };
         Perf::push(&mut self.perf.frame_ms, dt);
         if let Some(g) = gpu {
             Perf::push(&mut self.perf.gpu_ms, g);
+            Perf::push(&mut self.perf.gpu_recent, g);
         }
+        let stall = self.perf.stall_since_render;
         let vsync = self.perf.vsync_ms();
-        let late = dt > vsync * 1.5;
+        // A film frame is late if it took longer than a film frame to arrive.
+        let frame_ms = 1000.0 / self.fps();
+        let late = rendered && self.perf.since_render_ms() > (frame_ms.max(vsync) * 1.5);
+        if rendered {
+            self.perf.last_render = Some(now);
+            self.perf.stall_since_render = false;
+        }
         if late {
             if stall {
                 self.perf.stalled += 1;
@@ -543,53 +573,46 @@ impl Player {
                 self.perf.dropped += 1;
             }
         }
-        if self.scale_mode != ScaleMode::Auto || !rendered {
+        if self.scale_mode != ScaleMode::Auto {
             return;
         }
         if self.perf.cooldown > 0 {
             self.perf.cooldown -= 1;
             return;
         }
-        // Budget: one display refresh, but never stricter than 60 fps — a 144 Hz
-        // monitor shouldn't force a 30 fps film down to a blur.
-        let budget = vsync.max(1000.0 / 60.0);
+        // Each film frame may take up to one film-frame interval of GPU time
+        // (but not less than a display refresh). Aim for 80% of it.
+        let budget = frame_ms.max(vsync);
         let scale = self.auto_scale;
-        match gpu {
-            Some(g) => {
-                // Only the GPU time decides: frame-time spikes can come from compiles,
-                // sound synthesis or the OS. Cost grows with pixels (scale²), so predict
-                // the full-resolution cost and pick the largest scale that fits 75% of the budget.
-                let full = g / (scale * scale).max(0.01);
-                let target = (0.75 * budget / full.max(1e-3)).sqrt().clamp(0.3, 1.0);
-                if target < scale * 0.97 {
-                    self.auto_scale = target; // drop at once
-                    self.perf.cooldown = 10;
-                    self.perf.calm = 0;
-                } else if target > scale * 1.05 {
-                    self.perf.calm += 1;
-                    if self.perf.calm > 30 {
-                        // climb back quickly, but in steps, in case the prediction is optimistic
-                        self.auto_scale = (scale + (target - scale) * 0.6).min(1.0);
-                        self.perf.calm = 0;
-                        self.perf.cooldown = 10;
-                    }
-                } else {
-                    self.perf.calm = 0;
-                }
+        if self.renderer.has_gpu_timer() {
+            // Only GPU time decides, averaged over recent frames so one spike
+            // (a compile, the OS) can't change the resolution.
+            let recent: Vec<f32> = self.perf.gpu_recent.iter().rev().take(8).copied().collect();
+            if recent.len() < 8 || gpu.is_none() {
+                return;
             }
-            None => {
-                // No GPU timer: go by frame times, ignoring frames we stalled ourselves.
-                if late && !stall {
+            let avg = recent.iter().sum::<f32>() / recent.len() as f32;
+            if let Some(next) = next_scale(scale, avg, budget) {
+                self.auto_scale = next;
+                self.perf.gpu_recent.clear(); // measure afresh at the new scale
+                self.perf.cooldown = 10;
+            }
+        } else if rendered {
+            // No GPU timer: go by late film frames, ignoring ones we stalled ourselves.
+            if late && !stall {
+                self.perf.misses += 1;
+                if self.perf.misses >= 3 {
                     self.auto_scale = (scale * 0.85).max(0.3);
-                    self.perf.cooldown = 12;
+                    self.perf.misses = 0;
                     self.perf.calm = 0;
-                } else {
-                    self.perf.calm += 1;
-                    if self.perf.calm > 120 && scale < 1.0 {
-                        self.auto_scale = (scale * 1.08).min(1.0);
-                        self.perf.calm = 0;
-                        self.perf.cooldown = 20;
-                    }
+                    self.perf.cooldown = 30;
+                }
+            } else {
+                self.perf.calm += 1;
+                if self.perf.calm > 60 && scale < 1.0 {
+                    self.auto_scale = (scale * 1.1).min(1.0);
+                    self.perf.calm = 0;
+                    self.perf.misses = 0;
                 }
             }
         }
@@ -597,16 +620,24 @@ impl Player {
 
     fn render_view(&mut self, frame: &mut eframe::Frame, w: i32, h: i32) -> bool {
         let Some(m) = &self.movie else { return false };
-        let t = self.clock.time();
+        let fps = m.fps;
+        let playing = self.clock.playing();
+        // While playing, render each film frame once (fps from movie.toml) and keep it
+        // up until the next: a 30 fps film needs half the GPU work of a 60 Hz redraw,
+        // and playback shows exactly the frames `still` would.
+        let t = if playing {
+            (self.clock.time() * fps).floor() / fps
+        } else {
+            self.clock.time()
+        };
         let scale = self.effective_scale();
         let key = (t.to_bits(), w, h, scale.to_bits(), self.generation);
-        if !self.clock.playing() && self.rendered_key == Some(key) {
+        if self.rendered_key == Some(key) {
             return false;
         }
-        let fps = m.fps;
         let info = FrameInfo {
             t,
-            dt: 1.0 / 60.0,
+            dt: 1.0 / fps,
             frame: (t * fps) as i32,
             scale,
         };
@@ -1184,6 +1215,46 @@ impl eframe::App for Player {
         } else {
             ctx.request_repaint_after(Duration::from_millis(120));
         }
+    }
+}
+
+/// The auto render scale's next value, given the average GPU time per frame at the
+/// current scale and the per-frame budget (ms). None = keep the current scale.
+/// Cost grows with pixel count (scale²), so the full-resolution cost is predicted
+/// and the largest scale that fits 80% of the budget is chosen. It only lowers the
+/// scale when frames are really over 90% of budget, and climbs back in big steps.
+fn next_scale(scale: f32, avg_gpu_ms: f32, budget_ms: f32) -> Option<f32> {
+    let full = avg_gpu_ms / (scale * scale).max(0.01);
+    let target = (0.8 * budget_ms / full.max(1e-3)).sqrt().clamp(0.3, 1.0);
+    if avg_gpu_ms > 0.9 * budget_ms && target < scale {
+        Some(target)
+    } else if target > scale * 1.03 {
+        Some((scale + (target - scale) * 0.7).min(1.0))
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::next_scale;
+
+    #[test]
+    fn stays_at_full_resolution_when_it_fits() {
+        // 30 fps film: 33 ms budget. A 20 ms close-up at 100% is fine.
+        assert_eq!(next_scale(1.0, 20.0, 33.3), None);
+        // Even 29 ms (87% of budget) doesn't trigger a drop.
+        assert_eq!(next_scale(1.0, 29.0, 33.3), None);
+    }
+
+    #[test]
+    fn drops_when_over_budget_and_recovers_fast() {
+        let s = next_scale(1.0, 50.0, 33.3).unwrap();
+        assert!((0.7..0.75).contains(&s), "{s}");
+        // At the lower scale the shot now costs 50·s² ms; a cheap shot follows (2 ms)
+        let up = next_scale(s, 2.0, 33.3).unwrap();
+        assert!(up > 0.9, "{up}");
+        assert_eq!(next_scale(1.0, 2.0, 33.3), None);
     }
 }
 

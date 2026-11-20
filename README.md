@@ -225,7 +225,7 @@ the way.
 
 ## The player
 
-`shotglass play <movie> [--at 12.5 | --at moon | --at moon+2]`
+`shotglass play <movie> [--at 12.5 | --at moon | --at moon+2] [--scale auto | 1.0]`
 
 | key | action |
 |---|---|
@@ -248,10 +248,15 @@ To scrub, click or drag on the timeline. Hatched blocks are transitions;
 
 - **Audio is the master clock.** The picture always shows the frame for the
   sample being heard, so a late frame never causes drift.
-- **Adaptive resolution.** Auto mode times each frame on the GPU (`GL_TIME_ELAPSED`)
-  and lowers the shot render scale before frames start missing the display
-  refresh, then raises it again when there's headroom. When you pause, it renders
-  at full quality.
+- **One render per film frame.** Playback renders each frame of the film once, at
+  the `fps` in `movie.toml`, and holds it until the next, so a 30 fps film needs
+  half the GPU work of redrawing at 60 Hz. You see exactly the frames `still` renders.
+- **Adaptive resolution, only when needed.** Auto mode times each frame on the GPU
+  (`GL_TIME_ELAPSED`). It lowers the render scale only when the average GPU time
+  is above 90% of a film frame, and climbs back as soon as there's room.
+  Slow frames caused by compiling or sound synthesis don't count. When you
+  pause, it renders at full quality. To fix the scale, use
+  `play --scale 1.0` (or press Q).
 - **Shaders compile ahead of the playhead**, on driver threads where the GPU
   supports `KHR_parallel_shader_compile`, and get one tiny warm-up draw each. While
   playing, the player never waits for a compile: if a shot isn't ready, the previous
@@ -282,7 +287,7 @@ Nothing is loaded all at once, so a 20-minute episode costs about the same as a
 ## Command line
 
 ```sh
-shotglass play   <movie> [--at T]
+shotglass play   <movie> [--at T] [--scale auto|0.1..1.0]
 shotglass still  <movie> --at 3.5,moon,closeup+2 [--size 1280x720] [--out stills/]
 shotglass strip  <movie> [--count 12 | --at ...] [--size 384x216] [--cols 4] [--out strip.png]
 shotglass check  <movie> [--size 1280x720] [--frames 8]   # validate, compile, synth, time

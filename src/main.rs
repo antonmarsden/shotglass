@@ -38,6 +38,9 @@ enum Cmd {
         /// Start at this time (seconds, a shot id, or id+seconds).
         #[arg(long)]
         at: Option<String>,
+        /// Render scale: "auto" (adapts to the GPU) or a fixed fraction like 1.0 or 0.5.
+        #[arg(long, default_value = "auto")]
+        scale: String,
     },
     /// Render stills to PNG.
     Still {
@@ -99,7 +102,11 @@ fn real_main() -> Result<()> {
     let cli = Cli::parse();
     let cmd = match (cli.cmd, cli.movie) {
         (Some(c), _) => c,
-        (None, Some(m)) => Cmd::Play { movie: m, at: None },
+        (None, Some(m)) => Cmd::Play {
+            movie: m,
+            at: None,
+            scale: "auto".into(),
+        },
         (None, None) => {
             use clap::CommandFactory;
             Cli::command().print_help()?;
@@ -108,13 +115,25 @@ fn real_main() -> Result<()> {
         }
     };
     match cmd {
-        Cmd::Play { movie, at } => {
+        Cmd::Play { movie, at, scale } => {
             let m = Movie::load(&movie)?;
             let start = match at {
                 Some(a) => parse_times(&a, &m)?[0],
                 None => 0.0,
             };
-            app::run(movie, start)
+            let scale = match scale.as_str() {
+                "auto" => None,
+                s => {
+                    let v: f32 = s
+                        .parse()
+                        .map_err(|_| anyhow!("--scale must be \"auto\" or a number like 1.0"))?;
+                    if !(0.1..=1.0).contains(&v) {
+                        bail!("--scale must be between 0.1 and 1.0");
+                    }
+                    Some(v)
+                }
+            };
+            app::run(movie, start, scale)
         }
         Cmd::Still {
             movie,

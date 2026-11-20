@@ -991,6 +991,10 @@ impl Renderer {
         self.out.as_ref().map(|t| t.tex)
     }
 
+    pub fn has_gpu_timer(&self) -> bool {
+        self.timer.is_some()
+    }
+
     pub fn gpu_ms(&mut self) -> Option<f32> {
         let gl = self.gl.clone();
         self.timer.as_mut().and_then(|t| t.poll(&gl))
@@ -1556,7 +1560,6 @@ struct GpuTimer {
     pending: std::collections::VecDeque<glow::Query>,
     free: Vec<glow::Query>,
     active: Option<glow::Query>,
-    last_ms: Option<f32>,
 }
 
 impl GpuTimer {
@@ -1569,7 +1572,6 @@ impl GpuTimer {
             free: queries,
             pending: Default::default(),
             active: None,
-            last_ms: None,
         })
     }
     fn begin(&mut self, gl: &glow::Context) {
@@ -1584,17 +1586,19 @@ impl GpuTimer {
             self.pending.push_back(q);
         }
     }
+    /// The newest result that arrived since the last poll, if any.
     fn poll(&mut self, gl: &glow::Context) -> Option<f32> {
+        let mut fresh = None;
         while let Some(&q) = self.pending.front() {
             let ready = unsafe { gl.get_query_parameter_u32(q, glow::QUERY_RESULT_AVAILABLE) } != 0;
             if !ready {
                 break;
             }
             let ns = unsafe { gl.get_query_parameter_u32(q, glow::QUERY_RESULT) };
-            self.last_ms = Some(ns as f32 / 1.0e6);
+            fresh = Some(ns as f32 / 1.0e6);
             self.pending.pop_front();
             self.free.push(q);
         }
-        self.last_ms
+        fresh
     }
 }
