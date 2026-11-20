@@ -16,6 +16,8 @@ struct MovieFile {
     aspect: Option<[f32; 2]>,
     /// Frame rate used for frame stepping and iFrame. Playback itself runs at the display rate.
     fps: Option<f32>,
+    /// Opt in to a later desktop GLSL version: "330" (the default), "410" or "430".
+    glsl: Option<String>,
     sound: Option<SoundFile>,
     #[serde(rename = "shot", default)]
     shots: Vec<ShotFile>,
@@ -141,6 +143,9 @@ pub struct Movie {
     pub title: String,
     pub aspect: f32,
     pub fps: f32,
+    /// Desktop GLSL version the film opted in to (`glsl` in movie.toml); None = the
+    /// portable baseline (330 core, or 300 es on OpenGL ES).
+    pub glsl: Option<u32>,
     /// Movie-level music/ambience (`mainSound`, movie time).
     pub music: Option<PathBuf>,
     /// Final mix pass (`mainMix`).
@@ -307,6 +312,15 @@ impl Movie {
             });
         }
         let duration = shots.last().unwrap().end();
+        let glsl = match f.glsl.as_deref().map(str::trim) {
+            None => None,
+            Some(v) => match v.parse::<u32>() {
+                Ok(n) if crate::shader::DESKTOP_VERSIONS.contains(&n) => Some(n),
+                _ => bail!(
+                    "glsl = \"{v}\" isn't supported; use \"330\" (the portable default), \"410\" or \"430\""
+                ),
+            },
+        };
         let aspect = match f.aspect {
             Some([w, h]) if w > 0.0 && h > 0.0 => w / h,
             Some(_) => bail!("aspect must be two positive numbers, e.g. [16, 9]"),
@@ -317,6 +331,7 @@ impl Movie {
             title: f.title.unwrap_or_else(|| "Untitled".into()),
             aspect,
             fps: f.fps.unwrap_or(30.0).max(1.0),
+            glsl,
             volume: f.sound.as_ref().and_then(|s| s.volume).unwrap_or(1.0),
             music: f
                 .sound
@@ -709,6 +724,24 @@ mod tests {
                 let _ = Movie::parse(&t, Path::new("."));
             }
         }
+    }
+
+    #[test]
+    fn glsl_opt_in() {
+        let shot = "[[shot]]\nid=\"a\"\nscene=\"a.glsl\"\nduration=1\n";
+        assert_eq!(Movie::parse(shot, Path::new(".")).unwrap().glsl, None);
+        for v in ["330", "410", "430"] {
+            let m = Movie::parse(&format!("glsl = \"{v}\"\n{shot}"), Path::new(".")).unwrap();
+            assert_eq!(m.glsl, Some(v.parse().unwrap()));
+        }
+        for bad in ["\"450\"", "\"300 es\"", "\"\"", "430"] {
+            let e = Movie::parse(&format!("glsl = {bad}\n{shot}"), Path::new("."));
+            assert!(e.is_err(), "glsl = {bad} should be refused");
+        }
+        let e = Movie::parse(&format!("glsl = \"460\"\n{shot}"), Path::new("."))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("\"410\" or \"430\""), "{e}");
     }
 
     #[test]

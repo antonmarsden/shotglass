@@ -6,6 +6,7 @@
 
 use crate::gfx::{Frame, FrameInfo, Renderer};
 use crate::movie::{At, Movie};
+use crate::shader::Dialect;
 use crate::sound::Soundtrack;
 use anyhow::{Result, anyhow, bail};
 use std::path::{Path, PathBuf};
@@ -63,6 +64,10 @@ const CHECKS: &[Check] = &[
     Check {
         name: "non-blocking render waits for compiles, then matches",
         run: lazy_compile,
+    },
+    Check {
+        name: "shaders get the baseline #version, or the film's opt-in",
+        run: version_line,
     },
     Check {
         name: "chunked sound matches a single-pass render",
@@ -172,7 +177,26 @@ fn info(t: f32, scale: f32) -> FrameInfo {
     }
 }
 
+/// Fixture films must pass the strict check too, at the baseline and as GLSL ES, so
+/// the selftest doubles as the strict check's test corpus (and CI runs it).
+fn strict(m: &Movie) -> Result<()> {
+    if !crate::validate::AVAILABLE {
+        return Ok(());
+    }
+    for d in [Dialect::desktop(m.glsl), Dialect::WEB] {
+        let errors = crate::validate::validate_movie(m, d);
+        if !errors.is_empty() {
+            bail!(
+                "fixture isn't strictly valid {d}:\n{}",
+                errors.iter().map(|e| e.to_string()).collect::<String>()
+            );
+        }
+    }
+    Ok(())
+}
+
 fn renderer(gl: &Gl, m: &Movie) -> Result<Renderer> {
+    strict(m)?;
     let mut r = Renderer::new(gl.clone())?;
     r.set_cache_dir(None); // checks must not depend on (or pollute) the user's cache
     r.load_all(m)
@@ -233,6 +257,96 @@ fn movie(dir: &Path, toml: &str) -> Result<Movie> {
 }
 
 // ------------------------------------------------------------------ picture checks
+
+/// What the driver actually compiled: pictures and sound report `__VERSION__`, which
+/// the driver sets from the `#version` line the harness emitted.
+fn version_line(gl: &Gl, dir: &Path) -> Result<String> {
+    write(
+        dir,
+        &[
+            (
+                "v.glsl",
+                &scene("fragColor = vec4(float(__VERSION__) / 1000.0, 0.0, 0.0, 1.0);"),
+            ),
+            (
+                "music.glsl",
+                "vec2 mainSound(int samp, float time) {\n  return vec2(float(__VERSION__) / 1000.0);\n}\n",
+            ),
+        ],
+    )?;
+    let film = |glsl: Option<u32>| -> Result<Movie> {
+        let line = glsl.map_or(String::new(), |v| format!("glsl = \"{v}\"\n"));
+        movie(
+            dir,
+            &format!(
+                "{line}[sound]\nmusic = \"music.glsl\"\n[[shot]]\nid=\"v\"\nscene=\"v.glsl\"\nduration=0.1\n"
+            ),
+        )
+    };
+    // What the driver compiled each part as (picture, sound), or why it refused the film.
+    let compiled = |m: &Movie| -> Result<std::result::Result<(u32, u32), String>> {
+        let mut r = Renderer::new(gl.clone())?;
+        r.set_cache_dir(None);
+        if let Err(e) = r.load_all(m) {
+            return Ok(Err(e.iter().map(|e| e.to_string()).collect()));
+        }
+        let f = shot(
+            &mut r,
+            m,
+            At::Shot {
+                shot: 0,
+                local: 0.0,
+            },
+            1.0,
+        )?;
+        let picture = (px(&f, W as usize / 2, H as usize / 2)[0] as f32 / 255.0 * 1000.0).round();
+        let mut st = Soundtrack::new();
+        if let Err(e) = st.set_movie(&mut r, m, 48000) {
+            return Ok(Err(e.iter().map(|e| e.to_string()).collect()));
+        }
+        let mut first = None;
+        st.render_all(&mut r, |d| {
+            first.get_or_insert(d[0]);
+        })
+        .map_err(|e| anyhow!(e))?;
+        let sound = (first.ok_or_else(|| anyhow!("no sound"))? * 1000.0).round();
+        Ok(Ok((picture as u32, sound as u32)))
+    };
+    // 8-bit colour carries the version to within ±2 (4 per step); sound is exact.
+    let near = |got: u32, want: u32| got.abs_diff(want) <= 2;
+    let probe = Renderer::new(gl.clone())?;
+    let driver = probe.driver;
+    drop(probe);
+
+    let baseline = if driver.es { 300 } else { 330 };
+    let (p, snd) = compiled(&film(None)?)?.map_err(|e| anyhow!("baseline film refused: {e}"))?;
+    if !near(p, baseline) || snd != baseline {
+        bail!(
+            "a film without `glsl` compiled as {p} (picture) / {snd} (sound), want {baseline} \
+             on this GLSL {} driver",
+            driver.max
+        );
+    }
+    let mut notes = vec![format!("baseline {baseline}")];
+    for v in [410, 430] {
+        let got = compiled(&film(Some(v))?)?;
+        let possible = !driver.es && driver.max >= v;
+        match (possible, got) {
+            (true, Ok((p, snd))) if near(p, v) && snd == v => notes.push(format!("{v} ok")),
+            (true, Ok((p, snd))) => {
+                bail!("glsl = \"{v}\" compiled as {p} (picture) / {snd} (sound)")
+            }
+            (true, Err(e)) => bail!(
+                "glsl = \"{v}\" refused on a GLSL {} driver: {e}",
+                driver.max
+            ),
+            (false, Ok(_)) => bail!("glsl = \"{v}\" accepted on a GLSL {} driver", driver.max),
+            (false, Err(e)) if e.contains("glsl") => notes.push(format!("{v} refused")),
+            (false, Err(e)) => bail!("glsl = \"{v}\" refused without saying why: {e}"),
+        }
+    }
+    Ok(notes.join(", "))
+}
 
 fn transition_endpoints(gl: &Gl, dir: &Path) -> Result<String> {
     write(
@@ -820,6 +934,7 @@ fn sound_fixture(dir: &Path) -> Result<Movie> {
 }
 
 fn render_sound(gl: &Gl, m: &Movie, chunk: usize) -> Result<Vec<f32>> {
+    strict(m)?;
     let mut r = Renderer::new(gl.clone())?;
     let mut st = Soundtrack::with_chunk(chunk);
     st.set_movie(&mut r, m, 48000)
