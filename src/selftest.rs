@@ -193,7 +193,6 @@ fn shot(r: &mut Renderer, m: &Movie, at: At, scale: f32) -> Result<Frame> {
 
 /// (largest channel difference, fraction of pixels differing by more than `tol`).
 fn diff(a: &Frame, b: &Frame, tol: u8) -> (u8, f32) {
-    assert_eq!(a.size(), b.size());
     let mut max = 0u8;
     let mut over = 0usize;
     for (pa, pb) in a.cells().zip(b.cells()) {
@@ -210,6 +209,14 @@ fn px(f: &Frame, col: usize, row: usize) -> [u8; 4] {
 }
 
 fn expect_same(what: &str, a: &Frame, b: &Frame, tol: u8, frac: f32) -> Result<()> {
+    // Bulk compare first (TooDee's PartialEq: same size, same cells); only walk the
+    // pixels for the tolerance check and the error message when they differ.
+    if a == b {
+        return Ok(());
+    }
+    if a.size() != b.size() {
+        bail!("{what}: frames are {:?} and {:?}", a.size(), b.size());
+    }
     let (max, over) = diff(a, b, tol);
     if over > frac {
         bail!(
