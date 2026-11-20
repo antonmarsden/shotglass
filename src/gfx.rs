@@ -5,6 +5,7 @@
 //! plain copy) draws the result into the output texture at full size.
 
 use crate::anim::Anim;
+use crate::movie::TransitionKind;
 use crate::movie::{At, Movie, Shot, glsl_float};
 use crate::shader::{Assembled, Builder, Dialect, DriverGlsl, remap_log};
 use anyhow::{Result, anyhow};
@@ -928,7 +929,7 @@ impl Renderer {
             }
             if !linked {
                 gl.delete_program(p.prog);
-                return Err(errors);
+                return Err(src.explain(errors));
             }
             let mut locs = HashMap::new();
             let n = gl.get_active_uniforms(p.prog);
@@ -1903,20 +1904,25 @@ pub fn transition_source(
     }
     header += cues;
     let b = Builder::new(dialect, &header, root).libraries(&movie.libraries);
-    let b = if kind.ends_with(".glsl") {
-        b.file(&root.join(kind))?
-    } else {
-        let src = BUILTIN_TRANSITIONS
-            .iter()
-            .find(|(n, _)| *n == kind)
-            .map(|(_, s)| *s)
-            .ok_or_else(|| {
-                anyhow!(
-                    "unknown transition \"{kind}\"; built-ins are {}, or give a path ending in .glsl",
-                    BUILTIN_TRANSITIONS.iter().map(|(n, _)| *n).filter(|n| *n != "copy").collect::<Vec<_>>().join(", ")
-                )
-            })?;
-        b.builtin(kind, src)?
+    let b = match crate::movie::transition_kind(kind) {
+        TransitionKind::File(p) => b.file(&root.join(p))?,
+        TransitionKind::Library(lib, file) => b.generated(
+            &format!("transition \"{kind}\""),
+            &format!("#include <{lib}/{file}>\n"),
+        )?,
+        TransitionKind::Builtin(_) => {
+            let src = BUILTIN_TRANSITIONS
+                .iter()
+                .find(|(n, _)| *n == kind)
+                .map(|(_, s)| *s)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "unknown transition \"{kind}\"; use a library's (\"transitions/iris\") or \
+                     a file in the film (\"fx/iris.glsl\")"
+                    )
+                })?;
+            b.builtin(kind, src)?
+        }
     };
     Ok(b.footer(TRANSITION_FOOTER).build())
 }

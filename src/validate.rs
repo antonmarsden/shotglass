@@ -48,6 +48,7 @@ pub fn movie_sources(m: &Movie, d: Dialect) -> Vec<Source> {
             dialect: d,
             files: vec!["<shotglass vertex shader>".into()],
             warnings: vec![],
+            clashes: vec![],
         }),
     }];
     let mut frag = |what: String, src| {
@@ -111,7 +112,11 @@ pub fn validate_sources(sources: &[Source]) -> Vec<ShaderError> {
         .iter()
         .filter_map(|s| {
             let messages = match &s.src {
-                Ok(a) => explain_later_versions(a, s.stage, validate(a, s.stage).err()?),
+                Ok(a) => a.explain(explain_later_versions(
+                    a,
+                    s.stage,
+                    validate(a, s.stage).err()?,
+                )),
                 Err(e) => vec![format!("{e:#}")],
             };
             Some(ShaderError {
@@ -135,6 +140,7 @@ fn explain_later_versions(src: &Assembled, stage: Stage, messages: Vec<String>) 
         dialect: newest,
         files: src.files.clone(),
         warnings: vec![],
+        clashes: vec![],
     };
     let still = validate(&newer, stage).err().unwrap_or_default();
     messages
@@ -388,47 +394,72 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// The demo uses shotglass-kit, pinned by its shotglass.lock: this downloads the pinned
-    /// commit into the user cache once (git and network), as `shotglass fetch` would.
-    #[test]
-    fn demo_movie_passes_everywhere() {
+    /// Fetch a film's libraries into the user cache (git and network), as `shotglass
+    /// fetch` would, writing its shotglass.lock if it has none. Returns the lock, or None
+    /// when offline outside CI: the strict check of kit films is then left to CI.
+    fn fetch_libraries(root: &Path) -> Option<crate::library::Lock> {
         use crate::library;
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("movies/big-shadow");
-        let m = Movie::read(&root).unwrap();
-        let lock = library::Lock::load(&root).unwrap();
-        assert!(lock.is_some(), "the demo's shotglass.lock is committed");
+        let m = Movie::read(root).unwrap();
+        let old = library::Lock::load(root).unwrap();
         let missing = library::FetchMode::Missing {
             skip: Default::default(),
         };
-        let fetched = library::fetch(
+        match library::fetch(
             &m.library_specs,
-            lock.as_ref(),
+            old.as_ref(),
             &library::Git,
             &library::cache_dir(),
             &missing,
-        );
-        match fetched {
-            Ok((l, _)) => assert_eq!(Some(l), lock, "fetching must not move the demo's pins"),
-            // Offline, the strict check of the demo is left to CI (which has a network).
-            Err(e) if std::env::var_os("CI").is_none() => {
-                eprintln!("skipping the demo check: can't fetch its libraries ({e:#})");
-                return;
+        ) {
+            Ok((lock, _)) => {
+                if old.is_none() {
+                    std::fs::write(root.join(library::LOCK_FILE), lock.to_text()).unwrap();
+                }
+                Some(lock)
             }
-            Err(e) => panic!("fetching the demo's libraries: {e:#}"),
+            Err(e) if std::env::var_os("CI").is_none() => {
+                eprintln!(
+                    "skipping: can't fetch the libraries of {} ({e:#})",
+                    root.display()
+                );
+                None
+            }
+            Err(e) => panic!("fetching the libraries of {}: {e:#}", root.display()),
         }
+    }
+
+    /// The demo uses shotglass-kit, pinned by its committed shotglass.lock.
+    #[test]
+    fn demo_movie_passes_everywhere() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("movies/big-shadow");
+        let lock = crate::library::Lock::load(&root).unwrap();
+        assert!(lock.is_some(), "the demo's shotglass.lock is committed");
+        let Some(fetched) = fetch_libraries(&root) else {
+            return;
+        };
+        assert_eq!(
+            Some(fetched),
+            lock,
+            "fetching must not move the demo's pins"
+        );
         let m = Movie::load(&root).unwrap();
+        assert!(m.warnings.is_empty(), "{:?}", m.warnings);
         for d in all_dialects() {
             expect_clean(&m, d);
         }
     }
 
+    /// The template's transition comes from shotglass-kit (no built-ins, so no warnings).
     #[test]
     fn template_passes_everywhere() {
         let root = dir("template");
         crate::write_template(&root).unwrap();
-        let m = Movie::load(&root).unwrap();
-        for d in all_dialects() {
-            expect_clean(&m, d);
+        if fetch_libraries(&root).is_some() {
+            let m = Movie::load(&root).unwrap();
+            assert!(m.warnings.is_empty(), "{:?}", m.warnings);
+            for d in all_dialects() {
+                expect_clean(&m, d);
+            }
         }
         std::fs::remove_dir_all(&root).ok();
     }
@@ -478,6 +509,78 @@ mod tests {
         let errors = validate_movie(&m, Dialect::WEB);
         let text = errors.iter().map(|e| e.to_string()).collect::<String>();
         assert!(text.contains("kit/bad.glsl:2"), "{text}");
+        // The film defining a function the library already does: the clash comes first,
+        // naming both places, ahead of glslang's "redefinition".
+        std::fs::write(
+            root.join("scenes/a.glsl"),
+            format!(
+                "#include <kit/level.glsl>
+
+float kit_level() {{ return 0.25; }}
+{OK}"
+            ),
+        )
+        .unwrap();
+        let m = Movie::load(&root).unwrap();
+        for d in all_dialects() {
+            let errors = validate_movie(&m, d);
+            assert_eq!(errors.len(), 1, "{d}: {errors:?}");
+            let msgs = &errors[0].messages;
+            assert!(
+                msgs[0].contains(
+                    "`kit_level()` is defined by both library \"kit\" (kit/level.glsl:1) and the film (scenes/a.glsl:3)"
+                ),
+                "{d}: {msgs:#?}"
+            );
+            assert!(msgs.len() > 1, "glslang's own message follows: {msgs:#?}");
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// `type = "fx/wipe"` takes `wipe.glsl` from the library the film calls `fx`.
+    #[test]
+    fn library_transitions_are_checked() {
+        let root = dir("libtransition");
+        let lib = root.join("vendor/fx");
+        std::fs::create_dir_all(&lib).unwrap();
+        std::fs::write(
+            lib.join("library.toml"),
+            "name = \"me/transitions\"\nversion = \"1.0.0\"\n",
+        )
+        .unwrap();
+        let wipe = crate::gfx::BUILTIN_TRANSITIONS
+            .iter()
+            .find(|(n, _)| *n == "wipe")
+            .unwrap()
+            .1;
+        std::fs::write(lib.join("wipe.glsl"), wipe).unwrap();
+        std::fs::write(root.join("scenes/a.glsl"), OK).unwrap();
+        let film = |kind: &str| {
+            std::fs::write(
+                root.join("movie.toml"),
+                format!(
+                    "[libraries]\nfx = {{ path = \"vendor/fx\" }}\n\
+                     [[shot]]\nid = \"a\"\nscene = \"scenes/a.glsl\"\nduration = 1\n\
+                     [[shot]]\nid = \"b\"\nscene = \"scenes/a.glsl\"\nduration = 1\n\
+                     transition = {{ type = \"{kind}\", duration = 0.5, params = {{ direction = [0.0, 1.0] }} }}\n"
+                ),
+            )
+            .unwrap();
+            Movie::load(&root).unwrap()
+        };
+        let m = film("fx/wipe");
+        for d in all_dialects() {
+            expect_clean(&m, d);
+        }
+        let errors = validate_movie(&film("fx/swipe"), Dialect::BASELINE);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        let text = errors[0].to_string();
+        assert!(
+            errors[0].what.contains("transition into \"b\" (fx/swipe)")
+                && text.contains("transition \"fx/swipe\":1: can't find #include <fx/swipe.glsl>")
+                && text.contains("fx/swipe.glsl ("),
+            "{text}"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 

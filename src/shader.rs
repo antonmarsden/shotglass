@@ -7,7 +7,7 @@
 
 use crate::library::Library;
 use anyhow::{Result, anyhow, bail};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// The GLSL language a shader is written in: the `#version` line the harness emits.
@@ -129,6 +129,29 @@ pub struct Assembled {
     /// Portability problems that didn't stop the build (e.g. an include that only
     /// matches a file when ignoring case).
     pub warnings: Vec<String>,
+    /// Functions or structs defined in more than one file (e.g. by two libraries). Only
+    /// reported when the shader fails to compile (see [`Assembled::explain`]), because
+    /// preprocessor tricks can make a duplicate harmless.
+    pub clashes: Vec<String>,
+}
+
+impl Assembled {
+    /// Compile errors, led by any definition clashes: "both `toon` and `kit` define
+    /// `hash21(vec2)`" says more than the driver's "redefinition" at one of the two places.
+    pub fn explain(&self, errors: Vec<String>) -> Vec<String> {
+        self.clashes.iter().cloned().chain(errors).collect()
+    }
+}
+
+/// A top-level function or struct defined by one file of a shader.
+#[derive(Clone, Debug)]
+struct Definition {
+    /// `hash21(vec2)` (name and parameter types: overloads don't clash) or `struct Ray`.
+    key: String,
+    /// Source string number (index into `files`).
+    file: usize,
+    line: usize,
+    scope: Scope,
 }
 
 /// Which tree a file belongs to: the film, or one of its libraries (index into `libs`).
@@ -147,6 +170,7 @@ pub struct Builder {
     /// Absolute paths already in this shader: each file is included at most once.
     included: HashSet<PathBuf>,
     warnings: Vec<String>,
+    defs: Vec<Definition>,
 }
 
 impl Builder {
@@ -165,6 +189,7 @@ impl Builder {
             libs: vec![],
             included: HashSet::new(),
             warnings: vec![],
+            defs: vec![],
         }
     }
 
@@ -179,8 +204,14 @@ impl Builder {
         Ok(self)
     }
 
-    pub fn builtin(mut self, name: &str, src: &str) -> Result<Builder> {
-        let idx = self.new_string(format!("<builtin {name}>"));
+    pub fn builtin(self, name: &str, src: &str) -> Result<Builder> {
+        self.generated(&format!("<builtin {name}>"), src)
+    }
+
+    /// Film-level code the harness writes (e.g. the `#include` for a library transition),
+    /// shown as `label` in messages.
+    pub fn generated(mut self, label: &str, src: &str) -> Result<Builder> {
+        let idx = self.new_string(label.to_string());
         self.push_text(src, idx, None, Scope::Film, 0)?;
         Ok(self)
     }
@@ -193,12 +224,53 @@ impl Builder {
     }
 
     pub fn build(self) -> Assembled {
+        let clashes = self.clashes();
         Assembled {
             text: self.text,
             dialect: self.dialect,
             files: self.files,
             warnings: self.warnings,
+            clashes,
         }
+    }
+
+    /// One message per definition that a different file already made.
+    fn clashes(&self) -> Vec<String> {
+        let mut first: HashMap<&str, &Definition> = HashMap::new();
+        let mut out = vec![];
+        for d in &self.defs {
+            let Some(f) = first.get(d.key.as_str()) else {
+                first.insert(&d.key, d);
+                continue;
+            };
+            if f.file == d.file {
+                continue; // same file: the driver's own message points at it
+            }
+            let at = |x: &Definition| format!("{}:{}", self.files[x.file], x.line);
+            let owner = |x: &Definition| match x.scope {
+                Scope::Film => "the film".to_string(),
+                Scope::Lib(i) => format!("library \"{}\"", self.libs[i].name),
+            };
+            let advice = match (f.scope, d.scope) {
+                (Scope::Lib(a), Scope::Lib(b)) if a != b => {
+                    "; the libraries clash, so one of them has to rename it (public library \
+                     functions should start with the library's own prefix)"
+                }
+                (Scope::Lib(_), Scope::Film) | (Scope::Film, Scope::Lib(_)) => {
+                    "; rename the film's one, or use the library's"
+                }
+                _ => "; keep one of them",
+            };
+            out.push(format!(
+                "error: `{}` is defined by both {} ({}) and {} ({}){advice}",
+                d.key,
+                owner(f),
+                at(f),
+                owner(d),
+                at(d),
+            ));
+        }
+        out
     }
 
     fn new_string(&mut self, name: String) -> usize {
@@ -355,8 +427,19 @@ impl Builder {
         scope: Scope,
         depth: usize,
     ) -> Result<()> {
+        // Definitions are recorded in compile order: a file's own ones up to each include
+        // go before the included file's.
+        let mut defs = top_level_definitions(src).into_iter().peekable();
         self.text += &format!("#line 1 {idx}\n");
         for (n, line) in src.lines().enumerate() {
+            while let Some((key, l)) = defs.next_if(|d| d.1 <= n + 1) {
+                self.defs.push(Definition {
+                    key,
+                    file: idx,
+                    line: l,
+                    scope,
+                });
+            }
             let trimmed = line.trim_start();
             if let Some(rest) = trimmed.strip_prefix("#include") {
                 let rest = rest.trim();
@@ -387,8 +470,162 @@ impl Builder {
             self.text += line;
             self.text.push('\n');
         }
+        for (key, l) in defs {
+            self.defs.push(Definition {
+                key,
+                file: idx,
+                line: l,
+                scope,
+            });
+        }
         Ok(())
     }
+}
+
+/// Top-level functions and structs that `src` defines (with a body), as
+/// (`name(param types)` or `struct Name`, line). Comments are skipped, and so is code
+/// inside `#if`/`#ifdef` blocks (other than include guards), which may never be compiled.
+/// A heuristic for error messages, not a parser: anything odd is simply not reported.
+fn top_level_definitions(src: &str) -> Vec<(String, usize)> {
+    // Blank comments and preprocessor lines, keeping every newline (line numbers) and
+    // byte offset.
+    let mut code: Vec<u8> = src.as_bytes().to_vec();
+    let mut i = 0;
+    while i < code.len() {
+        if code[i..].starts_with(b"//") {
+            while i < code.len() && code[i] != b'\n' {
+                code[i] = b' ';
+                i += 1;
+            }
+        } else if code[i..].starts_with(b"/*") {
+            while i < code.len() && !code[i..].starts_with(b"*/") {
+                if code[i] != b'\n' {
+                    code[i] = b' ';
+                }
+                i += 1;
+            }
+            for _ in 0..2.min(code.len() - i) {
+                code[i] = b' ';
+                i += 1;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    let text = String::from_utf8_lossy(&code).into_owned();
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    // Conditional blocks: true = an include guard (#ifndef X / #define X), which counts
+    // as always compiled.
+    let mut conds: Vec<bool> = vec![];
+    for n in 0..lines.len() {
+        let t = lines[n].trim_start().to_string();
+        let skipped = conds.iter().any(|g| !g);
+        if let Some(d) = t.strip_prefix('#') {
+            let mut w = d.split_whitespace();
+            match w.next() {
+                Some("if" | "ifdef") => conds.push(false),
+                Some("ifndef") => {
+                    let name = w.next().unwrap_or("");
+                    let next = lines
+                        .get(n + 1)
+                        .map(|l| l.split_whitespace().collect::<Vec<_>>());
+                    let guard = !name.is_empty()
+                        && next.is_some_and(|v| {
+                            (v.first() == Some(&"#define") && v.get(1) == Some(&name))
+                                || (v.first() == Some(&"#")
+                                    && v.get(1) == Some(&"define")
+                                    && v.get(2) == Some(&name))
+                        });
+                    conds.push(guard);
+                }
+                Some("endif") => {
+                    conds.pop();
+                }
+                _ => {}
+            }
+            lines[n].clear();
+        } else if skipped {
+            lines[n].clear();
+        }
+    }
+    let code = lines.join("\n");
+    let bytes = code.as_bytes();
+    let mut out = vec![];
+    let (mut depth, mut start) = (0usize, 0usize);
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'{' => {
+                if depth == 0
+                    && let Some((key, at)) = definition(&code[start..i])
+                {
+                    let line = code[..start + at].matches('\n').count() + 1;
+                    out.push((key, line));
+                }
+                depth += 1;
+            }
+            b'}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    start = i + 1;
+                }
+            }
+            b';' if depth == 0 => start = i + 1,
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The text before a top-level `{`: a function header (`float f(vec2 p)`) or a struct
+/// (`struct Ray`)? Returns the key and the byte offset of the name.
+fn definition(head: &str) -> Option<(String, usize)> {
+    let is_ident = |s: &str| {
+        s.chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    };
+    let t = head.trim_end();
+    if let Some(close) = t.strip_suffix(')') {
+        let open = close.rfind('(')?;
+        let before = close[..open].trim_end();
+        let name_start = before
+            .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .map_or(0, |i| i + 1);
+        let name = &before[name_start..];
+        // A return type must come first (and `layout(...)` etc. aren't functions).
+        let ret = before[..name_start].trim();
+        if !is_ident(name) || ret.is_empty() || name == "layout" {
+            return None;
+        }
+        const QUALIFIERS: &[&str] = &[
+            "in", "out", "inout", "const", "highp", "mediump", "lowp", "precise",
+        ];
+        let mut types = vec![];
+        for p in close[open + 1..].split(',') {
+            let ty = p
+                .split(|c: char| c.is_whitespace() || c == '[')
+                .find(|w| !w.is_empty() && !QUALIFIERS.contains(w))
+                .unwrap_or("");
+            if ty.is_empty() || ty == "void" {
+                continue;
+            }
+            types.push(if p.contains('[') {
+                format!("{ty}[]")
+            } else {
+                ty.to_string()
+            });
+        }
+        return Some((format!("{name}({})", types.join(", ")), name_start));
+    }
+    let words: Vec<&str> = t.split_whitespace().collect();
+    if let [.., "struct", name] = words.as_slice()
+        && is_ident(name)
+    {
+        let at = t.rfind(name)?;
+        return Some((format!("struct {name}"), at));
+    }
+    None
 }
 
 /// Normalised absolute path, for include-once and "stays inside its root" checks.
@@ -711,6 +948,79 @@ mod tests {
             .build();
         assert_eq!(b.text.matches("float c()").count(), 1);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn finds_top_level_definitions() {
+        let src = "// float commented(){ }\n\
+                   /* float block(){ }\n */\n\
+                   float hash21(vec2 p) { return 0.0; }\n\
+                   vec3 shade(in vec3 p, const float k[4], out vec2 uv)\n{\n  if (k[0] > 0.0) { uv = p.xy; }\n  return p;\n}\n\
+                   void main(void){}\n\
+                   struct Ray { vec3 o; };\n\
+                   layout(std140) uniform Block { float x; };\n\
+                   float proto(float x);\n\
+                   #ifdef FANCY\nfloat maybe(){ return 1.0; }\n#endif\n\
+                   #ifndef GUARD\n#define GUARD\nfloat guarded(){ return 1.0; }\n#endif\n";
+        let d = top_level_definitions(src);
+        let keys: Vec<(&str, usize)> = d.iter().map(|(k, l)| (k.as_str(), *l)).collect();
+        assert_eq!(
+            keys,
+            vec![
+                ("hash21(vec2)", 4),
+                ("shade(vec3, float[], vec2)", 5),
+                ("main()", 10),
+                ("struct Ray", 11),
+                ("guarded()", 19),
+            ]
+        );
+    }
+
+    #[test]
+    fn clashes_name_both_owners() {
+        let (dir, mut libs) = film("clash");
+        // toon also defines kit's kit_hash(); the film defines toon_outline() itself.
+        write(
+            &libs[1].root,
+            &[(
+                "fx/hash.glsl",
+                "\nfloat kit_hash(){ return 0.25; }\nfloat kit_hash(float s){ return s; }\n",
+            )],
+        );
+        libs[1] = Library::read("toon", &libs[1].root, crate::library::Origin::Path).unwrap();
+        write(
+            &dir,
+            &[(
+                "scenes/a.glsl",
+                "#include <kit/noise.glsl>\n#include <toon/fx/hash.glsl>\n\
+                 #include <toon/fx/outline.glsl>\nfloat toon_outline(){ return 1.0; }\n",
+            )],
+        );
+        let a = Builder::new(D, "", &dir)
+            .libraries(&libs)
+            .file(&dir.join("scenes/a.glsl"))
+            .unwrap()
+            .build();
+        assert_eq!(a.clashes.len(), 2, "{:#?}", a.clashes);
+        assert!(
+            a.clashes[0].contains("`kit_hash()` is defined by both library \"kit\" (kit/hash.glsl:1) and library \"toon\" (toon/fx/hash.glsl:2)")
+                && a.clashes[0].contains("libraries clash"),
+            "{}",
+            a.clashes[0]
+        );
+        assert!(
+            a.clashes[1].contains(
+                "library \"toon\" (toon/fx/outline.glsl:2) and the film (scenes/a.glsl:4)"
+            ),
+            "{}",
+            a.clashes[1]
+        );
+        // The overload kit_hash(float) is fine. Clashes lead the compile errors.
+        let e = a.explain(vec!["kit/hash.glsl:1: error: redefinition".into()]);
+        assert_eq!(e.len(), 3);
+        assert!(e[2].contains("redefinition"));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&libs[1].root).ok();
     }
 
     fn include_error(dir: &Path, libs: &[Library], src: &str) -> String {
