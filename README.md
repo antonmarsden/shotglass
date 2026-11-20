@@ -67,7 +67,7 @@ movies/big-shadow/
 ```toml
 title = "Big Shadow"
 aspect = [16, 9]
-fps = 30                      # for frame stepping and iFrame; playback follows the display
+fps = 30                      # or 29.97, or "30000/1001"; frame stepping, iFrame and export
 # glsl = "430"                # opt in to a later GLSL; see "Portable shaders" (default 330)
 
 [sound]
@@ -363,12 +363,71 @@ shotglass strip  <movie> [--count 12 | --at ...] [--size 384x216] [--cols 4] [--
 shotglass check  <movie> [--web] [--no-gpu] [--size 1280x720] [--frames 8]
                  # validate movie.toml and the GLSL (strictly), compile, synth, time
 shotglass wav    <movie> [--out sound.wav] [--rate 48000]
+shotglass export <movie> --out film.webm [--size 1920x1080] [--format webm|av1|ffv1|png|ffmpeg] [--rate 48000]
 shotglass new    <dir>
 shotglass selftest [filter]                                # GPU + sound checks on this machine
 ```
 
-`still`, `strip`, `check` and `wav` render off-screen (`check --no-gpu` doesn't need OpenGL). On a Linux machine with
+`still`, `strip`, `check`, `wav` and `export` render off-screen (`check --no-gpu` doesn't need OpenGL). On a Linux machine with
 no display, run them under `xvfb-run`; Mesa's software OpenGL works.
+
+## Export
+
+`shotglass export` renders the film offline to a file. Playback is untouched: this
+is a separate path that never drops a frame or lowers the resolution.
+
+```sh
+shotglass export movies/big-shadow --out big-shadow.webm                  # VP9 + Opus
+shotglass export movies/big-shadow --out big-shadow.mkv --size 3840x2160  # lossless FFV1 + FLAC
+shotglass export movies/big-shadow --out frames/                          # PNG sequence + sound.wav
+```
+
+- **Frame-accurate.** Frame *n* is rendered at exactly *n* / `fps` (`fps` can be a
+  ratio, e.g. `"30000/1001"`, and is written to the file as one), at full size,
+  waiting for every shader to compile. It's the same picture `shotglass still`
+  renders at that time.
+- **Sample-accurate.** The soundtrack is the same 16-bit PCM `shotglass wav` writes,
+  `duration × rate` samples starting at sample 0. FLAC and WAV keep it bit for
+  bit. Opus is lossy and has an encoder delay, which WebM records so players skip
+  it and stay in sync.
+- **Colour.** Video formats are converted with the BT.709 matrix and tagged BT.709,
+  limited range, so players don't shift the colours. FFV1 stores the RGB pixels
+  as rendered (full range, tagged as RGB). VP9 and AV1 store colour at half
+  resolution, so the size must be even.
+- **Progress and Ctrl-C.** Progress goes to the terminal. Ctrl-C stops the export
+  and removes the half-written file (a second Ctrl-C quits at once).
+
+| `--format` | default for | video | audio | use it for |
+|---|---|---|---|---|
+| `webm` | `.webm` | VP9, CRF 20 | Opus 192 kb/s | sharing, the web |
+| `av1` | | AV1 (SVT-AV1, else libaom) | Opus 192 kb/s | smaller files, slower encode |
+| `ffv1` | `.mkv` | FFV1, lossless RGB | FLAC | archival, re-encoding later |
+| `png` | a folder (no extension) | `frame_000000.png` … | `sound.wav` | editors and compositing; needs no ffmpeg |
+| `ffmpeg` | | your `--ffmpeg-args` | | anything else your ffmpeg can do |
+
+All the defaults are royalty-free codecs. To use another one, pass your own ffmpeg
+output arguments; the container comes from the `--out` extension, and you choose
+the colour handling yourself:
+
+```sh
+shotglass export movies/big-shadow --out film.mov --format ffmpeg \
+  --ffmpeg-args "-c:v prores_ks -profile:v 3 -c:a pcm_s16le"
+```
+
+### Installing ffmpeg
+
+Every format except `png` pipes raw frames to an [ffmpeg](https://ffmpeg.org)
+process, so ffmpeg must be on your `PATH` (or set `SHOTGLASS_FFMPEG` to its full
+path). shotglass doesn't link or ship any codecs.
+
+- **Windows:** `winget install Gyan.FFmpeg` (then open a new terminal), or download a
+  build from <https://ffmpeg.org/download.html> and add its `bin` folder to `PATH`.
+- **macOS:** `brew install ffmpeg`
+- **Linux:** `sudo apt install ffmpeg` (Debian/Ubuntu), `sudo dnf install ffmpeg`
+  (Fedora, with RPM Fusion), or your distribution's package.
+
+Check with `ffmpeg -encoders`: `webm` needs `libvpx-vp9` and `libopus`, `av1` needs
+`libsvtav1` or `libaom-av1`, and `ffv1` needs `ffv1` and `flac` (built in).
 
 ## Testing
 
@@ -400,6 +459,10 @@ shotglass selftest strips   # only checks whose name contains "strips"
     at cuts, fades or chunk edges;
   - streamed sound (as during playback) never waits for the GPU and matches the
     blocking render bit for bit.
+  - reading a frame into part of a bigger image lands exactly in place, leaves the
+    rest alone and restores OpenGL's pixel-pack state;
+  - `export` writes every frame and sample: a PNG sequence always, and FFV1 + FLAC
+    when ffmpeg is installed (decoded and compared with `still` and `wav`).
 - On Linux without a display, use `xvfb-run -a cargo test` (that's what CI does).
   Set `SHOTGLASS_SKIP_GPU_TESTS=1` to skip the selftest.
 - **Docker:** `docker build -f docker/test.Dockerfile -t shotglass-test . && docker run --rm shotglass-test`

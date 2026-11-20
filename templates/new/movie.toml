@@ -1,7 +1,7 @@
 # A new shotglass movie. Save any file while `shotglass play` is open and it reloads.
 title = "My short"
 aspect = [16, 9]
-fps = 30
+fps = 30                  # or 29.97, or "30000/1001"
 # Shaders compile as GLSL 3.30 everywhere, so the film runs on any OpenGL 3.3 machine.
 # glsl = "430"           # opt in to a later GLSL ("410" or "430"); fewer machines run it
 

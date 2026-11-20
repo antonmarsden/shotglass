@@ -8,14 +8,64 @@ use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------- file format
 
+fn gcd(a: u64, b: u64) -> u64 {
+    if b == 0 { a } else { gcd(b, a % b) }
+}
+
+/// `fps` → (numerator, denominator), reduced. NTSC-style decimals (29.97, 23.976,
+/// 59.94) mean n×1000/1001, as video tools assume.
+fn parse_fps(f: FpsFile) -> Result<(u32, u32)> {
+    let (num, den): (f64, f64) = match f {
+        FpsFile::Int(n) => (n as f64, 1.0),
+        FpsFile::Ratio(s) => {
+            let (a, b) = s.split_once('/').unwrap_or((&s, "1"));
+            let a: u32 = a
+                .trim()
+                .parse()
+                .ok()
+                .context("fps must look like 30 or \"30000/1001\"")?;
+            let b: u32 = b
+                .trim()
+                .parse()
+                .ok()
+                .context("fps must look like 30 or \"30000/1001\"")?;
+            (a as f64, b as f64)
+        }
+        FpsFile::Float(x) => {
+            let milli = (x * 1000.0).round();
+            if (milli / 1000.0 - x).abs() > 1e-9 {
+                bail!("fps {x} has too many decimals; write it as a ratio, e.g. \"30000/1001\"");
+            }
+            let ntsc = x * 1.001;
+            if x.fract() == 0.0 {
+                (x, 1.0)
+            } else if (ntsc - ntsc.round()).abs() < 0.005 && ntsc.round() >= 1.0 {
+                (ntsc.round() * 1000.0, 1001.0)
+            } else {
+                (milli, 1000.0)
+            }
+        }
+    };
+    if !(num >= 1.0 && den >= 1.0 && num <= u32::MAX as f64 && num / den <= 1000.0) {
+        bail!("fps must be between 1 and 1000 (and a ratio of positive whole numbers)");
+    }
+    let g = gcd(num as u64, den as u64);
+    let (num, den) = (num as u64 / g, den as u64 / g);
+    if num as f64 / (den as f64) < 1.0 {
+        bail!("fps must be at least 1");
+    }
+    Ok((num as u32, den as u32))
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct MovieFile {
     title: Option<String>,
     /// Width:height, e.g. [16, 9]. Default 16:9.
     aspect: Option<[f32; 2]>,
-    /// Frame rate used for frame stepping and iFrame. Playback itself runs at the display rate.
-    fps: Option<f32>,
+    /// Frame rate: a number (30, 29.97) or a ratio string ("30000/1001"). Used for
+    /// frame stepping, iFrame and export; playback itself runs at the display rate.
+    fps: Option<FpsFile>,
     /// Opt in to a later desktop GLSL version: "330" (the default), "410" or "430".
     glsl: Option<String>,
     sound: Option<SoundFile>,
@@ -23,6 +73,14 @@ struct MovieFile {
     shots: Vec<ShotFile>,
     #[serde(rename = "marker", default)]
     markers: Vec<MarkerFile>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum FpsFile {
+    Int(i64),
+    Float(f64),
+    Ratio(String),
 }
 
 #[derive(Deserialize)]
@@ -142,7 +200,11 @@ pub struct Movie {
     pub root: PathBuf,
     pub title: String,
     pub aspect: f32,
+    /// `fps_num / fps_den` as a float, for playback and uniforms.
     pub fps: f32,
+    /// The exact frame rate. Frame n is at `frame_time(n)`.
+    pub fps_num: u32,
+    pub fps_den: u32,
     /// Desktop GLSL version the film opted in to (`glsl` in movie.toml); None = the
     /// portable baseline (330 core, or 300 es on OpenGL ES).
     pub glsl: Option<u32>,
@@ -326,11 +388,17 @@ impl Movie {
             Some(_) => bail!("aspect must be two positive numbers, e.g. [16, 9]"),
             None => 16.0 / 9.0,
         };
+        let (fps_num, fps_den) = match f.fps {
+            Some(f) => parse_fps(f)?,
+            None => (30, 1),
+        };
         Ok(Movie {
             root: root.to_path_buf(),
             title: f.title.unwrap_or_else(|| "Untitled".into()),
             aspect,
-            fps: f.fps.unwrap_or(30.0).max(1.0),
+            fps: (fps_num as f64 / fps_den as f64) as f32,
+            fps_num,
+            fps_den,
             glsl,
             volume: f.sound.as_ref().and_then(|s| s.volume).unwrap_or(1.0),
             music: f
@@ -355,6 +423,36 @@ impl Movie {
                 .collect(),
             duration,
         })
+    }
+
+    /// Time of frame `n`: exactly `n * den / num`, rounded once to f32.
+    pub fn frame_time(&self, n: u64) -> f32 {
+        (n as f64 * self.fps_den as f64 / self.fps_num as f64) as f32
+    }
+
+    /// The frame on screen at `t` (the inverse of `frame_time`: `frame_at(frame_time(n)) == n`).
+    pub fn frame_at(&self, t: f32) -> i64 {
+        let f = t.max(0.0) as f64 * self.fps_num as f64 / self.fps_den as f64;
+        // frame_time rounds to f32, which can land just below n/fps; don't drop a frame for that.
+        let n = f.round();
+        if (f - n).abs() < 1e-4 * n.max(1.0) {
+            n as i64
+        } else {
+            f.floor() as i64
+        }
+    }
+
+    /// Frames in the film: every n with `frame_time(n) < duration`.
+    pub fn frame_count(&self) -> u64 {
+        let mut n =
+            (self.duration as f64 * self.fps_num as f64 / self.fps_den as f64).ceil() as u64;
+        while n > 0 && self.frame_time(n - 1) >= self.duration {
+            n -= 1;
+        }
+        while self.frame_time(n) < self.duration {
+            n += 1;
+        }
+        n
     }
 
     pub fn at(&self, t: f32) -> At {
@@ -494,6 +592,57 @@ mod tests {
         scene = "c.glsl"
         duration = 3
     "#;
+
+    fn with_fps(fps: &str) -> Result<Movie> {
+        Movie::parse(&format!("fps = {fps}\n{M}"), Path::new("."))
+    }
+
+    #[test]
+    fn fps_is_rational() {
+        let rate = |s: &str| with_fps(s).map(|m| (m.fps_num, m.fps_den)).unwrap();
+        assert_eq!(rate("30"), (30, 1));
+        assert_eq!(rate("24.0"), (24, 1));
+        assert_eq!(rate("\"30000/1001\""), (30000, 1001));
+        assert_eq!(rate("29.97"), (30000, 1001));
+        assert_eq!(rate("23.976"), (24000, 1001));
+        assert_eq!(rate("59.94"), (60000, 1001));
+        assert_eq!(rate("12.5"), (25, 2));
+        assert_eq!(rate("\"50/2\""), (25, 1));
+        assert_eq!(rate("\" 60 \""), (60, 1));
+        assert_eq!(Movie::parse(M, Path::new(".")).unwrap().fps_den, 1);
+        for bad in [
+            "0", "-30", "0.5", "\"30/0\"", "\"x\"", "\"1/2\"", "29.9701", "5000",
+        ] {
+            assert!(with_fps(bad).is_err(), "fps = {bad} should be rejected");
+        }
+    }
+
+    #[test]
+    fn frame_time_and_frame_at_agree() {
+        for fps in [
+            "30",
+            "\"30000/1001\"",
+            "\"24000/1001\"",
+            "60",
+            "12.5",
+            "\"7/3\"",
+        ] {
+            let m = with_fps(fps).unwrap();
+            for n in (0..200_000u64).step_by(7).chain([1, 2, 3, 299, 300, 301]) {
+                assert_eq!(
+                    m.frame_at(m.frame_time(n)) as u64,
+                    n,
+                    "fps {fps}, frame {n}"
+                );
+            }
+            // Halfway between frames is still the earlier frame.
+            let mid = (m.frame_time(10) + m.frame_time(11)) / 2.0;
+            assert_eq!(m.frame_at(mid), 10);
+            let n = m.frame_count();
+            assert!(m.frame_time(n - 1) < m.duration && m.frame_time(n) >= m.duration);
+        }
+        assert_eq!(with_fps("30").unwrap().frame_count(), 330); // 11 s
+    }
 
     #[test]
     fn layout_overlaps_transitions() {

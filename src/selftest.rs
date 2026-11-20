@@ -12,7 +12,7 @@ use anyhow::{Result, anyhow, bail};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
-use toodee::{TooDeeOps, TooDeeOpsMut};
+use toodee::{CopyOps, TooDeeOps, TooDeeOpsMut};
 
 const W: i32 = 160;
 const H: i32 = 90;
@@ -40,6 +40,10 @@ const CHECKS: &[Check] = &[
     Check {
         name: "slow frames drawn in strips match a single draw",
         run: tiled_drawing,
+    },
+    Check {
+        name: "readback into a larger frame lands in place and restores pack state",
+        run: readback_into,
     },
     Check {
         name: "playback doesn't stall on driver error checks",
@@ -88,6 +92,10 @@ const CHECKS: &[Check] = &[
     Check {
         name: "sound shader errors point at the right file and line",
         run: sound_errors,
+    },
+    Check {
+        name: "export writes every frame and sample, matching still and wav",
+        run: export_lossless,
     },
 ];
 
@@ -584,6 +592,108 @@ fn tiled_drawing(gl: &Gl, dir: &Path) -> Result<String> {
         }
     }
     Ok(String::new())
+}
+
+fn readback_into(gl: &Gl, dir: &Path) -> Result<String> {
+    // Top and bottom differ, so an upside-down readback can't pass.
+    write(
+        dir,
+        &[
+            (
+                "a.glsl",
+                &scene(
+                    "fragColor = vec4(uv.x, uv.y * uv.y, fract(uv.x * 5.0 + uv.y * 11.0), 1.0);",
+                ),
+            ),
+            (
+                "b.glsl",
+                &scene("fragColor = vec4(1.0 - uv.y, 0.3, uv.x * uv.y, 1.0);"),
+            ),
+        ],
+    )?;
+    let m = movie(
+        dir,
+        "[[shot]]\nid=\"a\"\nscene=\"a.glsl\"\nduration=2\n[[shot]]\nid=\"b\"\nscene=\"b.glsl\"\nduration=2\n\
+         transition = { type = \"wipe\", duration = 1 }\n",
+    )?;
+    let defaults = [4, 0, 0, 0];
+    let mut plain = renderer(gl, &m)?;
+    let mut flipped = renderer(gl, &m)?;
+    flipped.set_readback(true);
+    if plain.pack_state() != defaults {
+        bail!(
+            "pack state isn't the default before any readback: {:?}",
+            plain.pack_state()
+        );
+    }
+    let (dw, dh) = (W as usize + 37, H as usize + 23);
+    let bg = Frame::init(dw, dh, [7, 8, 9, 10]);
+    let mut notes = 0;
+    // A plain shot (copy pass) and a mid-wipe transition (transition pass).
+    for (what, at) in [("shot", m.at(0.5)), ("transition", m.at(1.5))] {
+        let want_frame = shot(&mut plain, &m, at, 1.0)?;
+        for (x, y) in [(0, 0), (13, 11), (37, 23)] {
+            let mut want = bg.clone();
+            want.view_mut((x, y), (x + W as usize, y + H as usize))
+                .copy_from_toodee(&want_frame);
+            for (name, r) in [("plain", &mut plain), ("flipped composite", &mut flipped)] {
+                r.render_at(&m, W, H, &info(at_time(&m, at), 1.0), at, true)
+                    .ok_or_else(|| anyhow!("nothing rendered"))?;
+                let mut dst = bg.clone();
+                r.read_output_into(&mut dst, (x, y));
+                let window = (x, y, x + W as usize, y + H as usize);
+                if dst.view((window.0, window.1), (window.2, window.3)) != want_frame {
+                    bail!("{what}, {name}, at ({x}, {y}): the window differs from read_output");
+                }
+                if dst != want {
+                    bail!("{what}, {name}, at ({x}, {y}): pixels outside the window changed");
+                }
+                if r.pack_state() != defaults {
+                    bail!("{what}, {name}: pack state left at {:?}", r.pack_state());
+                }
+                // read_output (used by `still`) agrees as well.
+                expect_same(
+                    &format!("{what}, {name}: read_output"),
+                    &r.read_output().unwrap(),
+                    &want_frame,
+                    0,
+                    0.0,
+                )?;
+                notes += 1;
+            }
+        }
+    }
+    // A window that doesn't fit must panic before GL writes anything. The first
+    // probe overflows the right edge but stays inside the buffer's memory, so the
+    // bounds check is the only thing that can catch it (and dropping it is safe to
+    // try); toodee isn't involved, since the flipped renderer needs no row flip.
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {})); // the panics are expected: keep them quiet
+    let mut accepted = vec![];
+    for (size, at) in [((W + 1, H + 5), (2, 0)), ((W, H + 1), (0, 2))] {
+        let mut small = Frame::init(size.0 as usize, size.1 as usize, [0; 4]);
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            flipped.read_output_into(&mut small, at)
+        }));
+        if res.is_ok() {
+            accepted.push(format!("{W}x{H} at {at:?} in {}x{}", size.0, size.1));
+        }
+    }
+    std::panic::set_hook(hook);
+    if !accepted.is_empty() {
+        bail!(
+            "read_output_into accepted windows that don't fit: {}",
+            accepted.join(", ")
+        );
+    }
+    Ok(format!("{notes} readbacks"))
+}
+
+fn at_time(m: &Movie, at: At) -> f32 {
+    match at {
+        At::Shot { shot, local } => m.shots[shot].start + local,
+        At::Transition { to, to_local, .. } => m.shots[to].start + to_local,
+    }
 }
 
 fn error_check_rate(gl: &Gl, dir: &Path) -> Result<String> {
@@ -1168,4 +1278,174 @@ fn sound_errors(gl: &Gl, dir: &Path) -> Result<String> {
         }
     }
     Ok(String::new())
+}
+
+// ------------------------------------------------------------------ export
+
+const EXPORT_MOVIE: &str = r#"
+fps = "30000/1001"
+[sound]
+music = "music.glsl"
+
+[[shot]]
+id = "a"
+scene = "a.glsl"
+duration = 0.8
+
+[[shot]]
+id = "b"
+scene = "b.glsl"
+duration = 0.9
+transition = { type = "crossfade", duration = 0.4 }
+"#;
+
+/// Decode a video's frames as RGBA and its audio as 16-bit PCM bytes, with ffmpeg.
+fn decode(path: &Path, what: &[&str]) -> Result<Vec<u8>> {
+    let out = std::process::Command::new(crate::export::ffmpeg_bin())
+        .args(["-v", "error", "-i"])
+        .arg(path)
+        .args(what)
+        .arg("-")
+        .stdin(std::process::Stdio::null())
+        .output()?;
+    if !out.status.success() {
+        bail!("decoding failed: {}", String::from_utf8_lossy(&out.stderr));
+    }
+    Ok(out.stdout)
+}
+
+fn export_lossless(gl: &Gl, dir: &Path) -> Result<String> {
+    use crate::export::{self, Format, Options};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    // Every frame differs (iTime and iFrame), and top differs from bottom.
+    write(
+        dir,
+        &[
+            (
+                "a.glsl",
+                &scene(
+                    "fragColor = vec4(fract(iTime * 1.7 + uv.x), uv.y, fract(float(iFrame) / 7.0), 1.0);",
+                ),
+            ),
+            (
+                "b.glsl",
+                &scene(
+                    "fragColor = vec4(uv.y * uv.y, fract(iTime * 0.9), fract(float(iFrame) * 0.37 + uv.x), 1.0);",
+                ),
+            ),
+            (
+                "music.glsl",
+                "vec2 mainSound(int samp, float time) {\n  float s = 0.3 * sin(6.2831853 * 330.0 * time);\n  return vec2(s, -0.5 * s);\n}\n",
+            ),
+        ],
+    )?;
+    let m = movie(dir, EXPORT_MOVIE)?;
+    let total = m.frame_count();
+    let (w, h) = (W as usize, H as usize);
+
+    // The references: what `still` and `wav` produce.
+    let mut reference = renderer(gl, &m)?;
+    let wav = dir.join("ref.wav");
+    let samples = export::write_wav(&mut reference, &m, 48000, &wav)?;
+    let pcm = std::fs::read(&wav)?[44..].to_vec();
+    let mut still = |n: u64| -> Result<Frame> {
+        reference
+            .render(&m, W, H, &FrameInfo::at(&m, m.frame_time(n)), true)
+            .ok_or_else(|| anyhow!("nothing rendered"))?;
+        Ok(reference.read_output().unwrap())
+    };
+    let probes = [0, 1, total / 2, total - 1];
+    let no_cancel = AtomicBool::new(false);
+    let run = |format: Format, out: PathBuf, cancel: &AtomicBool, stop_at: u64| {
+        let mut r = renderer(gl, &m)?;
+        r.set_readback(true);
+        let opts = Options {
+            out,
+            w,
+            h,
+            format,
+            rate: 48000,
+        };
+        export::export(&mut r, &m, &opts, cancel, |done, _| {
+            if done == stop_at {
+                cancel.store(true, Ordering::Relaxed);
+            }
+        })
+    };
+
+    // PNG sequence + WAV: needs no ffmpeg, so it always runs.
+    let png_dir = dir.join("png");
+    let s = run(Format::Png, png_dir.clone(), &no_cancel, u64::MAX)?;
+    let pngs = std::fs::read_dir(&png_dir)?
+        .filter(|e| {
+            e.as_ref()
+                .is_ok_and(|e| e.path().extension().is_some_and(|x| x == "png"))
+        })
+        .count() as u64;
+    if s.frames != total || pngs != total {
+        bail!(
+            "png: {pngs} files ({} reported), expected {total}",
+            s.frames
+        );
+    }
+    if std::fs::read(png_dir.join("sound.wav"))?[44..] != pcm[..] || s.audio_frames != samples {
+        bail!("png: sound.wav differs from `wav`");
+    }
+    for n in probes {
+        let img = image::open(png_dir.join(format!("frame_{n:06}.png")))?.into_rgba8();
+        let got = Frame::from_vec(w, h, img.pixels().map(|p| p.0).collect());
+        expect_same(&format!("png frame {n}"), &got, &still(n)?, 0, 0.0)?;
+    }
+
+    if let Err(e) = export::ffmpeg_encoders() {
+        let first = e.to_string().lines().next().unwrap_or_default().to_string();
+        return Ok(format!("{total} frames as PNG; video skipped: {first}"));
+    }
+    // FFV1 + FLAC: lossless, so frames and samples must come back exactly.
+    let mkv = dir.join("film.mkv");
+    let s = run(Format::Ffv1, mkv.clone(), &no_cancel, u64::MAX)?;
+    let video = decode(
+        &mkv,
+        &["-map", "0:v:0", "-f", "rawvideo", "-pix_fmt", "rgba"],
+    )?;
+    let frame_bytes = w * h * 4;
+    if s.frames != total || video.len() != total as usize * frame_bytes {
+        bail!(
+            "mkv: {} frames decoded ({} reported), expected {total}",
+            video.len() as f32 / frame_bytes as f32,
+            s.frames
+        );
+    }
+    for n in probes {
+        let bytes = &video[n as usize * frame_bytes..][..frame_bytes];
+        let got = Frame::from_vec(w, h, bytes.as_chunks::<4>().0.to_vec());
+        expect_same(&format!("mkv frame {n}"), &got, &still(n)?, 0, 0.0)?;
+    }
+    let audio = decode(&mkv, &["-map", "0:a:0", "-f", "s16le"])?;
+    if audio.len() != samples * 4 || audio != pcm {
+        bail!(
+            "mkv: audio is {} stereo samples{}, expected {samples} identical to `wav`",
+            audio.len() / 4,
+            if audio.len() == samples * 4 {
+                " but differs"
+            } else {
+                ""
+            }
+        );
+    }
+
+    // Cancelling stops early and leaves no half-written file.
+    let cancelled = dir.join("cancelled.mkv");
+    let stop = AtomicBool::new(false);
+    match run(Format::Ffv1, cancelled.clone(), &stop, 3) {
+        Err(e) if e.to_string() == "cancelled" => {}
+        Err(e) => bail!("cancelled export failed oddly: {e:#}"),
+        Ok(_) => bail!("cancelling didn't stop the export"),
+    }
+    if cancelled.exists() {
+        bail!("a cancelled export left {}", cancelled.display());
+    }
+    Ok(format!(
+        "{total} frames, {samples} samples, as PNG + WAV and FFV1 + FLAC"
+    ))
 }

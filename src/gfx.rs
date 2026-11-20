@@ -12,7 +12,7 @@ use eframe::glow::{self, HasContext};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use toodee::TranslateOps;
+use toodee::{TooDeeOps, TooDeeOpsMut, TranslateOps};
 
 pub const BUILTIN_TRANSITIONS: &[(&str, &str)] = &[
     ("copy", include_str!("glsl/transitions/copy.glsl")),
@@ -59,13 +59,15 @@ uniform vec2 uToMax;
 uniform vec2 uOutRes;
 uniform float progress;
 uniform float ratio;
+uniform bool sg_flip;
 out vec4 shotglass_out;
 vec4 getFromColor(vec2 uv) { return texture(uFrom, min(clamp(uv, 0.0, 1.0) * uFromScale, uFromMax)); }
 vec4 getToColor(vec2 uv) { return texture(uTo, min(clamp(uv, 0.0, 1.0) * uToScale, uToMax)); }
 ";
 
-const TRANSITION_FOOTER: &str =
-    "void main(){ shotglass_out = vec4(transition(gl_FragCoord.xy / uOutRes).rgb, 1.0); }";
+// With `sg_flip` the output is drawn upside down, so a readback (bottom row first)
+// comes out top row first. Mirrored pixel centres are exact: H - (y + 0.5).
+const TRANSITION_FOOTER: &str = "void main(){\n  vec2 fc = gl_FragCoord.xy;\n  if (sg_flip) fc.y = uOutRes.y - fc.y;\n  shotglass_out = vec4(transition(fc / uOutRes).rgb, 1.0);\n}";
 
 /// An RGBA8 image, one `[r, g, b, a]` cell per pixel, top row first.
 pub type Frame = toodee::TooDee<[u8; 4]>;
@@ -195,6 +197,10 @@ pub struct Renderer {
     b: Option<Target>,
     freeze: Option<Target>,
     out: Option<Target>,
+    /// Draw the output upside down for readback (`set_readback`), and whether the
+    /// current output was drawn that way.
+    flip_output: bool,
+    out_flipped: bool,
     freeze_key: Option<(usize, u64)>,
     generation: u64,
     timer: Option<GpuTimer>,
@@ -250,6 +256,19 @@ pub struct FrameInfo {
     pub dt: f32,
     pub frame: i32,
     pub scale: f32,
+}
+
+impl FrameInfo {
+    /// Full-resolution frame at `t`: iFrame is the film frame on screen at `t`, so
+    /// `still`, `strip` and `export` give the same picture for the same time.
+    pub fn at(m: &Movie, t: f32) -> FrameInfo {
+        FrameInfo {
+            t,
+            dt: m.fps_den as f32 / m.fps_num as f32,
+            frame: m.frame_at(t).min(i32::MAX as i64) as i32,
+            scale: 1.0,
+        }
+    }
 }
 
 impl Renderer {
@@ -332,6 +351,8 @@ impl Renderer {
                 b: None,
                 freeze: None,
                 out: None,
+                flip_output: false,
+                out_flipped: false,
                 freeze_key: None,
                 generation: 0,
                 timer,
@@ -348,6 +369,13 @@ impl Renderer {
         if self.binary_dir.is_some() || dir.is_none() {
             self.binary_dir = dir;
         }
+    }
+
+    /// For renderers whose output is read back rather than shown (still, strip,
+    /// export): draw the final pass upside down so `read_output_into` needs no
+    /// row flip. Pixel-identical either way; the player leaves this off.
+    pub fn set_readback(&mut self, on: bool) {
+        self.flip_output = on;
     }
 
     /// Force audio blocks to be drawn in flushed bands, or not (tests).
@@ -1263,6 +1291,7 @@ impl Renderer {
         let (fs, fm, ftex) = (scale(ft), maxv(ft), ft.tex);
         let (ts, tm, ttex) = (scale(tt), maxv(tt), tt.tex);
         let out = self.out.as_ref().unwrap().fbo;
+        self.out_flipped = self.flip_output;
         let Some(p) = self.prog(prog) else { return };
         unsafe {
             gl.bind_framebuffer(glow::FRAMEBUFFER, Some(out));
@@ -1295,6 +1324,9 @@ impl Renderer {
             if let Some(l) = p.loc("ratio") {
                 gl.uniform_1_f32(Some(l), w as f32 / h as f32);
             }
+            if let Some(l) = p.loc("sg_flip") {
+                gl.uniform_1_i32(Some(l), self.flip_output as i32);
+            }
             gl.draw_arrays(glow::TRIANGLES, 0, 3);
             gl.active_texture(glow::TEXTURE1);
             gl.bind_texture(glow::TEXTURE_2D, None);
@@ -1303,30 +1335,81 @@ impl Renderer {
         }
     }
 
-    /// Read the output texture as tightly packed RGBA8, top row first.
+    /// Size of the output texture (the last render's w × h), if anything was rendered.
+    pub fn output_size(&self) -> Option<(usize, usize)> {
+        self.out
+            .as_ref()
+            .map(|t| (t.alloc.0 as usize, t.alloc.1 as usize))
+    }
+
     /// Read the output texture as an RGBA8 frame, top row first.
     pub fn read_output(&self) -> Option<Frame> {
-        let t = self.out.as_ref()?;
-        let (w, h) = t.alloc;
-        let mut frame = Frame::init(w as usize, h as usize, [0; 4]);
-        let buf = frame.data_mut().as_flattened_mut();
+        let (w, h) = self.output_size()?;
+        let mut frame = Frame::init(w, h, [0; 4]);
+        self.read_output_into(&mut frame, (0, 0));
+        Some(frame)
+    }
+
+    /// Read the output into `dst` with its top-left corner at (x, y), top row
+    /// first, straight into place: no intermediate frame, and no row flip when the
+    /// output was drawn for readback (`set_readback`). Pixels of `dst` outside that
+    /// window are untouched. Panics if the window doesn't fit, or if nothing has
+    /// been rendered yet.
+    pub fn read_output_into(&self, dst: &mut Frame, (x, y): (usize, usize)) {
+        let t = self
+            .out
+            .as_ref()
+            .expect("read_output_into before any render");
+        let (w, h) = (t.alloc.0 as usize, t.alloc.1 as usize);
+        let (dw, dh) = (dst.num_cols(), dst.num_rows());
+        // glReadPixels writes wherever the pack state points; it never sees the
+        // slice length. Everything below relies on this check.
+        assert!(
+            x.checked_add(w).is_some_and(|r| r <= dw) && y.checked_add(h).is_some_and(|b| b <= dh),
+            "read_output_into: {w}x{h} at ({x}, {y}) doesn't fit in {dw}x{dh}"
+        );
+        // GL fills rows bottom-up; with a flipped output, GL's first row is the
+        // image's top row, so it goes at row y. Otherwise we flip afterwards.
+        let buf = dst.data_mut().as_flattened_mut();
         unsafe {
-            self.gl.bind_framebuffer(glow::FRAMEBUFFER, Some(t.fbo));
-            self.gl.pixel_store_i32(glow::PACK_ALIGNMENT, 1);
-            self.gl.read_pixels(
+            let gl = &self.gl;
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(t.fbo));
+            gl.pixel_store_i32(glow::PACK_ALIGNMENT, 1);
+            gl.pixel_store_i32(glow::PACK_ROW_LENGTH, dw as i32);
+            gl.pixel_store_i32(glow::PACK_SKIP_PIXELS, x as i32);
+            gl.pixel_store_i32(glow::PACK_SKIP_ROWS, y as i32);
+            gl.read_pixels(
                 0,
                 0,
-                w,
-                h,
+                w as i32,
+                h as i32,
                 glow::RGBA,
                 glow::UNSIGNED_BYTE,
                 glow::PixelPackData::Slice(Some(buf)),
             );
-            self.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            // Global state that egui and every other readback assume is default.
+            gl.pixel_store_i32(glow::PACK_ROW_LENGTH, 0);
+            gl.pixel_store_i32(glow::PACK_SKIP_PIXELS, 0);
+            gl.pixel_store_i32(glow::PACK_SKIP_ROWS, 0);
+            gl.pixel_store_i32(glow::PACK_ALIGNMENT, 4);
+            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
         }
-        // OpenGL returns the bottom row first.
-        frame.flip_rows();
-        Some(frame)
+        if !self.out_flipped {
+            dst.view_mut((x, y), (x + w, y + h)).flip_rows();
+        }
+    }
+
+    /// The pack state (alignment, row length, skip pixels, skip rows), for tests.
+    pub fn pack_state(&self) -> [i32; 4] {
+        unsafe {
+            [
+                glow::PACK_ALIGNMENT,
+                glow::PACK_ROW_LENGTH,
+                glow::PACK_SKIP_PIXELS,
+                glow::PACK_SKIP_ROWS,
+            ]
+            .map(|p| self.gl.get_parameter_i32(p))
+        }
     }
 
     pub fn finish(&self) {

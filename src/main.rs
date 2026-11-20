@@ -3,6 +3,7 @@
 mod anim;
 mod app;
 mod audio;
+mod export;
 mod gfx;
 mod headless;
 mod movie;
@@ -17,7 +18,7 @@ use gfx::{Frame, FrameInfo, Renderer};
 use movie::{At, Movie};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
-use toodee::{CopyOps, TooDeeOps, TooDeeOpsMut};
+use toodee::TooDeeOps;
 
 #[derive(Parser)]
 #[command(
@@ -97,6 +98,26 @@ enum Cmd {
         #[arg(long, default_value_t = 48000)]
         rate: u32,
     },
+    /// Render the film to a video file (or a PNG sequence), frame- and sample-accurate.
+    /// Needs ffmpeg on the PATH (or SHOTGLASS_FFMPEG), except for --format png.
+    Export {
+        movie: PathBuf,
+        /// Output file (.webm, .mkv) or folder (PNG sequence + sound.wav).
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long, default_value = "1920x1080")]
+        size: String,
+        /// webm (VP9 + Opus), av1 (AV1 + Opus), ffv1 (lossless, + FLAC), png (frames + WAV),
+        /// or ffmpeg (with --ffmpeg-args). Default: from the --out extension.
+        #[arg(long)]
+        format: Option<String>,
+        /// Your own ffmpeg output arguments, e.g. "-c:v libx264 -crf 18 -c:a aac".
+        #[arg(long, allow_hyphen_values = true)]
+        ffmpeg_args: Option<String>,
+        /// Audio sample rate.
+        #[arg(long, default_value_t = 48000)]
+        rate: u32,
+    },
     /// Create a new movie folder from a template.
     New { dir: PathBuf },
     /// Check the renderer and soundtrack on this GPU and driver with built-in test films.
@@ -172,6 +193,21 @@ fn real_main() -> Result<()> {
             no_gpu,
         } => check(&movie, &size, frames, web, no_gpu),
         Cmd::Wav { movie, out, rate } => wav(&movie, &out, rate),
+        Cmd::Export {
+            movie,
+            out,
+            size,
+            format,
+            ffmpeg_args,
+            rate,
+        } => export(
+            &movie,
+            out,
+            &size,
+            format.as_deref(),
+            ffmpeg_args.as_deref(),
+            rate,
+        ),
         Cmd::New { dir } => new_movie(&dir),
         Cmd::Selftest { filter } => selftest::run(filter),
     }
@@ -228,12 +264,7 @@ fn load_renderer(gl: std::sync::Arc<eframe::glow::Context>, m: &Movie) -> Result
 }
 
 fn frame_info(m: &Movie, t: f32) -> FrameInfo {
-    FrameInfo {
-        t,
-        dt: 1.0 / m.fps,
-        frame: (t * m.fps) as i32,
-        scale: 1.0,
-    }
+    FrameInfo::at(m, t)
 }
 
 fn still(movie: &Path, at: &str, size: &str, out: &Path) -> Result<()> {
@@ -244,8 +275,10 @@ fn still(movie: &Path, at: &str, size: &str, out: &Path) -> Result<()> {
     let out = out.to_path_buf();
     headless::with_gl(move |gl| {
         let mut r = load_renderer(gl, &m)?;
+        r.set_readback(true);
         for t in times {
-            r.render(&m, w, h, &frame_info(&m, t), true);
+            r.render(&m, w, h, &frame_info(&m, t), true)
+                .ok_or_else(|| anyhow!("nothing rendered"))?;
             let frame = r.read_output().ok_or_else(|| anyhow!("nothing rendered"))?;
             let path = out.join(format!("t{:08.3}.png", t));
             save_png(&path, &frame)?;
@@ -280,6 +313,7 @@ fn strip(
     let out = out.to_path_buf();
     headless::with_gl(move |gl| {
         let mut r = load_renderer(gl, &m)?;
+        r.set_readback(true);
         let (w, h) = (w as usize, h as usize);
         let mut sheet = Frame::init(
             cols * (w + gap) + gap,
@@ -287,12 +321,10 @@ fn strip(
             [24, 24, 24, 255],
         );
         for (i, t) in times.iter().enumerate() {
-            r.render(&m, w as i32, h as i32, &frame_info(&m, *t), true);
-            let frame = r.read_output().ok_or_else(|| anyhow!("nothing rendered"))?;
+            r.render(&m, w as i32, h as i32, &frame_info(&m, *t), true)
+                .ok_or_else(|| anyhow!("nothing rendered"))?;
             let (x, y) = ((i % cols) * (w + gap) + gap, (i / cols) * (h + gap) + gap);
-            sheet
-                .view_mut((x, y), (x + w, y + h))
-                .copy_from_toodee(&frame);
+            r.read_output_into(&mut sheet, (x, y));
             println!("#{i:<3} {:>7.2}s  {}", t, describe(&m, *t));
         }
         save_png(&out, &sheet)?;
@@ -301,7 +333,7 @@ fn strip(
     })
 }
 
-fn save_png(path: &Path, frame: &Frame) -> Result<()> {
+pub(crate) fn save_png(path: &Path, frame: &Frame) -> Result<()> {
     image::save_buffer(
         path,
         frame.data().as_flattened(),
@@ -501,30 +533,107 @@ fn wav(movie: &Path, out: &Path, rate: u32) -> Result<()> {
     let out = out.to_path_buf();
     headless::with_gl(move |gl| {
         let mut r = Renderer::new(gl)?;
-        let mut st = sound::Soundtrack::new();
-        st.set_movie(&mut r, &m, rate).map_err(|errors| {
-            anyhow!(
-                "{}",
-                errors.iter().map(|e| e.to_string()).collect::<String>()
-            )
-        })?;
-        let frames = (m.duration * rate as f32).ceil() as usize;
-        let mut w = audio::WavWriter::create(&out, frames, rate)?;
-        let mut err = None;
-        st.render_all(&mut r, |d| {
-            if let Err(e) = w.write(d) {
-                err.get_or_insert(e);
-            }
-        })
-        .map_err(|e| anyhow!(e))?;
-        if let Some(e) = err {
-            return Err(e.into());
-        }
-        w.finish()?;
+        let frames = export::write_wav(&mut r, &m, rate, &out)?;
         println!(
             "wrote {} ({:.1}s at {rate} Hz)",
             out.display(),
             frames as f32 / rate as f32
+        );
+        Ok(())
+    })
+}
+
+fn export(
+    movie: &Path,
+    out: PathBuf,
+    size: &str,
+    format: Option<&str>,
+    ffmpeg_args: Option<&str>,
+    rate: u32,
+) -> Result<()> {
+    use std::io::IsTerminal;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let m = Movie::load(movie)?;
+    let (w, h) = parse_size(size)?;
+    let format = export::Format::choose(format, &out, ffmpeg_args)?;
+    format.check_size(w as usize, h as usize)?;
+    if format != export::Format::Png {
+        export::ffmpeg_encoders()?; // a clear message before any rendering
+    }
+    let cancel = Arc::new(AtomicBool::new(false));
+    {
+        let cancel = cancel.clone();
+        ctrlc::set_handler(move || {
+            if cancel.swap(true, Ordering::Relaxed) {
+                std::process::exit(130); // second Ctrl-C: stop now
+            }
+        })
+        .context("couldn't install the Ctrl-C handler")?;
+    }
+    let opts = export::Options {
+        out,
+        w: w as usize,
+        h: h as usize,
+        format,
+        rate,
+    };
+    println!(
+        "{} — {:.2}s at {}/{} fps, {w}x{h} → {} ({:?})",
+        m.title,
+        m.duration,
+        m.fps_num,
+        m.fps_den,
+        opts.out.display(),
+        opts.format
+    );
+    headless::with_gl(move |gl| {
+        let mut r = load_renderer(gl, &m)?;
+        r.set_readback(true);
+        println!("GPU: {}", r.gl_info);
+        let start = Instant::now();
+        let tty = std::io::stderr().is_terminal();
+        let mut last = Instant::now();
+        let mut last_pct = 0;
+        let res = export::export(&mut r, &m, &opts, &cancel, |done, total| {
+            let pct = done * 100 / total.max(1);
+            let now = Instant::now();
+            let show = if tty {
+                done == total || now - last >= std::time::Duration::from_millis(200)
+            } else {
+                pct / 10 != last_pct / 10 || done == total
+            };
+            if !show {
+                return;
+            }
+            last = now;
+            last_pct = pct;
+            let secs = start.elapsed().as_secs_f64();
+            let fps = done as f64 / secs.max(1e-6);
+            let eta = (total - done) as f64 / fps.max(1e-6);
+            let line = format!(
+                "frame {done}/{total} ({pct}%)  {fps:.1} fps  {}s left",
+                eta.round()
+            );
+            if tty {
+                eprint!("\r{line}    ");
+                if done == total {
+                    eprintln!();
+                }
+            } else {
+                eprintln!("{line}");
+            }
+        });
+        if tty && res.is_err() {
+            eprintln!();
+        }
+        let s = res?;
+        println!(
+            "wrote {}: {} frames, {} audio samples, in {:.1}s",
+            opts.out.display(),
+            s.frames,
+            s.audio_frames,
+            start.elapsed().as_secs_f32()
         );
         Ok(())
     })

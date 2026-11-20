@@ -30,8 +30,9 @@ cargo fmt && cargo clippy --all-targets -- -D warnings
 
 | file | what |
 |---|---|
-| `main.rs` | CLI (clap): play, still, strip, check, wav, new, selftest |
-| `movie.rs` | `movie.toml` → `Movie`; timeline (`at(t)`), cue defines, sound gains/windows |
+| `main.rs` | CLI (clap): play, still, strip, check, wav, export, new, selftest |
+| `export.rs` | offline export: frame n at `frame_time(n)`, raw RGBA piped to ffmpeg (or PNGs), WAV muxed in |
+| `movie.rs` | `movie.toml` → `Movie`; timeline (`at(t)`), rational fps (`frame_time`/`frame_at`), cue defines, sound gains/windows |
 | `anim.rs` | constants/keyframes, eases; `glsl_fn` turns keyframes into GLSL for sound shaders |
 | `shader.rs` | source assembly, `#include`, `#line 1 N` per file, driver-log → file:line; `Dialect` (fixed `330 core` / `300 es` baseline, `glsl` opt-in) |
 | `validate.rs` | strict, driver-independent check (glslang) of every assembled shader; `validate_movie(m, dialect)` is the API `check`/`check --web` and the web player use |
@@ -72,7 +73,11 @@ cargo fmt && cargo clippy --all-targets -- -D warnings
 - **Sound is identical whatever the chunk size,** and banded vs single draws give the same
   output, and streamed (async) vs blocking synthesis agree bit for bit. The mix may read at most `mix_lookback` back and 50 ms ahead.
 - **Deterministic frames:** a frame depends only on (movie, t, size, scale), so playback,
-  `still` and a future export agree.
+  `still` and `export` agree. Frame n is at `movie.frame_time(n)`; `FrameInfo::at` derives
+  iFrame with `frame_at`, never `t * fps` (rounding drops frames at 30000/1001).
+- **Readbacks restore GL pack state** (`PACK_ROW_LENGTH`/`SKIP_*` to 0, alignment 4) and
+  check bounds first: `glReadPixels` never sees the slice length. Headless renderers call
+  `set_readback(true)` (composite drawn upside down, no CPU flip); the player doesn't.
 - **Shaders compile as `#version 330 core` (or `300 es`) whatever the driver offers**, unless the
   film sets `glsl = "410"|"430"` (refused on drivers that can't). Selftest checks `__VERSION__`.
   Everything in this repo (demo, template, transitions, selftest fixtures) must pass
@@ -93,7 +98,7 @@ cargo fmt && cargo clippy --all-targets -- -D warnings
   `templates/new/movie.toml`.
 - **Renderer behaviour:** add a selftest check. Mutation-check it: break the code and make sure
   the check fails.
-- Keep user-facing docs in README.md. Open work is in GitHub issues: #1 export, #2 web player,
+- Keep user-facing docs in README.md. Open work is in GitHub issues: #1 export (follow-ups: PBO readback), #2 web player,
   #3 libraries by name and version, #4 kit core/transitions, #5 the shotglass-kit repo,
   #6 portable GLSL (done: fixed baseline, `glsl` opt-in, strict `check` / `check --web`).
 

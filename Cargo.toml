@@ -27,6 +27,7 @@ raw-window-handle = "0.6"
 serde = { version = "1.0.229", features = ["derive"] }
 toml = "1.2.1"
 toodee = "0.8"
+ctrlc = "3.5"
 winit = "0.30"
 
 # Dependencies are slow unoptimised; this keeps `cargo run` snappy.
