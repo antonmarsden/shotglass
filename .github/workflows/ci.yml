@@ -27,16 +27,18 @@ jobs:
         run: cargo clippy --no-default-features -- -D warnings
       # The selftest's fixture films must also pass the strict GLSL check (330 and ES),
       # and the unit tests run it on the demo, the template and the built-in transitions.
-      # Includes the golden-image tests (tests/golden.rs): strips of the demo and the
-      # template compared with tests/golden/*.png.
-      - name: Unit tests, GPU selftest and golden images (software OpenGL)
+      # Includes the golden tests (tests/golden.rs): strips and soundtracks of the demo
+      # and the template compared with tests/golden/*.png and *.wav.
+      - name: Unit tests, GPU selftest, golden images and soundtracks (software OpenGL)
         run: xvfb-run -a cargo test
-      - name: Upload the actual and diff images of failed golden-image tests
+      - name: Upload the actual and diff images / WAVs of failed golden tests
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: golden-image-failures
-          path: target/tmp/golden/*.png
+          path: |
+            target/tmp/golden/*.png
+            target/tmp/golden/*.wav
           if-no-files-found: ignore
       - name: Render the demo movie headlessly (software OpenGL)
         run: |

@@ -115,6 +115,19 @@ enum Cmd {
         out: PathBuf,
         #[arg(long, default_value_t = 48000)]
         rate: u32,
+        /// Compare against this reference WAV and fail if any 50 ms window of the
+        /// difference is beyond --max-rms or --max-peak; writes <out>.diff.wav.
+        #[arg(long, value_name = "REF")]
+        compare: Option<PathBuf>,
+        /// With --compare: write this soundtrack as the new reference instead of comparing.
+        #[arg(long, requires = "compare")]
+        bless: bool,
+        /// With --compare: the largest allowed RMS of the difference in a window (full scale 1.0).
+        #[arg(long, default_value_t = golden::SoundTolerance::default().rms)]
+        max_rms: f32,
+        /// With --compare: the largest allowed difference of a single sample (full scale 1.0).
+        #[arg(long, default_value_t = golden::SoundTolerance::default().peak)]
+        max_peak: f32,
     },
     /// Render the film to a video file (or a PNG sequence), frame- and sample-accurate.
     /// Needs ffmpeg on the PATH (or SHOTGLASS_FFMPEG), except for --format png.
@@ -237,7 +250,26 @@ fn real_main() -> Result<()> {
             web,
             no_gpu,
         } => check(&movie, &size, frames, web, no_gpu),
-        Cmd::Wav { movie, out, rate } => wav(&movie, &out, rate),
+        Cmd::Wav {
+            movie,
+            out,
+            rate,
+            compare,
+            bless,
+            max_rms,
+            max_peak,
+        } => {
+            let golden = compare.map(|reference| GoldenSound {
+                reference,
+                bless,
+                tol: golden::SoundTolerance {
+                    rms: max_rms,
+                    peak: max_peak,
+                    ..Default::default()
+                },
+            });
+            wav(&movie, &out, rate, golden)
+        }
         Cmd::Export {
             movie,
             out,
@@ -714,22 +746,79 @@ ok"
     })
 }
 
-fn wav(movie: &Path, out: &Path, rate: u32) -> Result<()> {
+/// `wav --compare`: the reference soundtrack and how close the new one must be.
+struct GoldenSound {
+    reference: PathBuf,
+    bless: bool,
+    tol: golden::SoundTolerance,
+}
+
+fn wav(movie: &Path, out: &Path, rate: u32, golden: Option<GoldenSound>) -> Result<()> {
     let m = load_movie(movie)?;
     if !m.has_sound() {
         bail!("this movie has no sound (no [sound] music and no shot sounds)");
     }
-    let out = out.to_path_buf();
+    let path = out.to_path_buf();
     headless::with_gl(move |gl| {
         let mut r = Renderer::new(gl)?;
-        let frames = export::write_wav(&mut r, &m, rate, &out)?;
+        let frames = export::write_wav(&mut r, &m, rate, &path)?;
         println!(
             "wrote {} ({:.1}s at {rate} Hz)",
-            out.display(),
+            path.display(),
             frames as f32 / rate as f32
         );
         Ok(())
-    })
+    })?;
+    match golden {
+        Some(g) => compare_golden_sound(out, &g),
+        None => Ok(()),
+    }
+}
+
+/// Compares the WAV as written (16-bit), so a blessed reference compares equal to itself.
+fn compare_golden_sound(out: &Path, g: &GoldenSound) -> Result<()> {
+    if g.bless {
+        if let Some(dir) = g.reference.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::copy(out, &g.reference)
+            .with_context(|| format!("writing {}", g.reference.display()))?;
+        println!("blessed: wrote the new reference {}", g.reference.display());
+        return Ok(());
+    }
+    if !g.reference.exists() {
+        bail!(
+            "no reference at {} (add --bless to make this soundtrack the reference)",
+            g.reference.display()
+        );
+    }
+    let (rate, actual) = golden::load_wav(out)?;
+    let (ref_rate, reference) = golden::load_wav(&g.reference)?;
+    if rate != ref_rate {
+        bail!(
+            "the soundtrack is at {rate} Hz but the reference {} is at {ref_rate} Hz (pass --rate {ref_rate})",
+            g.reference.display()
+        );
+    }
+    let c = golden::compare_sound(&actual, &reference, rate, g.tol)
+        .with_context(|| format!("comparing with {}", g.reference.display()))?;
+    let diff_path = out.with_extension("diff.wav");
+    if c.passes() {
+        let _ = std::fs::remove_file(&diff_path); // don't leave a stale one behind
+        println!("matches {}: {}", g.reference.display(), c.describe(g.tol));
+        return Ok(());
+    }
+    let mut w = audio::WavWriter::create(&diff_path, c.diff.len() / 2, rate)?;
+    w.write(&c.diff)?;
+    w.finish()?;
+    bail!(
+        "the soundtrack doesn't match {}: {}\n  actual: {}\n  diff:   {} (actual - reference)\n  \
+         if the change is intended, re-run with --bless and commit the new reference",
+        g.reference.display(),
+        c.describe(g.tol),
+        out.display(),
+        diff_path.display()
+    )
 }
 
 fn export(
