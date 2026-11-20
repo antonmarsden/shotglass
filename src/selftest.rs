@@ -1019,9 +1019,13 @@ fn sound_banding(gl: &Gl, dir: &Path) -> Result<String> {
 fn sound_streaming(gl: &Gl, dir: &Path) -> Result<String> {
     let m = sound_fixture(dir)?;
     let mut notes = vec![];
-    for chunk in [32768, 7919] {
+    for (chunk, persistent) in [(32768, true), (7919, true), (32768, false), (7919, false)] {
         let blocking = render_sound(gl, &m, chunk)?;
         let mut r = Renderer::new(gl.clone())?;
+        if r.set_persistent_buffers(persistent) != persistent {
+            notes.push("no persistent buffers on this driver".into());
+            continue;
+        }
         let mut st = Soundtrack::with_chunk(chunk);
         st.set_movie(&mut r, &m, 48000)
             .map_err(|e| anyhow!("{e:?}"))?;
@@ -1079,7 +1083,8 @@ fn sound_streaming(gl: &Gl, dir: &Path) -> Result<String> {
             );
         }
         notes.push(format!(
-            "{chunk}: {frames} frames, ≤{max_in_flight} blocks queued"
+            "{chunk}{}: {frames} frames, ≤{max_in_flight} queued",
+            if persistent { " persistent" } else { "" }
         ));
     }
     // The blocking path does count its waits, so the zero above means something.

@@ -60,7 +60,9 @@ cargo fmt && cargo clippy --all-targets -- -D warnings
   Every glGet / query / fence poll is a driver round trip on threaded drivers: ask limits
   once at startup, poll fences oldest-first and stop at the first unpassed one. A round trip
   can wait for the previous present (a whole refresh), so `stream_sound` runs *after* the
-  frame's render is queued, never before it.
+  frame's render is queued, never before it. Readback and mix-input buffers are persistently
+  mapped where GL 4.4 allows (no map/upload calls); fences are polled in batches
+  (`COLLECT_AFTER`). Selftest streams with and without persistent buffers.
 - **The audio callback (`fill`) never blocks or allocates.** Only atomics, `ArcSwap` and `try_lock`.
 - **`Clock::time()` never decreases while playing.** Use the sound card position only when it
   agrees with the system timer (within 0.25 s).

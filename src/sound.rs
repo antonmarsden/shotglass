@@ -12,7 +12,7 @@
 //! re-synthesises the chunks it touches.
 
 use crate::anim::GLSL_EASE;
-use crate::gfx::{AUDIO_BLOCK, AudioTicket, Renderer, ShaderError, TRACK_WIDTH};
+use crate::gfx::{AUDIO_BLOCK, AudioTicket, AudioTiming, Renderer, ShaderError, TRACK_WIDTH};
 use crate::movie::Movie;
 use crate::shader::{Assembled, Builder, Dialect};
 use std::collections::{HashMap, HashSet};
@@ -28,6 +28,12 @@ pub type Chunk = Arc<Vec<f32>>;
 
 /// Most sound blocks queued on the GPU at once while streaming.
 const MAX_IN_FLIGHT: usize = 6;
+
+/// Streaming doesn't poll fences until the oldest queued block is this old, then
+/// collects everything finished at once: a poll is a driver round trip, which on a
+/// threaded driver can wait for the driver thread (up to a whole refresh), so it's
+/// done in occasional batches rather than every frame.
+const COLLECT_AFTER: std::time::Duration = std::time::Duration::from_millis(30);
 
 /// How synthesis may treat the GPU.
 enum Mode {
@@ -52,6 +58,8 @@ pub struct StreamStats {
     pub cpu_ms: f32,
     pub collected: usize,
     pub submitted: usize,
+    /// The GL calls among the above, one by one.
+    pub gl: AudioTiming,
 }
 
 /// Where a finished block goes.
@@ -65,6 +73,7 @@ enum Place {
 /// A block queued on the GPU, waiting to be collected.
 struct InFlight {
     ticket: AudioTicket,
+    since: Instant,
     name: String,
     place: Place,
 }
@@ -73,6 +82,7 @@ impl InFlight {
     fn new(ticket: AudioTicket, name: String, place: Place) -> InFlight {
         InFlight {
             ticket,
+            since: Instant::now(),
             name,
             place,
         }
@@ -422,6 +432,7 @@ impl Soundtrack {
     ) -> Result<Vec<(usize, Chunk)>, String> {
         let start = Instant::now();
         self.stats = StreamStats::default();
+        r.audio_timing = AudioTiming::default();
         self.collect(r, deadline)?;
         self.stats.collect_ms = start.elapsed().as_secs_f32() * 1000.0;
         let mut mode = Mode::Async {
@@ -439,6 +450,7 @@ impl Soundtrack {
         }
         let total = start.elapsed().as_secs_f32() * 1000.0;
         self.stats.cpu_ms = (total - self.stats.collect_ms - self.stats.submit_ms).max(0.0);
+        self.stats.gl = r.audio_timing;
         Ok(done)
     }
 
@@ -466,6 +478,10 @@ impl Soundtrack {
         let mut order: Vec<(AudioTicket, (u64, usize))> =
             self.in_flight.iter().map(|(k, f)| (f.ticket, *k)).collect();
         order.sort();
+        match order.first() {
+            Some((_, k)) if self.in_flight[k].since.elapsed() >= COLLECT_AFTER => {}
+            _ => return Ok(()),
+        }
         for (ticket, key) in order {
             let Some(res) = r.poll_audio(ticket) else {
                 break;

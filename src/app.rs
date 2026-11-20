@@ -1095,9 +1095,13 @@ impl Player {
                     }
                     if let Some(w) = self.perf.worst_sound {
                         let s = w.sound;
+                        let g = s.gl;
                         ui.label(format!(
-                            "worst sound stall {:.1} ms: fences + reads {:.1} ({}), queueing {:.1} ({}), cpu {:.1}",
-                            w.sound_ms, s.collect_ms, s.collected, s.submit_ms, s.submitted, s.cpu_ms
+                            "worst sound stall {:.1} ms: fences + reads {:.1} ({}), queueing {:.1} ({}), cpu {:.1}\n\
+                             GL: poll {:.1}, read {:.1}, upload {:.1}, draw {:.1}, fence {:.1}{}",
+                            w.sound_ms, s.collect_ms, s.collected, s.submit_ms, s.submitted, s.cpu_ms,
+                            g.poll_ms, g.read_ms, g.upload_ms, g.draw_ms, g.fence_ms,
+                            if self.renderer.persistent_buffers() { " (persistent buffers)" } else { "" }
                         ))
                         .on_hover_text(
                             "where the slowest sound stall's time went: polling fences and reading \
