@@ -503,6 +503,8 @@ ignoring case, which works on Windows and macOS but not on Linux or the web.
 shotglass play   <movie> [--at T] [--scale auto|0.1..1.0]
 shotglass still  <movie> --at 3.5,moon,closeup+2 [--size 1280x720] [--out stills/]
 shotglass strip  <movie> [--count 12 | --at ...] [--size 384x216] [--cols 4] [--out strip.png]
+                 [--compare ref.png [--bless] [--tolerance 8] [--budget 0.1%] [--max-mean 0.25]]
+                 # --compare: fail if the strip differs from ref.png (writes strip.diff.png)
 shotglass check  <movie> [--web] [--no-gpu] [--size 1280x720] [--frames 8]
                  # validate movie.toml and the GLSL (strictly), compile, synth, time
 shotglass wav    <movie> [--out sound.wav] [--rate 48000]
@@ -609,8 +611,13 @@ shotglass selftest strips   # only checks whose name contains "strips"
     rest alone and restores OpenGL's pixel-pack state;
   - `export` writes every frame and sample: a PNG sequence always, and FFV1 + FLAC
     when ffmpeg is installed (decoded and compared with `still` and `wav`).
+- **Golden images** (`tests/golden.rs`): contact sheets of the demo film and the
+  `shotglass new` template are compared with reference PNGs in `tests/golden/`, so
+  a change that compiles but looks wrong fails the tests. A small per-pixel
+  tolerance absorbs the differences between software OpenGL and real GPUs. To
+  update the references on purpose, see [CONTRIBUTING.md](CONTRIBUTING.md#golden-images).
 - On Linux without a display, use `xvfb-run -a cargo test` (that's what CI does).
-  Set `SHOTGLASS_SKIP_GPU_TESTS=1` to skip the selftest.
+  Set `SHOTGLASS_SKIP_GPU_TESTS=1` to skip the selftest and the golden images.
 - **Docker:** `docker build -f docker/test.Dockerfile -t shotglass-test . && docker run --rm shotglass-test`
   runs the same suite on software OpenGL, reproducibly. It tests shotglass, not your
   driver. GPU access from a Linux container on Docker Desktop goes through WSL2's

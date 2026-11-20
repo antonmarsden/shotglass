@@ -5,6 +5,7 @@ mod app;
 mod audio;
 mod export;
 mod gfx;
+mod golden;
 mod headless;
 mod library;
 mod movie;
@@ -73,6 +74,22 @@ enum Cmd {
         cols: usize,
         #[arg(long, default_value = "strip.png")]
         out: PathBuf,
+        /// Compare against this reference PNG (a golden image) and fail if they differ
+        /// beyond --tolerance and --budget; writes <out>.diff.png (differences in magenta).
+        #[arg(long, value_name = "REF")]
+        compare: Option<PathBuf>,
+        /// With --compare: write this strip as the new reference instead of comparing.
+        #[arg(long, requires = "compare")]
+        bless: bool,
+        /// With --compare: a pixel differs when R, G or B is off by more than this (0-255).
+        #[arg(long, default_value_t = golden::Tolerance::default().per_pixel)]
+        tolerance: u8,
+        /// With --compare: how many pixels may differ, e.g. 0.1% or 0.001.
+        #[arg(long, default_value = "0.1%")]
+        budget: String,
+        /// With --compare: the largest allowed average difference over all pixels (0-255).
+        #[arg(long, default_value_t = golden::Tolerance::default().mean)]
+        max_mean: f32,
     },
     /// Validate the movie and its GLSL (strictly, independent of this driver), compile
     /// every shader, synthesize the sound, and time each shot.
@@ -193,7 +210,26 @@ fn real_main() -> Result<()> {
             size,
             cols,
             out,
-        } => strip(&movie, count, at.as_deref(), &size, cols, &out),
+            compare,
+            bless,
+            tolerance,
+            budget,
+            max_mean,
+        } => {
+            let golden = match compare {
+                Some(reference) => Some(Golden {
+                    reference,
+                    bless,
+                    tol: golden::Tolerance {
+                        per_pixel: tolerance,
+                        budget: golden::parse_budget(&budget)?,
+                        mean: max_mean,
+                    },
+                }),
+                None => None,
+            };
+            strip(&movie, count, at.as_deref(), &size, cols, &out, golden)
+        }
         Cmd::Check {
             movie,
             size,
@@ -362,6 +398,13 @@ fn still(movie: &Path, at: &str, size: &str, out: &Path) -> Result<()> {
     })
 }
 
+/// `strip --compare`: the reference picture and how close the strip must be.
+struct Golden {
+    reference: PathBuf,
+    bless: bool,
+    tol: golden::Tolerance,
+}
+
 fn strip(
     movie: &Path,
     count: usize,
@@ -369,6 +412,7 @@ fn strip(
     size: &str,
     cols: usize,
     out: &Path,
+    golden: Option<Golden>,
 ) -> Result<()> {
     let m = load_movie(movie)?;
     let times = match at {
@@ -403,8 +447,46 @@ fn strip(
         }
         save_png(&out, &sheet)?;
         println!("wrote {}", out.display());
-        Ok(())
+        match golden {
+            Some(g) => compare_golden(&sheet, &out, &g),
+            None => Ok(()),
+        }
     })
+}
+
+fn compare_golden(sheet: &Frame, out: &Path, g: &Golden) -> Result<()> {
+    if g.bless {
+        if let Some(dir) = g.reference.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        save_png(&g.reference, sheet)?;
+        println!("blessed: wrote the new reference {}", g.reference.display());
+        return Ok(());
+    }
+    if !g.reference.exists() {
+        bail!(
+            "no reference at {} (add --bless to make this strip the reference)",
+            g.reference.display()
+        );
+    }
+    let reference = golden::load_png(&g.reference)?;
+    let c = golden::compare(sheet, &reference, g.tol.per_pixel)
+        .with_context(|| format!("comparing with {}", g.reference.display()))?;
+    let diff_path = out.with_extension("diff.png");
+    if c.passes(g.tol) {
+        let _ = std::fs::remove_file(&diff_path); // don't leave a stale one behind
+        println!("matches {}: {}", g.reference.display(), c.describe(g.tol));
+        return Ok(());
+    }
+    save_png(&diff_path, &c.diff)?;
+    bail!(
+        "the strip doesn't match {}: {}\n  actual: {}\n  diff:   {} (differences in magenta)\n  \
+         if the change is intended, re-run with --bless and commit the new reference",
+        g.reference.display(),
+        c.describe(g.tol),
+        out.display(),
+        diff_path.display()
+    )
 }
 
 pub(crate) fn save_png(path: &Path, frame: &Frame) -> Result<()> {

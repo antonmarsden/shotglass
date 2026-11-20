@@ -27,8 +27,17 @@ jobs:
         run: cargo clippy --no-default-features -- -D warnings
       # The selftest's fixture films must also pass the strict GLSL check (330 and ES),
       # and the unit tests run it on the demo, the template and the built-in transitions.
-      - name: Unit tests and GPU selftest (software OpenGL)
+      # Includes the golden-image tests (tests/golden.rs): strips of the demo and the
+      # template compared with tests/golden/*.png.
+      - name: Unit tests, GPU selftest and golden images (software OpenGL)
         run: xvfb-run -a cargo test
+      - name: Upload the actual and diff images of failed golden-image tests
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: golden-image-failures
+          path: target/tmp/golden/*.png
+          if-no-files-found: ignore
       - name: Render the demo movie headlessly (software OpenGL)
         run: |
           cargo build --release
@@ -55,8 +64,8 @@ jobs:
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@v2
-      # GitHub's Windows machines have no usable OpenGL, so the GPU selftest is
-      # skipped here; run `cargo test` on a real Windows machine for that.
+      # GitHub's Windows machines have no usable OpenGL, so the GPU selftest and the
+      # golden images are skipped here; run `cargo test` on a real Windows machine for that.
       - run: cargo test
         env:
           SHOTGLASS_SKIP_GPU_TESTS: "1"
