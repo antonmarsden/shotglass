@@ -6,6 +6,7 @@ mod audio;
 mod export;
 mod gfx;
 mod headless;
+mod library;
 mod movie;
 mod selftest;
 mod shader;
@@ -120,6 +121,14 @@ enum Cmd {
     },
     /// Create a new movie folder from a template.
     New { dir: PathBuf },
+    /// Download the film's libraries and pin them in shotglass.lock (keeps existing pins).
+    Fetch { movie: PathBuf },
+    /// Move libraries in shotglass.lock to the newest version movie.toml allows.
+    Update {
+        movie: PathBuf,
+        /// Library names (local names from movie.toml); all if none.
+        names: Vec<String>,
+    },
     /// Check the renderer and soundtrack on this GPU and driver with built-in test films.
     Selftest {
         /// Only run checks whose name contains this text.
@@ -152,7 +161,7 @@ fn real_main() -> Result<()> {
     };
     match cmd {
         Cmd::Play { movie, at, scale } => {
-            let m = Movie::load(&movie)?;
+            let m = load_movie(&movie)?;
             let start = match at {
                 Some(a) => parse_times(&a, &m)?[0],
                 None => 0.0,
@@ -209,8 +218,73 @@ fn real_main() -> Result<()> {
             rate,
         ),
         Cmd::New { dir } => new_movie(&dir),
+        Cmd::Fetch { movie } => fetch_libraries(
+            &movie,
+            library::FetchMode::Missing {
+                skip: Default::default(),
+            },
+            true,
+        ),
+        Cmd::Update { movie, names } => {
+            fetch_libraries(&movie, library::FetchMode::Update(names), true)
+        }
         Cmd::Selftest { filter } => selftest::run(filter),
     }
+}
+
+/// Load a film for a command, first fetching libraries that aren't locked or downloaded
+/// yet (never moving an existing pin).
+fn load_movie(path: &Path) -> Result<Movie> {
+    let m = Movie::read(path)?;
+    if m.library_specs.iter().any(|s| s.source.is_some()) {
+        let env = |k: &str| std::env::var(k).ok();
+        let skip = library::overrides(&m.root, &m.library_specs, &env)?
+            .into_keys()
+            .collect();
+        fetch_libraries(path, library::FetchMode::Missing { skip }, false)?;
+    }
+    let m = Movie::load(path)?;
+    for w in &m.warnings {
+        eprintln!("warning: {w}");
+    }
+    Ok(m)
+}
+
+/// `fetch`, `update`, and the automatic fetch before other commands (`verbose` = false:
+/// only says something when it downloads or changes the lock).
+fn fetch_libraries(path: &Path, mode: library::FetchMode, verbose: bool) -> Result<()> {
+    let m = Movie::read(path)?;
+    if !m.library_specs.iter().any(|s| s.source.is_some()) {
+        if verbose {
+            println!(
+                "{} has no libraries with a source; nothing to fetch",
+                m.title
+            );
+        }
+        return Ok(());
+    }
+    let old = library::Lock::load(&m.root)?;
+    let (lock, log) = library::fetch(
+        &m.library_specs,
+        old.as_ref(),
+        &library::Git,
+        &library::cache_dir(),
+        &mode,
+    )?;
+    let changed = old.as_ref() != Some(&lock);
+    if verbose || changed || log.iter().any(|l| l.contains("downloaded")) {
+        for l in &log {
+            println!("  {l}");
+        }
+    }
+    if changed {
+        let p = m.root.join(library::LOCK_FILE);
+        std::fs::write(&p, lock.to_text()).with_context(|| format!("writing {}", p.display()))?;
+        println!("wrote {}", p.display());
+    } else if verbose {
+        println!("{} is up to date", library::LOCK_FILE);
+    }
+    Ok(())
 }
 
 fn parse_size(s: &str) -> Result<(i32, i32)> {
@@ -268,7 +342,7 @@ fn frame_info(m: &Movie, t: f32) -> FrameInfo {
 }
 
 fn still(movie: &Path, at: &str, size: &str, out: &Path) -> Result<()> {
-    let m = Movie::load(movie)?;
+    let m = load_movie(movie)?;
     let times = parse_times(at, &m)?;
     let (w, h) = parse_size(size)?;
     std::fs::create_dir_all(out)?;
@@ -296,7 +370,7 @@ fn strip(
     cols: usize,
     out: &Path,
 ) -> Result<()> {
-    let m = Movie::load(movie)?;
+    let m = load_movie(movie)?;
     let times = match at {
         Some(a) => parse_times(a, &m)?,
         None => {
@@ -425,12 +499,42 @@ fn strict_check(m: &Movie, web: bool) -> Result<()> {
 }
 
 fn check(movie: &Path, size: &str, frames: usize, web: bool, no_gpu: bool) -> Result<()> {
-    let m = Movie::load(movie)?;
+    let m = load_movie(movie)?;
     let (w, h) = parse_size(size)?;
-    println!("{} — {:.2}s, {} shots", m.title, m.duration, m.shots.len());
+    println!(
+        "{} — {:.2}s, {} shots{}",
+        m.title,
+        m.duration,
+        m.shots.len(),
+        m.shotglass
+            .as_ref()
+            .map_or(String::new(), |v| format!(", made for shotglass {v}"))
+    );
+    for l in &m.libraries {
+        let from = match &l.origin {
+            library::Origin::Path => "in the film".to_string(),
+            library::Origin::Env(v) => format!("override {v}"),
+            library::Origin::Local => format!("override in {}", library::LOCAL_FILE),
+            library::Origin::Locked => library::LOCK_FILE.to_string(),
+        };
+        println!(
+            "library {}{}  [{}]  from {from}: {}",
+            l.describe(),
+            l.glsl.map_or(String::new(), |g| format!(", GLSL {g}")),
+            if l.licences.is_empty() {
+                "no licence declared".to_string()
+            } else {
+                l.licences.join(", ")
+            },
+            l.root.display()
+        );
+    }
     strict_check(&m, web)?;
     if no_gpu {
-        println!("\nok");
+        println!(
+            "
+ok"
+        );
         return Ok(());
     }
     headless::with_gl(move |gl| {
@@ -458,6 +562,9 @@ fn check(movie: &Path, size: &str, frames: usize, web: bool, no_gpu: bool) -> Re
             "compiled {compiled} programs in {:.0} ms",
             t0.elapsed().as_secs_f32() * 1000.0
         );
+        for w in &r.warnings {
+            println!("warning: {w}");
+        }
         if m.has_sound() {
             let t = Instant::now();
             let mut st = sound::Soundtrack::new();
@@ -526,7 +633,7 @@ fn check(movie: &Path, size: &str, frames: usize, web: bool, no_gpu: bool) -> Re
 }
 
 fn wav(movie: &Path, out: &Path, rate: u32) -> Result<()> {
-    let m = Movie::load(movie)?;
+    let m = load_movie(movie)?;
     if !m.has_sound() {
         bail!("this movie has no sound (no [sound] music and no shot sounds)");
     }
@@ -554,7 +661,7 @@ fn export(
     use std::io::IsTerminal;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
-    let m = Movie::load(movie)?;
+    let m = load_movie(movie)?;
     let (w, h) = parse_size(size)?;
     let format = export::Format::choose(format, &out, ffmpeg_args)?;
     format.check_size(w as usize, h as usize)?;
@@ -641,6 +748,7 @@ fn export(
 
 const TEMPLATE: &[(&str, &str)] = &[
     ("movie.toml", include_str!("../templates/new/movie.toml")),
+    (".gitignore", include_str!("../templates/new/gitignore")),
     (
         "scenes/first.glsl",
         include_str!("../templates/new/scenes/first.glsl"),
@@ -656,12 +764,29 @@ const TEMPLATE: &[(&str, &str)] = &[
     ),
 ];
 
+/// The template's `shotglass = "…"` names this engine's contract.
+fn template_text(name: &str, text: &str) -> String {
+    if name != "movie.toml" {
+        return text.to_string();
+    }
+    let v = library::contract();
+    text.lines()
+        .map(|l| match l.strip_prefix("shotglass = \"") {
+            Some(rest) => {
+                let comment = rest.split_once('"').map_or("", |(_, c)| c);
+                format!("shotglass = \"{}.{}\"{comment}\n", v.major, v.minor)
+            }
+            None => format!("{l}\n"),
+        })
+        .collect()
+}
+
 /// Write the `shotglass new` template into `dir`.
 fn write_template(dir: &Path) -> Result<()> {
     for (name, text) in TEMPLATE {
         let p = dir.join(name);
         std::fs::create_dir_all(p.parent().unwrap())?;
-        std::fs::write(&p, text)?;
+        std::fs::write(&p, template_text(name, text))?;
     }
     Ok(())
 }
@@ -677,4 +802,19 @@ fn new_movie(dir: &Path) -> Result<()> {
         dir.display()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn template_parses_and_names_this_engine() {
+        let (_, text) = TEMPLATE.iter().find(|(n, _)| *n == "movie.toml").unwrap();
+        let text = template_text("movie.toml", text);
+        let m = Movie::parse(&text, Path::new(".")).unwrap();
+        let v = library::contract();
+        assert_eq!(m.shotglass, Some(format!("{}.{}", v.major, v.minor)));
+        assert!(text.contains("# engine contract"));
+    }
 }

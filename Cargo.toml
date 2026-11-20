@@ -24,7 +24,9 @@ glutin-winit = "0.5"
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 notify = "8.2.2"
 raw-window-handle = "0.6"
+semver = "1.0.28"
 serde = { version = "1.0.229", features = ["derive"] }
+sha2 = "0.11.1"
 toml = "1.2.1"
 toodee = "0.8"
 ctrlc = "3.5"

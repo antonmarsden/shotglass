@@ -1,4 +1,5 @@
 # A new shotglass movie. Save any file while `shotglass play` is open and it reloads.
+shotglass = "0.1"         # engine contract this film was made for
 title = "My short"
 aspect = [16, 9]
 fps = 30                  # or 29.97, or "30000/1001"
@@ -26,3 +27,8 @@ transition = { type = "iris", duration = 1.2, freeze = true, params = { center =
 # This shot's own sound: time is shot-local. sound_lead / sound_tail (seconds)
 # start it early or let it ring on; otherwise it fades with the transitions.
 sound = "sfx/chime.glsl"
+
+# Shared GLSL by name; shaders use #include <kit/file.glsl>. See README, "Libraries".
+# [libraries]
+# kit = { version = "0.4", source = "https://github.com/antonmarsden/shotglass-kit", subdir = "core" }
+# mine = { path = "lib/mine" }

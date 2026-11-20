@@ -65,6 +65,7 @@ movies/big-shadow/
 `movie.toml`:
 
 ```toml
+shotglass = "0.1"             # optional: the engine contract the film was made for
 title = "Big Shadow"
 aspect = [16, 9]
 fps = 30                      # or 29.97, or "30000/1001"; frame stepping, iFrame and export
@@ -137,6 +138,9 @@ These uniforms are available:
 | `CUE_<ID>_START`, `CUE_<ID>_SETTLED`, `CUE_<ID>_END`, `MOVIE_DURATION` | `#define`s from the edit (`SETTLED` = the incoming transition has finished) |
 
 `#include "file.glsl"` works relative to the including file, then relative to the movie folder.
+`#include <name/file.glsl>` takes `file.glsl` from the library the film calls `name`
+(see [Libraries](#libraries)). Each file is included at most once per shader, so
+shared helpers can include each other freely.
 
 ### Transitions
 
@@ -354,6 +358,113 @@ soundtrack (`shotglass wav`) in 4 s:
 - The Sound panel shows how much sound is buffered ahead and any underruns.
   The overlay shows shaders still compiling.
 
+## Libraries
+
+Shared GLSL comes from versioned libraries that a film declares by name. The engine
+provides only the contract (uniforms, entry points, the transition interface, cue
+defines), so upgrading shotglass doesn't change how a finished film looks or sounds.
+
+```toml
+shotglass = "0.1"        # engine contract this film needs; other engines refuse with a clear message
+
+[libraries]
+kit  = { version = "0.4", source = "https://github.com/antonmarsden/shotglass-kit", subdir = "core" }
+sfx  = { version = "0.3", source = "https://github.com/antonmarsden/shotglass-kit", subdir = "sounds" }
+toon = { version = "1.2", source = "https://github.com/someone/toon-kit" }
+mine = { path = "lib/mykit" }            # a library inside the film's own folder
+```
+
+```glsl
+#include <kit/noise.glsl>
+#include <toon/outline.glsl>
+```
+
+- **The film chooses the name.** The include prefix is the local name from
+  `[libraries]`, so two publishers' libraries can both be called "kit" without clashing.
+- **`version`** is a semver range (`"0.4"` means `>=0.4.0, <0.5.0`, as in Cargo),
+  matched against the source's git tags (`v0.4.2` or `0.4.2`).
+- **`source`** is the https URL of a git repository. **`subdir`** picks a folder of
+  it as the library root, so one repository can publish several libraries that a film
+  pins separately. Every folder shares the repository's tags.
+- **`path`** is a library inside the film folder. It may not climb above it.
+- Errors inside a library file show `kit/noise.glsl:12`. A missing include lists
+  every place that was searched.
+
+### library.toml
+
+Each library root has one:
+
+```toml
+name = "shotglass-kit/core"        # canonical name
+version = "0.4.2"
+requires_shotglass = "0.1"         # engine contract it needs (optional)
+licences = ["MIT"]                 # SPDX identifiers
+glsl = 430                         # optional: needs more than the GLSL 3.30 baseline
+
+[requires]                         # peer libraries: checked, not installed
+"shotglass-kit/sounds" = ">=0.3"
+```
+
+Libraries are pure GLSL and data: no scripts, build steps or plugins. Inside a
+library, includes of *other* libraries use canonical names
+(`#include <shotglass-kit/sounds/bell.glsl>`), which shotglass maps to whatever the
+film calls them. A peer requirement means the film must list that library itself;
+shotglass checks the versions and says what's missing, but never adds anything.
+
+### Fetching and shotglass.lock
+
+```sh
+shotglass fetch  <movie>           # download what's missing, write shotglass.lock
+shotglass update <movie> [name..]  # move pins to the newest version in range
+```
+
+`fetch` (also run automatically by `play`, `still`, `strip`, `check` and `wav` when
+something isn't downloaded yet) resolves each library to an exact version and writes
+`shotglass.lock` next to `movie.toml`: version, source, tag, `subdir`, and a sha256
+of the library's files. **Commit it with the film.** A new library release never
+changes a finished film; only `update` moves a pin. If the files don't match the lock
+(a moved tag, an edited cache), that's an error. Loading a film (including live
+reload) only reads the lock and the cache and never touches the network.
+
+Downloads use `git` and are cached per user, shared between films and between
+libraries from the same repository and version, and work offline afterwards:
+`%LOCALAPPDATA%\shotglass\libs` on Windows, `~/Library/Caches/shotglass/libs` on macOS,
+`~/.cache/shotglass/libs` elsewhere (`SHOTGLASS_CACHE` overrides it).
+
+The hash is sha256 over the library root's files, sorted by their `/`-separated path
+relative to the root and skipping hidden files and folders (`.git`); CRLF becomes LF in
+UTF-8 files so Windows checkouts hash the same. For each file it hashes the path, a 0
+byte, the content length as 8 little-endian bytes, then the content.
+
+### Working on a library locally
+
+Point a library at a working copy without putting machine paths in the film:
+
+```sh
+SHOTGLASS_LIB_KIT=../shotglass-kit/core shotglass play movies/my-film
+```
+
+or put an uncommitted `movie.local.toml` next to `movie.toml` (`shotglass new` adds
+it to `.gitignore`):
+
+```toml
+[libraries.kit]
+path = "C:/src/shotglass-kit/core"
+```
+
+The variable is `SHOTGLASS_LIB_` plus the local name in capitals, with `-` as `_`.
+It wins over `movie.local.toml`. Relative override paths are relative to the film
+folder. The version range in `movie.toml` still has to match the working copy's
+`library.toml`. Live reload watches library folders, overrides included.
+
+### Portable paths
+
+The same `movie.toml` has to work on every OS and in a future web player, so paths in
+it use forward slashes and stay inside the film folder: no absolute paths, drive
+letters, backslashes or `..` that climbs out. URLs only go in `source`. File names are
+case-sensitive: `check` (and every command) warns when a name only matches a file by
+ignoring case, which works on Windows and macOS but not on Linux or the web.
+
 ## Command line
 
 ```sh
@@ -365,6 +476,8 @@ shotglass check  <movie> [--web] [--no-gpu] [--size 1280x720] [--frames 8]
 shotglass wav    <movie> [--out sound.wav] [--rate 48000]
 shotglass export <movie> --out film.webm [--size 1920x1080] [--format webm|av1|ffv1|png|ffmpeg] [--rate 48000]
 shotglass new    <dir>
+shotglass fetch  <movie>                                   # download libraries, write shotglass.lock
+shotglass update <movie> [library..]                       # move library pins to the newest allowed
 shotglass selftest [filter]                                # GPU + sound checks on this machine
 ```
 
@@ -449,7 +562,8 @@ shotglass selftest strips   # only checks whose name contains "strips"
   - transitions start exactly on the old shot and end on the new one;
   - live and frozen crossfades blend correctly;
   - reduced render scale has no edge bleed, and strip-drawn frames match single draws;
-  - errors point at the right file:line, including inside `#include`s;
+  - errors point at the right file:line, including inside `#include`s and as
+    `name/file.glsl:line` inside libraries, and each file is included once;
   - shaders get `#version 330 core` whatever the driver offers (or the film's
     `glsl` opt-in, refused on drivers that can't provide it);
   - a broken edit keeps the last working version on screen;
