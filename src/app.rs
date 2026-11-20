@@ -7,13 +7,106 @@ use crate::sound::Soundtrack;
 use eframe::egui::{self, Color32, Key, Modifiers, Pos2, Rect, RichText, Sense, Stroke, Vec2};
 use eframe::glow;
 use std::collections::VecDeque;
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, channel};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use web_time::Instant;
 
 /// Seconds of sound synthesised ahead of the playhead while playing.
 const SOUND_AHEAD: f32 = 6.0;
 
+/// Where the player gets its movie from.
+pub enum MovieSource {
+    /// A movie folder (or movie.toml) on disk, reloaded when its files change.
+    #[cfg(not(target_arch = "wasm32"))]
+    Disk(PathBuf),
+    /// A movie whose files were downloaded before the player started (web
+    /// player). `label` is where it came from (its URL).
+    #[cfg(target_arch = "wasm32")]
+    Loaded { movie: Box<Movie>, label: String },
+}
+
+impl MovieSource {
+    fn load(&self) -> anyhow::Result<Movie> {
+        match self {
+            #[cfg(not(target_arch = "wasm32"))]
+            MovieSource::Disk(path) => Movie::load(path),
+            #[cfg(target_arch = "wasm32")]
+            MovieSource::Loaded { movie, .. } => Ok((**movie).clone()),
+        }
+    }
+
+    fn label(&self) -> String {
+        match self {
+            #[cfg(not(target_arch = "wasm32"))]
+            MovieSource::Disk(path) => path.display().to_string(),
+            #[cfg(target_arch = "wasm32")]
+            MovieSource::Loaded { label, .. } => label.clone(),
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+type Watcher = notify::RecommendedWatcher;
+#[cfg(target_arch = "wasm32")]
+type Watcher = ();
+
+/// Live reload: a message on the receiver whenever a movie file changes on disk.
+#[cfg(not(target_arch = "wasm32"))]
+fn watch(source: &MovieSource, ctx: egui::Context) -> (Option<Watcher>, Receiver<()>) {
+    let (tx, rx) = channel();
+    let MovieSource::Disk(path) = source;
+    let root = if path.is_dir() {
+        path.clone()
+    } else {
+        path.parent().map(PathBuf::from).unwrap_or_default()
+    };
+    let watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+        if let Ok(ev) = res {
+            use notify::EventKind::*;
+            let relevant = matches!(ev.kind, Modify(_) | Create(_) | Remove(_))
+                && ev.paths.iter().any(|p| {
+                    matches!(
+                        p.extension().and_then(|e| e.to_str()),
+                        Some("glsl" | "toml" | "frag" | "inc" | "h")
+                    )
+                });
+            if relevant {
+                let _ = tx.send(());
+                ctx.request_repaint();
+            }
+        }
+    })
+    .and_then(|mut w| {
+        use notify::Watcher;
+        w.watch(&root, notify::RecursiveMode::Recursive).map(|_| w)
+    })
+    .ok();
+    (watcher, rx)
+}
+
+/// No live reload in the browser.
+#[cfg(target_arch = "wasm32")]
+fn watch(_source: &MovieSource, _ctx: egui::Context) -> (Option<Watcher>, Receiver<()>) {
+    (None, channel().1)
+}
+
+/// The player as an eframe app, already playing (the web player starts it on a
+/// canvas after the page's Play button is clicked).
+#[cfg(target_arch = "wasm32")]
+pub fn new_player(
+    cc: &eframe::CreationContext<'_>,
+    source: MovieSource,
+    audio: anyhow::Result<AudioOut>,
+) -> anyhow::Result<Box<dyn eframe::App>> {
+    let mut p = Player::new(cc, source, audio, 0.0, None)?;
+    // The page's Play button (which unlocked audio) also starts playback.
+    p.toggle_play();
+    Ok(Box::new(p))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 pub fn run(path: PathBuf, start: f32, scale: Option<f32>) -> anyhow::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -26,7 +119,9 @@ pub fn run(path: PathBuf, start: f32, scale: Option<f32>) -> anyhow::Result<()> 
         "shotglass",
         options,
         Box::new(move |cc| {
-            let app = Player::new(cc, path, start, scale).map_err(|e| format!("{e:#}"))?;
+            let source = MovieSource::Disk(path);
+            let app = Player::new(cc, source, AudioOut::open(), start, scale)
+                .map_err(|e| format!("{e:#}"))?;
             Ok(Box::new(app))
         }),
     )
@@ -122,7 +217,7 @@ impl Perf {
 }
 
 struct Player {
-    path: PathBuf,
+    source: MovieSource,
     movie: Option<Movie>,
     load_error: Option<String>,
     /// Errors assembling sources (missing files): the movie isn't switched.
@@ -140,7 +235,7 @@ struct Player {
     perf_frame: u64,
     soundtrack: Soundtrack,
     sound_info: String,
-    _watcher: Option<notify::RecommendedWatcher>,
+    _watcher: Option<Watcher>,
     rx: Receiver<()>,
     reload_at: Option<Instant>,
     reloads: u32,
@@ -158,12 +253,15 @@ struct Player {
     last_input: Instant,
     show_panel: bool,
     scrub_resume: Option<bool>,
+    #[cfg(target_arch = "wasm32")]
+    blit: crate::web::Blit,
 }
 
 impl Player {
     fn new(
         cc: &eframe::CreationContext<'_>,
-        path: PathBuf,
+        source: MovieSource,
+        audio: anyhow::Result<AudioOut>,
         start: f32,
         scale: Option<f32>,
     ) -> anyhow::Result<Player> {
@@ -171,8 +269,10 @@ impl Player {
             .gl
             .clone()
             .ok_or_else(|| anyhow::anyhow!("eframe didn't give us an OpenGL context"))?;
+        #[cfg(target_arch = "wasm32")]
+        let blit = crate::web::Blit::new(&gl).map_err(|e| anyhow::anyhow!(e))?;
         let renderer = Renderer::new(gl)?;
-        let (audio, sound_info) = match AudioOut::open() {
+        let (audio, sound_info) = match audio {
             Ok(a) => {
                 let s = format!("{} | {} Hz", a.device_name, a.sample_rate);
                 (Some(a), s)
@@ -185,37 +285,10 @@ impl Player {
         let mut clock = Clock::new(audio);
         clock.seek(start);
 
-        let (tx, rx) = channel();
-        let ctx = cc.egui_ctx.clone();
-        let root = if path.is_dir() {
-            path.clone()
-        } else {
-            path.parent().map(PathBuf::from).unwrap_or_default()
-        };
-        let watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-            if let Ok(ev) = res {
-                use notify::EventKind::*;
-                let relevant = matches!(ev.kind, Modify(_) | Create(_) | Remove(_))
-                    && ev.paths.iter().any(|p| {
-                        matches!(
-                            p.extension().and_then(|e| e.to_str()),
-                            Some("glsl" | "toml" | "frag" | "inc" | "h")
-                        )
-                    });
-                if relevant {
-                    let _ = tx.send(());
-                    ctx.request_repaint();
-                }
-            }
-        })
-        .and_then(|mut w| {
-            use notify::Watcher;
-            w.watch(&root, notify::RecursiveMode::Recursive).map(|_| w)
-        })
-        .ok();
+        let (watcher, rx) = watch(&source, cc.egui_ctx.clone());
 
         let mut p = Player {
-            path,
+            source,
             movie: None,
             load_error: None,
             shader_errors: vec![],
@@ -264,6 +337,8 @@ impl Player {
             last_input: Instant::now(),
             show_panel: true,
             scrub_resume: None,
+            #[cfg(target_arch = "wasm32")]
+            blit,
         };
         p.clock.set_gain(p.volume);
         p.reload();
@@ -273,7 +348,7 @@ impl Player {
     // ------------------------------------------------------------ loading
 
     fn reload(&mut self) {
-        let m = match Movie::load(&self.path) {
+        let m = match self.source.load() {
             Ok(m) => m,
             Err(e) => {
                 self.load_error = Some(format!("{e:#}"));
@@ -766,7 +841,14 @@ impl Player {
         if let Some(tex) = tex
             && self.tex.map(|(t, _)| t) != Some(tex)
         {
+            #[cfg(not(target_arch = "wasm32"))]
             let id = frame.register_native_glow_texture(tex);
+            // Drawn by `blit` instead (eframe's web backend can't register GL textures).
+            #[cfg(target_arch = "wasm32")]
+            let id = {
+                let _ = &frame;
+                egui::TextureId::User(0)
+            };
             self.tex = Some((tex, id));
         }
         true
@@ -1044,11 +1126,7 @@ impl Player {
         egui::ScrollArea::vertical().show(ui, |ui| {
             if let Some(m) = self.movie.clone() {
                 ui.heading(&m.title);
-                ui.label(
-                    RichText::new(self.path.display().to_string())
-                        .small()
-                        .weak(),
-                );
+                ui.label(RichText::new(self.source.label()).small().weak());
                 ui.add_space(6.0);
                 egui::CollapsingHeader::new("Now")
                     .default_open(true)
@@ -1298,8 +1376,13 @@ impl eframe::App for Player {
             let (w, h) = ((view.width() * ppp).round() as i32, (view.height() * ppp).round() as i32);
             if w > 0 && h > 0 {
                 rendered = self.render_view(frame, w, h);
+                #[cfg(not(target_arch = "wasm32"))]
                 if let Some((_, id)) = self.tex {
                     ui.painter().image(id, view, Rect::from_min_max(Pos2::new(0.0, 1.0), Pos2::new(1.0, 0.0)), Color32::WHITE);
+                }
+                #[cfg(target_arch = "wasm32")]
+                if let Some((tex, _)) = self.tex {
+                    ui.painter().add(self.blit.paint(view, tex));
                 }
             }
             if self.gpu_lost {

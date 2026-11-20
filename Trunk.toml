@@ -1,0 +1,7 @@
+# Web player: `trunk serve` (or `trunk build --release`), see README "Web player".
+[build]
+target = "web/index.html"
+dist = "dist"
+
+[watch]
+ignore = ["dist", "target"]

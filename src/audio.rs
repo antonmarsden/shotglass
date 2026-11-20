@@ -4,14 +4,21 @@
 //! clock for the time of the sample being heard right now, so a slow frame becomes a
 //! skipped frame instead of a slow-motion drift out of sync. Without an audio device
 //! the clock falls back to the system timer.
+//!
+//! On the desktop the sound card is reached through cpal; in the browser (wasm32)
+//! through WebAudio (see `web`). Both call the same `fill`.
 
 use arc_swap::ArcSwap;
+#[cfg(not(target_arch = "wasm32"))]
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+#[cfg(not(target_arch = "wasm32"))]
 use cpal::{FromSample, SizedSample};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+// std::time::Instant panics in the browser; web_time re-exports it on the desktop.
+use web_time::Instant;
 
 const FRAC: f64 = 4294967296.0; // 32.32 fixed point sample position
 
@@ -36,14 +43,51 @@ struct Shared {
     last: Mutex<Option<(u64, Instant, Duration)>>,
 }
 
+impl Shared {
+    fn new() -> Shared {
+        Shared {
+            store: ArcSwap::from_pointee(ChunkStore::default()),
+            underruns: AtomicU64::new(0),
+            pos: AtomicU64::new(0),
+            playing: AtomicBool::new(false),
+            rate: AtomicU32::new(1f32.to_bits()),
+            gain: AtomicU32::new(1f32.to_bits()),
+            last: Mutex::new(None),
+        }
+    }
+}
+
+/// A sample type the output can be written in.
+trait OutSample: Copy {
+    fn from_f32(v: f32) -> Self;
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl<T: SizedSample + FromSample<f32>> OutSample for T {
+    fn from_f32(v: f32) -> T {
+        T::from_sample(v)
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+impl OutSample for f32 {
+    fn from_f32(v: f32) -> f32 {
+        v
+    }
+}
+
 pub struct AudioOut {
     shared: Arc<Shared>,
     pub sample_rate: u32,
     pub device_name: String,
+    #[cfg(not(target_arch = "wasm32"))]
     _stream: Option<cpal::Stream>,
+    #[cfg(target_arch = "wasm32")]
+    _stream: Option<web::Output>,
 }
 
 impl AudioOut {
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn open() -> anyhow::Result<AudioOut> {
         let host = cpal::default_host();
         let device = host
@@ -55,15 +99,7 @@ impl AudioOut {
             .unwrap_or_else(|_| "audio device".into());
         let config = device.default_output_config()?;
         let sample_rate = config.sample_rate();
-        let shared = Arc::new(Shared {
-            store: ArcSwap::from_pointee(ChunkStore::default()),
-            underruns: AtomicU64::new(0),
-            pos: AtomicU64::new(0),
-            playing: AtomicBool::new(false),
-            rate: AtomicU32::new(1f32.to_bits()),
-            gain: AtomicU32::new(1f32.to_bits()),
-            last: Mutex::new(None),
-        });
+        let shared = Arc::new(Shared::new());
         let fmt = config.sample_format();
         let cfg: cpal::StreamConfig = config.into();
         let stream = match fmt {
@@ -83,18 +119,25 @@ impl AudioOut {
         })
     }
 
+    /// Open WebAudio. Browsers only let audio start from a user gesture, so call
+    /// this inside a click handler.
+    #[cfg(target_arch = "wasm32")]
+    pub fn open() -> anyhow::Result<AudioOut> {
+        let shared = Arc::new(Shared::new());
+        let (out, sample_rate) =
+            web::open(shared.clone()).map_err(|e| anyhow::anyhow!("WebAudio: {e:?}"))?;
+        Ok(AudioOut {
+            shared,
+            sample_rate,
+            device_name: "WebAudio".into(),
+            _stream: Some(out),
+        })
+    }
+
     /// An output with no real device, driven by calling `FakeDevice::callback` (tests).
     #[cfg(test)]
     pub fn fake(sample_rate: u32) -> (AudioOut, FakeDevice) {
-        let shared = Arc::new(Shared {
-            store: ArcSwap::from_pointee(ChunkStore::default()),
-            underruns: AtomicU64::new(0),
-            pos: AtomicU64::new(0),
-            playing: AtomicBool::new(false),
-            rate: AtomicU32::new(1f32.to_bits()),
-            gain: AtomicU32::new(1f32.to_bits()),
-            last: Mutex::new(None),
-        });
+        let shared = Arc::new(Shared::new());
         let dev = FakeDevice {
             shared: shared.clone(),
         };
@@ -127,6 +170,7 @@ impl FakeDevice {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn build<T: SizedSample + FromSample<f32>>(
     device: &cpal::Device,
     cfg: cpal::StreamConfig,
@@ -147,12 +191,7 @@ fn build<T: SizedSample + FromSample<f32>>(
 
 /// The audio callback: copy the chunks under the play position into `data` and
 /// advance it. Lock-free apart from a `try_lock` that never waits.
-fn fill<T: SizedSample + FromSample<f32>>(
-    sh: &Shared,
-    data: &mut [T],
-    channels: usize,
-    latency: Duration,
-) {
+fn fill<T: OutSample>(sh: &Shared, data: &mut [T], channels: usize, latency: Duration) {
     let playing = sh.playing.load(Ordering::Acquire);
     let start = sh.pos.load(Ordering::Acquire);
     let mut pos = start;
@@ -164,7 +203,7 @@ fn fill<T: SizedSample + FromSample<f32>>(
         };
     }
     if !playing {
-        data.iter_mut().for_each(|s| *s = T::from_sample(0.0f32));
+        data.iter_mut().for_each(|s| *s = T::from_f32(0.0f32));
         return;
     }
     let store = sh.store.load();
@@ -198,14 +237,14 @@ fn fill<T: SizedSample + FromSample<f32>>(
             (0.0, 0.0)
         };
         for (c, s) in frame.iter_mut().enumerate() {
-            *s = T::from_sample(match c {
+            *s = T::from_f32(match c {
                 0 => l,
                 1 => r,
                 _ => 0.0,
             });
         }
         if channels == 1 {
-            frame[0] = T::from_sample((l + r) * 0.5);
+            frame[0] = T::from_f32((l + r) * 0.5);
         }
         pos += step;
     }
@@ -216,6 +255,91 @@ fn fill<T: SizedSample + FromSample<f32>>(
     let _ = sh
         .pos
         .compare_exchange(start, pos, Ordering::AcqRel, Ordering::Relaxed);
+}
+
+/// WebAudio output: a ScriptProcessorNode whose callback runs the same `fill` as
+/// the desktop's sound card callback.
+///
+/// The latency handed to `fill` comes from the AudioContext's clock: how far the
+/// buffer's `playbackTime` is ahead of `currentTime`, plus `outputLatency` (the
+/// time from the audio graph to the speakers), so `Clock::time` is the sample
+/// being heard, as on the desktop.
+#[cfg(target_arch = "wasm32")]
+mod web {
+    use super::{Shared, fill};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen::prelude::*;
+    use web_sys::{AudioContext, AudioProcessingEvent, ScriptProcessorNode};
+
+    /// Frames per callback. The callback runs on the browser's main thread, between
+    /// our frames, so the buffer must outlast a frame busy compiling a shader;
+    /// the clock subtracts the latency this adds.
+    const BUFFER: u32 = 8192;
+
+    pub struct Output {
+        ctx: AudioContext,
+        node: ScriptProcessorNode,
+        _callback: Closure<dyn FnMut(AudioProcessingEvent)>,
+    }
+
+    impl Drop for Output {
+        fn drop(&mut self) {
+            self.node.set_onaudioprocess(None);
+            let _ = self.node.disconnect();
+            let _ = self.ctx.close();
+        }
+    }
+
+    pub fn open(sh: Arc<Shared>) -> Result<(Output, u32), JsValue> {
+        let ctx = AudioContext::new()?;
+        // Inside a click handler this unlocks audio (Safari needs it there).
+        let _ = ctx.resume()?;
+        let sample_rate = ctx.sample_rate() as u32;
+        let node = ctx
+            .create_script_processor_with_buffer_size_and_number_of_input_channels_and_number_of_output_channels(
+                BUFFER, 0, 2,
+            )?;
+        // Allocated once here: the callback itself doesn't allocate.
+        let n = BUFFER as usize;
+        let (mut both, mut left, mut right) = (vec![0f32; n * 2], vec![0f32; n], vec![0f32; n]);
+        let clock = ctx.clone();
+        let callback =
+            Closure::<dyn FnMut(AudioProcessingEvent)>::new(move |ev: AudioProcessingEvent| {
+                let Ok(buf) = ev.output_buffer() else { return };
+                let frames = (buf.length() as usize).min(n);
+                let ahead = (ev.playback_time() - clock.current_time()).max(0.0);
+                let latency = Duration::from_secs_f64(ahead + output_latency(&clock));
+                fill(&sh, &mut both[..frames * 2], 2, latency);
+                for (i, lr) in both[..frames * 2].chunks_exact(2).enumerate() {
+                    left[i] = lr[0];
+                    right[i] = lr[1];
+                }
+                let _ = buf.copy_to_channel(&left[..frames], 0);
+                let _ = buf.copy_to_channel(&right[..frames], 1);
+            });
+        node.set_onaudioprocess(Some(callback.as_ref().unchecked_ref()));
+        node.connect_with_audio_node(&ctx.destination())?;
+        Ok((
+            Output {
+                ctx,
+                node,
+                _callback: callback,
+            },
+            sample_rate,
+        ))
+    }
+
+    /// `outputLatency` (not in Safari), else `baseLatency`, else 0.
+    fn output_latency(ctx: &AudioContext) -> f64 {
+        ["outputLatency", "baseLatency"]
+            .iter()
+            .filter_map(|k| js_sys::Reflect::get(ctx, &JsValue::from_str(k)).ok())
+            .filter_map(|v| v.as_f64())
+            .find(|v| v.is_finite() && *v > 0.0)
+            .unwrap_or(0.0)
+    }
 }
 
 pub struct Clock {
@@ -427,10 +551,12 @@ impl Clock {
 }
 
 /// Streams interleaved stereo f32 to a 16-bit WAV file.
+#[cfg(not(target_arch = "wasm32"))]
 pub struct WavWriter {
     f: std::io::BufWriter<std::fs::File>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl WavWriter {
     /// `frames` = total stereo frames that will be written.
     pub fn create(

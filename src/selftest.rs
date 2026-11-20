@@ -70,6 +70,10 @@ const CHECKS: &[Check] = &[
         run: version_line,
     },
     Check {
+        name: "a movie downloaded file by file plays like the one on disk",
+        run: downloaded_movie,
+    },
+    Check {
         name: "chunked sound matches a single-pass render",
         run: sound_chunk_equivalence,
     },
@@ -350,6 +354,88 @@ fn version_line(gl: &Gl, dir: &Path) -> Result<String> {
         }
     }
     Ok(notes.join(", "))
+}
+
+/// The web player's path: find the files by following `movie.toml` and the
+/// `#include`s one fetch at a time (here from disk instead of HTTP), then play
+/// from memory. Pictures and sound must be identical to loading from disk.
+fn downloaded_movie(gl: &Gl, dir: &Path) -> Result<String> {
+    use crate::files::Preloader;
+    write(
+        dir,
+        &[
+            (
+                "common.glsl",
+                "#include \"lib/tint.glsl\"\nvec3 base(vec2 uv) { return tint(vec3(uv, 0.3)); }\n",
+            ),
+            (
+                "lib/tint.glsl",
+                "vec3 tint(vec3 c) { return c * vec3(1.0, 0.8, 0.9); }\n",
+            ),
+            (
+                "scenes/a.glsl",
+                &format!(
+                    "#include \"../common.glsl\"\n{}",
+                    scene("fragColor = vec4(base(uv), 1.0);")
+                ),
+            ),
+            (
+                "scenes/b.glsl",
+                &format!(
+                    "#include \"../common.glsl\"\n{}",
+                    scene("fragColor = vec4(base(uv.yx).bgr, 1.0);")
+                ),
+            ),
+            (
+                "fx/push.glsl",
+                "vec4 transition(vec2 uv) {\n  return uv.x < progress ? getToColor(uv) : getFromColor(uv);\n}\n",
+            ),
+            (
+                "music.glsl",
+                "#include \"lib/osc.glsl\"\nvec2 mainSound(int samp, float time) { return vec2(osc(220.0, time)); }\n",
+            ),
+            (
+                "lib/osc.glsl",
+                "float osc(float f, float t) { return 0.2 * sin(6.2831853 * f * t); }\n",
+            ),
+        ],
+    )?;
+    let toml = "[sound]\nmusic = \"music.glsl\"\n\
+        [[shot]]\nid = \"a\"\nscene = \"scenes/a.glsl\"\nduration = 1\n\
+        [[shot]]\nid = \"b\"\nscene = \"scenes/b.glsl\"\nduration = 1\n\
+        transition = { type = \"fx/push.glsl\", duration = 0.5 }\n";
+    let on_disk = movie(dir, toml)?;
+
+    let file = Path::new("movie.toml");
+    let mut first = crate::files::Memory::default();
+    first.insert(file, toml.into());
+    let named = Movie::load_from(Arc::new(first), file)?;
+    let mut pre = Preloader::new(&named.root, named.referenced_files());
+    pre.insert(file, toml.into());
+    let mut fetches = 0;
+    loop {
+        let want = pre.wanted();
+        if want.is_empty() {
+            break;
+        }
+        for p in want {
+            fetches += 1;
+            pre.provide(&p, std::fs::read_to_string(dir.join(&p)).ok());
+        }
+    }
+    let downloaded = Movie::load_from(Arc::new(pre.finish()), file)?;
+
+    let mut rd = renderer(gl, &on_disk)?;
+    let mut rm = renderer(gl, &downloaded)?;
+    for t in [0.25, 0.75, 1.25] {
+        let a = shot(&mut rd, &on_disk, on_disk.at(t), 1.0)?;
+        let b = shot(&mut rm, &downloaded, downloaded.at(t), 1.0)?;
+        expect_same(&format!("frame at {t}s"), &b, &a, 0, 0.0)?;
+    }
+    if render_sound(gl, &on_disk, 32768)? != render_sound(gl, &downloaded, 32768)? {
+        bail!("the downloaded movie's sound differs");
+    }
+    Ok(format!("{fetches} fetches"))
 }
 
 fn transition_endpoints(gl: &Gl, dir: &Path) -> Result<String> {

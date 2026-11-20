@@ -166,7 +166,7 @@ pub struct Renderer {
     /// Strips a scene is drawn in (more when frames are very slow; see draw_scene).
     tiles: u32,
     /// When `context_lost` last asked the driver, and how often it has (tests).
-    last_error_check: Option<std::time::Instant>,
+    last_error_check: Option<web_time::Instant>,
     pub error_checks: usize,
     /// The last audio block was slow: draw the next ones in flushed bands.
     audio_banded: bool,
@@ -211,7 +211,7 @@ struct AudioJob {
     staging: Option<GpuBuf>,
     fence: glow::Fence,
     count: usize,
-    submitted: std::time::Instant,
+    submitted: web_time::Instant,
 }
 
 /// A pixel pack (readback) or unpack (staging) buffer for sound blocks. With
@@ -240,7 +240,7 @@ pub struct AudioTiming {
     pub fence_ms: f32,
 }
 
-fn ms_since(t: std::time::Instant) -> f32 {
+fn ms_since(t: web_time::Instant) -> f32 {
     t.elapsed().as_secs_f32() * 1000.0
 }
 
@@ -277,12 +277,19 @@ impl Renderer {
             gl.bind_texture(glow::TEXTURE_2D, None);
             let timer = if driver.es { None } else { GpuTimer::new(&gl) };
             let ext = gl.supported_extensions();
+            // WebGL names extensions without the "GL_" prefix (glow enables them all).
             let parallel = ext.contains("GL_KHR_parallel_shader_compile")
-                || ext.contains("GL_ARB_parallel_shader_compile");
+                || ext.contains("GL_ARB_parallel_shader_compile")
+                || ext.contains("KHR_parallel_shader_compile");
             if parallel {
                 gl.max_shader_compiler_threads(0xFFFF_FFFF);
             }
-            let formats = gl.get_parameter_i32(glow::NUM_PROGRAM_BINARY_FORMATS);
+            // WebGL has no program binaries (and no disk): never cache there.
+            let formats = if cfg!(target_arch = "wasm32") {
+                0
+            } else {
+                gl.get_parameter_i32(glow::NUM_PROGRAM_BINARY_FORMATS)
+            };
             let v = gl.version();
             let can_persist = !driver.es
                 && ((v.major, v.minor) >= (4, 4) || ext.contains("GL_ARB_buffer_storage"))
@@ -401,11 +408,11 @@ impl Renderer {
                 }
             }
         };
-        let src = transition_source(dialect, "copy", &[], &cues, &movie.root);
+        let src = transition_source(dialect, "copy", &[], &cues, movie);
         let copy = add(self, "copy pass".into(), src);
         let mut wanted = vec![];
         for shot in &movie.shots {
-            let src = scene_source(dialect, shot, &cues, &movie.root);
+            let src = scene_source(dialect, shot, &cues, movie);
             let scene = add(
                 self,
                 format!("shot \"{}\" ({})", shot.id, rel(&shot.scene, &movie.root)),
@@ -413,7 +420,7 @@ impl Renderer {
             );
             let trans = match &shot.transition_in {
                 Some(t) => {
-                    let src = transition_source(dialect, &t.kind, &t.params, &cues, &movie.root);
+                    let src = transition_source(dialect, &t.kind, &t.params, &cues, movie);
                     add(
                         self,
                         format!("transition into \"{}\" ({})", shot.id, t.kind),
@@ -1133,7 +1140,7 @@ impl Renderer {
         if !suspicious && !slow_gpu && !due {
             return false;
         }
-        self.last_error_check = Some(std::time::Instant::now());
+        self.last_error_check = Some(web_time::Instant::now());
         self.error_checks += 1;
         unsafe { self.gl.get_error() == glow::CONTEXT_LOST }
     }
@@ -1440,7 +1447,7 @@ impl Renderer {
             gl.use_program(Some(prog.prog));
             let mut input_tex = vec![];
             let mut staging = None;
-            let t_upload = std::time::Instant::now();
+            let t_upload = web_time::Instant::now();
             if let Some((music, sfx, base)) = inputs {
                 let rows = (music.len() / 2).max(1).div_ceil(TRACK_WIDTH);
                 if rows > self.max_texture_size {
@@ -1534,7 +1541,7 @@ impl Renderer {
                 }
             }
             self.audio_timing.upload_ms += ms_since(t_upload);
-            let t_draw = std::time::Instant::now();
+            let t_draw = web_time::Instant::now();
             gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
             gl.viewport(0, 0, W, rows);
             gl.disable(glow::BLEND);
@@ -1558,7 +1565,7 @@ impl Renderer {
             // job runs long enough to trip the driver's watchdog. Flushing costs
             // batching, so it's only done when needed. gl_FragCoord stays
             // window-relative, so the sample index is the same either way.
-            let submitted = std::time::Instant::now();
+            let submitted = web_time::Instant::now();
             let band = if self.audio_banded { 4 } else { rows };
             let mut y0 = 0;
             while y0 < rows {
@@ -1590,7 +1597,7 @@ impl Renderer {
             );
             gl.bind_buffer(glow::PIXEL_PACK_BUFFER, None);
             self.audio_timing.draw_ms += ms_since(t_draw);
-            let t_fence = std::time::Instant::now();
+            let t_fence = web_time::Instant::now();
             let fence = gl.fence_sync(glow::SYNC_GPU_COMMANDS_COMPLETE, 0)?;
             // Make sure the fence reaches the GPU without anyone waiting on it.
             gl.flush();
@@ -1625,7 +1632,7 @@ impl Renderer {
         let Some(job) = self.audio_jobs.get(&t.0) else {
             return Some(Err("unknown sound block".into()));
         };
-        let t_poll = std::time::Instant::now();
+        let t_poll = web_time::Instant::now();
         let status = unsafe { self.gl.client_wait_sync(job.fence, 0, 0) };
         self.audio_timing.poll_ms += ms_since(t_poll);
         match status {
@@ -1674,7 +1681,7 @@ impl Renderer {
         let gl = self.gl.clone();
         let n = job.count;
         let mut out = Vec::with_capacity(n * 2);
-        let t_read = std::time::Instant::now();
+        let t_read = web_time::Instant::now();
         unsafe {
             let mapped = !job.pbo.ptr.is_null();
             let p = if mapped {
@@ -1775,13 +1782,13 @@ impl Renderer {
 }
 
 /// The fragment shader for a shot's scene.
-pub fn scene_source(dialect: Dialect, shot: &Shot, cues: &str, root: &Path) -> Result<Assembled> {
+pub fn scene_source(dialect: Dialect, shot: &Shot, cues: &str, movie: &Movie) -> Result<Assembled> {
     let mut header = SCENE_HEADER.to_string();
     for (name, a) in &shot.uniforms {
         header += &format!("uniform {} {name};\n", a.glsl_type());
     }
     header += cues;
-    Ok(Builder::new(dialect, &header, root)
+    Ok(Builder::new(dialect, &header, &movie.files, &movie.root)
         .file(&shot.scene)?
         .footer(SCENE_FOOTER)
         .build())
@@ -1793,8 +1800,9 @@ pub fn transition_source(
     kind: &str,
     params: &[(String, Vec<f32>)],
     cues: &str,
-    root: &Path,
+    movie: &Movie,
 ) -> Result<Assembled> {
+    let root = &movie.root;
     let mut header = TRANSITION_HEADER.to_string();
     for (name, v) in params {
         let val = match v.len() {
@@ -1810,7 +1818,7 @@ pub fn transition_source(
         header += &format!("#define {name} {val}\n");
     }
     header += cues;
-    let b = Builder::new(dialect, &header, root);
+    let b = Builder::new(dialect, &header, &movie.files, root);
     let b = if kind.ends_with(".glsl") {
         b.file(&root.join(kind))?
     } else {
