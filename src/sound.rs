@@ -110,6 +110,7 @@ const SAMPLE_INDEX: &str =
 /// The movie-level music shader (`mainSound`, movie time).
 pub fn music_source(d: Dialect, m: &Movie, cues: &str, path: &Path) -> anyhow::Result<Assembled> {
     Ok(Builder::new(d, &format!("{COMMON}{GLSL_EASE}{cues}"), &m.root)
+        .libraries(&m.libraries)
         .file(path)?
         .footer(&format!(
             "void main() {{\n  {SAMPLE_INDEX}\n  shotglass_out = vec4(mainSound(s, float(s) / iSampleRate), 0.0, 1.0);\n}}"
@@ -132,6 +133,7 @@ pub fn shot_sound_source(d: Dialect, m: &Movie, cues: &str, i: usize) -> anyhow:
         assign += &format!("  {name} = sg_u_{name}(t);\n");
     }
     Ok(Builder::new(d, &header, &m.root)
+        .libraries(&m.libraries)
         .file(&snd.path)?
         .footer(&format!(
             "void main() {{\n  {SAMPLE_INDEX}\n  float t = float(s) / iSampleRate - iShotStart;\n{assign}  shotglass_out = vec4(mainSound(s, t), 0.0, 1.0);\n}}"
@@ -143,6 +145,7 @@ pub fn shot_sound_source(d: Dialect, m: &Movie, cues: &str, i: usize) -> anyhow:
 pub fn mix_source(d: Dialect, m: &Movie, cues: &str, path: &Path) -> anyhow::Result<Assembled> {
     Ok(
         Builder::new(d, &format!("{COMMON}{GLSL_EASE}{cues}{}", mix_helpers()), &m.root)
+            .libraries(&m.libraries)
             .file(path)?
             .footer(&format!(
                 "void main() {{\n  {SAMPLE_INDEX}\n  shotglass_out = vec4(mainMix(s, float(s) / iSampleRate), 0.0, 1.0);\n}}"

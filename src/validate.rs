@@ -47,6 +47,7 @@ pub fn movie_sources(m: &Movie, d: Dialect) -> Vec<Source> {
             text: vertex_source(d),
             dialect: d,
             files: vec!["<shotglass vertex shader>".into()],
+            warnings: vec![],
         }),
     }];
     let mut frag = |what: String, src| {
@@ -58,18 +59,18 @@ pub fn movie_sources(m: &Movie, d: Dialect) -> Vec<Source> {
     };
     frag(
         "copy pass".into(),
-        transition_source(d, "copy", &[], &cues, &m.root),
+        transition_source(d, "copy", &[], &cues, m),
     );
     for shot in &m.shots {
         if let Some(t) = &shot.transition_in {
             frag(
                 format!("transition into \"{}\" ({})", shot.id, t.kind),
-                transition_source(d, &t.kind, &t.params, &cues, &m.root),
+                transition_source(d, &t.kind, &t.params, &cues, m),
             );
         }
         frag(
             format!("shot \"{}\" ({})", shot.id, rel(&shot.scene)),
-            scene_source(d, shot, &cues, &m.root),
+            scene_source(d, shot, &cues, m),
         );
     }
     if let Some(p) = &m.music {
@@ -133,6 +134,7 @@ fn explain_later_versions(src: &Assembled, stage: Stage, messages: Vec<String>) 
         text: format!("{}{}", newest.version_line(), &src.text[old_line.len()..]),
         dialect: newest,
         files: src.files.clone(),
+        warnings: vec![],
     };
     let still = validate(&newer, stage).err().unwrap_or_default();
     messages
@@ -407,6 +409,54 @@ mod tests {
         for d in all_dialects() {
             expect_clean(&m, d);
         }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// `<kit/…>` includes resolve through the film's `[libraries]`, and errors inside a
+    /// library are reported as `kit/file.glsl:line`.
+    #[test]
+    fn library_includes_are_checked() {
+        let root = dir("library");
+        let lib = root.join("vendor/kit");
+        std::fs::create_dir_all(&lib).unwrap();
+        std::fs::write(
+            lib.join("library.toml"),
+            "name = \"shotglass-kit/core\"\nversion = \"0.4.0\"\nlicences = [\"MIT\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            lib.join("level.glsl"),
+            "float kit_level() { return 0.5; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            lib.join("bad.glsl"),
+            "// kit\nfloat kit_bad() { return 1; }\n",
+        )
+        .unwrap();
+        let film = |include: &str| {
+            std::fs::write(
+                root.join("scenes/a.glsl"),
+                format!("#include <kit/{include}>\n{OK}"),
+            )
+            .unwrap();
+            Movie::load(&root).unwrap()
+        };
+        std::fs::write(
+            root.join("movie.toml"),
+            "[libraries]\nkit = { path = \"vendor/kit\", version = \"0.4\" }\n\
+             [[shot]]\nid = \"a\"\nscene = \"scenes/a.glsl\"\nduration = 1\n",
+        )
+        .unwrap();
+        let m = film("level.glsl");
+        for d in all_dialects() {
+            expect_clean(&m, d);
+        }
+        // `return 1;` from a float function: implicit int→float, invalid in GLSL ES.
+        let m = film("bad.glsl");
+        let errors = validate_movie(&m, Dialect::WEB);
+        let text = errors.iter().map(|e| e.to_string()).collect::<String>();
+        assert!(text.contains("kit/bad.glsl:2"), "{text}");
         std::fs::remove_dir_all(&root).ok();
     }
 

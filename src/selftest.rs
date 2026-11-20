@@ -54,6 +54,10 @@ const CHECKS: &[Check] = &[
         run: error_mapping,
     },
     Check {
+        name: "library files are included once and errors point at name/file:line",
+        run: library_errors,
+    },
+    Check {
         name: "a broken edit keeps the last working version on screen",
         run: keep_last_working,
     },
@@ -789,6 +793,82 @@ fn error_mapping(gl: &Gl, dir: &Path) -> Result<String> {
         notes.push(expect.trim_end_matches(':').to_string());
     }
     Ok(notes.join(", "))
+}
+
+/// A film-local library (`path = …`) under its local name `kit`: a working include
+/// renders (and only compiles if each file is included once), and an error inside the
+/// library is reported as `kit/noise.glsl:3`, not by its folder on disk.
+fn library_errors(gl: &Gl, dir: &Path) -> Result<String> {
+    write(
+        dir,
+        &[
+            (
+                "vendor/kit-core/library.toml",
+                "name = \"shotglass-kit/core\"\nversion = \"0.4.0\"\nlicences = [\"MIT\"]\n",
+            ),
+            (
+                "vendor/kit-core/hash.glsl",
+                "float kit_level() { return 0.75; }\n",
+            ),
+            (
+                "vendor/kit-core/fx.glsl",
+                "#include \"hash.glsl\"\nvec3 kit_fx() { return vec3(kit_level(), 0.0, 0.25); }\n",
+            ),
+            (
+                "vendor/kit-core/noise.glsl",
+                "// kit noise\n// line two\nfloat kit_noise() { return notDeclaredAnywhere; }\n",
+            ),
+            (
+                "good.glsl",
+                &format!(
+                    "#include <kit/hash.glsl>\n#include <kit/fx.glsl>\n{}",
+                    scene("fragColor = vec4(kit_fx(), 1.0);")
+                ),
+            ),
+            (
+                "bad.glsl",
+                &format!(
+                    "// scene\n#include <kit/noise.glsl>\n{}",
+                    scene("fragColor = vec4(kit_noise());")
+                ),
+            ),
+        ],
+    )?;
+    let toml = |scene_file: &str| {
+        format!(
+            "[libraries]\nkit = {{ path = \"vendor/kit-core\", version = \"0.4\" }}\n\
+             [[shot]]\nid=\"a\"\nscene=\"{scene_file}\"\nduration=1\n"
+        )
+    };
+    let m = movie(dir, &toml("good.glsl"))?;
+    let mut r = renderer(gl, &m)?;
+    let f = shot(
+        &mut r,
+        &m,
+        At::Shot {
+            shot: 0,
+            local: 0.5,
+        },
+        1.0,
+    )?;
+    let p = px(&f, W as usize / 2, H as usize / 2);
+    if p[0].abs_diff(191) > 2 || p[1] > 2 || p[2].abs_diff(64) > 2 {
+        bail!("library include rendered {p:?}, expected about [191, 0, 64]");
+    }
+
+    let m = movie(dir, &toml("bad.glsl"))?;
+    let mut r = Renderer::new(gl.clone())?;
+    r.set_cache_dir(None);
+    let errors = match r.load_all(&m) {
+        Ok(_) => bail!("bad.glsl compiled, but its library has an error"),
+        Err(e) => e,
+    };
+    let text: String = errors.iter().map(|e| e.to_string()).collect();
+    let expect = "kit/noise.glsl:3:";
+    if !text.contains(expect) {
+        bail!("expected an error at {expect}, got:\n{text}");
+    }
+    Ok("kit/noise.glsl:3".into())
 }
 
 fn keep_last_working(gl: &Gl, dir: &Path) -> Result<String> {

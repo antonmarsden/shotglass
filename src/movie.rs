@@ -1,7 +1,8 @@
 //! `movie.toml` parsing and the timeline: which shot (or transition) is on screen at time t.
 
 use crate::anim::{Anim, Ease, vector};
-use anyhow::{Context, Result, bail};
+use crate::library::{self, Library, LibraryDecl, LibrarySpec};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -60,6 +61,8 @@ fn parse_fps(f: FpsFile) -> Result<(u32, u32)> {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct MovieFile {
+    /// Engine contract this film needs, e.g. "0.4".
+    shotglass: Option<String>,
     title: Option<String>,
     /// Width:height, e.g. [16, 9]. Default 16:9.
     aspect: Option<[f32; 2]>,
@@ -73,6 +76,9 @@ struct MovieFile {
     shots: Vec<ShotFile>,
     #[serde(rename = "marker", default)]
     markers: Vec<MarkerFile>,
+    /// Shared GLSL by local name: `kit = { version = "0.4", source = "https://…", subdir = "core" }`.
+    #[serde(default)]
+    libraries: BTreeMap<String, LibraryDecl>,
 }
 
 #[derive(Deserialize)]
@@ -217,6 +223,14 @@ pub struct Movie {
     pub shots: Vec<Shot>,
     pub markers: Vec<Marker>,
     pub duration: f32,
+    /// `shotglass = "…"`: the engine contract range the film was made for.
+    pub shotglass: Option<String>,
+    /// `[libraries]` as declared (validated, not yet looked up on disk).
+    pub library_specs: Vec<LibrarySpec>,
+    /// Libraries found on disk; filled by `load` (empty after a bare `parse`).
+    pub libraries: Vec<Library>,
+    /// Portability warnings (e.g. a file name that only matches when ignoring case).
+    pub warnings: Vec<String>,
 }
 
 /// What is on screen at a moment.
@@ -239,6 +253,15 @@ pub enum At {
 impl Movie {
     /// Load `movie.toml` from a movie folder (or the path of the toml itself).
     pub fn load(path: &Path) -> Result<Movie> {
+        let mut m = Movie::read(path)?;
+        m.resolve_libraries(&|k| std::env::var(k).ok(), &library::cache_dir())
+            .with_context(|| format!("in {}", m.root.join("movie.toml").display()))?;
+        m.check_case();
+        Ok(m)
+    }
+
+    /// Read and validate `movie.toml` without looking libraries up on disk.
+    pub fn read(path: &Path) -> Result<Movie> {
         let file = if path.is_dir() {
             path.join("movie.toml")
         } else {
@@ -250,8 +273,85 @@ impl Movie {
         Movie::parse(&text, &root).with_context(|| format!("in {}", file.display()))
     }
 
+    /// Find the declared libraries on disk: local overrides (`env`, `movie.local.toml`),
+    /// in-film paths, or the cache as pinned by `shotglass.lock`. No network.
+    pub fn resolve_libraries(
+        &mut self,
+        env: &dyn Fn(&str) -> Option<String>,
+        cache: &Path,
+    ) -> Result<()> {
+        if self.library_specs.is_empty() {
+            return Ok(());
+        }
+        let o = library::overrides(&self.root, &self.library_specs, env)?;
+        let lock = library::Lock::load(&self.root)?;
+        self.libraries =
+            library::resolve(&self.root, &self.library_specs, &o, lock.as_ref(), cache)?;
+        Ok(())
+    }
+
+    /// Files the edit refers to directly (scenes, sounds, transition files).
+    pub fn referenced_files(&self) -> Vec<PathBuf> {
+        let mut v: Vec<PathBuf> = self.music.iter().chain(self.mix.iter()).cloned().collect();
+        for s in &self.shots {
+            v.push(s.scene.clone());
+            v.extend(s.sound.as_ref().map(|x| x.path.clone()));
+            if let Some(t) = &s.transition_in
+                && t.kind.ends_with(".glsl")
+            {
+                v.push(self.root.join(&t.kind));
+            }
+        }
+        v.sort();
+        v.dedup();
+        v
+    }
+
+    /// Warn about references that only match a file when ignoring case: they work on
+    /// Windows and macOS but not on Linux or the web.
+    fn check_case(&mut self) {
+        for p in self.referenced_files() {
+            let rel = p
+                .strip_prefix(&self.root)
+                .unwrap_or(&p)
+                .to_string_lossy()
+                .replace('\\', "/");
+            if let Some(actual) = library::case_mismatch(&self.root, &rel) {
+                self.warnings.push(format!(
+                    "movie.toml refers to \"{rel}\", but the file is \"{actual}\" (names are \
+                     case-sensitive on Linux and the web)"
+                ));
+            }
+        }
+    }
+
     pub fn parse(text: &str, root: &Path) -> Result<Movie> {
+        // Check the engine contract first: a newer film may use fields this engine
+        // doesn't know, and "upgrade shotglass" is the useful message then.
+        match toml::from_str::<toml::Table>(text)
+            .ok()
+            .and_then(|t| t.get("shotglass").cloned())
+        {
+            Some(toml::Value::String(v)) => library::check_engine(&v)?,
+            Some(_) => bail!("shotglass must be a version string, e.g. shotglass = \"0.1\""),
+            None => {}
+        }
         let f: MovieFile = toml::from_str(text)?;
+        let path_rule = |what: String, p: &str| -> Result<()> {
+            library::check_rel_path(p).map_err(|e| anyhow!("{what}: {e}"))
+        };
+        let mut library_specs = vec![];
+        for (name, d) in &f.libraries {
+            library_specs.push(LibrarySpec::parse(name, d)?);
+        }
+        if let Some(snd) = &f.sound {
+            if let Some(p) = &snd.music {
+                path_rule("[sound] music".into(), p)?;
+            }
+            if let Some(p) = &snd.mix {
+                path_rule("[sound] mix".into(), p)?;
+            }
+        }
         if f.shots.is_empty() {
             bail!("a movie needs at least one [[shot]]");
         }
@@ -269,6 +369,15 @@ impl Movie {
                     .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
             {
                 bail!("shot id \"{}\" may only use letters, digits, _ and -", s.id);
+            }
+            path_rule(format!("{}: scene", ctx()), &s.scene)?;
+            if let Some(p) = &s.sound {
+                path_rule(format!("{}: sound", ctx()), p)?;
+            }
+            if let Some(t) = &s.transition
+                && t.kind.ends_with(".glsl")
+            {
+                path_rule(format!("{}: transition", ctx()), &t.kind)?;
             }
             if s.duration.is_nan() || s.duration <= 0.0 {
                 bail!("{}: duration must be > 0", ctx());
@@ -422,6 +531,10 @@ impl Movie {
                 })
                 .collect(),
             duration,
+            shotglass: f.shotglass,
+            library_specs,
+            libraries: vec![],
+            warnings: vec![],
         })
     }
 
@@ -873,6 +986,109 @@ mod tests {
                 let _ = Movie::parse(&t, Path::new("."));
             }
         }
+    }
+
+    const SHOT: &str = "[[shot]]\nid = \"a\"\nscene = \"a.glsl\"\nduration = 1\n";
+
+    #[test]
+    fn engine_contract_is_checked_first() {
+        let v = crate::library::contract();
+        let ok = format!("shotglass = \"{}.{}\"\n{SHOT}", v.major, v.minor);
+        assert_eq!(
+            Movie::parse(&ok, Path::new(".")).unwrap().shotglass,
+            Some(format!("{}.{}", v.major, v.minor))
+        );
+        // A film from the future may use fields we don't know; the engine message wins.
+        let future = format!("shotglass = \"99.1\"\nnew_thing = 3\n{SHOT}");
+        let e = format!("{:#}", Movie::parse(&future, Path::new(".")).unwrap_err());
+        assert!(
+            e.contains("needs shotglass 99.1") && e.contains("newer"),
+            "{e}"
+        );
+        assert!(Movie::parse(&format!("shotglass = 0.4\n{SHOT}"), Path::new(".")).is_err());
+    }
+
+    #[test]
+    fn libraries_are_declared_by_local_name() {
+        let m = Movie::parse(
+            &format!(
+                "[libraries]\n\
+                 kit = {{ version = \"0.4\", source = \"https://github.com/antonmarsden/shotglass-kit\", subdir = \"core\" }}\n\
+                 mine = {{ path = \"lib/mykit\" }}\n{SHOT}"
+            ),
+            Path::new("."),
+        )
+        .unwrap();
+        assert_eq!(m.library_specs.len(), 2);
+        assert_eq!(m.library_specs[0].name, "kit");
+        assert_eq!(m.library_specs[0].subdir.as_deref(), Some("core"));
+        assert_eq!(m.library_specs[1].path.as_deref(), Some("lib/mykit"));
+        assert!(m.libraries.is_empty(), "parse doesn't touch the disk");
+        let bad = format!("[libraries]\nkit = {{ path = \"../kit\" }}\n{SHOT}");
+        assert!(
+            format!("{:#}", Movie::parse(&bad, Path::new(".")).unwrap_err()).contains("climbs")
+        );
+        let bad = format!("[libraries]\nkit = {{ path = \"kit\", url = \"x\" }}\n{SHOT}");
+        assert!(Movie::parse(&bad, Path::new(".")).is_err());
+    }
+
+    #[test]
+    fn paths_must_be_web_friendly() {
+        // Each line goes into shot "b".
+        for (line, why) in [
+            ("scene = \"/home/me/a.glsl\"", "absolute"),
+            ("scene = \"C:/films/a.glsl\"", "drive letter"),
+            ("scene = \"scenes\\\\a.glsl\"", "backslash"),
+            ("scene = \"../other/a.glsl\"", "climbs"),
+            ("scene = \"x.glsl\"\nsound = \"sfx/../../a.glsl\"", "climbs"),
+            (
+                "scene = \"x.glsl\"\ntransition = { type = \"/t/wipe.glsl\", duration = 0.5 }",
+                "absolute",
+            ),
+        ] {
+            let text = format!("{SHOT}[[shot]]\nid = \"b\"\nduration = 1\n{line}\n");
+            let e = format!("{:#}", Movie::parse(&text, Path::new(".")).unwrap_err());
+            assert!(e.contains(why) && e.contains("shot \"b\""), "{line}: {e}");
+        }
+        let text = format!("[sound]\nmusic = \"D:\\\\m.glsl\"\n{SHOT}");
+        let e = format!("{:#}", Movie::parse(&text, Path::new(".")).unwrap_err());
+        assert!(
+            e.contains("[sound] music") && e.contains("backslash"),
+            "{e}"
+        );
+        // Paths that climb and come back down inside the film are fine.
+        let text =
+            format!("{SHOT}[[shot]]\nid = \"b\"\nduration = 1\nscene = \"scenes/../b.glsl\"\n");
+        assert!(Movie::parse(&text, Path::new(".")).is_ok());
+    }
+
+    #[test]
+    fn load_resolves_libraries_and_warns_about_case() {
+        let dir = std::env::temp_dir().join(format!("shotglass-movie-load-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("lib/mykit")).unwrap();
+        std::fs::create_dir_all(dir.join("Scenes")).unwrap();
+        std::fs::write(dir.join("Scenes/a.glsl"), "").unwrap();
+        std::fs::write(
+            dir.join("lib/mykit/library.toml"),
+            "name = \"me/mykit\"\nversion = \"0.2.0\"\nlicences = [\"MIT\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("movie.toml"),
+            "[libraries]\nmine = { path = \"lib/mykit\", version = \"0.2\" }\n\
+             [[shot]]\nid = \"a\"\nscene = \"scenes/a.glsl\"\nduration = 1\n",
+        )
+        .unwrap();
+        let m = Movie::load(&dir).unwrap();
+        assert_eq!(m.libraries[0].canonical, "me/mykit");
+        assert_eq!(m.libraries[0].root, dir.join("lib/mykit"));
+        assert!(
+            m.warnings.iter().any(|w| w.contains("\"Scenes/a.glsl\"")),
+            "{:?}",
+            m.warnings
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

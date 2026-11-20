@@ -204,6 +204,8 @@ pub struct Renderer {
     freeze_key: Option<(usize, u64)>,
     generation: u64,
     timer: Option<GpuTimer>,
+    /// Portability warnings from assembling the current movie's shaders.
+    pub warnings: Vec<String>,
 }
 
 /// A sound block submitted with `Renderer::submit_audio`, not yet collected.
@@ -315,6 +317,7 @@ impl Renderer {
                 None
             };
             Ok(Renderer {
+                warnings: vec![],
                 gl_info,
                 gl,
                 driver,
@@ -408,9 +411,11 @@ impl Renderer {
         })?;
         let cues = movie.cue_defines();
         let mut errors = vec![];
+        let mut warnings: Vec<String> = vec![];
         let mut add = |r: &mut Renderer, what: String, src: Result<Assembled>| -> Option<u64> {
             match src {
                 Ok(src) => {
+                    warnings.extend(src.warnings.iter().map(|w| format!("{what}: {w}")));
                     let k = hash(&src.text);
                     r.programs.entry(k).or_insert(Entry {
                         src,
@@ -429,11 +434,11 @@ impl Renderer {
                 }
             }
         };
-        let src = transition_source(dialect, "copy", &[], &cues, &movie.root);
+        let src = transition_source(dialect, "copy", &[], &cues, movie);
         let copy = add(self, "copy pass".into(), src);
         let mut wanted = vec![];
         for shot in &movie.shots {
-            let src = scene_source(dialect, shot, &cues, &movie.root);
+            let src = scene_source(dialect, shot, &cues, movie);
             let scene = add(
                 self,
                 format!("shot \"{}\" ({})", shot.id, rel(&shot.scene, &movie.root)),
@@ -441,7 +446,7 @@ impl Renderer {
             );
             let trans = match &shot.transition_in {
                 Some(t) => {
-                    let src = transition_source(dialect, &t.kind, &t.params, &cues, &movie.root);
+                    let src = transition_source(dialect, &t.kind, &t.params, &cues, movie);
                     add(
                         self,
                         format!("transition into \"{}\" ({})", shot.id, t.kind),
@@ -455,6 +460,8 @@ impl Renderer {
                 wanted.push(ShotKeys { scene, trans });
             }
         }
+        warnings.dedup();
+        self.warnings = warnings;
         if !errors.is_empty() {
             self.collect_garbage();
             return Err(errors);
@@ -1858,13 +1865,14 @@ impl Renderer {
 }
 
 /// The fragment shader for a shot's scene.
-pub fn scene_source(dialect: Dialect, shot: &Shot, cues: &str, root: &Path) -> Result<Assembled> {
+pub fn scene_source(dialect: Dialect, shot: &Shot, cues: &str, movie: &Movie) -> Result<Assembled> {
     let mut header = SCENE_HEADER.to_string();
     for (name, a) in &shot.uniforms {
         header += &format!("uniform {} {name};\n", a.glsl_type());
     }
     header += cues;
-    Ok(Builder::new(dialect, &header, root)
+    Ok(Builder::new(dialect, &header, &movie.root)
+        .libraries(&movie.libraries)
         .file(&shot.scene)?
         .footer(SCENE_FOOTER)
         .build())
@@ -1876,8 +1884,9 @@ pub fn transition_source(
     kind: &str,
     params: &[(String, Vec<f32>)],
     cues: &str,
-    root: &Path,
+    movie: &Movie,
 ) -> Result<Assembled> {
+    let root = &movie.root;
     let mut header = TRANSITION_HEADER.to_string();
     for (name, v) in params {
         let val = match v.len() {
@@ -1893,7 +1902,7 @@ pub fn transition_source(
         header += &format!("#define {name} {val}\n");
     }
     header += cues;
-    let b = Builder::new(dialect, &header, root);
+    let b = Builder::new(dialect, &header, root).libraries(&movie.libraries);
     let b = if kind.ends_with(".glsl") {
         b.file(&root.join(kind))?
     } else {

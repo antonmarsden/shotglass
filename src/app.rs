@@ -140,7 +140,9 @@ struct Player {
     perf_frame: u64,
     soundtrack: Soundtrack,
     sound_info: String,
-    _watcher: Option<notify::RecommendedWatcher>,
+    watcher: Option<notify::RecommendedWatcher>,
+    /// Library folders outside the film folder that the watcher also follows.
+    watched_libs: Vec<PathBuf>,
     rx: Receiver<()>,
     reload_at: Option<Instant>,
     reloads: u32,
@@ -199,7 +201,7 @@ impl Player {
                     && ev.paths.iter().any(|p| {
                         matches!(
                             p.extension().and_then(|e| e.to_str()),
-                            Some("glsl" | "toml" | "frag" | "inc" | "h")
+                            Some("glsl" | "toml" | "lock" | "frag" | "inc" | "h")
                         )
                     });
                 if relevant {
@@ -229,7 +231,8 @@ impl Player {
             perf_frame: 0,
             soundtrack: Soundtrack::new(),
             sound_info,
-            _watcher: watcher,
+            watcher,
+            watched_libs: vec![],
             rx,
             reload_at: None,
             reloads: 0,
@@ -281,6 +284,10 @@ impl Player {
             }
         };
         self.load_error = None;
+        self.watch_libraries(&m);
+        for w in &m.warnings {
+            eprintln!("warning: {w}");
+        }
         match self.renderer.set_movie(&m) {
             Ok(()) => {
                 self.shader_errors.clear();
@@ -412,6 +419,33 @@ impl Player {
             self.soundtrack.evict(keep.clone());
             self.clock.drop_chunks_outside(keep);
         }
+    }
+
+    /// Live reload follows library folders too (in-film paths are already covered by
+    /// watching the film folder; overrides and the cache usually live elsewhere).
+    fn watch_libraries(&mut self, m: &Movie) {
+        use notify::Watcher;
+        let Some(w) = self.watcher.as_mut() else {
+            return;
+        };
+        let film = std::path::absolute(&m.root).unwrap_or_else(|_| m.root.clone());
+        let want: Vec<PathBuf> = m
+            .libraries
+            .iter()
+            .map(|l| std::path::absolute(&l.root).unwrap_or_else(|_| l.root.clone()))
+            .filter(|p| !p.starts_with(&film))
+            .collect();
+        for p in &self.watched_libs {
+            if !want.contains(p) {
+                let _ = w.unwatch(p);
+            }
+        }
+        for p in &want {
+            if !self.watched_libs.contains(p) {
+                let _ = w.watch(p, notify::RecursiveMode::Recursive);
+            }
+        }
+        self.watched_libs = want;
     }
 
     fn say(&mut self, s: String) {
