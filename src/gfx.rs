@@ -173,11 +173,11 @@ pub struct Renderer {
     /// Submitted sound blocks (see `submit_audio`), keyed by ticket.
     audio_jobs: HashMap<u64, AudioJob>,
     audio_ticket: u64,
-    /// Idle pixel pack buffers (buffer, bytes) and timer queries for sound blocks.
+    /// Idle pixel pack buffers (buffer, bytes) for sound blocks.
     audio_pbos: Vec<(glow::Buffer, i32)>,
-    audio_queries: Vec<glow::Query>,
     /// Sound readbacks that waited for the GPU (`wait_audio`): playback must do none.
     pub blocking_audio_reads: usize,
+    max_texture_size: usize,
     /// GPU frame times not yet handed to `gpu_ms`.
     gpu_samples: std::collections::VecDeque<f32>,
     /// Compiled audio programs and the float target they render into.
@@ -193,13 +193,13 @@ pub struct Renderer {
 }
 
 /// A sound block submitted with `Renderer::submit_audio`, not yet collected.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+/// Tickets order like submissions, and fences pass in that order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct AudioTicket(u64);
 
 struct AudioJob {
     pbo: (glow::Buffer, i32),
     fence: glow::Fence,
-    query: Option<glow::Query>,
     count: usize,
     submitted: std::time::Instant,
 }
@@ -243,6 +243,8 @@ impl Renderer {
                 gl.max_shader_compiler_threads(0xFFFF_FFFF);
             }
             let formats = gl.get_parameter_i32(glow::NUM_PROGRAM_BINARY_FORMATS);
+            // Asked once: on threaded drivers every glGet is a round trip.
+            let max_texture_size = gl.get_parameter_i32(glow::MAX_TEXTURE_SIZE) as usize;
             let gl_info = format!("{renderer} · OpenGL {version} · GLSL {glsl}");
             let binary_dir = if formats > 0 && std::env::var_os("SHOTGLASS_NO_CACHE").is_none() {
                 cache_dir().map(|d| d.join(format!("{:016x}", hash(&gl_info))))
@@ -272,8 +274,8 @@ impl Renderer {
                 audio_jobs: HashMap::new(),
                 audio_ticket: 0,
                 audio_pbos: vec![],
-                audio_queries: vec![],
                 blocking_audio_reads: 0,
+                max_texture_size,
                 gpu_samples: Default::default(),
                 audio: HashMap::new(),
                 audio_target: None,
@@ -1391,7 +1393,7 @@ impl Renderer {
                 {
                     // select the unit first: upload_track binds the new texture to it
                     gl.active_texture(glow::TEXTURE0 + unit as u32);
-                    let tex = upload_track(&gl, data)?;
+                    let tex = upload_track(&gl, data, self.max_texture_size)?;
                     gl.bind_texture(glow::TEXTURE_2D, Some(tex));
                     if let Some(l) = prog.loc(name) {
                         gl.uniform_1_i32(Some(l), unit as i32);
@@ -1429,15 +1431,6 @@ impl Renderer {
             // batching, so it's only done when needed. gl_FragCoord stays
             // window-relative, so the sample index is the same either way.
             let submitted = std::time::Instant::now();
-            // GPU time of the draws, for the banding decision (results arrive later).
-            let query = if self.timer.is_some() {
-                self.audio_queries.pop().or_else(|| gl.create_query().ok())
-            } else {
-                None
-            };
-            if let Some(q) = query {
-                gl.begin_query(glow::TIME_ELAPSED, q);
-            }
             let band = if self.audio_banded { 4 } else { rows };
             let mut y0 = 0;
             while y0 < rows {
@@ -1448,9 +1441,6 @@ impl Renderer {
                     gl.flush();
                 }
                 y0 += h;
-            }
-            if query.is_some() {
-                gl.end_query(glow::TIME_ELAPSED);
             }
             // Read back into a buffer on the GPU: queued like a draw, no wait.
             let bytes = W * rows * 16;
@@ -1492,7 +1482,6 @@ impl Renderer {
                 AudioJob {
                     pbo,
                     fence,
-                    query,
                     count,
                     submitted,
                 },
@@ -1587,31 +1576,20 @@ impl Renderer {
             gl.bind_buffer(glow::PIXEL_PACK_BUFFER, None);
         }
         // Normally one draw per block; after a slow one (a heavy mainSound on a slow
-        // GPU), bands (see submit_audio). Judged by the GPU time of the draws, or,
-        // without a timer, by the wall time of a blocking wait (as long as it took).
-        let ms = match job.query {
-            Some(q) => unsafe {
-                (gl.get_query_parameter_u32(q, glow::QUERY_RESULT_AVAILABLE) != 0)
-                    .then(|| gl.get_query_parameter_u32(q, glow::QUERY_RESULT) as f32 / 1.0e6)
-            },
-            None => waited.then(|| job.submitted.elapsed().as_secs_f32() * 1000.0),
-        };
-        if let Some(ms) = ms {
-            self.audio_banded = if self.audio_banded {
-                ms > 20.0
-            } else {
-                ms > 50.0
-            };
-        }
+        // GPU), bands (see submit_audio). Judged by the time from submit to result, with
+        // no timer queries (each would be another driver round trip). A blocking wait
+        // measures the block itself, as before. A polled block's time also includes the
+        // frames until it was polled and the scene queued ahead of it, so the
+        // thresholds are looser: only a clearly heavy mainSound switches banding on.
+        let ms = job.submitted.elapsed().as_secs_f32() * 1000.0;
+        let (on, off) = if waited { (50.0, 20.0) } else { (250.0, 100.0) };
+        self.audio_banded = if self.audio_banded { ms > off } else { ms > on };
         self.release_audio(job);
         out
     }
 
     fn release_audio(&mut self, job: AudioJob) {
         unsafe { self.gl.delete_sync(job.fence) };
-        if let Some(q) = job.query {
-            self.audio_queries.push(q);
-        }
         if self.audio_pbos.len() < 8 {
             self.audio_pbos.push(job.pbo);
         } else {
@@ -1696,10 +1674,10 @@ pub fn vertex_source(dialect: Dialect) -> String {
 unsafe fn upload_track(
     gl: &glow::Context,
     data: &[f32],
+    max: usize,
 ) -> std::result::Result<glow::Texture, String> {
     let n = (data.len() / 2).max(1);
     let rows = n.div_ceil(TRACK_WIDTH);
-    let max = unsafe { gl.get_parameter_i32(glow::MAX_TEXTURE_SIZE) } as usize;
     if rows > max {
         return Err(format!(
             "the soundtrack is too long for one texture ({rows} rows, GPU max {max})"
@@ -1756,9 +1734,6 @@ impl Drop for Renderer {
             }
             for (b, _) in std::mem::take(&mut self.audio_pbos) {
                 self.gl.delete_buffer(b);
-            }
-            for q in std::mem::take(&mut self.audio_queries) {
-                self.gl.delete_query(q);
             }
             if let Some((fbo, tex)) = self.audio_target.take() {
                 self.gl.delete_framebuffer(fbo);

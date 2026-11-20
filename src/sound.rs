@@ -33,8 +33,25 @@ const MAX_IN_FLIGHT: usize = 6;
 enum Mode {
     /// Wait for each block (headless, or the chunk under a paused playhead).
     Blocking,
-    /// Never wait; queue at most this many more blocks.
-    Async { max_submits: usize },
+    /// Never wait; queue at most this many more blocks, and none after the deadline.
+    Async {
+        max_submits: usize,
+        deadline: Instant,
+    },
+}
+
+/// Where the time of the last `Soundtrack::stream` call went (for the player's
+/// stall diagnostics).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StreamStats {
+    /// Polling fences and reading finished blocks back.
+    pub collect_ms: f32,
+    /// Queueing blocks (draw, readback into a buffer, fence; mix input uploads).
+    pub submit_ms: f32,
+    /// Everything else on the CPU: fades and sums, assembling mix inputs.
+    pub cpu_ms: f32,
+    pub collected: usize,
+    pub submitted: usize,
 }
 
 /// Where a finished block goes.
@@ -189,6 +206,7 @@ pub struct Soundtrack {
     rendered: Vec<String>,
     /// Blocks queued on the GPU by `stream`, keyed like `chunks`.
     in_flight: HashMap<(u64, usize), InFlight>,
+    stats: StreamStats,
 }
 
 impl Default for Soundtrack {
@@ -211,6 +229,7 @@ impl Soundtrack {
             chunks: HashMap::new(),
             rendered: vec![],
             in_flight: HashMap::new(),
+            stats: StreamStats::default(),
         }
     }
 
@@ -401,8 +420,14 @@ impl Soundtrack {
         max_submits: usize,
         deadline: Instant,
     ) -> Result<Vec<(usize, Chunk)>, String> {
-        self.collect(r)?;
-        let mut mode = Mode::Async { max_submits };
+        let start = Instant::now();
+        self.stats = StreamStats::default();
+        self.collect(r, deadline)?;
+        self.stats.collect_ms = start.elapsed().as_secs_f32() * 1000.0;
+        let mut mode = Mode::Async {
+            max_submits,
+            deadline,
+        };
         let mut done = vec![];
         for &c in wanted {
             if let Some(d) = self.out_chunk(r, c, &mut mode)? {
@@ -412,7 +437,14 @@ impl Soundtrack {
                 break;
             }
         }
+        let total = start.elapsed().as_secs_f32() * 1000.0;
+        self.stats.cpu_ms = (total - self.stats.collect_ms - self.stats.submit_ms).max(0.0);
         Ok(done)
+    }
+
+    /// Where the time of the last `stream` call went.
+    pub fn stats(&self) -> StreamStats {
+        self.stats
     }
 
     /// Sound blocks queued on the GPU and not yet collected.
@@ -427,14 +459,22 @@ impl Soundtrack {
         }
     }
 
-    /// Store the blocks the GPU has finished. Never waits.
-    fn collect(&mut self, r: &mut Renderer) -> Result<(), String> {
-        let keys: Vec<(u64, usize)> = self.in_flight.keys().copied().collect();
-        for key in keys {
-            let ticket = self.in_flight[&key].ticket;
-            if let Some(res) = r.poll_audio(ticket) {
-                let job = self.in_flight.remove(&key).unwrap();
-                self.store(key, job, res?);
+    /// Store the blocks the GPU has finished. Never waits. Fences pass in submission
+    /// order, so this polls oldest first and stops at the first that hasn't passed:
+    /// usually one poll per frame (each is a driver round trip).
+    fn collect(&mut self, r: &mut Renderer, deadline: Instant) -> Result<(), String> {
+        let mut order: Vec<(AudioTicket, (u64, usize))> =
+            self.in_flight.iter().map(|(k, f)| (f.ticket, *k)).collect();
+        order.sort();
+        for (ticket, key) in order {
+            let Some(res) = r.poll_audio(ticket) else {
+                break;
+            };
+            let job = self.in_flight.remove(&key).unwrap();
+            self.store(key, job, res?);
+            self.stats.collected += 1;
+            if Instant::now() > deadline {
+                break;
             }
         }
         Ok(())
@@ -469,13 +509,11 @@ impl Soundtrack {
             return Ok(Some(d.clone()));
         }
         if let Some(f) = self.in_flight.get(&key) {
-            let res = match mode {
-                Mode::Blocking => r.wait_audio(f.ticket),
-                Mode::Async { .. } => match r.poll_audio(f.ticket) {
-                    Some(res) => res,
-                    None => return Ok(None),
-                },
+            // Streaming: `collect` picks it up once its fence has passed.
+            let Mode::Blocking = mode else {
+                return Ok(None);
             };
+            let res = r.wait_audio(f.ticket);
             let f = self.in_flight.remove(&key).unwrap();
             return Ok(Some(self.store(key, f, res?)));
         }
@@ -485,13 +523,33 @@ impl Soundtrack {
                 let d = r.wait_audio(f.ticket)?;
                 Ok(Some(self.store(key, f, d)))
             }
-            Mode::Async { max_submits } => {
-                if *max_submits > 0 && self.in_flight.len() < MAX_IN_FLIGHT {
-                    *max_submits -= 1;
+            Mode::Async { .. } => {
+                if self.can_submit(mode) {
+                    if let Mode::Async { max_submits, .. } = mode {
+                        *max_submits -= 1;
+                    }
+                    let t = Instant::now();
                     let f = job(r)?;
+                    self.stats.submit_ms += t.elapsed().as_secs_f32() * 1000.0;
+                    self.stats.submitted += 1;
                     self.in_flight.insert(key, f);
                 }
                 Ok(None)
+            }
+        }
+    }
+
+    /// May another block be queued now?
+    fn can_submit(&self, mode: &Mode) -> bool {
+        match mode {
+            Mode::Blocking => true,
+            Mode::Async {
+                max_submits,
+                deadline,
+            } => {
+                *max_submits > 0
+                    && self.in_flight.len() < MAX_IN_FLIGHT
+                    && Instant::now() < *deadline
             }
         }
     }
@@ -533,6 +591,12 @@ impl Soundtrack {
                     let (Some(music), Some(sfx)) = (music, sfx) else {
                         return Ok(None);
                     };
+                    // Copying the inputs out costs; only do it to queue the block.
+                    if !self.can_submit(mode) {
+                        return Ok(None);
+                    }
+                    let music = self.splice(&music, in_lo, in_hi);
+                    let sfx = self.splice(&sfx, in_lo, in_hi);
                     return self.block(r, key, mode, |r| {
                         let t = r.submit_audio(
                             mix.prog,
@@ -550,9 +614,11 @@ impl Soundtrack {
             None => {
                 let music = self.music_range(r, lo, hi, mode)?;
                 let sfx = self.sfx_range(r, lo, hi, mode)?;
-                let (Some(mut o), Some(sfx)) = (music, sfx) else {
+                let (Some(music), Some(sfx)) = (music, sfx) else {
                     return Ok(None);
                 };
+                let mut o = self.splice(&music, lo, hi);
+                let sfx = self.splice(&sfx, lo, hi);
                 for (a, b) in o.iter_mut().zip(&sfx) {
                     *a += b;
                 }
@@ -563,53 +629,64 @@ impl Soundtrack {
         }
     }
 
-    /// Music for global samples lo..hi.
+    /// The music chunks covering global samples lo..hi (None: not all ready).
     fn music_range(
         &mut self,
         r: &mut Renderer,
         lo: usize,
         hi: usize,
         mode: &mut Mode,
-    ) -> Result<Option<Vec<f32>>, String> {
+    ) -> Result<Option<Vec<Chunk>>, String> {
         let Some(t) = self.plan.as_ref().and_then(|p| p.music.clone()) else {
-            return Ok(Some(vec![0.0; (hi - lo) * 2]));
+            let silence = Arc::new(vec![0.0; self.chunk_size * 2]);
+            return Ok(Some(
+                (lo / self.chunk_size..hi.div_ceil(self.chunk_size))
+                    .map(|_| silence.clone())
+                    .collect(),
+            ));
         };
         self.range(lo, hi, |s, c| s.track_chunk(r, &t, c, mode))
     }
 
-    /// The sfx bus (all shot sounds × their fades) for global samples lo..hi.
+    /// The sfx bus (all shot sounds × their fades) chunks covering lo..hi.
     fn sfx_range(
         &mut self,
         r: &mut Renderer,
         lo: usize,
         hi: usize,
         mode: &mut Mode,
-    ) -> Result<Option<Vec<f32>>, String> {
+    ) -> Result<Option<Vec<Chunk>>, String> {
         self.range(lo, hi, |s, c| s.sfx_chunk(r, c, mode))
     }
 
-    /// Samples lo..hi from the chunks `chunk` makes. Asks for every chunk (so the
-    /// missing ones are all queued) before saying None.
+    /// The chunks covering lo..hi. Asks for every one (so the missing ones are all
+    /// queued) before saying None.
     fn range(
         &mut self,
         lo: usize,
         hi: usize,
-        mut chunk: impl FnMut(&mut Self, usize) -> Result<Option<Arc<Vec<f32>>>, String>,
-    ) -> Result<Option<Vec<f32>>, String> {
+        mut chunk: impl FnMut(&mut Self, usize) -> Result<Option<Chunk>, String>,
+    ) -> Result<Option<Vec<Chunk>>, String> {
         let mut parts = vec![];
         let mut c = lo / self.chunk_size;
         while c * self.chunk_size < hi {
-            parts.push((c, chunk(self, c)?));
+            parts.push(chunk(self, c)?);
             c += 1;
         }
+        Ok(parts.into_iter().collect())
+    }
+
+    /// Samples lo..hi out of `parts`, the chunks covering them (from `range`).
+    fn splice(&self, parts: &[Chunk], lo: usize, hi: usize) -> Vec<f32> {
         let mut out = Vec::with_capacity((hi - lo) * 2);
-        for (c, d) in parts {
-            let Some(d) = d else { return Ok(None) };
+        let first = lo / self.chunk_size;
+        for (i, d) in parts.iter().enumerate() {
+            let c = first + i;
             let a = lo.max(c * self.chunk_size) - c * self.chunk_size;
             let b = hi.min((c + 1) * self.chunk_size) - c * self.chunk_size;
             out.extend_from_slice(&d[a * 2..b * 2]);
         }
-        Ok(Some(out))
+        out
     }
 
     /// One chunk of one track; zero outside the track's window.

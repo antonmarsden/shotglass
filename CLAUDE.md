@@ -57,6 +57,8 @@ cargo fmt && cargo clippy --all-targets -- -D warnings
   through `Soundtrack::stream` (`submit_audio` → PBO + fence, `poll_audio` with
   `glClientWaitSync(.., 0)`), never `wait_audio`. Selftest counts `blocking_audio_reads`.
   Paused/scrubbing may block for the chunk under the playhead; headless commands block.
+  Every glGet / query / fence poll is a driver round trip on threaded drivers: ask limits
+  once at startup, poll fences oldest-first and stop at the first unpassed one.
 - **The audio callback (`fill`) never blocks or allocates.** Only atomics, `ArcSwap` and `try_lock`.
 - **`Clock::time()` never decreases while playing.** Use the sound card position only when it
   agrees with the system timer (within 0.25 s).

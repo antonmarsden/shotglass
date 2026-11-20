@@ -321,7 +321,8 @@ To scrub, click or drag on the timeline. Hatched blocks are transitions;
   finished (a pixel buffer readback behind a fence), so the player never waits for
   the GPU to finish the scene before the sound. When paused or scrubbing, the chunk
   under the playhead is made on the spot. Right after a seek during playback the
-  sound can start a frame or two late.
+  sound can start a frame or two late. The Performance panel splits stalls into sound and
+  compiling, and shows where the worst sound stall's time went.
 - **Frozen transitions** render only one scene.
 - `shotglass check` times every shot and transition, so you can see which ones
   are over budget.

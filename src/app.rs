@@ -39,6 +39,27 @@ enum ScaleMode {
     Fixed(f32),
 }
 
+/// Slow housekeeping in one frame, and where its time went.
+#[derive(Clone, Copy)]
+struct Stall {
+    sound_ms: f32,
+    compile_ms: f32,
+    sound: crate::sound::StreamStats,
+}
+
+impl Stall {
+    fn worse(a: Option<Stall>, b: Option<Stall>) -> Option<Stall> {
+        match (a, b) {
+            (Some(a), Some(b)) => Some(if b.sound_ms + b.compile_ms > a.sound_ms + a.compile_ms {
+                b
+            } else {
+                a
+            }),
+            (a, b) => a.or(b),
+        }
+    }
+}
+
 struct Perf {
     last: Option<Instant>,
     frame_ms: VecDeque<f32>,
@@ -46,10 +67,14 @@ struct Perf {
     dropped: u32,
     /// Dropped frames caused by compiling or sound synthesis, not by rendering.
     stalled: u32,
-    /// This frame did blocking housekeeping work.
-    stall: bool,
+    /// ... of which sound took most of the housekeeping time.
+    stalled_sound: u32,
+    /// The slowest sound housekeeping among those stalls.
+    worst_sound: Option<Stall>,
+    /// This frame did slow housekeeping work.
+    stall: Option<Stall>,
     last_render: Option<Instant>,
-    stall_since_render: bool,
+    stall_since_render: Option<Stall>,
     /// GPU times since the last scale change (for the scaler).
     gpu_recent: VecDeque<f32>,
     misses: u32,
@@ -201,9 +226,11 @@ impl Player {
                 gpu_ms: VecDeque::new(),
                 dropped: 0,
                 stalled: 0,
-                stall: false,
+                stalled_sound: 0,
+                worst_sound: None,
+                stall: None,
                 last_render: None,
-                stall_since_render: false,
+                stall_since_render: None,
                 gpu_recent: VecDeque::new(),
                 misses: 0,
                 cooldown: 0,
@@ -332,7 +359,8 @@ impl Player {
         // A block or two per frame; more right after a seek, when the playhead's
         // chunk is missing.
         let blocks = if wanted.first() == Some(&c0) { 4 } else { 2 };
-        let deadline = Instant::now() + Duration::from_millis(4);
+        // Well under the 3 ms that counts as a stall.
+        let deadline = Instant::now() + Duration::from_micros(1500);
         match self
             .soundtrack
             .stream(&mut self.renderer, &wanted, blocks, deadline)
@@ -566,11 +594,12 @@ impl Player {
         self.perf.last = Some(now);
         let gpu = self.renderer.gpu_ms();
         // Any housekeeping stall since the last rendered frame excuses its lateness.
-        self.perf.stall_since_render |= std::mem::take(&mut self.perf.stall);
+        self.perf.stall_since_render =
+            Stall::worse(self.perf.stall_since_render, self.perf.stall.take());
         if !self.clock.playing() {
             self.perf.last = None;
             self.perf.last_render = None;
-            self.perf.stall_since_render = false;
+            self.perf.stall_since_render = None;
             return;
         }
         let Some(dt) = dt else { return };
@@ -589,11 +618,21 @@ impl Player {
         let late = rendered && self.perf.since_render_ms() > (frame_ms.max(vsync) * 1.5);
         if rendered {
             self.perf.last_render = Some(now);
-            self.perf.stall_since_render = false;
+            self.perf.stall_since_render = None;
         }
         if late {
-            if stall {
+            if let Some(st) = stall {
                 self.perf.stalled += 1;
+                if st.sound_ms >= st.compile_ms {
+                    self.perf.stalled_sound += 1;
+                    if self
+                        .perf
+                        .worst_sound
+                        .is_none_or(|w| st.sound_ms > w.sound_ms)
+                    {
+                        self.perf.worst_sound = Some(st);
+                    }
+                }
             } else {
                 self.perf.dropped += 1;
             }
@@ -624,7 +663,7 @@ impl Player {
             }
         } else if rendered {
             // No GPU timer: go by late film frames, ignoring ones we stalled ourselves.
-            if late && !stall {
+            if late && stall.is_none() {
                 self.perf.misses += 1;
                 if self.perf.misses >= 3 {
                     self.auto_scale = (scale * 0.85).max(0.3);
@@ -1047,9 +1086,24 @@ impl Player {
                     .on_hover_text("frames that missed the display refresh while rendering");
                     if self.perf.stalled > 0 {
                         ui.label(format!(
-                            "stalls {} (compiling or synthesizing sound)",
-                            self.perf.stalled
-                        ));
+                            "stalls {} (sound {}, compiling {})",
+                            self.perf.stalled,
+                            self.perf.stalled_sound,
+                            self.perf.stalled - self.perf.stalled_sound
+                        ))
+                        .on_hover_text("late frames whose housekeeping took over 3 ms");
+                    }
+                    if let Some(w) = self.perf.worst_sound {
+                        let s = w.sound;
+                        ui.label(format!(
+                            "worst sound stall {:.1} ms: fences + reads {:.1} ({}), queueing {:.1} ({}), cpu {:.1}",
+                            w.sound_ms, s.collect_ms, s.collected, s.submit_ms, s.submitted, s.cpu_ms
+                        ))
+                        .on_hover_text(
+                            "where the slowest sound stall's time went: polling fences and reading \
+                             finished blocks (count), queueing blocks on the GPU (count), and CPU \
+                             work (fades, sums, mix inputs)",
+                        );
                     }
                     graph(
                         ui,
@@ -1060,6 +1114,8 @@ impl Player {
                     if ui.small_button("reset counters").clicked() {
                         self.perf.dropped = 0;
                         self.perf.stalled = 0;
+                        self.perf.stalled_sound = 0;
+                        self.perf.worst_sound = None;
                         self.perf.frame_ms.clear();
                         self.perf.gpu_ms.clear();
                     }
@@ -1146,12 +1202,18 @@ impl eframe::App for Player {
         // so a slow frame caused by it isn't mistaken for the GPU being overloaded.
         let work = Instant::now();
         self.stream_sound();
+        let sound_ms = work.elapsed().as_secs_f32() * 1000.0;
         if let Some(m) = &self.movie {
             // Without parallel compiling, a compile blocks: don't do background ones mid-playback.
             let background = !self.clock.playing() || self.renderer.parallel;
             self.renderer.pump(m, self.clock.time(), background);
         }
-        self.perf.stall = work.elapsed() > Duration::from_millis(3);
+        let total_ms = work.elapsed().as_secs_f32() * 1000.0;
+        self.perf.stall = (total_ms > 3.0).then(|| Stall {
+            sound_ms,
+            compile_ms: total_ms - sound_ms,
+            sound: self.soundtrack.stats(),
+        });
 
         egui::Panel::bottom("transport").show(ui, |ui| {
             ui.add_space(4.0);
