@@ -8,39 +8,37 @@
 use anyhow::{Result, anyhow, bail};
 use std::path::{Path, PathBuf};
 
-#[derive(Clone, Copy, Debug)]
+/// The GLSL language a shader is written in: the `#version` line the harness emits.
+///
+/// Films get a fixed baseline whatever the driver offers (`330 core` on desktop,
+/// `300 es` on OpenGL ES / the web), so every machine compiles the same language.
+/// A film may opt in to a later desktop version with `glsl = "410"` or `"430"`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Dialect {
     pub es: bool,
     pub version: u32,
 }
 
+/// Desktop GLSL versions a film may ask for in `movie.toml` (`glsl = "..."`).
+pub const DESKTOP_VERSIONS: &[u32] = &[330, 410, 430];
+
 impl Dialect {
-    /// Pick a GLSL version from GL_SHADING_LANGUAGE_VERSION / GL_VERSION.
-    pub fn detect(glsl_version: &str, gl_version: &str) -> Dialect {
-        let es = gl_version.contains("OpenGL ES") || glsl_version.contains("OpenGL ES");
-        let num: String = glsl_version
-            .split_whitespace()
-            .find(|w| w.chars().next().is_some_and(|c| c.is_ascii_digit()))
-            .unwrap_or("3.30")
-            .chars()
-            .filter(|c| c.is_ascii_digit())
-            .take(3)
-            .collect();
-        let v: u32 = num.parse().unwrap_or(330);
-        if es {
-            Dialect {
-                es: true,
-                version: 300,
-            }
-        } else {
-            let version = if v >= 430 {
-                430
-            } else if v >= 410 {
-                410
-            } else {
-                330
-            };
-            Dialect { es: false, version }
+    /// The portable desktop baseline: OpenGL 3.3 core.
+    pub const BASELINE: Dialect = Dialect {
+        es: false,
+        version: 330,
+    };
+    /// GLSL ES 3.00: OpenGL ES 3.0 and WebGL 2.
+    pub const WEB: Dialect = Dialect {
+        es: true,
+        version: 300,
+    };
+
+    /// Desktop GLSL at `version` (`None` = the baseline).
+    pub fn desktop(version: Option<u32>) -> Dialect {
+        Dialect {
+            es: false,
+            version: version.unwrap_or(Self::BASELINE.version),
         }
     }
 
@@ -53,16 +51,84 @@ impl Dialect {
     }
 }
 
+impl std::fmt::Display for Dialect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.es {
+            write!(
+                f,
+                "GLSL ES {}.{:02}",
+                self.version / 100,
+                self.version % 100
+            )
+        } else {
+            write!(f, "GLSL {} core", self.version)
+        }
+    }
+}
+
+/// What the driver can compile, from GL_SHADING_LANGUAGE_VERSION / GL_VERSION.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DriverGlsl {
+    pub es: bool,
+    /// Highest GLSL version the driver accepts, e.g. 460 for "4.60 NVIDIA".
+    pub max: u32,
+}
+
+impl DriverGlsl {
+    pub fn detect(glsl_version: &str, gl_version: &str) -> DriverGlsl {
+        let es = gl_version.contains("OpenGL ES") || glsl_version.contains("OpenGL ES");
+        let num: String = glsl_version
+            .split_whitespace()
+            .find(|w| w.chars().next().is_some_and(|c| c.is_ascii_digit()))
+            .unwrap_or(if es { "3.00" } else { "3.30" })
+            .chars()
+            .filter(|c| c.is_ascii_digit())
+            .take(3)
+            .collect();
+        let max = num.parse().unwrap_or(if es { 300 } else { 330 });
+        DriverGlsl { es, max }
+    }
+
+    /// The dialect a film compiles in on this driver: the baseline, or the film's
+    /// opt-in (`glsl` in movie.toml). Refuses an opt-in the driver can't provide.
+    pub fn dialect(&self, opt_in: Option<u32>) -> std::result::Result<Dialect, String> {
+        match (self.es, opt_in) {
+            (true, None) => Ok(Dialect::WEB),
+            (true, Some(v)) => Err(format!(
+                "this film asks for desktop GLSL {v} (glsl = \"{v}\" in movie.toml), but this \
+                 driver is OpenGL ES and only runs GLSL ES 3.00; remove the glsl line to use \
+                 the portable baseline"
+            )),
+            (false, v) => {
+                let d = Dialect::desktop(v);
+                if self.max < d.version {
+                    Err(format!(
+                        "this film asks for GLSL {} (glsl = \"{}\" in movie.toml), but this driver \
+                         only goes up to GLSL {}; remove the glsl line to use the portable \
+                         baseline (330)",
+                        d.version, d.version, self.max
+                    ))
+                } else {
+                    Ok(d)
+                }
+            }
+        }
+    }
+}
+
 /// A fully assembled shader plus the names of the files it came from.
 #[derive(Clone, Debug)]
 pub struct Assembled {
     pub text: String,
+    /// The language `text` declares in its `#version` line.
+    pub dialect: Dialect,
     /// Index = GLSL source string number.
     pub files: Vec<String>,
 }
 
 pub struct Builder {
     text: String,
+    dialect: Dialect,
     files: Vec<String>,
     root: PathBuf,
 }
@@ -77,6 +143,7 @@ impl Builder {
         }
         Builder {
             text,
+            dialect,
             files: vec!["<shotglass header>".into()],
             root: root.to_path_buf(),
         }
@@ -103,6 +170,7 @@ impl Builder {
     pub fn build(self) -> Assembled {
         Assembled {
             text: self.text,
+            dialect: self.dialect,
             files: self.files,
         }
     }
@@ -298,11 +366,7 @@ mod tests {
             "#include \"../common.glsl\"\nvoid f(){}\n",
         )
         .unwrap();
-        let d = Dialect {
-            es: false,
-            version: 330,
-        };
-        let a = Builder::new(d, "uniform float iTime;", &dir)
+        let a = Builder::new(Dialect::BASELINE, "uniform float iTime;", &dir)
             .file(&dir.join("scenes/a.glsl"))
             .unwrap()
             .build();
@@ -316,13 +380,53 @@ mod tests {
     }
 
     #[test]
-    fn detects_dialect() {
-        assert_eq!(Dialect::detect("4.60 NVIDIA", "4.6.0 NVIDIA").version, 430);
+    fn detects_driver() {
         assert_eq!(
-            Dialect::detect("4.50", "4.5 (Core Profile) Mesa").version,
-            430
+            DriverGlsl::detect("4.60 NVIDIA", "4.6.0 NVIDIA"),
+            DriverGlsl {
+                es: false,
+                max: 460
+            }
         );
-        assert_eq!(Dialect::detect("4.10", "4.1 Metal").version, 410);
-        assert!(Dialect::detect("OpenGL ES GLSL ES 3.00", "OpenGL ES 3.0").es);
+        assert_eq!(
+            DriverGlsl::detect("4.50", "4.5 (Core Profile) Mesa").max,
+            450
+        );
+        assert_eq!(DriverGlsl::detect("4.10", "4.1 Metal").max, 410);
+        assert!(DriverGlsl::detect("OpenGL ES GLSL ES 3.00", "OpenGL ES 3.0").es);
+    }
+
+    #[test]
+    fn baseline_whatever_the_driver_offers() {
+        for (glsl, gl) in [
+            ("4.60 NVIDIA", "4.6.0 NVIDIA"),
+            ("4.10", "4.1 Metal"),
+            ("3.30", "3.3 Mesa"),
+        ] {
+            let d = DriverGlsl::detect(glsl, gl).dialect(None).unwrap();
+            assert_eq!(d, Dialect::BASELINE);
+            assert!(d.version_line().starts_with("#version 330 core\n"));
+        }
+        let es = DriverGlsl::detect("OpenGL ES GLSL ES 3.20", "OpenGL ES 3.2");
+        assert_eq!(es.dialect(None).unwrap(), Dialect::WEB);
+        assert!(Dialect::WEB.version_line().starts_with("#version 300 es\n"));
+    }
+
+    #[test]
+    fn opt_in_needs_a_driver_that_provides_it() {
+        let nv = DriverGlsl::detect("4.60 NVIDIA", "4.6.0 NVIDIA");
+        assert_eq!(nv.dialect(Some(430)).unwrap(), Dialect::desktop(Some(430)));
+        assert_eq!(nv.dialect(Some(410)).unwrap().version, 410);
+        let mac = DriverGlsl::detect("4.10", "4.1 Metal");
+        assert_eq!(mac.dialect(Some(410)).unwrap().version, 410);
+        let e = mac.dialect(Some(430)).unwrap_err();
+        assert!(
+            e.contains("GLSL 430") && e.contains("up to GLSL 410"),
+            "{e}"
+        );
+        let arm = DriverGlsl::detect("3.30", "3.3 compatibility pack");
+        assert!(arm.dialect(Some(410)).is_err());
+        let es = DriverGlsl::detect("OpenGL ES GLSL ES 3.20", "OpenGL ES 3.2");
+        assert!(es.dialect(Some(410)).unwrap_err().contains("OpenGL ES"));
     }
 }

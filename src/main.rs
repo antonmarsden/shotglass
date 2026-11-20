@@ -9,6 +9,7 @@ mod movie;
 mod selftest;
 mod shader;
 mod sound;
+mod validate;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
@@ -71,7 +72,8 @@ enum Cmd {
         #[arg(long, default_value = "strip.png")]
         out: PathBuf,
     },
-    /// Validate the movie, compile every shader, synthesize the sound, and time each shot.
+    /// Validate the movie and its GLSL (strictly, independent of this driver), compile
+    /// every shader, synthesize the sound, and time each shot.
     Check {
         movie: PathBuf,
         /// Resolution to time frames at.
@@ -80,6 +82,12 @@ enum Cmd {
         /// Frames rendered per measurement.
         #[arg(long, default_value_t = 8)]
         frames: usize,
+        /// Also require every shader to be valid GLSL ES 3.00 (WebGL 2), for the web player.
+        #[arg(long)]
+        web: bool,
+        /// Only validate (movie.toml and the strict GLSL check); no GPU needed.
+        #[arg(long)]
+        no_gpu: bool,
     },
     /// Write the GLSL soundtrack to a WAV file.
     Wav {
@@ -160,7 +168,9 @@ fn real_main() -> Result<()> {
             movie,
             size,
             frames,
-        } => check(&movie, &size, frames),
+            web,
+            no_gpu,
+        } => check(&movie, &size, frames, web, no_gpu),
         Cmd::Wav { movie, out, rate } => wav(&movie, &out, rate),
         Cmd::New { dir } => new_movie(&dir),
         Cmd::Selftest { filter } => selftest::run(filter),
@@ -317,14 +327,86 @@ fn describe(m: &Movie, t: f32) -> String {
     }
 }
 
-fn check(movie: &Path, size: &str, frames: usize) -> Result<()> {
+/// The driver-independent part of `check`: every shader through the reference front
+/// end at the film's desktop dialect, and as GLSL ES 3.00 (errors with `web`,
+/// warnings otherwise).
+fn strict_check(m: &Movie, web: bool) -> Result<()> {
+    use shader::Dialect;
+    if !validate::AVAILABLE {
+        if web {
+            bail!(
+                "--web needs the strict GLSL check, but this build doesn't have it (strict-glsl feature)"
+            );
+        }
+        println!("strict GLSL check: skipped (built without the strict-glsl feature)");
+        return Ok(());
+    }
+    let report = |errors: &[gfx::ShaderError]| {
+        for e in errors {
+            eprint!("{e}");
+        }
+    };
+    let opt_in = m.glsl.filter(|v| *v != Dialect::BASELINE.version);
+    if let Some(v) = opt_in {
+        println!(
+            "warning: glsl = \"{v}\" narrows where this film runs: it needs an OpenGL {}.{} \
+             driver (macOS stops at 4.1, Windows on ARM at 3.3) and can't run in a browser",
+            v / 100,
+            v % 100 / 10
+        );
+    }
+    let desktop = Dialect::desktop(m.glsl);
+    let sources = validate::movie_sources(m, desktop);
+    let errors = validate::validate_sources(&sources);
+    if !errors.is_empty() {
+        report(&errors);
+        bail!(
+            "{} shader(s) aren't valid {desktop} (strict check; your driver may be more lenient)",
+            errors.len()
+        );
+    }
+    println!("strict GLSL: {} shaders valid as {desktop}", sources.len());
+    match opt_in {
+        Some(v) if web => bail!(
+            "--web: glsl = \"{v}\" films can't run in a browser (GLSL ES 3.00); remove the glsl line"
+        ),
+        Some(_) => {}
+        None => {
+            let errors = validate::validate_movie(m, Dialect::WEB);
+            if errors.is_empty() {
+                println!("strict GLSL: valid as {} (web)", Dialect::WEB);
+            } else if web {
+                report(&errors);
+                bail!("{} shader(s) aren't valid {}", errors.len(), Dialect::WEB);
+            } else {
+                println!(
+                    "warning: {} shader(s) aren't valid {}, so they won't run in a browser \
+                     (`check --web` makes this an error):",
+                    errors.len(),
+                    Dialect::WEB
+                );
+                report(&errors);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn check(movie: &Path, size: &str, frames: usize, web: bool, no_gpu: bool) -> Result<()> {
     let m = Movie::load(movie)?;
     let (w, h) = parse_size(size)?;
     println!("{} — {:.2}s, {} shots", m.title, m.duration, m.shots.len());
+    strict_check(&m, web)?;
+    if no_gpu {
+        println!("\nok");
+        return Ok(());
+    }
     headless::with_gl(move |gl| {
         let t0 = Instant::now();
         let mut r = Renderer::new(gl)?;
         println!("GPU: {}", r.gl_info);
+        let dialect = r.dialect_for(&m).map_err(|e| anyhow!(e))?;
+        println!("compiling as {dialect}");
         println!(
             "parallel shader compile: {}  |  program cache: {}",
             if r.parallel { "yes" } else { "no" },
@@ -465,15 +547,21 @@ const TEMPLATE: &[(&str, &str)] = &[
     ),
 ];
 
-fn new_movie(dir: &Path) -> Result<()> {
-    if dir.exists() && std::fs::read_dir(dir)?.next().is_some() {
-        bail!("{} already exists and isn't empty", dir.display());
-    }
+/// Write the `shotglass new` template into `dir`.
+fn write_template(dir: &Path) -> Result<()> {
     for (name, text) in TEMPLATE {
         let p = dir.join(name);
         std::fs::create_dir_all(p.parent().unwrap())?;
         std::fs::write(&p, text)?;
     }
+    Ok(())
+}
+
+fn new_movie(dir: &Path) -> Result<()> {
+    if dir.exists() && std::fs::read_dir(dir)?.next().is_some() {
+        bail!("{} already exists and isn't empty", dir.display());
+    }
+    write_template(dir)?;
     println!(
         "created {}\nnext: shotglass play {}",
         dir.display(),

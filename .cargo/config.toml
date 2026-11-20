@@ -1,0 +1,6 @@
+[env]
+# glslang-sys compiles glslang without NDEBUG, so glslang's internal debug asserts
+# stay on, and one of them aborts the whole process on valid input (`texture2D` at
+# `#version 330 core`). glslang's own release builds define NDEBUG; so do we.
+# (An explicit CXXFLAGS in your environment takes precedence over this.)
+CXXFLAGS = "-DNDEBUG"

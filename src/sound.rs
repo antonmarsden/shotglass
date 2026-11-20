@@ -14,7 +14,7 @@
 use crate::anim::GLSL_EASE;
 use crate::gfx::{AUDIO_BLOCK, Renderer, ShaderError, TRACK_WIDTH};
 use crate::movie::Movie;
-use crate::shader::{Assembled, Builder};
+use crate::shader::{Assembled, Builder, Dialect};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
@@ -31,6 +31,50 @@ out vec4 shotglass_out;
 
 const SAMPLE_INDEX: &str =
     "int s = iBlockOffset + int(gl_FragCoord.y) * iBlockWidth + int(gl_FragCoord.x);";
+
+/// The movie-level music shader (`mainSound`, movie time).
+pub fn music_source(d: Dialect, m: &Movie, cues: &str, path: &Path) -> anyhow::Result<Assembled> {
+    Ok(Builder::new(d, &format!("{COMMON}{GLSL_EASE}{cues}"), &m.root)
+        .file(path)?
+        .footer(&format!(
+            "void main() {{\n  {SAMPLE_INDEX}\n  shotglass_out = vec4(mainSound(s, float(s) / iSampleRate), 0.0, 1.0);\n}}"
+        ))
+        .build())
+}
+
+/// The sound shader of shot `i` (`mainSound`, shot time, the shot's uniforms).
+/// Panics if the shot has no sound.
+pub fn shot_sound_source(d: Dialect, m: &Movie, cues: &str, i: usize) -> anyhow::Result<Assembled> {
+    let shot = &m.shots[i];
+    let snd = shot.sound.as_ref().expect("shot has a sound");
+    let mut header = format!(
+        "{COMMON}{GLSL_EASE}uniform float iShotStart;\nuniform float iShotDuration;\n{cues}"
+    );
+    let mut assign = String::new();
+    for (name, a) in &shot.uniforms {
+        header += &format!("{} {name};\n", a.glsl_type());
+        header += &a.glsl_fn(&format!("sg_u_{name}"));
+        assign += &format!("  {name} = sg_u_{name}(t);\n");
+    }
+    Ok(Builder::new(d, &header, &m.root)
+        .file(&snd.path)?
+        .footer(&format!(
+            "void main() {{\n  {SAMPLE_INDEX}\n  float t = float(s) / iSampleRate - iShotStart;\n{assign}  shotglass_out = vec4(mainSound(s, t), 0.0, 1.0);\n}}"
+        ))
+        .build())
+}
+
+/// The final mix shader (`mainMix`, reading `music()` and `sfx()`).
+pub fn mix_source(d: Dialect, m: &Movie, cues: &str, path: &Path) -> anyhow::Result<Assembled> {
+    Ok(
+        Builder::new(d, &format!("{COMMON}{GLSL_EASE}{cues}{}", mix_helpers()), &m.root)
+            .file(path)?
+            .footer(&format!(
+                "void main() {{\n  {SAMPLE_INDEX}\n  shotglass_out = vec4(mainMix(s, float(s) / iSampleRate), 0.0, 1.0);\n}}"
+            ))
+            .build(),
+    )
+}
 
 fn mix_helpers() -> String {
     format!(
@@ -150,6 +194,12 @@ impl Soundtrack {
         m: &Movie,
         sr: u32,
     ) -> Result<(), Vec<ShaderError>> {
+        let dialect = r.dialect_for(m).map_err(|e| {
+            vec![ShaderError {
+                what: "movie.toml".into(),
+                messages: vec![e],
+            }]
+        })?;
         let total = (m.duration * sr as f32).ceil() as usize;
         let cues = m.cue_defines();
         let mut errors = vec![];
@@ -189,12 +239,7 @@ impl Soundtrack {
 
         let music = m.music.as_ref().and_then(|path| {
             let what = format!("music ({})", rel(path, &m.root));
-            let src = Builder::new(r.dialect(), &format!("{COMMON}{GLSL_EASE}{cues}"), &m.root).file(path).map(|b| {
-                b.footer(&format!(
-                    "void main() {{\n  {SAMPLE_INDEX}\n  shotglass_out = vec4(mainSound(s, float(s) / iSampleRate), 0.0, 1.0);\n}}"
-                ))
-                .build()
-            });
+            let src = music_source(dialect, m, &cues, path);
             compile(r, what, src).map(|k| track("music", k, 0, total, (0.0, m.duration)))
         });
 
@@ -205,22 +250,8 @@ impl Soundtrack {
             };
             let first = (from * sr as f32).floor() as usize;
             let last = ((to * sr as f32).ceil() as usize).min(total);
-            let mut header = format!(
-                "{COMMON}{GLSL_EASE}uniform float iShotStart;\nuniform float iShotDuration;\n{cues}"
-            );
-            let mut assign = String::new();
-            for (name, a) in &shot.uniforms {
-                header += &format!("{} {name};\n", a.glsl_type());
-                header += &a.glsl_fn(&format!("sg_u_{name}"));
-                assign += &format!("  {name} = sg_u_{name}(t);\n");
-            }
             let what = format!("sound for \"{}\" ({})", shot.id, rel(&snd.path, &m.root));
-            let src = Builder::new(r.dialect(), &header, &m.root).file(&snd.path).map(|b| {
-                b.footer(&format!(
-                    "void main() {{\n  {SAMPLE_INDEX}\n  float t = float(s) / iSampleRate - iShotStart;\n{assign}  shotglass_out = vec4(mainSound(s, t), 0.0, 1.0);\n}}"
-                ))
-                .build()
-            });
+            let src = shot_sound_source(dialect, m, &cues, i);
             if let Some(k) = compile(r, what, src) {
                 let name = format!("sound for \"{}\"", shot.id);
                 shots.push((
@@ -238,14 +269,7 @@ impl Soundtrack {
 
         let mix = m.mix.as_ref().and_then(|path| {
             let what = format!("mix ({})", rel(path, &m.root));
-            let src = Builder::new(r.dialect(), &format!("{COMMON}{GLSL_EASE}{cues}{}", mix_helpers()), &m.root)
-                .file(path)
-                .map(|b| {
-                    b.footer(&format!(
-                        "void main() {{\n  {SAMPLE_INDEX}\n  shotglass_out = vec4(mainMix(s, float(s) / iSampleRate), 0.0, 1.0);\n}}"
-                    ))
-                    .build()
-                });
+            let src = mix_source(dialect, m, &cues, path);
             compile(r, what, src).map(|k| track("mix", k, 0, total, (0.0, m.duration)))
         });
 

@@ -68,6 +68,7 @@ movies/big-shadow/
 title = "Big Shadow"
 aspect = [16, 9]
 fps = 30                      # for frame stepping and iFrame; playback follows the display
+# glsl = "430"                # opt in to a later GLSL; see "Portable shaders" (default 330)
 
 [sound]
 music = "music.glsl"          # optional
@@ -226,6 +227,57 @@ previous version keeps playing. Recursive filters (resonant sweeps, feedback rev
 thing GLSL sound can't do cheaply. Multi-tap delays in the mix get you most of
 the way.
 
+### Portable shaders
+
+A film that compiles on your machine should compile on every machine with
+OpenGL 3.3, and in a browser. Two things get in the way: drivers offer different
+GLSL versions, and some drivers (NVIDIA especially) accept code the spec forbids.
+shotglass handles both.
+
+**One language everywhere.** Every shader is compiled as `#version 330 core`
+(OpenGL 3.3), on every desktop driver, even one that offers 4.6. On OpenGL ES it's
+`#version 300 es`, which the web player will use too. The harness writes the
+`#version` line; a `#version` in your file is ignored. So `bitfieldExtract` (GLSL 4.00)
+or `textureQueryLevels` (4.30) fail on your machine too, not just on someone
+else's Mac.
+
+**Opting in to more.** If a film really needs a later version, say so in `movie.toml`:
+
+```toml
+glsl = "430"     # or "410" (the most macOS offers); "330" is the default
+```
+
+This narrows where the film runs. macOS stops at 4.10, Windows on ARM at 3.30, and
+browsers only run GLSL ES 3.00. On a driver that can't provide the version, the
+film is refused with a message saying so, and `check` warns about it.
+
+**Strict checking.** `shotglass check` runs every shader (scenes, transitions,
+sound, mix, with your `#include`s) through [glslang](https://github.com/KhronosGroup/glslang),
+the Khronos reference compiler, built into shotglass. It doesn't depend on your
+driver, so it catches code your driver accepts but others reject. Errors point at
+your file and line:
+
+```
+shot "moon" (scenes/moon.glsl):
+  scenes/moon.glsl:12: error: 'textureQueryLevels' : no matching overloaded function found (valid in GLSL 430 core: this film compiles as GLSL 330 core, the portable baseline)
+```
+
+`check` also tries every shader as GLSL ES 3.00 and warns about anything that
+wouldn't run in a browser. `check --web` turns those warnings into errors.
+`check --no-gpu` runs only these checks, with no OpenGL needed (handy in CI).
+
+Common things that work on one driver and fail on another:
+
+| construct | problem | portable version |
+|---|---|---|
+| `float x = 1;`, `v * 2`, `pow(x, 2)`, `i < 3.0` | implicit int→float: legal desktop GLSL, an error in GLSL ES | `1.0`, `v * 2.0`, `pow(x, 2.0)`, `float(i) < 3.0` |
+| `bitfieldExtract`, `fma`, `textureQueryLevels`, `textureGather` | from GLSL 4.x | write it out, or opt in with `glsl` |
+| `saturate`, `lerp`, `frac`, `float3`, `mul` | HLSL, accepted by some drivers | `clamp(x, 0.0, 1.0)`, `mix`, `fract`, `vec3`, `*` |
+| `texture2D`, `gl_FragColor` | deprecated; gone in GLSL ES | `texture`, `fragColor` (`mainImage`'s out parameter) |
+| `x % y` on floats | `%` is for integers | `mod(x, y)` |
+| `layout(binding = 0)` | needs GLSL 4.20 | leave bindings to the harness |
+| a `sampler3D` or `isampler2D` | GLSL ES needs a precision qualifier | `uniform highp sampler3D t;` |
+
 ## The player
 
 `shotglass play <movie> [--at 12.5 | --at moon | --at moon+2] [--scale auto | 1.0]`
@@ -295,13 +347,14 @@ soundtrack (`shotglass wav`) in 4 s:
 shotglass play   <movie> [--at T] [--scale auto|0.1..1.0]
 shotglass still  <movie> --at 3.5,moon,closeup+2 [--size 1280x720] [--out stills/]
 shotglass strip  <movie> [--count 12 | --at ...] [--size 384x216] [--cols 4] [--out strip.png]
-shotglass check  <movie> [--size 1280x720] [--frames 8]   # validate, compile, synth, time
+shotglass check  <movie> [--web] [--no-gpu] [--size 1280x720] [--frames 8]
+                 # validate movie.toml and the GLSL (strictly), compile, synth, time
 shotglass wav    <movie> [--out sound.wav] [--rate 48000]
 shotglass new    <dir>
 shotglass selftest [filter]                                # GPU + sound checks on this machine
 ```
 
-`still`, `strip`, `check` and `wav` render off-screen. On a Linux machine with
+`still`, `strip`, `check` and `wav` render off-screen (`check --no-gpu` doesn't need OpenGL). On a Linux machine with
 no display, run them under `xvfb-run`; Mesa's software OpenGL works.
 
 ## Testing
@@ -315,13 +368,18 @@ shotglass selftest strips   # only checks whose name contains "strips"
 - **Unit and property tests** cover timeline maths, keyframes, error-log parsing,
   the render-scale logic and the master clock (against a simulated sound card that
   can lag, stall or run away). Random timelines and malformed `movie.toml` files
-  are generated too, to check the parser never panics.
-- **`selftest`** writes small fixture films to a temporary folder and checks on the
+  are generated too, to check the parser never panics. The strict GLSL checker is
+  tested on non-portable snippets, and the demo film, the `shotglass new` template
+  and the built-in transitions must pass it at every `glsl` version and as GLSL ES.
+- **`selftest`** writes small fixture films to a temporary folder (each must also
+  pass the strict GLSL check, at the baseline and as GLSL ES) and checks on the
   actual GPU and driver that:
   - transitions start exactly on the old shot and end on the new one;
   - live and frozen crossfades blend correctly;
   - reduced render scale has no edge bleed, and strip-drawn frames match single draws;
   - errors point at the right file:line, including inside `#include`s;
+  - shaders get `#version 330 core` whatever the driver offers (or the film's
+    `glsl` opt-in, refused on drivers that can't provide it);
   - a broken edit keeps the last working version on screen;
   - the program cache reloads identically and survives corruption;
   - evicted shaders come back correctly;

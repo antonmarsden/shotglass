@@ -6,7 +6,7 @@
 
 use crate::anim::Anim;
 use crate::movie::{At, Movie, Shot, glsl_float};
-use crate::shader::{Assembled, Builder, Dialect, remap_log};
+use crate::shader::{Assembled, Builder, Dialect, DriverGlsl, remap_log};
 use anyhow::{Result, anyhow};
 use eframe::glow::{self, HasContext};
 use std::collections::HashMap;
@@ -142,6 +142,9 @@ const MAX_READY: usize = 64;
 
 pub struct Renderer {
     gl: Arc<glow::Context>,
+    /// What the driver can compile.
+    pub driver: DriverGlsl,
+    /// The language the current movie's shaders are assembled in (see `dialect_for`).
     pub dialect: Dialect,
     pub gl_info: String,
     vao: glow::VertexArray,
@@ -195,7 +198,8 @@ impl Renderer {
             let glsl = gl.get_parameter_string(glow::SHADING_LANGUAGE_VERSION);
             let version = gl.get_parameter_string(glow::VERSION);
             let renderer = gl.get_parameter_string(glow::RENDERER);
-            let dialect = Dialect::detect(&glsl, &version);
+            let driver = DriverGlsl::detect(&glsl, &version);
+            let dialect = driver.dialect(None).map_err(|e| anyhow!(e))?;
             let vao = gl.create_vertex_array().map_err(|e| anyhow!(e))?;
             let dummy = gl.create_texture().map_err(|e| anyhow!(e))?;
             gl.bind_texture(glow::TEXTURE_2D, Some(dummy));
@@ -211,7 +215,7 @@ impl Renderer {
                 glow::PixelUnpackData::Slice(Some(&[0, 0, 0, 255])),
             );
             gl.bind_texture(glow::TEXTURE_2D, None);
-            let timer = if dialect.es { None } else { GpuTimer::new(&gl) };
+            let timer = if driver.es { None } else { GpuTimer::new(&gl) };
             let ext = gl.supported_extensions();
             let parallel = ext.contains("GL_KHR_parallel_shader_compile")
                 || ext.contains("GL_ARB_parallel_shader_compile");
@@ -219,7 +223,7 @@ impl Renderer {
                 gl.max_shader_compiler_threads(0xFFFF_FFFF);
             }
             let formats = gl.get_parameter_i32(glow::NUM_PROGRAM_BINARY_FORMATS);
-            let gl_info = format!("{renderer} · OpenGL {version} · GLSL {}", dialect.version);
+            let gl_info = format!("{renderer} · OpenGL {version} · GLSL {glsl}");
             let binary_dir = if formats > 0 && std::env::var_os("SHOTGLASS_NO_CACHE").is_none() {
                 cache_dir().map(|d| d.join(format!("{:016x}", hash(&gl_info))))
             } else {
@@ -228,6 +232,7 @@ impl Renderer {
             Ok(Renderer {
                 gl_info,
                 gl,
+                driver,
                 dialect,
                 vao,
                 dummy,
@@ -291,6 +296,12 @@ impl Renderer {
     /// file is reported at once); compiling happens later, nearest the playhead first.
     /// On error nothing changes.
     pub fn set_movie(&mut self, movie: &Movie) -> std::result::Result<(), Vec<ShaderError>> {
+        let dialect = self.dialect_for(movie).map_err(|e| {
+            vec![ShaderError {
+                what: "movie.toml".into(),
+                messages: vec![e],
+            }]
+        })?;
         let cues = movie.cue_defines();
         let mut errors = vec![];
         let mut add = |r: &mut Renderer, what: String, src: Result<Assembled>| -> Option<u64> {
@@ -314,11 +325,11 @@ impl Renderer {
                 }
             }
         };
-        let src = self.transition_source("copy", &[], &cues, &movie.root);
+        let src = transition_source(dialect, "copy", &[], &cues, &movie.root);
         let copy = add(self, "copy pass".into(), src);
         let mut wanted = vec![];
         for shot in &movie.shots {
-            let src = self.scene_source(shot, &cues, &movie.root);
+            let src = scene_source(dialect, shot, &cues, &movie.root);
             let scene = add(
                 self,
                 format!("shot \"{}\" ({})", shot.id, rel(&shot.scene, &movie.root)),
@@ -326,7 +337,7 @@ impl Renderer {
             );
             let trans = match &shot.transition_in {
                 Some(t) => {
-                    let src = self.transition_source(&t.kind, &t.params, &cues, &movie.root);
+                    let src = transition_source(dialect, &t.kind, &t.params, &cues, &movie.root);
                     add(
                         self,
                         format!("transition into \"{}\" ({})", shot.id, t.kind),
@@ -350,6 +361,7 @@ impl Renderer {
                 self.fallback.insert(id.clone(), k);
             }
         }
+        self.dialect = dialect;
         self.wanted = wanted;
         self.wanted_ids = movie.shots.iter().map(|s| s.id.clone()).collect();
         self.fallback
@@ -698,59 +710,6 @@ impl Renderer {
         }
     }
 
-    fn scene_source(&self, shot: &Shot, cues: &str, root: &Path) -> Result<Assembled> {
-        let mut header = SCENE_HEADER.to_string();
-        for (name, a) in &shot.uniforms {
-            header += &format!("uniform {} {name};\n", a.glsl_type());
-        }
-        header += cues;
-        Ok(Builder::new(self.dialect, &header, root)
-            .file(&shot.scene)?
-            .footer(SCENE_FOOTER)
-            .build())
-    }
-
-    fn transition_source(
-        &self,
-        kind: &str,
-        params: &[(String, Vec<f32>)],
-        cues: &str,
-        root: &Path,
-    ) -> Result<Assembled> {
-        let mut header = TRANSITION_HEADER.to_string();
-        for (name, v) in params {
-            let val = match v.len() {
-                1 => glsl_float(v[0]),
-                n => format!(
-                    "vec{n}({})",
-                    v.iter()
-                        .map(|x| glsl_float(*x))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
-            };
-            header += &format!("#define {name} {val}\n");
-        }
-        header += cues;
-        let b = Builder::new(self.dialect, &header, root);
-        let b = if kind.ends_with(".glsl") {
-            b.file(&root.join(kind))?
-        } else {
-            let src = BUILTIN_TRANSITIONS
-                .iter()
-                .find(|(n, _)| *n == kind)
-                .map(|(_, s)| *s)
-                .ok_or_else(|| {
-                    anyhow!(
-                        "unknown transition \"{kind}\"; built-ins are {}, or give a path ending in .glsl",
-                        BUILTIN_TRANSITIONS.iter().map(|(n, _)| *n).filter(|n| *n != "copy").collect::<Vec<_>>().join(", ")
-                    )
-                })?;
-            b.builtin(kind, src)?
-        };
-        Ok(b.footer(TRANSITION_FOOTER).build())
-    }
-
     fn binary_path(&self, src: &Assembled) -> Option<PathBuf> {
         self.binary_dir
             .as_ref()
@@ -797,7 +756,7 @@ impl Renderer {
                 }
                 gl.delete_program(prog); // stale (driver update): compile from source
             }
-            let vs_src = format!("{}{VERTEX}", self.dialect.version_line());
+            let vs_src = vertex_source(src.dialect);
             let vs = gl.create_shader(glow::VERTEX_SHADER).map_err(|e| vec![e])?;
             gl.shader_source(vs, &vs_src);
             gl.compile_shader(vs);
@@ -1488,9 +1447,72 @@ impl Renderer {
         }
     }
 
-    pub fn dialect(&self) -> Dialect {
-        self.dialect
+    /// The language `m`'s shaders compile in on this driver: the portable baseline,
+    /// or the film's `glsl` opt-in. Err (a message for the user) if the driver can't
+    /// provide the opt-in.
+    pub fn dialect_for(&self, m: &Movie) -> std::result::Result<Dialect, String> {
+        self.driver.dialect(m.glsl)
     }
+}
+
+/// The fragment shader for a shot's scene.
+pub fn scene_source(dialect: Dialect, shot: &Shot, cues: &str, root: &Path) -> Result<Assembled> {
+    let mut header = SCENE_HEADER.to_string();
+    for (name, a) in &shot.uniforms {
+        header += &format!("uniform {} {name};\n", a.glsl_type());
+    }
+    header += cues;
+    Ok(Builder::new(dialect, &header, root)
+        .file(&shot.scene)?
+        .footer(SCENE_FOOTER)
+        .build())
+}
+
+/// The fragment shader for a transition (a built-in name or a path ending in .glsl).
+pub fn transition_source(
+    dialect: Dialect,
+    kind: &str,
+    params: &[(String, Vec<f32>)],
+    cues: &str,
+    root: &Path,
+) -> Result<Assembled> {
+    let mut header = TRANSITION_HEADER.to_string();
+    for (name, v) in params {
+        let val = match v.len() {
+            1 => glsl_float(v[0]),
+            n => format!(
+                "vec{n}({})",
+                v.iter()
+                    .map(|x| glsl_float(*x))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        };
+        header += &format!("#define {name} {val}\n");
+    }
+    header += cues;
+    let b = Builder::new(dialect, &header, root);
+    let b = if kind.ends_with(".glsl") {
+        b.file(&root.join(kind))?
+    } else {
+        let src = BUILTIN_TRANSITIONS
+            .iter()
+            .find(|(n, _)| *n == kind)
+            .map(|(_, s)| *s)
+            .ok_or_else(|| {
+                anyhow!(
+                    "unknown transition \"{kind}\"; built-ins are {}, or give a path ending in .glsl",
+                    BUILTIN_TRANSITIONS.iter().map(|(n, _)| *n).filter(|n| *n != "copy").collect::<Vec<_>>().join(", ")
+                )
+            })?;
+        b.builtin(kind, src)?
+    };
+    Ok(b.footer(TRANSITION_FOOTER).build())
+}
+
+/// The vertex shader every program uses: one full-screen triangle.
+pub fn vertex_source(dialect: Dialect) -> String {
+    format!("{}{VERTEX}", dialect.version_line())
 }
 
 /// Upload interleaved stereo as an RG32F texture, `TRACK_WIDTH` samples per row.

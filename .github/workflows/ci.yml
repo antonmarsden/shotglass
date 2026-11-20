@@ -23,13 +23,22 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev xvfb libgl1-mesa-dri libegl-mesa0 libxkbcommon-x11-0
       - run: cargo fmt --check
       - run: cargo clippy -- -D warnings
+      - name: Clippy without the strict GLSL checker (glslang)
+        run: cargo clippy --no-default-features -- -D warnings
+      # The selftest's fixture films must also pass the strict GLSL check (330 and ES),
+      # and the unit tests run it on the demo, the template and the built-in transitions.
       - name: Unit tests and GPU selftest (software OpenGL)
         run: xvfb-run -a cargo test
       - name: Render the demo movie headlessly (software OpenGL)
         run: |
           cargo build --release
-          xvfb-run -a ./target/release/shotglass check movies/big-shadow --size 320x180 --frames 1
+          xvfb-run -a ./target/release/shotglass check movies/big-shadow --web --size 320x180 --frames 1
           xvfb-run -a ./target/release/shotglass strip movies/big-shadow --count 8 --size 320x180 --out strip.png
+      - name: Strict GLSL check (glslang, no GPU) on the demo movie and the template
+        run: |
+          ./target/release/shotglass check movies/big-shadow --web --no-gpu
+          ./target/release/shotglass new "$RUNNER_TEMP/template"
+          ./target/release/shotglass check "$RUNNER_TEMP/template" --web --no-gpu
       - uses: actions/upload-artifact@v4
         with:
           name: big-shadow-strip
@@ -49,3 +58,10 @@ jobs:
         env:
           SHOTGLASS_SKIP_GPU_TESTS: "1"
       - run: cargo build --release
+      # Needs no OpenGL, so it runs here too (and proves glslang builds with MSVC).
+      - name: Strict GLSL check on the demo movie and the template
+        shell: bash
+        run: |
+          ./target/release/shotglass check movies/big-shadow --web --no-gpu
+          ./target/release/shotglass new "$RUNNER_TEMP/template"
+          ./target/release/shotglass check "$RUNNER_TEMP/template" --web --no-gpu

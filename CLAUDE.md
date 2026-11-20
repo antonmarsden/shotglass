@@ -10,6 +10,7 @@ cargo build
 xvfb-run -a cargo test                 # Linux without a display; plain `cargo test` on Windows/macOS
 xvfb-run -a cargo run -- selftest      # just the GPU + sound checks (filter: `selftest strips`)
 xvfb-run -a cargo run -- check movies/big-shadow --size 320x180 --frames 1
+cargo run -- check movies/big-shadow --web --no-gpu   # strict GLSL (330 + ES 3.00), no GL needed
 xvfb-run -a cargo run -- strip movies/big-shadow --count 8 --out /tmp/s.png   # look at the PNG
 cargo fmt && cargo clippy --all-targets -- -D warnings
 ```
@@ -32,7 +33,8 @@ cargo fmt && cargo clippy --all-targets -- -D warnings
 | `main.rs` | CLI (clap): play, still, strip, check, wav, new, selftest |
 | `movie.rs` | `movie.toml` → `Movie`; timeline (`at(t)`), cue defines, sound gains/windows |
 | `anim.rs` | constants/keyframes, eases; `glsl_fn` turns keyframes into GLSL for sound shaders |
-| `shader.rs` | source assembly, `#include`, `#line 1 N` per file, driver-log → file:line |
+| `shader.rs` | source assembly, `#include`, `#line 1 N` per file, driver-log → file:line; `Dialect` (fixed `330 core` / `300 es` baseline, `glsl` opt-in) |
+| `validate.rs` | strict, driver-independent check (glslang) of every assembled shader; `validate_movie(m, dialect)` is the API `check`/`check --web` and the web player use |
 | `gfx.rs` | `Renderer`: lazy prioritised compiles, program cache (disk + LRU), off-screen targets, transitions/freeze, strips, GPU timer, audio rendering |
 | `sound.rs` | `Soundtrack`: music / per-shot / mix tracks synthesised in cached chunks |
 | `audio.rs` | cpal output, lock-free `fill` callback, chunk store, master `Clock`, WAV writer |
@@ -61,9 +63,11 @@ cargo fmt && cargo clippy --all-targets -- -D warnings
   output. The mix may read at most `mix_lookback` back and 50 ms ahead.
 - **Deterministic frames:** a frame depends only on (movie, t, size, scale), so playback,
   `still` and a future export agree.
-- Shaders should stay portable: GLSL 3.30 features only, and GLSL-ES-compatible so a future
-  web player can run them (#2, #6). The dev GPU (NVIDIA) accepts some invalid GLSL that
-  other drivers reject, so passing locally isn't proof.
+- **Shaders compile as `#version 330 core` (or `300 es`) whatever the driver offers**, unless the
+  film sets `glsl = "410"|"430"` (refused on drivers that can't). Selftest checks `__VERSION__`.
+  Everything in this repo (demo, template, transitions, selftest fixtures) must pass
+  `check --web`: the strict glslang check at 330 and as GLSL ES 3.00. The dev GPU (NVIDIA)
+  accepts invalid GLSL that other drivers reject, so passing locally isn't proof.
 - **The engine provides a contract, not looks.** Uniforms, entry points, the transition interface
   and cue defines are the engine's API (semver). Reusable GLSL belongs in versioned libraries
   (the shotglass-kit repo, #3–#5), not embedded in the binary; the built-in transitions are
@@ -81,7 +85,7 @@ cargo fmt && cargo clippy --all-targets -- -D warnings
   the check fails.
 - Keep user-facing docs in README.md. Open work is in GitHub issues: #1 export, #2 web player,
   #3 libraries by name and version, #4 kit core/transitions, #5 the shotglass-kit repo,
-  #6 portable GLSL (fixed `330 core` baseline + strict validation in `check`).
+  #6 portable GLSL (done: fixed baseline, `glsl` opt-in, strict `check` / `check --web`).
 
 ## Conventions
 

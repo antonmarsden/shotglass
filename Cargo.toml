@@ -16,6 +16,9 @@ arc-swap = "1.9.5"
 clap = { version = "4.6.9", features = ["derive"] }
 cpal = "0.18.2"
 eframe = { version = "0.37.0", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
+# Khronos glslang (the GLSL reference front end), built from source with `cc`: no
+# system packages needed. Powers the strict, driver-independent `shotglass check`.
+glslang = { version = "0.9.1", optional = true }
 glutin = "0.32"
 glutin-winit = "0.5"
 image = { version = "0.25.10", default-features = false, features = ["png"] }
@@ -35,6 +38,11 @@ opt-level = 2
 [[test]]
 name = "gpu"
 harness = false
+
+[features]
+default = ["strict-glsl"]
+# Strict GLSL validation in `check` (needs a C++ compiler at build time).
+strict-glsl = ["dep:glslang"]
 
 [dev-dependencies]
 proptest = "1.12.0"
