@@ -419,8 +419,12 @@ fn normalize(p: &Path) -> PathBuf {
     out
 }
 
+/// `p` relative to `root`, with forward slashes. Both are compared in normalised absolute
+/// form: a root like `film/../../core` (a `movie.local.toml` override) must still match
+/// the normalised file paths that `resolve` returns.
 fn display_path(p: &Path, root: &Path) -> String {
-    p.strip_prefix(root)
+    let (abs, abs_root) = (absolute(p), absolute(root));
+    abs.strip_prefix(&abs_root)
         .unwrap_or(p)
         .to_string_lossy()
         .replace('\\', "/")
@@ -636,6 +640,42 @@ mod tests {
         assert!(a.text.contains("#line 2 1\n\n\nvoid f(){}"), "{}", a.text);
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&libs[1].root).ok();
+    }
+
+    #[test]
+    fn override_outside_the_film_shows_local_names() {
+        use crate::library::Origin;
+        // Like a `movie.local.toml` override `path = "../../core"`: the root keeps its `..`.
+        let top = tmp("outside");
+        let film = top.join("tests/film");
+        write(
+            &top,
+            &[
+                (
+                    "core/library.toml",
+                    "name = \"shotglass-kit/core\"\nversion = \"0.4.0\"\n",
+                ),
+                ("core/ease.glsl", "#include \"fx/step.glsl\"\nfloat e;\n"),
+                ("core/fx/step.glsl", "float s;\n"),
+                ("tests/film/scenes/a.glsl", "#include <kit/ease.glsl>\n"),
+            ],
+        );
+        let libs = vec![Library::read("kit", &film.join("../../core"), Origin::Path).unwrap()];
+        let a = Builder::new(D, "", &film)
+            .libraries(&libs)
+            .file(&film.join("scenes/a.glsl"))
+            .unwrap()
+            .build();
+        assert_eq!(
+            a.files,
+            vec![
+                "<shotglass header>",
+                "scenes/a.glsl",
+                "kit/ease.glsl",
+                "kit/fx/step.glsl",
+            ]
+        );
+        std::fs::remove_dir_all(&top).ok();
     }
 
     #[test]
