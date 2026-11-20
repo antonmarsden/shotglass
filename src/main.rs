@@ -7,6 +7,7 @@ mod gfx;
 mod headless;
 mod movie;
 mod shader;
+mod sound;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
@@ -300,9 +301,19 @@ fn check(movie: &Path, size: &str, frames: usize) -> Result<()> {
             "compiled {compiled} programs in {:.0} ms",
             t0.elapsed().as_secs_f32() * 1000.0
         );
-        if m.sound.is_some() {
+        if m.has_sound() {
             let t = Instant::now();
-            let s = r.render_sound(&m, 48000)?;
+            let built = match sound::Soundtrack::new().build(&mut r, &m, 48000) {
+                Ok(b) => b,
+                Err(errors) => {
+                    for e in &errors {
+                        eprint!("{e}");
+                    }
+                    bail!("{} sound shader(s) failed", errors.len());
+                }
+            };
+            println!("sound tracks: {}", built.rendered.join(", "));
+            let s = built.samples;
             let peak = s.iter().fold(0f32, |a, x| a.max(x.abs()));
             let rms = (s.iter().map(|x| x * x).sum::<f32>() / s.len().max(1) as f32).sqrt();
             println!(
@@ -353,13 +364,19 @@ fn check(movie: &Path, size: &str, frames: usize) -> Result<()> {
 
 fn wav(movie: &Path, out: &Path, rate: u32) -> Result<()> {
     let m = Movie::load(movie)?;
-    if m.sound.is_none() {
-        bail!("this movie has no [sound] shader");
+    if !m.has_sound() {
+        bail!("this movie has no sound (no [sound] music and no shot sounds)");
     }
     let out = out.to_path_buf();
     headless::with_gl(move |gl| {
         let mut r = Renderer::new(gl)?;
-        let s = r.render_sound(&m, rate)?;
+        let s = match sound::Soundtrack::new().build(&mut r, &m, rate) {
+            Ok(b) => b.samples,
+            Err(errors) => bail!(
+                "{}",
+                errors.iter().map(|e| e.to_string()).collect::<String>()
+            ),
+        };
         audio::write_wav(&out, &s, rate)?;
         println!(
             "wrote {} ({:.1}s at {rate} Hz)",
@@ -380,7 +397,11 @@ const TEMPLATE: &[(&str, &str)] = &[
         "scenes/second.glsl",
         include_str!("../templates/new/scenes/second.glsl"),
     ),
-    ("sound.glsl", include_str!("../templates/new/sound.glsl")),
+    ("music.glsl", include_str!("../templates/new/music.glsl")),
+    (
+        "sfx/chime.glsl",
+        include_str!("../templates/new/sfx/chime.glsl"),
+    ),
 ];
 
 fn new_movie(dir: &Path) -> Result<()> {

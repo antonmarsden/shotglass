@@ -7,7 +7,7 @@
 use crate::anim::Anim;
 use crate::movie::{At, Movie, Shot, glsl_float};
 use crate::shader::{Assembled, Builder, Dialect, remap_log};
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result, anyhow};
 use eframe::glow::{self, HasContext};
 use std::collections::HashMap;
 use std::path::Path;
@@ -65,15 +65,6 @@ vec4 getToColor(vec2 uv) { return texture(uTo, min(clamp(uv, 0.0, 1.0) * uToScal
 
 const TRANSITION_FOOTER: &str =
     "void main(){ shotglass_out = vec4(transition(gl_FragCoord.xy / uOutRes).rgb, 1.0); }";
-
-const SOUND_HEADER: &str = "\
-uniform float iSampleRate;
-uniform int iBlockOffset;
-uniform int iBlockWidth;
-out vec4 shotglass_out;
-";
-
-const SOUND_FOOTER: &str = "void main(){\n  int s = iBlockOffset + int(gl_FragCoord.y) * iBlockWidth + int(gl_FragCoord.x);\n  vec2 v = mainSound(s, float(s) / iSampleRate);\n  shotglass_out = vec4(v, 0.0, 1.0);\n}";
 
 /// A shader that failed to compile, with messages mapped to file:line.
 #[derive(Clone, Debug)]
@@ -731,33 +722,54 @@ impl Renderer {
         unsafe { self.gl.finish() };
     }
 
-    /// Synthesize the movie's soundtrack on the GPU. Returns interleaved stereo f32.
-    pub fn render_sound(&mut self, movie: &Movie, sample_rate: u32) -> Result<Vec<f32>> {
-        let Some(path) = &movie.sound else {
-            return Ok(vec![]);
-        };
-        let mut header = SOUND_HEADER.to_string();
-        header += &movie.cue_defines();
-        let src = Builder::new(self.dialect, &header, &movie.root)
-            .file(path)?
-            .footer(SOUND_FOOTER)
-            .build();
-        let prog = self.compile(&src).map_err(|m| {
-            anyhow!(
-                "{}",
-                ShaderError {
-                    what: format!("sound ({})", rel(path, &movie.root)),
-                    messages: m
-                }
-            )
+    /// Run an audio shader for samples `first .. first + count`. The shader's footer
+    /// writes the stereo sample for global index `iBlockOffset + pixel` into RG.
+    /// `inputs` are whole-movie stereo buses bound as `sg_music` / `sg_sfx`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_audio(
+        &mut self,
+        src: &Assembled,
+        what: &str,
+        first: usize,
+        count: usize,
+        sample_rate: u32,
+        shot: (f32, f32),
+        inputs: Option<(&[f32], &[f32])>,
+    ) -> std::result::Result<Vec<f32>, ShaderError> {
+        let prog = self.compile(src).map_err(|m| ShaderError {
+            what: what.into(),
+            messages: m,
         })?;
+        let fail = |m: String| ShaderError {
+            what: what.into(),
+            messages: vec![m],
+        };
         let gl = self.gl.clone();
         const W: i32 = 1024;
         const H: i32 = 128;
-        let total = (movie.duration * sample_rate as f32).ceil() as usize;
-        let mut out = Vec::with_capacity(total * 2);
+        let mut out = Vec::with_capacity(count * 2);
         unsafe {
-            let tex = gl.create_texture().map_err(|e| anyhow!(e))?;
+            let mut input_tex = vec![];
+            if let Some((music, sfx)) = inputs {
+                for (unit, (name, data)) in [("sg_music", music), ("sg_sfx", sfx)]
+                    .into_iter()
+                    .enumerate()
+                {
+                    let tex = upload_track(&gl, data).map_err(fail)?;
+                    gl.active_texture(glow::TEXTURE0 + unit as u32);
+                    gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+                    gl.use_program(Some(prog.prog));
+                    if let Some(l) = prog.loc(name) {
+                        gl.uniform_1_i32(Some(l), unit as i32);
+                    }
+                    input_tex.push(tex);
+                }
+                if let Some(l) = prog.loc("sg_len") {
+                    gl.uniform_1_i32(Some(l), (music.len() / 2) as i32);
+                }
+            }
+            gl.active_texture(glow::TEXTURE0);
+            let tex = gl.create_texture().map_err(fail)?;
             gl.bind_texture(glow::TEXTURE_2D, Some(tex));
             gl.tex_image_2d(
                 glow::TEXTURE_2D,
@@ -780,7 +792,16 @@ impl Renderer {
                 glow::TEXTURE_MAG_FILTER,
                 glow::NEAREST as i32,
             );
-            let fbo = gl.create_framebuffer().map_err(|e| anyhow!(e))?;
+            gl.bind_texture(glow::TEXTURE_2D, None);
+            if let Some((_, _)) = inputs {
+                // rebind inputs: the output texture must not be bound while rendering into it
+                for (unit, t) in input_tex.iter().enumerate() {
+                    gl.active_texture(glow::TEXTURE0 + unit as u32);
+                    gl.bind_texture(glow::TEXTURE_2D, Some(*t));
+                }
+                gl.active_texture(glow::TEXTURE0);
+            }
+            let fbo = gl.create_framebuffer().map_err(fail)?;
             gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
             gl.framebuffer_texture_2d(
                 glow::FRAMEBUFFER,
@@ -789,27 +810,47 @@ impl Renderer {
                 Some(tex),
                 0,
             );
-            if gl.check_framebuffer_status(glow::FRAMEBUFFER) != glow::FRAMEBUFFER_COMPLETE {
+            let cleanup = |gl: &glow::Context| {
+                gl.bind_framebuffer(glow::FRAMEBUFFER, None);
                 gl.delete_framebuffer(fbo);
                 gl.delete_texture(tex);
+                for t in &input_tex {
+                    gl.delete_texture(*t);
+                }
                 gl.delete_program(prog.prog);
-                bail!("this GPU can't render to float textures, so GLSL sound is unavailable");
+                gl.use_program(None);
+                gl.bind_vertex_array(None);
+                gl.active_texture(glow::TEXTURE1);
+                gl.bind_texture(glow::TEXTURE_2D, None);
+                gl.active_texture(glow::TEXTURE0);
+                gl.bind_texture(glow::TEXTURE_2D, None);
+            };
+            if gl.check_framebuffer_status(glow::FRAMEBUFFER) != glow::FRAMEBUFFER_COMPLETE {
+                cleanup(&gl);
+                return Err(fail(
+                    "this GPU can't render to float textures, so GLSL sound is unavailable".into(),
+                ));
             }
             gl.viewport(0, 0, W, H);
             gl.disable(glow::BLEND);
             gl.bind_vertex_array(Some(self.vao));
             gl.use_program(Some(prog.prog));
-            if let Some(l) = prog.loc("iSampleRate") {
-                gl.uniform_1_f32(Some(l), sample_rate as f32);
-            }
+            let f1 = |n: &str, v: f32| {
+                if let Some(l) = prog.loc(n) {
+                    gl.uniform_1_f32(Some(l), v)
+                }
+            };
+            f1("iSampleRate", sample_rate as f32);
+            f1("iShotStart", shot.0);
+            f1("iShotDuration", shot.1);
             if let Some(l) = prog.loc("iBlockWidth") {
                 gl.uniform_1_i32(Some(l), W);
             }
             let mut buf = vec![0f32; (W * H * 4) as usize];
             let mut offset = 0usize;
-            while offset < total {
+            while offset < count {
                 if let Some(l) = prog.loc("iBlockOffset") {
-                    gl.uniform_1_i32(Some(l), offset as i32);
+                    gl.uniform_1_i32(Some(l), (first + offset) as i32);
                 }
                 gl.draw_arrays(glow::TRIANGLES, 0, 3);
                 let bytes =
@@ -823,23 +864,70 @@ impl Renderer {
                     glow::FLOAT,
                     glow::PixelPackData::Slice(Some(bytes)),
                 );
-                let n = (total - offset).min((W * H) as usize);
+                let n = (count - offset).min((W * H) as usize);
                 for i in 0..n {
-                    out.push(sanitize(buf[i * 4]) * movie.volume);
-                    out.push(sanitize(buf[i * 4 + 1]) * movie.volume);
+                    out.push(sanitize(buf[i * 4]));
+                    out.push(sanitize(buf[i * 4 + 1]));
                 }
                 offset += n;
             }
-            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
-            gl.delete_framebuffer(fbo);
-            gl.delete_texture(tex);
-            gl.delete_program(prog.prog);
-            gl.use_program(None);
-            gl.bind_vertex_array(None);
+            cleanup(&gl);
         }
         Ok(out)
     }
+
+    pub fn dialect(&self) -> Dialect {
+        self.dialect
+    }
 }
+
+/// Upload interleaved stereo as an RG32F texture, `TRACK_WIDTH` samples per row.
+unsafe fn upload_track(
+    gl: &glow::Context,
+    data: &[f32],
+) -> std::result::Result<glow::Texture, String> {
+    let n = (data.len() / 2).max(1);
+    let rows = n.div_ceil(TRACK_WIDTH);
+    let max = unsafe { gl.get_parameter_i32(glow::MAX_TEXTURE_SIZE) } as usize;
+    if rows > max {
+        return Err(format!(
+            "the soundtrack is too long for one texture ({rows} rows, GPU max {max})"
+        ));
+    }
+    let mut padded = vec![0f32; rows * TRACK_WIDTH * 2];
+    padded[..data.len()].copy_from_slice(data);
+    let bytes =
+        unsafe { std::slice::from_raw_parts(padded.as_ptr() as *const u8, padded.len() * 4) };
+    unsafe {
+        let tex = gl.create_texture()?;
+        gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+        gl.tex_image_2d(
+            glow::TEXTURE_2D,
+            0,
+            glow::RG32F as i32,
+            TRACK_WIDTH as i32,
+            rows as i32,
+            0,
+            glow::RG,
+            glow::FLOAT,
+            glow::PixelUnpackData::Slice(Some(bytes)),
+        );
+        gl.tex_parameter_i32(
+            glow::TEXTURE_2D,
+            glow::TEXTURE_MIN_FILTER,
+            glow::NEAREST as i32,
+        );
+        gl.tex_parameter_i32(
+            glow::TEXTURE_2D,
+            glow::TEXTURE_MAG_FILTER,
+            glow::NEAREST as i32,
+        );
+        Ok(tex)
+    }
+}
+
+/// Samples per row of a track texture (must match `sg_fetch` in sound.rs).
+pub const TRACK_WIDTH: usize = 4096;
 
 impl Drop for Renderer {
     fn drop(&mut self) {

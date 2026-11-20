@@ -27,7 +27,10 @@ struct MovieFile {
 #[serde(deny_unknown_fields)]
 struct SoundFile {
     /// GLSL file with `vec2 mainSound(int samp, float time)`; time is movie time.
-    shader: String,
+    #[serde(alias = "shader")]
+    music: Option<String>,
+    /// GLSL file with `vec2 mainMix(int samp, float time)`, reading music() and sfx().
+    mix: Option<String>,
     volume: Option<f32>,
 }
 
@@ -45,6 +48,13 @@ struct ShotFile {
     uniforms: BTreeMap<String, toml::Value>,
     /// Transition *into* this shot from the previous one. No transition = hard cut.
     transition: Option<TransitionFile>,
+    /// GLSL `mainSound` for this shot; `time` is shot-local, like iTime.
+    sound: Option<String>,
+    /// Start the sound this many seconds before the shot (a J-cut).
+    sound_lead: Option<f32>,
+    /// Let the sound ring on this many seconds after the shot (an L-cut).
+    sound_tail: Option<f32>,
+    sound_gain: Option<f32>,
 }
 
 #[derive(Deserialize)]
@@ -82,6 +92,14 @@ pub struct Transition {
 }
 
 #[derive(Clone, Debug)]
+pub struct ShotSound {
+    pub path: PathBuf,
+    pub lead: f32,
+    pub tail: f32,
+    pub gain: f32,
+}
+
+#[derive(Clone, Debug)]
 pub struct Shot {
     pub id: String,
     pub index: usize,
@@ -92,6 +110,7 @@ pub struct Shot {
     pub time_scale: f32,
     pub uniforms: Vec<(String, Anim)>,
     pub transition_in: Option<Transition>,
+    pub sound: Option<ShotSound>,
 }
 
 impl Shot {
@@ -120,7 +139,10 @@ pub struct Movie {
     pub title: String,
     pub aspect: f32,
     pub fps: f32,
-    pub sound: Option<PathBuf>,
+    /// Movie-level music/ambience (`mainSound`, movie time).
+    pub music: Option<PathBuf>,
+    /// Final mix pass (`mainMix`).
+    pub mix: Option<PathBuf>,
     pub volume: f32,
     pub shots: Vec<Shot>,
     pub markers: Vec<Marker>,
@@ -249,7 +271,27 @@ impl Movie {
                     p.end() - d
                 }
             };
+            let lead = s.sound_lead.unwrap_or(0.0);
+            let tail = s.sound_tail.unwrap_or(0.0);
+            if lead < 0.0 || tail < 0.0 || lead.is_nan() || tail.is_nan() {
+                bail!("{}: sound_lead and sound_tail must be >= 0", ctx());
+            }
+            if s.sound.is_none()
+                && (s.sound_lead.is_some() || s.sound_tail.is_some() || s.sound_gain.is_some())
+            {
+                bail!(
+                    "{}: sound_lead/sound_tail/sound_gain need sound = \"file.glsl\"",
+                    ctx()
+                );
+            }
+            let sound = s.sound.map(|p| ShotSound {
+                path: root.join(p),
+                lead,
+                tail,
+                gain: s.sound_gain.unwrap_or(1.0),
+            });
             shots.push(Shot {
+                sound,
                 id: s.id,
                 index,
                 start,
@@ -273,7 +315,16 @@ impl Movie {
             aspect,
             fps: f.fps.unwrap_or(30.0).max(1.0),
             volume: f.sound.as_ref().and_then(|s| s.volume).unwrap_or(1.0),
-            sound: f.sound.map(|s| root.join(s.shader)),
+            music: f
+                .sound
+                .as_ref()
+                .and_then(|s| s.music.as_ref())
+                .map(|p| root.join(p)),
+            mix: f
+                .sound
+                .as_ref()
+                .and_then(|s| s.mix.as_ref())
+                .map(|p| root.join(p)),
             shots,
             markers: f
                 .markers
@@ -308,6 +359,50 @@ impl Movie {
             shot: i,
             local: t - s.start,
         }
+    }
+
+    pub fn has_sound(&self) -> bool {
+        self.music.is_some() || self.shots.iter().any(|s| s.sound.is_some())
+    }
+
+    /// Where a shot's sound plays: (from, to) in movie seconds.
+    pub fn sound_window(&self, i: usize) -> Option<(f32, f32)> {
+        let s = &self.shots[i];
+        let snd = s.sound.as_ref()?;
+        Some((
+            (s.start - snd.lead).max(0.0),
+            (s.end() + snd.tail).min(self.duration),
+        ))
+    }
+
+    /// Gain of shot `i`'s sound at movie time `t`: equal-power fades that follow the
+    /// picture transitions, except where a lead or tail lets the sound carry over.
+    pub fn sound_gain(&self, i: usize, t: f32) -> f32 {
+        let Some((from, to)) = self.sound_window(i) else {
+            return 0.0;
+        };
+        if t < from || t > to {
+            return 0.0;
+        }
+        let s = &self.shots[i];
+        let snd = s.sound.as_ref().unwrap();
+        let mut g = snd.gain;
+        if let (Some(tr), true) = (&s.transition_in, snd.lead == 0.0)
+            && t < s.start + tr.duration
+        {
+            let p = tr.ease.apply((t - s.start) / tr.duration);
+            g *= (p * std::f32::consts::FRAC_PI_2).sin();
+        }
+        if let (Some(next), true) = (self.shots.get(i + 1), snd.tail == 0.0)
+            && let Some(tr) = &next.transition_in
+            && t > next.start
+        {
+            let p = tr.ease.apply((t - next.start) / tr.duration);
+            g *= (p * std::f32::consts::FRAC_PI_2).cos();
+        }
+        // 5 ms de-click ramps at the window edges
+        let ramp = 0.005;
+        g * ((t - from) / ramp).clamp(0.0, 1.0) * ((to - t) / ramp).clamp(0.0, 1.0)
     }
 
     pub fn shot_by_id(&self, id: &str) -> Option<&Shot> {
@@ -475,6 +570,36 @@ mod tests {
         "#;
         let e = Movie::parse(bad, Path::new(".")).unwrap_err().to_string();
         assert!(e.contains("overlaps"), "{e}");
+    }
+
+    #[test]
+    fn shot_sound_follows_transitions() {
+        let m = Movie::parse(
+            r#"
+            [[shot]]
+            id = "a"
+            scene = "a.glsl"
+            duration = 5
+            sound = "a.glsl"
+            [[shot]]
+            id = "b"
+            scene = "b.glsl"
+            duration = 4
+            sound = "b.glsl"
+            sound_lead = 0.5
+            transition = { type = "crossfade", duration = 1, ease = "linear" }
+            "#,
+            Path::new("."),
+        )
+        .unwrap();
+        // a fades out across the transition (4..5) with equal power
+        assert!((m.sound_gain(0, 2.0) - 1.0).abs() < 1e-6);
+        assert!((m.sound_gain(0, 4.5) - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-5);
+        assert!(m.sound_gain(0, 4.999) < 0.01);
+        // b has a lead: it starts 0.5 s early at full level and skips the fade-in
+        assert_eq!(m.sound_window(1), Some((3.5, 8.0)));
+        assert_eq!(m.sound_gain(1, 3.4), 0.0);
+        assert!((m.sound_gain(1, 4.2) - 1.0).abs() < 1e-6);
     }
 
     #[test]

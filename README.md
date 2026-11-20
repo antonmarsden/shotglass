@@ -11,9 +11,9 @@ headless stills. Rust + OpenGL, no browser.
 - **Transitions combine two shots.** There are built-in fades, irises, dissolves and wipes,
   or you can write your own using the [gl-transitions](https://gl-transitions.com)
   `getFromColor` / `getToColor` / `progress` convention.
-- **The sound is GLSL too.** `vec2 mainSound(int samp, float time)` is synthesised on the GPU when
-  the movie loads. Cue points from the edit are `#define`d, so the music follows
-  the picture.
+- **The sound is GLSL too.** Music runs across the cuts, each shot can have its own
+  sound that fades with the transitions, and an optional mix pass adds echo, reverb
+  or ducking. All of it is synthesised on the GPU.
 - **The sound card is the clock.** A slow frame is skipped instead of drifting out
   of sync, and adaptive resolution keeps frames on time.
 - **Live reload.** Save a shader or `movie.toml` and the player reloads in place
@@ -51,7 +51,12 @@ movies/big-shadow/
 │   ├── shadow.glsl
 │   ├── moon.glsl
 │   └── black.glsl
-└── sound.glsl          vec2 mainSound(int samp, float time)
+├── music.glsl          vec2 mainSound(int samp, float time), movie time
+├── sfx/                one sound per shot, shot time
+│   ├── candle.glsl
+│   ├── plucks.glsl
+│   └── thump.glsl
+└── mix.glsl            vec2 mainMix(int samp, float time)
 ```
 
 `movie.toml`:
@@ -62,7 +67,8 @@ aspect = [16, 9]
 fps = 30                      # for frame stepping and iFrame; playback follows the display
 
 [sound]
-shader = "sound.glsl"
+music = "music.glsl"          # optional
+mix = "mix.glsl"              # optional; without it, music and shot sounds are summed
 volume = 0.9
 
 [[shot]]
@@ -73,6 +79,7 @@ uniforms.uRadius = 0.003                                       # float
 uniforms.uOrbit  = [0.0, 0.0]                                  # vec2 (up to vec4)
 uniforms.uDist   = { keys = [[0, 0.95], [6, 0.22]], ease = "smoother" }
 uniforms.uLight  = { keys = [[0, 1], [6.4, 1], [8.2, 0, "in"]] }   # per-key ease
+sound = "sfx/candle.glsl"     # this shot's sound
 
 [[shot]]
 id = "moon"
@@ -87,6 +94,8 @@ scene = "scenes/shadow.glsl"     # shots can reuse a scene with different unifor
 duration = 8.0
 time_offset = 20.0               # iTime starts here (default 0); time_scale also available
 transition = { type = "iris", duration = 1.5, freeze = true, ease = "inout", params = { center = [0.72, 0.70] } }
+sound = "sfx/plucks.glsl"
+sound_lead = 0.6                 # start the sound before the picture (J-cut); sound_tail lets it ring on
 
 [[marker]]
 t = 6.4
@@ -159,9 +168,16 @@ irises. Leave it off for slow dissolves, where a still frame looks dead.
 
 ### Sound
 
-`sound.glsl` is rendered once on the GPU when the movie loads and played back
-sample-accurately. `time` is movie time, so use the cue `#define`s to place
-music against the edit:
+All sound is GLSL, synthesised on the GPU when the movie loads. It comes in three layers:
+
+```
+music.glsl   movie time, runs across cuts ───────────────► music() ─┐
+shot sounds  shot time + shot uniforms, faded per transition ► sfx() ─┼─► mix.glsl ─► speakers
+                                                                     (or music + sfx)
+```
+
+**Music** (`[sound] music`) is `vec2 mainSound(int samp, float time)` with `time` in
+movie seconds. Use the cue `#define`s to place it against the edit:
 
 ```glsl
 vec2 mainSound(int samp, float time) {
@@ -171,8 +187,35 @@ vec2 mainSound(int samp, float time) {
 }
 ```
 
-When you edit `sound.glsl`, or change timings in `movie.toml`, the sound is
-synthesised again on reload. Other edits leave it alone.
+**Shot sounds** (`sound = "sfx/candle.glsl"` on a shot) use the same signature, but
+`time` is shot-local (like `iTime`) and the shot's uniforms are available, evaluated
+at that time. The candle in the demo multiplies by `uLight`, so its crackle dies
+exactly when the flame does. Shot sounds move with their shot when you retime the
+edit. During a transition the outgoing and incoming sounds crossfade, using the
+transition's ease and equal-power gains. `sound_lead` starts a sound before its
+shot (a J-cut; `time` is negative during the lead), and `sound_tail` lets it ring
+on after the shot. In both cases the sound skips the fade on that side.
+`sound_gain` scales it.
+
+**The mix** (`[sound] mix`) is optional: `vec2 mainMix(int samp, float time)` runs
+after everything else and can read any sample of the two buses. That makes
+delays, echoes and multi-tap reverbs cheap lookups, which a single `mainSound`
+can't do:
+
+```glsl
+vec2 mainMix(int samp, float time) {
+    int ms = int(iSampleRate * 0.001);
+    vec2 echo = music(samp - 310 * ms) * 0.35;                       // 310 ms echo
+    float duck = 1.0 - 0.7 * smoothstep(0.12, 0.35, sfxLevel(samp)); // music dips under loud effects
+    return (music(samp) + echo) * duck + sfx(samp);
+}
+```
+
+Each track is cached by its source and timing. Editing one shot's sound
+re-synthesises only that shot (and the mix), and picture-only edits don't touch
+the sound. Recursive filters (resonant sweeps, feedback reverb) are the main
+thing GLSL sound can't do cheaply. Multi-tap delays in the mix get you most of
+the way.
 
 ## The player
 

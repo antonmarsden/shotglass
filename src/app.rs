@@ -3,7 +3,7 @@
 use crate::audio::{AudioOut, Clock};
 use crate::gfx::{FrameInfo, Renderer, ShaderError};
 use crate::movie::{At, Movie};
-use crate::shader::Builder;
+use crate::sound::Soundtrack;
 use eframe::egui::{self, Color32, Key, Modifiers, Pos2, Rect, RichText, Sense, Stroke, Vec2};
 use eframe::glow;
 use std::collections::VecDeque;
@@ -71,6 +71,7 @@ struct Player {
     renderer: Renderer,
     clock: Clock,
     sound_key: Option<u64>,
+    soundtrack: Soundtrack,
     sound_info: String,
     _watcher: Option<notify::RecommendedWatcher>,
     rx: Receiver<()>,
@@ -149,6 +150,7 @@ impl Player {
             renderer,
             clock,
             sound_key: None,
+            soundtrack: Soundtrack::new(),
             sound_info,
             _watcher: watcher,
             rx,
@@ -196,13 +198,15 @@ impl Player {
         match self.renderer.load(&m) {
             Ok(n) => {
                 self.shader_errors.clear();
-                self.update_sound(&m);
+                let pic_ms = t0.elapsed().as_secs_f32() * 1000.0;
+                let snd = self.update_sound(&m);
                 self.reloads += 1;
                 if self.reloads > 1 {
-                    self.say(format!(
-                        "reloaded | {n} shader(s) compiled in {:.0} ms",
-                        t0.elapsed().as_secs_f32() * 1000.0
-                    ));
+                    let mut msg = format!("reloaded | {n} shader(s) compiled in {pic_ms:.0} ms");
+                    if let Some(s) = snd {
+                        msg += &format!(" | {s}");
+                    }
+                    self.say(msg);
                 }
                 self.movie = Some(m);
                 self.generation += 1;
@@ -218,46 +222,35 @@ impl Player {
         }
     }
 
-    fn update_sound(&mut self, m: &Movie) {
-        let Some(path) = &m.sound else {
+    /// Rebuild the soundtrack (cached per track). Returns a note about what was re-synthesized.
+    fn update_sound(&mut self, m: &Movie) -> Option<String> {
+        if !m.has_sound() {
             self.sound_key = None;
             self.clock.set_samples(vec![]);
-            return;
-        };
-        // Re-synthesize only when the sound shader or the cue timings changed.
-        let key = Builder::new(self.renderer.dialect, &m.cue_defines(), &m.root)
-            .file(path)
-            .map(|b| b.build().text)
-            .map(|t| hash(&format!("{t}{}{}", m.volume, self.clock.sample_rate())));
-        let key = match key {
-            Ok(k) => k,
-            Err(e) => {
-                self.shader_errors.push(ShaderError {
-                    what: "sound".into(),
-                    messages: vec![format!("{e:#}")],
-                });
-                return;
-            }
-        };
-        if self.sound_key == Some(key) {
-            return;
+            return None;
         }
         let t0 = Instant::now();
-        match self.renderer.render_sound(m, self.clock.sample_rate()) {
-            Ok(s) => {
-                self.clock.set_samples(s);
-                self.sound_key = Some(key);
-                if self.reloads > 0 {
-                    self.say(format!(
-                        "sound re-synthesized in {:.0} ms",
-                        t0.elapsed().as_secs_f32() * 1000.0
-                    ));
+        match self
+            .soundtrack
+            .build(&mut self.renderer, m, self.clock.sample_rate())
+        {
+            Ok(built) => {
+                if self.sound_key != Some(built.key) {
+                    self.clock.set_samples(built.samples);
+                    self.sound_key = Some(built.key);
                 }
+                (!built.rendered.is_empty()).then(|| {
+                    format!(
+                        "sound: {} in {:.0} ms",
+                        built.rendered.join(", "),
+                        t0.elapsed().as_secs_f32() * 1000.0
+                    )
+                })
             }
-            Err(e) => self.shader_errors.push(ShaderError {
-                what: "sound".into(),
-                messages: vec![format!("{e:#}")],
-            }),
+            Err(errors) => {
+                self.shader_errors.extend(errors);
+                None
+            }
         }
     }
 
@@ -887,12 +880,14 @@ impl Player {
                             "clock: system timer"
                         });
                     }
-                    let has = self.movie.as_ref().is_some_and(|m| m.sound.is_some());
-                    ui.label(if has {
-                        "GLSL soundtrack loaded"
-                    } else {
-                        "no [sound] in movie.toml"
-                    });
+                    if let Some(m) = &self.movie {
+                        let shots = m.shots.iter().filter(|s| s.sound.is_some()).count();
+                        ui.label(format!(
+                            "music: {}  |  shot sounds: {shots}  |  mix: {}",
+                            if m.music.is_some() { "yes" } else { "no" },
+                            if m.mix.is_some() { "mix.glsl" } else { "sum" }
+                        ));
+                    }
                 });
             egui::CollapsingHeader::new("System")
                 .default_open(false)
@@ -1119,11 +1114,4 @@ fn describe(m: &Movie, t: f32) -> String {
 fn clock_text(t: f32) -> String {
     let t = t.max(0.0);
     format!("{:02}:{:05.2}", (t / 60.0) as u32, t % 60.0)
-}
-
-fn hash(s: &str) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    s.hash(&mut h);
-    h.finish()
 }

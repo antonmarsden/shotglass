@@ -27,6 +27,19 @@ impl Ease {
         })
     }
 
+    /// Matches `sg_ease` in generated GLSL.
+    pub fn code(self) -> i32 {
+        match self {
+            Ease::Linear => 0,
+            Ease::Smooth => 1,
+            Ease::Smoother => 2,
+            Ease::In => 3,
+            Ease::Out => 4,
+            Ease::InOut => 5,
+            Ease::Step => 6,
+        }
+    }
+
     pub fn apply(self, x: f32) -> f32 {
         let x = x.clamp(0.0, 1.0);
         match self {
@@ -112,6 +125,45 @@ impl Anim {
         out
     }
 
+    /// A GLSL function `T name(float t)` that evaluates this value, for sound shaders
+    /// (which need the value at every sample, so it can't be a uniform).
+    pub fn glsl_fn(&self, name: &str) -> String {
+        let ty = self.glsl_type();
+        let lit = |v: &[f32]| match v.len() {
+            1 => glsl_f(v[0]),
+            n => format!(
+                "vec{n}({})",
+                v.iter().map(|x| glsl_f(*x)).collect::<Vec<_>>().join(", ")
+            ),
+        };
+        let mut s = format!("{ty} {name}(float t) {{\n");
+        match self {
+            Anim::Const(v) => s += &format!("  return {};\n", lit(v)),
+            Anim::Keys(ks) => {
+                s += &format!(
+                    "  if (t <= {}) return {};\n",
+                    glsl_f(ks[0].t),
+                    lit(&ks[0].v)
+                );
+                for w in ks.windows(2) {
+                    let (a, b) = (&w[0], &w[1]);
+                    let span = (b.t - a.t).max(1e-6);
+                    s += &format!(
+                        "  if (t <= {}) return mix({}, {}, sg_ease({}, (t - {}) / {}));\n",
+                        glsl_f(b.t),
+                        lit(&a.v),
+                        lit(&b.v),
+                        b.ease.code(),
+                        glsl_f(a.t),
+                        glsl_f(span)
+                    );
+                }
+                s += &format!("  return {};\n", lit(&ks[ks.len() - 1].v));
+            }
+        }
+        s + "}\n"
+    }
+
     /// Parse a TOML value: `0.5`, `[0.1, 0.2]`, or `{ keys = [[0, 0.7], [8, 0.2, "out"]], ease = "smooth" }`.
     pub fn from_toml(v: &toml::Value) -> Result<Anim> {
         match v {
@@ -164,6 +216,23 @@ impl Anim {
     }
 }
 
+/// GLSL source for `sg_ease`, matching [`Ease::apply`].
+pub const GLSL_EASE: &str = "float sg_ease(int e, float x) {
+  x = clamp(x, 0.0, 1.0);
+  if (e == 0) return x;
+  if (e == 1) return x * x * (3.0 - 2.0 * x);
+  if (e == 2) return x * x * x * (x * (6.0 * x - 15.0) + 10.0);
+  if (e == 3) return x * x;
+  if (e == 4) return 1.0 - (1.0 - x) * (1.0 - x);
+  if (e == 5) return x < 0.5 ? 2.0 * x * x : 1.0 - 2.0 * (1.0 - x) * (1.0 - x);
+  return x < 1.0 ? 0.0 : 1.0;
+}
+";
+
+fn glsl_f(x: f32) -> String {
+    crate::movie::glsl_float(x)
+}
+
 fn num(v: &toml::Value) -> Result<f32> {
     match v {
         toml::Value::Float(f) => Ok(*f as f32),
@@ -213,6 +282,19 @@ mod tests {
         let s = parse(r#"{ keys = [[0, 0], [2, 10]], ease = "smooth" }"#);
         assert!((s.eval(1.0)[0] - 5.0).abs() < 1e-5);
         assert!(s.eval(0.5)[0] < 2.5);
+    }
+
+    #[test]
+    fn glsl_functions() {
+        let a = parse(r#"{ keys = [[0, 0], [2, 10, "linear"]] }"#);
+        let g = a.glsl_fn("f");
+        assert!(g.starts_with("float f(float t) {"), "{g}");
+        assert!(g.contains("sg_ease(0, (t - 0.0) / 2.0)"), "{g}");
+        assert!(
+            parse("[1, 2]")
+                .glsl_fn("v")
+                .contains("return vec2(1.0, 2.0);")
+        );
     }
 
     #[test]

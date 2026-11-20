@@ -1,4 +1,4 @@
-// Stereo sample at `time` seconds of the movie. CUE_<SHOT>_START/_SETTLED/_END and
+// Music: stereo sample at `time` seconds of the movie (it runs across the cuts). CUE_<SHOT>_START/_SETTLED/_END and
 // MOVIE_DURATION are defined for you, so the music can follow the edit.
 #define TAU 6.2831853
 
