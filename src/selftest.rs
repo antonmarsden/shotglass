@@ -566,11 +566,12 @@ fn render_scale_edges(gl: &Gl, dir: &Path) -> Result<String> {
 }
 
 fn tiled_drawing(gl: &Gl, dir: &Path) -> Result<String> {
-    // The picture changes with time, and every tiled frame is drawn over a different
-    // one: a strip the driver skips shows up as stale pixels instead of hiding behind
-    // an identical previous frame. (The Apple Software Renderer dropped parts of
-    // scissored strips at 320x180 with 40 and 64 strips: the demo's golden strip
-    // showed lines from the frame before.)
+    // The strip count is pinned (otherwise the GPU timer puts it back to 1 on the
+    // next frame and nothing is tested), the picture changes with time, and every
+    // tiled frame is drawn over a different one: a strip the driver skips shows up as
+    // stale pixels instead of hiding behind an identical previous frame. (The Apple
+    // Software Renderer dropped parts of scissored strips at 320x180 with 40 and 64
+    // strips: the demo's golden strip showed rows from the frame before.)
     write(
         dir,
         &[(
@@ -588,7 +589,7 @@ duration=2
     )?;
     let mut r = renderer(gl, &m)?;
     let draw = |r: &mut Renderer, (w, h): (i32, i32), tiles: u32, local: f32, scale: f32| {
-        r.set_tiles(tiles);
+        r.set_tiles(Some(tiles));
         let t = m.shots[0].start + local;
         r.render_at(&m, w, h, &info(t, scale), At::Shot { shot: 0, local }, true)
             .ok_or_else(|| anyhow!("nothing rendered"))?;
@@ -610,7 +611,7 @@ duration=2
             }
         }
     }
-    r.set_tiles(1);
+    r.set_tiles(None);
     Ok(String::new())
 }
 
