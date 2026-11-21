@@ -157,7 +157,12 @@ struct Player {
     auto_scale: f32,
     perf: Perf,
     loop_region: Option<(f32, f32)>,
+    /// "repeat movie": on by default for `loop = true` films, which then loop
+    /// seamlessly (the clock and sound card wrap); other films seek back to 0.
     loop_all: bool,
+    /// The film loaded last was a `loop = true` film (to switch `loop_all` on when
+    /// a film starts looping).
+    loop_film: bool,
     volume: f32,
     muted: bool,
     last_input: Instant,
@@ -278,6 +283,7 @@ impl Player {
             },
             loop_region: None,
             loop_all: false,
+            loop_film: false,
             volume: 0.8,
             muted: false,
             last_input: Instant::now(),
@@ -320,8 +326,14 @@ impl Player {
                     }
                     self.say(msg);
                 }
+                let looping = m.loop_frames.is_some();
+                if looping != self.loop_film {
+                    self.loop_film = looping;
+                    self.loop_all = looping;
+                }
                 self.movie = Some(m);
                 self.generation += 1;
+                self.sync_loop();
                 if let Some((a, b)) = self.loop_region {
                     let d = self.duration();
                     self.loop_region = Some((a.min(d), b.min(d)));
@@ -374,6 +386,9 @@ impl Player {
         let t = self.clock.time();
         let c0 = ((t * sr) as usize / self.soundtrack.chunk_size()).min(n - 1);
         let playing = self.clock.playing();
+        // A seamless loop: the chunks after the last are the first ones again.
+        let looping = self.clock.looping();
+        let wrap = |c: usize| if looping { c % n } else { c };
         let chunk = self.soundtrack.chunk_size();
         let per_s = sr / chunk as f32;
         let ahead = if playing {
@@ -381,7 +396,10 @@ impl Player {
         } else {
             1
         };
-        let total = (self.duration() * sr).ceil() as usize;
+        let total = self
+            .movie
+            .as_ref()
+            .map_or(0, |m| m.sound_samples(sr as u32));
         // Paused or scrubbing, the chunk under the playhead is made at once (this may
         // wait for the GPU, like a blocking compile). While playing, nothing waits:
         // blocks are queued on the GPU and collected on later frames.
@@ -397,9 +415,12 @@ impl Player {
                 }
             }
         }
-        let wanted: Vec<usize> = (c0..(c0 + ahead + 1).min(n))
-            .filter(|&c| self.clock.chunk_version(c) != Some(version))
-            .collect();
+        let mut wanted: Vec<usize> = if looping {
+            (c0..c0 + ahead.min(n - 1) + 1).map(wrap).collect()
+        } else {
+            (c0..(c0 + ahead + 1).min(n)).collect()
+        };
+        wanted.retain(|&c| self.clock.chunk_version(c) != Some(version));
         // A block or two per frame; more right after a seek, when the playhead's
         // chunk is missing.
         let blocks = if wanted.first() == Some(&c0) { 4 } else { 2 };
@@ -425,15 +446,26 @@ impl Player {
         if !made.is_empty() {
             self.last_synth = made.join(", ");
         }
-        self.buffered = (c0..n)
-            .take_while(|c| self.clock.chunk_version(*c) == Some(version))
+        let ahead_of_playhead = if looping { c0 + n } else { n };
+        self.buffered = (c0..ahead_of_playhead)
+            .take_while(|c| self.clock.chunk_version(wrap(*c)) == Some(version))
             .count() as f32
             / per_s;
         if self.perf_frame.is_multiple_of(30) {
-            let keep = c0.saturating_sub((3.0 * per_s).ceil() as usize)
-                ..(c0 + ahead + (4.0 * per_s).ceil() as usize);
-            self.soundtrack.evict(keep.clone());
-            self.clock.drop_chunks_outside(keep);
+            let back = (3.0 * per_s).ceil() as usize;
+            let fwd = ahead + (4.0 * per_s).ceil() as usize;
+            // Chunks from `back` behind the playhead to `fwd` ahead of it (across the
+            // seam of a loop).
+            let keep = move |c: usize| {
+                if !looping {
+                    return c + back >= c0 && c < c0 + fwd;
+                }
+                let behind = (c0 + n - c) % n;
+                let ahead = (c + n - c0) % n;
+                behind <= back || ahead < fwd
+            };
+            self.soundtrack.evict_where(keep);
+            self.clock.drop_chunks_where(keep);
         }
     }
 
@@ -626,9 +658,27 @@ impl Player {
 
     // ------------------------------------------------------------ frame logic
 
+    /// Loop the clock (seamless: the sound card plays across the wrap) when a loop
+    /// film plays with "repeat movie" on and no shot loop.
+    fn sync_loop(&mut self) {
+        let want = match &self.movie {
+            Some(m) if m.loop_frames.is_some() && self.loop_all && self.loop_region.is_none() => {
+                Some(m.sound_samples(self.clock.sample_rate()))
+            }
+            _ => None,
+        };
+        if want != self.clock.loop_samples() {
+            self.clock.set_loop(want);
+        }
+    }
+
     fn advance_clock(&mut self) {
+        self.sync_loop();
         if !self.clock.playing() {
             return;
+        }
+        if self.clock.looping() {
+            return; // wraps by itself
         }
         let t = self.clock.time();
         if let Some((a, b)) = self.loop_region {
@@ -855,7 +905,12 @@ impl Player {
             if ui.selectable_label(looping, "Loop").on_hover_text("loop the shot or transition under the playhead (L, or double-click the timeline)").clicked() {
                 self.toggle_loop();
             }
-            ui.checkbox(&mut self.loop_all, "repeat movie");
+            let tip = if self.loop_film {
+                "loop = true: play forever, seamlessly (sound included)"
+            } else {
+                "start again from the beginning at the end"
+            };
+            ui.checkbox(&mut self.loop_all, "repeat movie").on_hover_text(tip);
             ui.separator();
             let mut rate = self.clock.rate();
             egui::ComboBox::from_id_salt("rate")
@@ -872,8 +927,13 @@ impl Player {
             ui.separator();
             let t = self.clock.time();
             let fps = self.fps();
+            let loops = if self.clock.looping() {
+                format!("   loop {}", self.clock.loops() + 1)
+            } else {
+                String::new()
+            };
             ui.label(
-                RichText::new(format!("{}  /  {}   frame {}", clock_text(t), clock_text(self.duration()), (t * fps).round() as i64))
+                RichText::new(format!("{}  /  {}   frame {}{loops}", clock_text(t), clock_text(self.duration()), (t * fps).round() as i64))
                     .monospace()
                     .size(14.0),
             );

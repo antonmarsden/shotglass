@@ -1,0 +1,27 @@
+# Golden film for loop = true (tests/golden.rs): picture and sound repeat every 2 s
+# (60 frames) forever. The golden strip shows two periods (its second row is the
+# first again); the golden soundtrack is one period, whose echo rings over the seam.
+shotglass = "0.1.2"
+title = "loop"
+fps = 30
+loop = true
+
+[sound]
+music = "music.glsl"      # periodic in the 2 s loop: no click at the seam
+mix = "mix.glsl"          # a 400 ms echo that carries over the seam
+mix_lookback = 0.6
+
+[[shot]]
+id = "orbit"
+scene = "scenes/orbit.glsl"
+duration = 1.25
+sound = "sfx/tick.glsl"
+uniforms.uPitch = 1.0
+
+[[shot]]
+id = "rings"
+scene = "scenes/rings.glsl"
+duration = 1.25
+transition = { type = "fx/mix.glsl", duration = 0.5 }
+sound = "sfx/tick.glsl"
+uniforms.uPitch = 1.5

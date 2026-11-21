@@ -205,6 +205,9 @@ struct Plan {
     mix: Option<TrackDef>,
     lookback: usize,
     lookahead: usize,
+    /// A loop film: the buses repeat every `total` samples, and the mix reads them
+    /// circularly (sample x is sample x mod total), so an echo rings over the seam.
+    wrap: bool,
     sfx_key: u64,
     out_key: u64,
 }
@@ -283,7 +286,8 @@ impl Soundtrack {
                 messages: vec![e],
             }]
         })?;
-        let total = (m.duration * sr as f32).ceil() as usize;
+        let total = m.sound_samples(sr);
+        let wrap = m.loop_frames.is_some();
         let cues = m.cue_defines();
         let mut errors = vec![];
         let mut progs = vec![];
@@ -378,7 +382,7 @@ impl Soundtrack {
         let lookback = (m.mix_lookback.max(0.0) * sr as f32).ceil() as usize;
         let lookahead = (0.05 * sr as f32).ceil() as usize;
         let out_key = hash(&format!(
-            "out {:?} {sfx_key} {:?} {} {lookback} {total}",
+            "out {:?} {sfx_key} {:?} {} {lookback} {total} {wrap}",
             music.as_ref().map(|t| t.key),
             mix.as_ref().map(|t| t.key),
             m.volume
@@ -395,6 +399,7 @@ impl Soundtrack {
             mix,
             lookback,
             lookahead,
+            wrap,
             sfx_key,
             out_key,
         });
@@ -589,7 +594,7 @@ impl Soundtrack {
         if lo >= hi {
             return Ok(Some(Arc::new(vec![])));
         }
-        let (mix, lookback, lookahead, total, volume, sr, dur) = (
+        let (mix, lookback, lookahead, total, volume, sr, dur, wrap) = (
             p.mix.clone(),
             p.lookback,
             p.lookahead,
@@ -597,16 +602,26 @@ impl Soundtrack {
             p.movie.volume,
             p.sr,
             p.movie.duration,
+            p.wrap,
         );
         match mix {
             Some(mix) => {
                 // A mix block can only be queued once its inputs have arrived; until
                 // then this just keeps them coming.
                 if !self.in_flight.contains_key(&key) {
-                    let in_lo = lo.saturating_sub(lookback);
-                    let in_hi = (hi + lookahead).min(total);
-                    let music = self.music_range(r, in_lo, in_hi, mode)?;
-                    let sfx = self.sfx_range(r, in_lo, in_hi, mode)?;
+                    // A loop film's mix reads across the seam: before sample 0 is the
+                    // end of the period, after the end is its start.
+                    let (in_lo, in_hi) = if wrap {
+                        (lo as i64 - lookback as i64, (hi + lookahead) as i64)
+                    } else {
+                        (
+                            lo.saturating_sub(lookback) as i64,
+                            (hi + lookahead).min(total) as i64,
+                        )
+                    };
+                    let segs = circular_segments(in_lo, in_hi, total);
+                    let music = self.segments(&segs, |s, a, b| s.music_range(r, a, b, mode))?;
+                    let sfx = self.segments(&segs, |s, a, b| s.sfx_range(r, a, b, mode))?;
                     let (Some(music), Some(sfx)) = (music, sfx) else {
                         return Ok(None);
                     };
@@ -614,8 +629,8 @@ impl Soundtrack {
                     if !self.can_submit(mode) {
                         return Ok(None);
                     }
-                    let music = self.splice(&music, in_lo, in_hi);
-                    let sfx = self.splice(&sfx, in_lo, in_hi);
+                    let music = self.splice_segments(&segs, &music);
+                    let sfx = self.splice_segments(&segs, &sfx);
                     return self.block(r, key, mode, |r| {
                         let t = r.submit_audio(
                             mix.prog,
@@ -623,7 +638,7 @@ impl Soundtrack {
                             hi - lo,
                             sr,
                             (0.0, dur),
-                            Some((&music, &sfx, in_lo as i64)),
+                            Some((&music, &sfx, in_lo)),
                         )?;
                         Ok(InFlight::new(t, mix.name, Place::Mix { volume }))
                     });
@@ -695,6 +710,29 @@ impl Soundtrack {
         Ok(parts.into_iter().collect())
     }
 
+    /// The chunks of each segment (from `circular_segments`), all asked for before
+    /// saying None, so the missing ones are all queued together.
+    fn segments(
+        &mut self,
+        segs: &[(usize, usize)],
+        mut range: impl FnMut(&mut Self, usize, usize) -> Result<Option<Vec<Chunk>>, String>,
+    ) -> Result<Option<Vec<Vec<Chunk>>>, String> {
+        let mut parts = vec![];
+        for &(a, b) in segs {
+            parts.push(range(self, a, b)?);
+        }
+        Ok(parts.into_iter().collect())
+    }
+
+    /// The samples of every segment, one after the other.
+    fn splice_segments(&self, segs: &[(usize, usize)], parts: &[Vec<Chunk>]) -> Vec<f32> {
+        let mut out = vec![];
+        for (&(a, b), p) in segs.iter().zip(parts) {
+            out.extend(self.splice(p, a, b));
+        }
+        out
+    }
+
     /// Samples lo..hi out of `parts`, the chunks covering them (from `range`).
     fn splice(&self, parts: &[Chunk], lo: usize, hi: usize) -> Vec<f32> {
         let mut out = Vec::with_capacity((hi - lo) * 2);
@@ -722,6 +760,15 @@ impl Soundtrack {
         let n = ((c + 1) * self.chunk_size).min(total).saturating_sub(lo);
         let a = lo.max(t.first);
         let b = (lo + n).min(t.first + t.count);
+        // A cached chunk made when the soundtrack had another length (a track's key
+        // doesn't change with it) has the wrong size for the last chunk.
+        if self
+            .chunks
+            .get(&(t.key, c))
+            .is_some_and(|d| d.len() != n * 2)
+        {
+            self.chunks.remove(&(t.key, c));
+        }
         if a >= b {
             if let Some(d) = self.chunks.get(&(t.key, c)) {
                 return Ok(Some(d.clone()));
@@ -780,7 +827,12 @@ impl Soundtrack {
 
     /// Drop cached chunks outside `keep` (chunk indices), plus any from old versions.
     pub fn evict(&mut self, keep: std::ops::Range<usize>) {
-        self.chunks.retain(|(_, c), _| keep.contains(c));
+        self.evict_where(|c| keep.contains(&c));
+    }
+
+    /// Drop cached chunks `keep` says no to, plus any from old versions.
+    pub fn evict_where(&mut self, keep: impl Fn(usize) -> bool) {
+        self.chunks.retain(|(_, c), _| keep(*c));
         self.forget_stale();
     }
 
@@ -821,6 +873,21 @@ impl Soundtrack {
     }
 }
 
+/// Global samples lo..hi as pieces within one soundtrack of `total` samples: sample x
+/// is sample x mod total. Without wrapping (0 <= lo <= hi <= total) it's lo..hi itself.
+fn circular_segments(lo: i64, hi: i64, total: usize) -> Vec<(usize, usize)> {
+    let total = total.max(1) as i64;
+    let mut v = vec![];
+    let mut x = lo;
+    while x < hi {
+        let base = x.div_euclid(total) * total;
+        let end = hi.min(base + total);
+        v.push(((x - base) as usize, (end - base) as usize));
+        x = end;
+    }
+    v
+}
+
 fn rel(p: &Path, root: &Path) -> String {
     p.strip_prefix(root)
         .unwrap_or(p)
@@ -833,4 +900,23 @@ fn hash(s: &str) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     s.hash(&mut h);
     h.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::circular_segments;
+
+    #[test]
+    fn circular_segments_wrap_around_the_period() {
+        assert_eq!(circular_segments(10, 50, 100), vec![(10, 50)]);
+        assert_eq!(circular_segments(0, 100, 100), vec![(0, 100)]);
+        assert_eq!(circular_segments(-30, 20, 100), vec![(70, 100), (0, 20)]);
+        assert_eq!(circular_segments(90, 130, 100), vec![(90, 100), (0, 30)]);
+        // Longer than the period: whole periods in between.
+        assert_eq!(
+            circular_segments(-150, 120, 100),
+            vec![(50, 100), (0, 100), (0, 100), (0, 20)]
+        );
+        assert!(circular_segments(5, 5, 100).is_empty());
+    }
 }

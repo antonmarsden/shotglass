@@ -150,6 +150,10 @@ enum Cmd {
         /// Audio sample rate.
         #[arg(long, default_value_t = 48000)]
         rate: u32,
+        /// For a loop = true film: write this many periods, one after another. One period
+        /// (the default) loops seamlessly itself, picture and sound, when the file loops.
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..))]
+        loops: u64,
     },
     /// Create a new movie folder from a template.
     New { dir: PathBuf },
@@ -289,6 +293,7 @@ fn real_main() -> Result<()> {
             format,
             ffmpeg_args,
             rate,
+            loops,
         } => export(
             &movie,
             out,
@@ -296,6 +301,7 @@ fn real_main() -> Result<()> {
             format.as_deref(),
             ffmpeg_args.as_deref(),
             rate,
+            loops,
         ),
         Cmd::New { dir } => new_movie(&dir),
         Cmd::Fetch { movie } => fetch_libraries(
@@ -547,7 +553,7 @@ pub(crate) fn save_png(path: &Path, frame: &Frame) -> Result<()> {
 }
 
 fn describe(m: &Movie, t: f32) -> String {
-    match m.at(t) {
+    match m.at(m.wrap(t)) {
         At::Shot { shot, local } => format!("{} +{local:.2}s", m.shots[shot].id),
         At::Transition {
             from, to, progress, ..
@@ -722,10 +728,12 @@ fn check(movie: &Path, size: &str, frames: usize, web: bool, no_gpu: bool) -> Re
     let m = load_movie(movie)?;
     let (w, h) = parse_size(size)?;
     println!(
-        "{} — {:.2}s, {} shots{}",
+        "{} — {:.2}s, {} shots{}{}",
         m.title,
         m.duration,
         m.shots.len(),
+        m.loop_frames
+            .map_or(String::new(), |n| format!(", loops every {n} frames")),
         m.shotglass
             .as_ref()
             .map_or(String::new(), |v| format!(", made for shotglass {v}"))
@@ -798,14 +806,21 @@ ok"
             }
             // Stream: keep only running stats, not the whole soundtrack.
             let (mut peak, mut sum_sq, mut n) = (0f32, 0f64, 0usize);
+            let mut seam = SeamCheck::default();
             st.render_all(&mut r, |d| {
                 for x in d {
                     peak = peak.max(x.abs());
                     sum_sq += (*x as f64) * (*x as f64);
                 }
                 n += d.len();
+                seam.feed(d);
             })
             .map_err(|e| anyhow!(e))?;
+            if m.loop_frames.is_some()
+                && let Some(w) = seam.warning()
+            {
+                println!("warning: {w}");
+            }
             println!("sound tracks: {}", st.take_rendered().join(", "));
             let rms = (sum_sq / n.max(1) as f64).sqrt();
             println!(
@@ -854,6 +869,49 @@ ok"
     })
 }
 
+/// Does a loop film's sound jump at the seam (last sample → first) much more than
+/// anywhere else? Music shaders must be periodic themselves for a click-free loop.
+#[derive(Default)]
+struct SeamCheck {
+    first: Option<[f32; 2]>,
+    last: Option<[f32; 2]>,
+    largest_step: f32,
+}
+
+impl SeamCheck {
+    fn feed(&mut self, interleaved: &[f32]) {
+        for &f in interleaved.as_chunks::<2>().0 {
+            match self.last {
+                Some(l) => {
+                    let step = (f[0] - l[0]).abs().max((f[1] - l[1]).abs());
+                    self.largest_step = self.largest_step.max(step);
+                }
+                None => self.first = Some(f),
+            }
+            self.last = Some(f);
+        }
+    }
+
+    fn seam_step(&self) -> f32 {
+        match (self.first, self.last) {
+            (Some(a), Some(b)) => (a[0] - b[0]).abs().max((a[1] - b[1]).abs()),
+            _ => 0.0,
+        }
+    }
+
+    fn warning(&self) -> Option<String> {
+        let seam = self.seam_step();
+        (seam > 0.05 && seam > 2.0 * self.largest_step).then(|| {
+            format!(
+                "the sound jumps by {seam:.3} at the loop seam (end → start), more than anywhere \
+                 else in the film (at most {:.3}), so it clicks every time the film loops; make the \
+                 music periodic in the film's duration, or fade it at both ends",
+                self.largest_step
+            )
+        })
+    }
+}
+
 /// `wav --compare`: the reference soundtrack and how close the new one must be.
 struct GoldenSound {
     reference: PathBuf,
@@ -869,7 +927,7 @@ fn wav(movie: &Path, out: &Path, rate: u32, golden: Option<GoldenSound>) -> Resu
     let path = out.to_path_buf();
     headless::with_gl(move |gl| {
         let mut r = Renderer::new(gl)?;
-        let frames = export::write_wav(&mut r, &m, rate, &path)?;
+        let frames = export::write_wav(&mut r, &m, rate, &path, 1)?;
         println!(
             "wrote {} ({:.1}s at {rate} Hz)",
             path.display(),
@@ -936,11 +994,15 @@ fn export(
     format: Option<&str>,
     ffmpeg_args: Option<&str>,
     rate: u32,
+    loops: u64,
 ) -> Result<()> {
     use std::io::IsTerminal;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     let m = load_movie(movie)?;
+    if loops > 1 && m.loop_frames.is_none() {
+        bail!("--loops needs a film with loop = true in movie.toml");
+    }
     let (w, h) = parse_size(size)?;
     let format = export::Format::choose(format, &out, ffmpeg_args)?;
     format.check_size(w as usize, h as usize)?;
@@ -963,11 +1025,17 @@ fn export(
         h: h as usize,
         format,
         rate,
+        loops,
     };
     println!(
-        "{} — {:.2}s at {}/{} fps, {w}x{h} → {} ({:?})",
+        "{} — {:.2}s{} at {}/{} fps, {w}x{h} → {} ({:?})",
         m.title,
         m.duration,
+        if loops > 1 {
+            format!(" × {loops} loops")
+        } else {
+            String::new()
+        },
         m.fps_num,
         m.fps_den,
         opts.out.display(),
@@ -1099,5 +1167,36 @@ mod tests {
         let v = library::contract();
         assert_eq!(m.shotglass, Some(format!("{}.{}", v.major, v.minor)));
         assert!(text.contains("# engine contract"));
+    }
+
+    #[test]
+    fn seam_check_warns_only_about_a_jump_at_the_seam() {
+        // A sine with a whole number of cycles per period: no jump at the seam.
+        let sine = |cycles: f32, n: usize| -> Vec<f32> {
+            (0..n)
+                .flat_map(|i| {
+                    let x = (std::f32::consts::TAU * cycles * i as f32 / n as f32).sin() * 0.5;
+                    [x, x]
+                })
+                .collect()
+        };
+        let mut s = SeamCheck::default();
+        for c in sine(20.0, 4800).chunks(1000) {
+            s.feed(c);
+        }
+        assert_eq!(s.warning(), None);
+        // A ramp: smooth everywhere, then it drops from the top to 0 at the seam.
+        let ramp: Vec<f32> = (0..4800).flat_map(|i| [i as f32 / 4800.0; 2]).collect();
+        let mut s = SeamCheck::default();
+        s.feed(&ramp);
+        let w = s.warning().unwrap();
+        assert!(w.contains("loop seam"), "{w}");
+        // Noise jumps everywhere: the seam is nothing special.
+        let noise: Vec<f32> = (0..4800u32)
+            .flat_map(|i| [((i.wrapping_mul(2654435761) >> 16) as f32 / 65536.0) - 0.5; 2])
+            .collect();
+        let mut s = SeamCheck::default();
+        s.feed(&noise);
+        assert_eq!(s.warning(), None);
     }
 }

@@ -357,14 +357,23 @@ pub struct FrameInfo {
 
 impl FrameInfo {
     /// Full-resolution frame at `t`: iFrame is the film frame on screen at `t`, so
-    /// `still`, `strip` and `export` give the same picture for the same time.
+    /// `still`, `strip` and `export` give the same picture for the same time. A loop
+    /// film's `t` is taken within one period (t + k·period is the frame at t).
     pub fn at(m: &Movie, t: f32) -> FrameInfo {
+        let t = m.wrap(t);
         FrameInfo {
             t,
             dt: m.fps_den as f32 / m.fps_num as f32,
             frame: m.frame_at(t).min(i32::MAX as i64) as i32,
             scale: 1.0,
         }
+    }
+}
+
+impl FrameInfo {
+    /// Full-resolution film frame `n` (of a loop film: frame `n` mod the period, exactly).
+    pub fn frame(m: &Movie, n: u64) -> FrameInfo {
+        FrameInfo::at(m, m.frame_time(m.wrap_frame(n)))
     }
 }
 
@@ -899,7 +908,7 @@ impl Renderer {
             let Some(k) = self.wanted.get(i) else {
                 continue;
             };
-            let d = distance(shot, t);
+            let d = distance(movie, shot, t);
             v.extend(k.channels.iter().flatten().map(|c| (c.tex, d)));
         }
         v.sort_by(|a, b| a.1.total_cmp(&b.1));
@@ -1182,7 +1191,7 @@ impl Renderer {
             let Some(k) = self.wanted.get(i) else {
                 continue;
             };
-            let d = distance(shot, t);
+            let d = distance(movie, shot, t);
             v.push((k.scene, d));
             if let Some(tr) = k.trans {
                 v.push((tr, d));
@@ -2833,7 +2842,17 @@ fn hash(s: &str) -> u64 {
 
 /// How soon the playhead at `t` needs `shot` (seconds); behind it counts double (only
 /// needed when scrubbing back).
-fn distance(shot: &Shot, t: f32) -> f32 {
+/// How soon the playhead at `t` needs `shot` (seconds). A loop film's first shots
+/// are also near its end: the playhead reaches them again across the wrap.
+fn distance(movie: &Movie, shot: &Shot, t: f32) -> f32 {
+    let d = distance_once(shot, t);
+    match movie.loop_period() {
+        Some(p) => d.min(distance_once(shot, t - p as f32)),
+        None => d,
+    }
+}
+
+fn distance_once(shot: &Shot, t: f32) -> f32 {
     if t < shot.start {
         shot.start - t
     } else if t > shot.end() {
