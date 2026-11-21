@@ -1,0 +1,10 @@
+# Per-machine library overrides (local kit checkout, the shared lib/).
+movie.local.toml
+# Renders: exports, stills, strips, scratch output of scripts/check.sh.
+target/
+renders/
+*.webm
+*.mkv
+*.mp4
+# Bundles for hosting (shotglass bundle <film> --out site/<film>).
+site/

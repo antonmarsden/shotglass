@@ -1,0 +1,7 @@
+# The films' shared library: primitives a film is trying out before they graduate to
+# shotglass-kit. Films call it `films` and include `<films/file.glsl>`; the path comes
+# from SHOTGLASS_LIB_FILMS=../lib (see the README, "The shared lib/").
+name = "films/lib"
+version = "0.1.0"
+requires_shotglass = "0.1"
+licences = ["LicenseRef-Private"]   # the films repo is private; say so if a file is borrowed

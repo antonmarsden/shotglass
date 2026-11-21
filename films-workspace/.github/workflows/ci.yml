@@ -1,0 +1,85 @@
+name: Films
+
+on:
+  push:
+  pull_request:
+  # "Run workflow" on the Actions tab. Tick "bless" to render new golden references on
+  # CI's software OpenGL and download them as the golden-references artifact.
+  workflow_dispatch:
+    inputs:
+      bless:
+        description: "Render golden references of every film (commit only the finished ones)"
+        type: boolean
+        default: false
+
+# The engine is pinned like a library: bump SHOTGLASS_REV on purpose, run CI, and
+# re-bless finished films only if their change is expected.
+env:
+  SHOTGLASS_REV: c86455804d7e1e8e5aaf3d991625f3bdbbb5323d
+  RUST_TOOLCHAIN: "1.100.0"          # shotglass's own RUST_TOOLCHAIN at that commit
+  SHOTGLASS_LIB_FILMS: ../lib        # every film's `films` library is the shared lib/
+  GALLIUM_DRIVER: llvmpipe
+
+jobs:
+  films:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: System packages
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev xvfb libgl1-mesa-dri libegl-mesa0 libxkbcommon-x11-0
+
+      - name: Cached shotglass build
+        id: engine
+        uses: actions/cache@v4
+        with:
+          path: ~/.shotglass
+          key: shotglass-${{ runner.os }}-${{ env.SHOTGLASS_REV }}
+
+      - uses: dtolnay/rust-toolchain@master
+        if: steps.engine.outputs.cache-hit != 'true'
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Build shotglass at the pinned commit
+        if: steps.engine.outputs.cache-hit != 'true'
+        run: cargo install --locked --git https://github.com/antonmarsden/shotglass --rev "$SHOTGLASS_REV" --root ~/.shotglass shotglass
+
+      - run: echo "$HOME/.shotglass/bin" >> "$GITHUB_PATH"
+
+      # Kit downloads, keyed on every film's pins.
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/shotglass/libs
+          key: shotglass-libs-${{ hashFiles('*/shotglass.lock') }}
+          restore-keys: shotglass-libs-
+
+      - name: Strict GLSL check of every film (330 and GLSL ES 3.00)
+        run: scripts/check.sh
+
+      # Finished films (golden/<film>.png exists): strips and soundtracks vs references,
+      # so a kit, lib/ or engine change that alters a finished film shows up here.
+      - name: Golden strips and soundtracks of finished films (software OpenGL)
+        if: ${{ !inputs.bless }}
+        run: xvfb-run -a scripts/check.sh --golden
+
+      - name: Re-bless golden references
+        if: ${{ inputs.bless }}
+        env:
+          BLESS_NEW: 1
+        run: xvfb-run -a scripts/check.sh --bless
+
+      - name: Upload new golden references
+        if: ${{ inputs.bless }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: golden-references
+          path: golden/
+
+      - name: Upload actual and diff strips / soundtracks of failed golden comparisons
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: golden-failures
+          path: target/golden/
+          if-no-files-found: ignore

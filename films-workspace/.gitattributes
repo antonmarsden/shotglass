@@ -1,0 +1,11 @@
+# LF everywhere (shaders, toml, scripts), CRLF checkouts included.
+* text=auto eol=lf
+# Binary: never convert line endings.
+*.png binary
+*.PNG binary
+*.jpg binary
+*.JPG binary
+*.jpeg binary
+*.JPEG binary
+*.wav binary
+*.WAV binary
