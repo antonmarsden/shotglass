@@ -46,6 +46,18 @@ cargo run --release -- play movies/my-film
 
 Or install it with `cargo install --path .`, then run `shotglass play movies/my-film`.
 
+To install from crates.io instead, set `CXXFLAGS` as shown:
+
+```sh
+CXXFLAGS=-DNDEBUG cargo install shotglass              # Linux / macOS
+$env:CXXFLAGS="-DNDEBUG"; cargo install shotglass      # Windows PowerShell
+```
+
+The strict GLSL checker (glslang) must be built with `NDEBUG`, or one of its debug
+assertions aborts `shotglass check` on valid shaders. Inside this repository,
+`.cargo/config.toml` sets it for you, but Cargo ignores that file when installing
+from crates.io.
+
 ## A movie
 
 A movie is a folder:
