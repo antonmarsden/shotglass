@@ -14,8 +14,21 @@ cargo run -- check movies/big-shadow --web --no-gpu
 
 `cargo test` runs the unit and property tests, `shotglass selftest` on your GPU
 (tests/gpu.rs) and the golden-image and soundtrack tests (tests/golden.rs). On a machine without
-OpenGL, `SHOTGLASS_SKIP_GPU_TESTS=1` skips the last two; CI still runs them on
-software OpenGL.
+OpenGL, `SHOTGLASS_SKIP_GPU_TESTS=1` skips the last two; CI still runs them (see
+below).
+
+## CI
+
+CI (`.github/workflows/ci.yml`) runs fmt, clippy, `cargo test` (unit tests, GPU
+selftest, golden images and soundtracks) and the strict `check --web --no-gpu` on
+Linux, Windows and macOS, all with the same pinned `RUST_TOOLCHAIN`. None of the
+machines has a real GPU:
+
+| | OpenGL | skipped |
+|---|---|---|
+| Linux | Mesa llvmpipe under Xvfb | nothing (also renders and exports the demo) |
+| Windows | Mesa llvmpipe ([mesa-dist-win](https://github.com/pal1000/mesa-dist-win)) | the selftest's video export (no ffmpeg; PNG + WAV export still checked) |
+| macOS | Apple's OpenGL 4.1 | the demo's golden strip (`--skip demo_film`): the references are llvmpipe renders and Apple's driver rounds the demo's noise differently in about 1% of pixels. The template's strip and both soundtracks are compared. Also the video export, as on Windows. |
 
 ## Golden images
 

@@ -30,6 +30,9 @@ cargo fmt && cargo clippy --all-targets -- -D warnings
   `transitions` pin), so moving that pin can need a re-bless too.
 - CI (`.github/workflows/ci.yml`) pins Rust in `RUST_TOOLCHAIN` and runs clippy with
   `-D warnings`. Upgrade the toolchain on purpose and fix new lints in the same commit.
+  Linux and Windows run the GPU tests on Mesa llvmpipe, macOS on Apple's GL 4.1 (no
+  GL 4.2+ entry points: glow's query getters panicked there). Skips are listed in
+  CONTRIBUTING.md.
 - Software OpenGL (llvmpipe) is slow: auto render scale drops to 30% and frame
   timings mean nothing. Judge performance only on a real GPU.
 - The owner tests on Windows with a real GPU. Their working copy is
