@@ -91,11 +91,12 @@ fn fetch_libraries(movie: &Path) -> bool {
 
 /// `shotglass strip <movie> --compare tests/golden/<name>.png` (or `--bless`).
 fn golden(name: &str, movie: &Path) {
-    golden_frames(name, movie, &["--count", COUNT]);
+    golden_frames(name, movie, &["--count", COUNT], &[]);
 }
 
-/// `golden` with these frames (`--count n` or `--at times`).
-fn golden_frames(name: &str, movie: &Path, frames: &[&str]) {
+/// `golden` with these frames (`--count n` or `--at times`) and extra `strip` options
+/// (a looser tolerance).
+fn golden_frames(name: &str, movie: &Path, frames: &[&str], extra: &[&str]) {
     if !fetch_libraries(movie) {
         return;
     }
@@ -115,6 +116,7 @@ fn golden_frames(name: &str, movie: &Path, frames: &[&str]) {
         "--compare".as_ref(),
         reference.as_os_str(),
     ];
+    args.extend(extra.iter().map(std::ffi::OsStr::new));
     bless(&mut args);
     let out = shotglass(&args);
     assert!(
@@ -193,14 +195,22 @@ fn new_template() {
 
 /// iChannel textures: a small film with a checked-in 64×64 PNG and JPEG (mipmaps,
 /// repeat, nearest, clamp, mirror, vflip, iChannelResolution, a frozen transition).
+///
+/// Its mean limit is looser than the default 0.25: how a renderer picks and blends
+/// mipmap levels on the receding plane is up to it. The Apple Software Renderer (CI's
+/// macOS job) is within 3/255 everywhere but averages 0.253/255 from llvmpipe. A broken
+/// texture option (filter, wrap, vflip, a missing mipmap chain) moves many pixels by far
+/// more than 8/255, which the per-pixel budget still catches.
 #[test]
 fn channels_film() {
     if skip() {
         return;
     }
-    golden(
+    golden_frames(
         "channels",
         &root().join("tests").join("films").join("channels"),
+        &["--count", COUNT],
+        &["--max-mean", "0.4"],
     );
 }
 
@@ -215,6 +225,7 @@ fn loop_film() {
         "loop",
         &root().join("tests").join("films").join("loop"),
         &["--at", "0.1,0.6,1.0,1.9,2.1,2.6,3.0,3.9"],
+        &[],
     );
 }
 
