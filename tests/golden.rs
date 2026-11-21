@@ -10,7 +10,9 @@
 //!   (on Linux without a display: under `xvfb-run -a`) and commit the PNGs and WAVs
 //!   with the change that caused them.
 //! - Needs OpenGL like tests/gpu.rs; SHOTGLASS_SKIP_GPU_TESTS=1 skips it. The films'
-//!   libraries are fetched (pinned by shotglass.lock) on first use.
+//!   libraries are fetched (pinned by shotglass.lock) on first use. If that fails
+//!   outside CI (no `CI` env var, e.g. offline), the test is skipped with a message;
+//!   in CI it fails.
 //!
 //! The references are rendered with Mesa's software OpenGL (llvmpipe), as in CI.
 //! The tolerance (`strip --compare`'s defaults, see `golden::Tolerance`) absorbs the
@@ -66,8 +68,30 @@ fn bless(args: &mut Vec<&std::ffi::OsStr>) {
     }
 }
 
+/// `shotglass fetch <movie>`: false (skip the test) if the libraries can't be fetched
+/// outside CI, e.g. offline; a failure in CI panics.
+fn fetch_libraries(movie: &Path) -> bool {
+    let out = shotglass(&["fetch".as_ref(), movie.as_os_str()]);
+    if out.status.success() {
+        return true;
+    }
+    assert!(
+        std::env::var_os("CI").is_none(),
+        "couldn't fetch the libraries of {} (see the message above)",
+        movie.display()
+    );
+    println!(
+        "golden test skipped: can't fetch the libraries of {} (offline?)",
+        movie.display()
+    );
+    false
+}
+
 /// `shotglass strip <movie> --compare tests/golden/<name>.png` (or `--bless`).
 fn golden(name: &str, movie: &Path) {
+    if !fetch_libraries(movie) {
+        return;
+    }
     let reference = reference(&format!("{name}.png"));
     let actual = out_dir().join(format!("{name}.png"));
     let mut args: Vec<&std::ffi::OsStr> = vec![
@@ -96,6 +120,9 @@ fn golden(name: &str, movie: &Path) {
 
 /// `shotglass wav <movie> --compare tests/golden/<name>.wav` (or `--bless`).
 fn golden_sound(name: &str, movie: &Path) {
+    if !fetch_libraries(movie) {
+        return;
+    }
     let reference = reference(&format!("{name}.wav"));
     let actual = out_dir().join(format!("{name}.wav"));
     let mut args: Vec<&std::ffi::OsStr> = vec![

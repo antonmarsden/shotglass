@@ -34,6 +34,9 @@ cargo fmt && cargo clippy --all-targets -- -D warnings
   Renderer (GL 4.1, no 4.2+ entry points: glow's query getters panicked there); the
   macOS job runs only on pushes to `main` and by hand (workflow_dispatch). Skips
   are listed in CONTRIBUTING.md.
+- `.github/workflows/canary.yml` (daily + by hand, never on PRs) runs `.github/canary.sh`:
+  the demo and template with their pins moved to kit `main`, strict check + golden
+  comparisons. Red = bump the pin and re-bless, or fix the kit.
 - Software OpenGL (llvmpipe) is slow: auto render scale drops to 30% and frame
   timings mean nothing. Judge performance only on a real GPU.
 - The owner tests on Windows with a real GPU. Their working copy is
