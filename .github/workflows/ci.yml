@@ -28,7 +28,7 @@ jobs:
       - name: Clippy without the strict GLSL checker (glslang)
         run: cargo clippy --no-default-features -- -D warnings
       # The selftest's fixture films must also pass the strict GLSL check (330 and ES),
-      # and the unit tests run it on the demo, the template and the built-in transitions.
+      # and the unit tests run it on the demo and the template.
       # Includes the golden tests (tests/golden.rs): strips and soundtracks of the demo
       # and the template compared with tests/golden/*.png and *.wav.
       - name: Unit tests, GPU selftest, golden images and soundtracks (software OpenGL)
