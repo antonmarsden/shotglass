@@ -111,8 +111,10 @@ for the kit (functions, transitions) goes to the
 
 CI (`.github/workflows/ci.yml`) runs fmt, clippy, `cargo test` (unit tests, GPU
 selftest, golden images and soundtracks) and the strict `check --web --no-gpu` on
-Linux, Windows and macOS, all with the same pinned `RUST_TOOLCHAIN`. None of the
-machines has a real GPU:
+Linux, Windows and macOS, all with the same pinned `RUST_TOOLCHAIN`. macOS is the
+slowest, so it runs only on pushes to `main` (after a merge) and when the workflow is
+started by hand ("Run workflow" on the Actions tab, any branch): do that for a branch
+that changes the renderer or the demo's shaders. None of the machines has a real GPU:
 
 | | OpenGL | skipped |
 |---|---|---|

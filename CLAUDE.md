@@ -31,7 +31,8 @@ cargo fmt && cargo clippy --all-targets -- -D warnings
 - CI (`.github/workflows/ci.yml`) pins Rust in `RUST_TOOLCHAIN` and runs clippy with
   `-D warnings`. Upgrade the toolchain on purpose and fix new lints in the same commit.
   Linux and Windows run the GPU tests on Mesa llvmpipe, macOS on the Apple Software
-  Renderer (GL 4.1, no 4.2+ entry points: glow's query getters panicked there). Skips
+  Renderer (GL 4.1, no 4.2+ entry points: glow's query getters panicked there); the
+  macOS job runs only on pushes to `main` and by hand (workflow_dispatch). Skips
   are listed in CONTRIBUTING.md.
 - Software OpenGL (llvmpipe) is slow: auto render scale drops to 30% and frame
   timings mean nothing. Judge performance only on a real GPU.
