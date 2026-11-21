@@ -12,6 +12,7 @@ mod movie;
 mod selftest;
 mod shader;
 mod sound;
+mod texture;
 mod validate;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -612,6 +613,98 @@ fn strict_check(m: &Movie, web: bool) -> Result<()> {
     Ok(())
 }
 
+/// The texture part of `check` (no GPU needed): decode every texture, check the limits
+/// and each shot's memory, and point out channels a scene reads but nothing is bound to.
+fn check_textures(m: &Movie, web: bool) -> Result<()> {
+    if let Some(w) = m.contract_warning() {
+        println!("warning: {w}");
+    }
+    let mut sizes: std::collections::HashMap<PathBuf, (usize, usize)> = Default::default();
+    let mut failed = 0;
+    for c in m.textures() {
+        match texture::load(&c.file, &c.label, c.vflip) {
+            Ok(img) => {
+                let (w, h) = (img.width, img.height);
+                println!(
+                    "texture {}: {w}×{h}, {} on the GPU{}",
+                    c.label,
+                    texture::describe_bytes(texture::gpu_bytes(w, h)),
+                    match (c.srgb, c.vflip) {
+                        (true, true) => ", srgb",
+                        (true, false) => ", srgb, vflip = false",
+                        (false, false) => ", vflip = false",
+                        (false, true) => "",
+                    }
+                );
+                for warning in &img.warnings {
+                    println!("warning: {warning}");
+                }
+                if w.max(h) > texture::WEB_MAX_SIZE {
+                    let max = texture::WEB_MAX_SIZE;
+                    println!(
+                        "warning: {}: {w}×{h} is over {max}×{max}, the most some phones' browsers \
+                         support{}",
+                        c.label,
+                        if web {
+                            ""
+                        } else {
+                            " (matters for the web player)"
+                        }
+                    );
+                }
+                sizes.insert(c.file.clone(), (w, h));
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                failed += 1;
+            }
+        }
+    }
+    if failed > 0 {
+        bail!("{failed} texture(s) can't be used");
+    }
+    let mut largest: Option<(usize, &str)> = None;
+    let cues = m.cue_defines();
+    for s in &m.shots {
+        let mut files: Vec<&PathBuf> = s.channels.iter().flatten().map(|c| &c.file).collect();
+        files.sort();
+        files.dedup();
+        let total: usize = files
+            .iter()
+            .filter_map(|f| sizes.get(*f))
+            .map(|(w, h)| texture::gpu_bytes(*w, *h))
+            .sum();
+        if total > 0 && largest.is_none_or(|(b, _)| total > b) {
+            largest = Some((total, &s.id));
+        }
+        if let Ok(src) = gfx::scene_source(shader::Dialect::BASELINE, s, &cues, m) {
+            for (n, reads) in gfx::channels_read(&src).iter().enumerate() {
+                if *reads && s.channels[n].is_none() {
+                    println!(
+                        "warning: shot \"{}\" ({}): reads iChannel{n}, but channels has nothing \
+                         at {n} (it reads black)",
+                        s.id,
+                        s.scene
+                            .strip_prefix(&m.root)
+                            .unwrap_or(&s.scene)
+                            .to_string_lossy()
+                            .replace('\\', "/")
+                    );
+                }
+            }
+        }
+    }
+    if let Some((b, id)) = largest {
+        println!(
+            "textures: {} file(s); the most one shot needs is {} (shot \"{id}\"; budget {})",
+            sizes.len(),
+            texture::describe_bytes(b),
+            texture::describe_bytes(texture::BUDGET)
+        );
+    }
+    Ok(())
+}
+
 fn check(movie: &Path, size: &str, frames: usize, web: bool, no_gpu: bool) -> Result<()> {
     let m = load_movie(movie)?;
     let (w, h) = parse_size(size)?;
@@ -644,6 +737,7 @@ fn check(movie: &Path, size: &str, frames: usize, web: bool, no_gpu: bool) -> Re
         );
     }
     strict_check(&m, web)?;
+    check_textures(&m, web)?;
     if no_gpu {
         println!(
             "
@@ -920,6 +1014,10 @@ fn export(
 const TEMPLATE: &[(&str, &str)] = &[
     ("movie.toml", include_str!("../templates/new/movie.toml")),
     (".gitignore", include_str!("../templates/new/gitignore")),
+    (
+        ".gitattributes",
+        include_str!("../templates/new/gitattributes"),
+    ),
     (
         "scenes/first.glsl",
         include_str!("../templates/new/scenes/first.glsl"),

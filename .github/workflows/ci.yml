@@ -48,9 +48,10 @@ jobs:
           xvfb-run -a ./target/release/shotglass check movies/big-shadow --web --size 320x180 --frames 1
           xvfb-run -a ./target/release/shotglass strip movies/big-shadow --count 8 --size 320x180 --out strip.png
           xvfb-run -a ./target/release/shotglass export movies/big-shadow --size 320x180 --out big-shadow.webm
-      - name: Strict GLSL check (glslang, no GPU) on the demo movie and the template
+      - name: Strict GLSL check (glslang, no GPU) on the demo movie, the textures film and the template
         run: |
           ./target/release/shotglass check movies/big-shadow --web --no-gpu
+          ./target/release/shotglass check tests/films/channels --web --no-gpu
           ./target/release/shotglass new "$RUNNER_TEMP/template"
           ./target/release/shotglass check "$RUNNER_TEMP/template" --web --no-gpu
       - uses: actions/upload-artifact@v4

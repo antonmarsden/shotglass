@@ -17,6 +17,8 @@ scene = "scenes/first.glsl"
 duration = 5.0
 # Uniforms are declared for you. Constants, vectors, or keyframes in shot-local seconds.
 uniforms.uHue = { keys = [[0, 0.0], [5, 0.3]], ease = "smooth" }
+# Images on iChannel0..3 (PNG or JPEG; needs shotglass = "0.1.1"). See README, "Textures".
+# channels = ["textures/brick.png", "", { file = "textures/grid.png", filter = "nearest", wrap = "clamp" }]
 
 [[shot]]
 id = "second"
@@ -28,6 +30,11 @@ transition = { type = "transitions/iris", duration = 1.2, freeze = true, params 
 # This shot's own sound: time is shot-local. sound_lead / sound_tail (seconds)
 # start it early or let it ring on; otherwise it fades with the transitions.
 sound = "sfx/chime.glsl"
+
+# Named textures, for images several shots use or that have options:
+# [textures]
+# brick = "textures/brick.png"
+# noise = { file = "<kit/textures/noise.png>", filter = "linear" }   # from a library
 
 # Shared GLSL by name; shaders use #include <kit/file.glsl>. See README, "Libraries".
 # `shotglass play` fetches them with git and pins them in shotglass.lock (commit it).

@@ -1301,6 +1301,8 @@ dependencies = [
  "num-traits",
  "png",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -2644,7 +2646,7 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "shotglass"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2657,6 +2659,7 @@ dependencies = [
  "glutin-winit",
  "image",
  "notify",
+ "png",
  "proptest",
  "raw-window-handle",
  "semver",

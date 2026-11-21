@@ -8,6 +8,7 @@ use crate::anim::Anim;
 use crate::movie::TransitionKind;
 use crate::movie::{At, Movie, Shot, glsl_float};
 use crate::shader::{Assembled, Builder, Dialect, DriverGlsl, remap_log};
+use crate::texture::{DecodedImage, Filter, Wrap};
 use anyhow::{Result, anyhow};
 use eframe::glow::{self, HasContext};
 use std::collections::HashMap;
@@ -42,6 +43,8 @@ uniform float iShotDuration;
 uniform float iShotProgress;
 out vec4 shotglass_out;
 ";
+
+const CHANNEL_UNIFORMS: [&str; 4] = ["iChannel0", "iChannel1", "iChannel2", "iChannel3"];
 
 const SCENE_FOOTER: &str = "void main(){\n  vec4 c = vec4(0.0, 0.0, 0.0, 1.0);\n  mainImage(c, gl_FragCoord.xy);\n  shotglass_out = vec4(c.rgb, 1.0);\n}";
 
@@ -126,12 +129,89 @@ struct Entry {
     last_used: u64,
 }
 
-/// Program keys for one shot: its scene and the transition into it.
+/// Program keys for one shot: its scene and the transition into it, and the textures
+/// on its channels.
 #[derive(Clone, Copy, PartialEq)]
 struct ShotKeys {
     scene: u64,
     trans: Option<u64>,
+    channels: [Option<ChanKey>; 4],
 }
+
+/// A texture on a channel: what's uploaded (`tex`, a `TexKey`) and how it's sampled.
+#[derive(Clone, Copy, PartialEq)]
+struct ChanKey {
+    tex: u64,
+    filter: Filter,
+    wrap: Wrap,
+}
+
+/// A texture's load state. Textures load lazily, nearest the playhead first, like
+/// programs: decoded on a worker thread, then uploaded in bands of rows in `pump`.
+enum TexState {
+    Idle,
+    /// The worker is reading and decoding the file.
+    Decoding,
+    /// RGBA8 on the CPU, waiting for its upload to start.
+    Decoded(DecodedImage),
+    /// Level 0 partly uploaded: rows below `row` are submitted.
+    Uploading {
+        tex: glow::Texture,
+        img: DecodedImage,
+        row: usize,
+    },
+    /// Every band and the mipmaps are submitted (GL runs commands in order, so a draw
+    /// issued now sees them: nothing to wait for).
+    Ready {
+        tex: glow::Texture,
+        w: usize,
+        h: usize,
+        bytes: usize,
+    },
+    Failed(String),
+}
+
+struct TexEntry {
+    path: PathBuf,
+    label: String,
+    vflip: bool,
+    srgb: bool,
+    state: TexState,
+    last_used: u64,
+}
+
+/// The decode worker: jobs (key, file, label, vflip) in, decoded images out.
+struct Decoder {
+    jobs: std::sync::mpsc::Sender<(u64, PathBuf, String, bool)>,
+    results: std::sync::mpsc::Receiver<(u64, std::result::Result<DecodedImage, String>)>,
+}
+
+impl Decoder {
+    fn new() -> Decoder {
+        let (jobs, rx) = std::sync::mpsc::channel::<(u64, PathBuf, String, bool)>();
+        let (tx, results) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("shotglass-texture-decode".into())
+            .spawn(move || {
+                // Ends when the renderer (the sender) is dropped.
+                while let Ok((k, path, label, vflip)) = rx.recv() {
+                    if tx
+                        .send((k, crate::texture::load(&path, &label, vflip)))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+            .expect("spawn the texture decode thread");
+        Decoder { jobs, results }
+    }
+}
+
+/// Texel bytes uploaded per `pump` (about 1–3 ms of driver memcpy on a desktop GPU).
+pub const UPLOAD_BUDGET: usize = 8 << 20;
+/// Decoded images waiting for (or in) upload at once: bounds CPU memory.
+const TEXTURES_IN_FLIGHT: usize = 2;
 
 /// How far ahead of the playhead programs are compiled.
 pub const LOOKAHEAD: f32 = 10.0;
@@ -161,6 +241,8 @@ pub struct Renderer {
     frame_no: u64,
     /// Programs loaded from the on-disk cache instead of compiled.
     pub binary_hits: usize,
+    /// Scene and transition compiles started (tests: a texture edit compiles nothing).
+    pub compiles_started: usize,
     /// Strips a scene is drawn in (more when frames are very slow; see draw_scene).
     tiles: u32,
     /// `set_tiles` fixed the strip count: the GPU timer doesn't change it.
@@ -199,11 +281,26 @@ pub struct Renderer {
     /// current output was drawn that way.
     flip_output: bool,
     out_flipped: bool,
-    freeze_key: Option<(usize, u64)>,
+    /// (shot, movie generation, outgoing shot's keys) of the frozen frame.
+    freeze_key: Option<(usize, u64, ShotKeys)>,
     generation: u64,
     timer: Option<GpuTimer>,
     /// Portability warnings from assembling the current movie's shaders.
     pub warnings: Vec<String>,
+    /// Every texture we know about, keyed by `TexKey` (file, length, mtime, vflip, srgb).
+    textures: HashMap<u64, TexEntry>,
+    /// One sampler object per (filter, wrap), made once.
+    samplers: Vec<((Filter, Wrap), glow::Sampler)>,
+    decoder: Option<Decoder>,
+    /// Textures loaded on the spot (`usable` with `blocking`): playback must do none.
+    pub blocking_texture_loads: usize,
+    /// Bands of rows uploaded (tests: an upload is spread over frames).
+    pub texture_bands: usize,
+    /// Resident texture memory before `pump` evicts unused textures.
+    texture_budget: usize,
+    upload_budget: usize,
+    /// Time the last `pump` spent on textures (collecting decodes, uploading).
+    pub texture_ms: f32,
 }
 
 /// A sound block submitted with `Renderer::submit_audio`, not yet collected.
@@ -309,6 +406,27 @@ impl Renderer {
             // Asked once: on threaded drivers every glGet is a round trip.
             let max_texture_size = gl.get_parameter_i32(glow::MAX_TEXTURE_SIZE) as usize;
             let gl_info = format!("{renderer} · OpenGL {version} · GLSL {glsl}");
+            let mut samplers = vec![];
+            for filter in [Filter::Mipmap, Filter::Linear, Filter::Nearest] {
+                for wrap in [Wrap::Repeat, Wrap::Clamp, Wrap::Mirror] {
+                    let s = gl.create_sampler().map_err(|e| anyhow!(e))?;
+                    let (min, mag) = match filter {
+                        Filter::Mipmap => (glow::LINEAR_MIPMAP_LINEAR, glow::LINEAR),
+                        Filter::Linear => (glow::LINEAR, glow::LINEAR),
+                        Filter::Nearest => (glow::NEAREST, glow::NEAREST),
+                    };
+                    let w = match wrap {
+                        Wrap::Repeat => glow::REPEAT,
+                        Wrap::Clamp => glow::CLAMP_TO_EDGE,
+                        Wrap::Mirror => glow::MIRRORED_REPEAT,
+                    };
+                    gl.sampler_parameter_i32(s, glow::TEXTURE_MIN_FILTER, min as i32);
+                    gl.sampler_parameter_i32(s, glow::TEXTURE_MAG_FILTER, mag as i32);
+                    gl.sampler_parameter_i32(s, glow::TEXTURE_WRAP_S, w as i32);
+                    gl.sampler_parameter_i32(s, glow::TEXTURE_WRAP_T, w as i32);
+                    samplers.push(((filter, wrap), s));
+                }
+            }
             let binary_dir = if formats > 0 && std::env::var_os("SHOTGLASS_NO_CACHE").is_none() {
                 cache_dir().map(|d| d.join(format!("{:016x}", hash(&gl_info))))
             } else {
@@ -331,6 +449,7 @@ impl Renderer {
                 binary_dir,
                 frame_no: 0,
                 binary_hits: 0,
+                compiles_started: 0,
                 tiles: 1,
                 tiles_pinned: false,
                 last_error_check: None,
@@ -358,6 +477,14 @@ impl Renderer {
                 freeze_key: None,
                 generation: 0,
                 timer,
+                textures: HashMap::new(),
+                samplers,
+                decoder: None,
+                blocking_texture_loads: 0,
+                texture_bands: 0,
+                texture_budget: crate::texture::BUDGET,
+                upload_budget: UPLOAD_BUDGET,
+                texture_ms: 0.0,
             })
         }
     }
@@ -391,6 +518,39 @@ impl Renderer {
     pub fn set_tiles(&mut self, n: Option<u32>) {
         self.tiles_pinned = n.is_some();
         self.tiles = n.unwrap_or(1).max(1);
+    }
+
+    /// Resident texture memory before unused textures are evicted (tests force a tiny one).
+    pub fn set_texture_budget(&mut self, bytes: usize) {
+        self.texture_budget = bytes;
+    }
+
+    /// Texel bytes uploaded per `pump` (tests use a small one).
+    pub fn set_upload_budget(&mut self, bytes: usize) {
+        self.upload_budget = bytes.max(1);
+    }
+
+    /// Textures fully uploaded and held on the GPU.
+    pub fn textures_ready(&self) -> usize {
+        self.textures
+            .values()
+            .filter(|e| matches!(e.state, TexState::Ready { .. }))
+            .count()
+    }
+
+    /// The unpack state (alignment, row length, skip rows, skip pixels, unpack buffer
+    /// binding), for tests: uploads must leave it at the defaults.
+    pub fn unpack_state(&self) -> [i32; 5] {
+        unsafe {
+            [
+                glow::UNPACK_ALIGNMENT,
+                glow::UNPACK_ROW_LENGTH,
+                glow::UNPACK_SKIP_ROWS,
+                glow::UNPACK_SKIP_PIXELS,
+                glow::PIXEL_UNPACK_BUFFER_BINDING,
+            ]
+            .map(|p| self.gl.get_parameter_i32(p))
+        }
     }
 
     /// Compiled (ready) programs currently held.
@@ -439,6 +599,7 @@ impl Renderer {
         let src = transition_source(dialect, "copy", &[], &cues, movie);
         let copy = add(self, "copy pass".into(), src);
         let mut wanted = vec![];
+        let mut tex_errors = vec![];
         for shot in &movie.shots {
             let src = scene_source(dialect, shot, &cues, movie);
             let scene = add(
@@ -458,10 +619,55 @@ impl Renderer {
                 }
                 None => Some(None),
             };
+            let mut channels = [None; 4];
+            for (n, c) in shot.channels.iter().enumerate() {
+                let Some(c) = c else { continue };
+                match std::fs::metadata(&c.file) {
+                    Ok(md) => {
+                        let mtime = md
+                            .modified()
+                            .ok()
+                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                            .map_or(0, |d| d.as_nanos());
+                        let tex = hash(&format!(
+                            "{}\0{}\0{mtime}\0{}\0{}",
+                            c.file.display(),
+                            md.len(),
+                            c.vflip,
+                            c.srgb
+                        ));
+                        self.textures.entry(tex).or_insert(TexEntry {
+                            path: c.file.clone(),
+                            label: c.label.clone(),
+                            vflip: c.vflip,
+                            srgb: c.srgb,
+                            state: TexState::Idle,
+                            last_used: 0,
+                        });
+                        channels[n] = Some(ChanKey {
+                            tex,
+                            filter: c.filter,
+                            wrap: c.wrap,
+                        });
+                    }
+                    Err(e) => tex_errors.push(ShaderError {
+                        what: "movie.toml".into(),
+                        messages: vec![format!(
+                            "shot \"{}\": channels[{n}]: \"{}\": {e}",
+                            shot.id, c.label
+                        )],
+                    }),
+                }
+            }
             if let (Some(scene), Some(trans)) = (scene, trans) {
-                wanted.push(ShotKeys { scene, trans });
+                wanted.push(ShotKeys {
+                    scene,
+                    trans,
+                    channels,
+                });
             }
         }
+        errors.extend(tex_errors);
         warnings.dedup();
         self.warnings = warnings;
         if !errors.is_empty() {
@@ -508,6 +714,16 @@ impl Renderer {
         for k in &keys {
             self.compile_now(*k);
         }
+        let mut texs: Vec<u64> = self
+            .wanted
+            .iter()
+            .flat_map(|k| k.channels.iter().flatten().map(|c| c.tex))
+            .collect();
+        texs.sort_unstable();
+        texs.dedup();
+        for k in texs {
+            self.load_texture_now(k);
+        }
         let errors = self.errors();
         if errors.is_empty() {
             Ok(fresh)
@@ -540,7 +756,43 @@ impl Renderer {
                 });
             }
         }
+        for k in self
+            .wanted
+            .iter()
+            .flat_map(|k| k.channels.iter().flatten().map(|c| c.tex))
+        {
+            if let Some(TexEntry {
+                state: TexState::Failed(m),
+                ..
+            }) = self.textures.get(&k)
+                && seen.insert(k)
+            {
+                out.push(ShaderError {
+                    what: "texture".into(),
+                    messages: vec![m.clone()],
+                });
+            }
+        }
         out
+    }
+
+    /// (loaded, total) textures for the current version (failed ones count as loaded).
+    pub fn texture_progress(&self) -> (usize, usize) {
+        let keys: std::collections::HashSet<u64> = self
+            .wanted
+            .iter()
+            .flat_map(|k| k.channels.iter().flatten().map(|c| c.tex))
+            .collect();
+        let done = keys
+            .iter()
+            .filter(|k| {
+                matches!(
+                    self.textures.get(*k).map(|e| &e.state),
+                    Some(TexState::Ready { .. } | TexState::Failed(_))
+                )
+            })
+            .count();
+        (done, keys.len())
     }
 
     /// (ready, total) programs for the current version.
@@ -586,36 +838,42 @@ impl Renderer {
                 .filter(|e| matches!(e.state, State::Pending(_)))
                 .count()
         };
-        for (k, dist) in &order {
-            if *dist > LOOKAHEAD {
-                break;
-            }
-            if self.is_idle(*k) {
-                if self.parallel {
-                    self.start(*k);
-                } else {
-                    // Without parallel compiling a compile blocks: do one per frame.
-                    self.compile_now(*k);
-                    return;
-                }
-            }
-        }
-        if background {
-            // Everything else, so errors show up early. Few at a time.
-            for (k, _) in &order {
-                if in_flight(self) >= 2 {
+        'compile: {
+            for (k, dist) in &order {
+                if *dist > LOOKAHEAD {
                     break;
                 }
                 if self.is_idle(*k) {
                     if self.parallel {
                         self.start(*k);
                     } else {
+                        // Without parallel compiling a compile blocks: do one per frame.
                         self.compile_now(*k);
+                        break 'compile;
+                    }
+                }
+            }
+            if background {
+                // Everything else, so errors show up early. Few at a time.
+                for (k, _) in &order {
+                    if in_flight(self) >= 2 {
                         break;
+                    }
+                    if self.is_idle(*k) {
+                        if self.parallel {
+                            self.start(*k);
+                        } else {
+                            self.compile_now(*k);
+                            break;
+                        }
                     }
                 }
             }
         }
+        let tex_order = self.texture_order(movie, t);
+        let t_tex = std::time::Instant::now();
+        self.pump_textures(&tex_order, background);
+        self.texture_ms = ms_since(t_tex);
         // Drop fallbacks once their replacement works.
         let ready_ids: Vec<String> = self
             .wanted_ids
@@ -630,6 +888,290 @@ impl Renderer {
         if self.frame_no.is_multiple_of(30) {
             self.collect_garbage();
             self.evict(&order);
+            self.evict_textures(&tex_order);
+        }
+    }
+
+    /// Textures sorted by how soon the playhead needs them (seconds).
+    fn texture_order(&self, movie: &Movie, t: f32) -> Vec<(u64, f32)> {
+        let mut v: Vec<(u64, f32)> = vec![];
+        for (i, shot) in movie.shots.iter().enumerate() {
+            let Some(k) = self.wanted.get(i) else {
+                continue;
+            };
+            let d = distance(shot, t);
+            v.extend(k.channels.iter().flatten().map(|c| (c.tex, d)));
+        }
+        v.sort_by(|a, b| a.1.total_cmp(&b.1));
+        let mut seen = std::collections::HashSet::new();
+        v.retain(|(k, _)| seen.insert(*k));
+        v
+    }
+
+    /// Texture housekeeping, never blocking: collect finished decodes, upload at most
+    /// `upload_budget` bytes of rows (nearest first), start decodes within the
+    /// lookahead (everything with `background`), a couple at a time.
+    fn pump_textures(&mut self, order: &[(u64, f32)], background: bool) {
+        if self.textures.is_empty() {
+            return;
+        }
+        if let Some(d) = &self.decoder {
+            while let Ok((k, r)) = d.results.try_recv() {
+                if let Some(e) = self.textures.get_mut(&k)
+                    && matches!(e.state, TexState::Decoding)
+                {
+                    e.state = match r {
+                        Ok(img) => TexState::Decoded(img),
+                        Err(m) => TexState::Failed(m),
+                    };
+                }
+            }
+        }
+        let wanted = |d: f32| background || d <= LOOKAHEAD;
+        let mut budget = self.upload_budget;
+        for (k, d) in order {
+            if budget == 0 || !wanted(*d) {
+                break;
+            }
+            budget = self.upload_some(*k, budget);
+        }
+        let in_flight = |r: &Renderer| {
+            r.textures
+                .values()
+                .filter(|e| {
+                    matches!(
+                        e.state,
+                        TexState::Decoding | TexState::Decoded(_) | TexState::Uploading { .. }
+                    )
+                })
+                .count()
+        };
+        for (k, d) in order {
+            if !wanted(*d) || in_flight(self) >= TEXTURES_IN_FLIGHT {
+                break;
+            }
+            let Some(e) = self.textures.get_mut(k) else {
+                continue;
+            };
+            if matches!(e.state, TexState::Idle) {
+                let job = (*k, e.path.clone(), e.label.clone(), e.vflip);
+                e.state = TexState::Decoding;
+                let d = self.decoder.get_or_insert_with(Decoder::new);
+                if d.jobs.send(job).is_err() {
+                    self.textures.get_mut(k).unwrap().state =
+                        TexState::Failed("the texture decode thread stopped".into());
+                }
+            }
+        }
+    }
+
+    /// Upload up to `budget` bytes of texture `k` (at least one row, so a wide image
+    /// still makes progress), starting its upload if it's decoded. Returns the budget left.
+    fn upload_some(&mut self, k: u64, budget: usize) -> usize {
+        let Some(e) = self.textures.get_mut(&k) else {
+            return budget;
+        };
+        if !matches!(e.state, TexState::Decoded(_) | TexState::Uploading { .. }) {
+            return budget;
+        }
+        let (srgb, label) = (e.srgb, e.label.clone());
+        let (tex, img, row) = match std::mem::replace(&mut e.state, TexState::Idle) {
+            TexState::Decoded(img) => match self.begin_upload(&img, srgb, &label) {
+                Ok(tex) => (tex, img, 0),
+                Err(m) => {
+                    self.textures.get_mut(&k).unwrap().state = TexState::Failed(m);
+                    return budget;
+                }
+            },
+            TexState::Uploading { tex, img, row } => (tex, img, row),
+            other => {
+                self.textures.get_mut(&k).unwrap().state = other;
+                return budget;
+            }
+        };
+        let row_bytes = img.width * 4;
+        let rows = (budget / row_bytes).clamp(1, img.height - row);
+        self.upload_rows(tex, &img, row, rows);
+        let row = row + rows;
+        let state = if row == img.height {
+            TexState::Ready {
+                tex,
+                w: img.width,
+                h: img.height,
+                bytes: crate::texture::gpu_bytes(img.width, img.height),
+            }
+        } else {
+            TexState::Uploading { tex, img, row }
+        };
+        self.textures.get_mut(&k).unwrap().state = state;
+        budget.saturating_sub(rows * row_bytes)
+    }
+
+    /// Make texture `k` ready (or failed) now: decode on this thread if needed and
+    /// upload the rest at once. Only for paused/scrubbing and headless renders.
+    fn load_texture_now(&mut self, k: u64) {
+        let Some(e) = self.textures.get_mut(&k) else {
+            return;
+        };
+        match &e.state {
+            TexState::Ready { .. } | TexState::Failed(_) => return,
+            TexState::Idle | TexState::Decoding => {
+                // A worker may be decoding it too; its result is ignored once this is done.
+                e.state = match crate::texture::load(&e.path, &e.label, e.vflip) {
+                    Ok(img) => TexState::Decoded(img),
+                    Err(m) => TexState::Failed(m),
+                };
+            }
+            _ => {}
+        }
+        self.blocking_texture_loads += 1;
+        self.upload_some(k, usize::MAX);
+    }
+
+    /// Allocate level 0 (`RGBA8`, or `SRGB8_ALPHA8` with `srgb`) for `img`.
+    fn begin_upload(
+        &self,
+        img: &DecodedImage,
+        srgb: bool,
+        label: &str,
+    ) -> std::result::Result<glow::Texture, String> {
+        let max = self.max_texture_size;
+        if img.width > max || img.height > max {
+            return Err(format!(
+                "{label}: {}×{} is larger than this GPU's limit of {max} (GL_MAX_TEXTURE_SIZE)",
+                img.width, img.height
+            ));
+        }
+        let gl = &self.gl;
+        unsafe {
+            let tex = gl.create_texture()?;
+            gl.active_texture(glow::TEXTURE0);
+            gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+            let internal = if srgb {
+                glow::SRGB8_ALPHA8
+            } else {
+                glow::RGBA8
+            };
+            gl.tex_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                internal as i32,
+                img.width as i32,
+                img.height as i32,
+                0,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelUnpackData::Slice(None),
+            );
+            // Sampling state comes from sampler objects; these only keep the texture
+            // complete if one is ever sampled without.
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_MIN_FILTER,
+                glow::LINEAR_MIPMAP_LINEAR as i32,
+            );
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_MAG_FILTER,
+                glow::LINEAR as i32,
+            );
+            gl.bind_texture(glow::TEXTURE_2D, None);
+            Ok(tex)
+        }
+    }
+
+    /// Submit rows `row .. row + rows` of level 0 from client memory (the driver copies
+    /// them before returning: nothing to wait for), and the mipmaps after the last band.
+    /// The unpack state is set for the band and put back to GL's defaults, and no
+    /// unpack buffer is bound (with one bound, the slice would be read as an offset).
+    fn upload_rows(&mut self, tex: glow::Texture, img: &DecodedImage, row: usize, rows: usize) {
+        let gl = &self.gl;
+        let stride = img.width * 4;
+        unsafe {
+            gl.active_texture(glow::TEXTURE0);
+            gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+            gl.bind_buffer(glow::PIXEL_UNPACK_BUFFER, None);
+            gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
+            gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, 0);
+            gl.pixel_store_i32(glow::UNPACK_SKIP_ROWS, 0);
+            gl.pixel_store_i32(glow::UNPACK_SKIP_PIXELS, 0);
+            gl.tex_sub_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                0,
+                row as i32,
+                img.width as i32,
+                rows as i32,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelUnpackData::Slice(Some(&img.rgba[row * stride..(row + rows) * stride])),
+            );
+            gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 4);
+            if row + rows == img.height {
+                gl.generate_mipmap(glow::TEXTURE_2D);
+            }
+            gl.bind_texture(glow::TEXTURE_2D, None);
+        }
+        self.texture_bands += 1;
+    }
+
+    fn texture_ready(&self, k: u64) -> bool {
+        matches!(
+            self.textures.get(&k).map(|e| &e.state),
+            Some(TexState::Ready { .. })
+        )
+    }
+
+    /// Keep resident texture memory under the budget: drop the least recently used
+    /// textures that the playhead won't need soon and no fallback holds. They come
+    /// back through the same decode and upload, identically.
+    fn evict_textures(&mut self, order: &[(u64, f32)]) {
+        let mut total: usize = self
+            .textures
+            .values()
+            .map(|e| match e.state {
+                TexState::Ready { bytes, .. } => bytes,
+                _ => 0,
+            })
+            .sum();
+        if total <= self.texture_budget {
+            return;
+        }
+        let near: std::collections::HashSet<u64> = order
+            .iter()
+            .filter(|(_, d)| *d <= LOOKAHEAD * 1.5)
+            .map(|(k, _)| *k)
+            .collect();
+        let held: std::collections::HashSet<u64> = self
+            .fallback
+            .values()
+            .flat_map(|f| f.channels.iter().flatten().map(|c| c.tex))
+            .collect();
+        let mut candidates: Vec<(u64, u64, usize)> = self
+            .textures
+            .iter()
+            .filter_map(|(k, e)| match e.state {
+                TexState::Ready { bytes, .. } if !near.contains(k) && !held.contains(k) => {
+                    Some((*k, e.last_used, bytes))
+                }
+                _ => None,
+            })
+            .collect();
+        candidates.sort_by_key(|(_, used, _)| *used);
+        for (k, _, bytes) in candidates {
+            if total <= self.texture_budget {
+                break;
+            }
+            let e = self.textures.get_mut(&k).unwrap();
+            let old = std::mem::replace(&mut e.state, TexState::Idle);
+            self.delete_texture_state(old);
+            total -= bytes;
+        }
+    }
+
+    fn delete_texture_state(&self, s: TexState) {
+        if let TexState::Ready { tex, .. } | TexState::Uploading { tex, .. } = s {
+            unsafe { self.gl.delete_texture(tex) };
         }
     }
 
@@ -640,13 +1182,7 @@ impl Renderer {
             let Some(k) = self.wanted.get(i) else {
                 continue;
             };
-            let d = if t < shot.start {
-                shot.start - t
-            } else if t > shot.end() {
-                (t - shot.end()) * 2.0 // behind the playhead: only needed when scrubbing back
-            } else {
-                0.0
-            };
+            let d = distance(shot, t);
             v.push((k.scene, d));
             if let Some(tr) = k.trans {
                 v.push((tr, d));
@@ -673,7 +1209,12 @@ impl Renderer {
                 Some(State::Ready(_))
             )
         };
-        ok(k.scene) && k.trans.is_none_or(ok)
+        ok(k.scene)
+            && k.trans.is_none_or(ok)
+            && k.channels
+                .iter()
+                .flatten()
+                .all(|c| self.texture_ready(c.tex))
     }
 
     /// The programs to draw shot `i` with: the current version if it compiled,
@@ -685,6 +1226,9 @@ impl Renderer {
             self.compile_now(k.scene);
             if let Some(t) = k.trans {
                 self.compile_now(t);
+            }
+            for c in k.channels.iter().flatten() {
+                self.load_texture_now(c.tex);
             }
         }
         if self.keys_ready(k) {
@@ -699,7 +1243,7 @@ impl Renderer {
             return Some(f);
         }
         // Nothing working to show: with `blocking`, draw what we have (a failed
-        // scene shows black); otherwise wait for the compile.
+        // scene shows black, a failed texture reads black); otherwise wait.
         blocking.then_some(k)
     }
 
@@ -714,6 +1258,7 @@ impl Renderer {
             Ok(p) => State::Pending(p),
             Err(m) => State::Failed(m),
         };
+        self.compiles_started += 1;
         self.programs.get_mut(&k).unwrap().state = state;
     }
 
@@ -761,6 +1306,23 @@ impl Renderer {
         for k in drop {
             if let Some(e) = self.programs.remove(&k) {
                 self.delete_state(e.state);
+            }
+        }
+        let keep: std::collections::HashSet<u64> = self
+            .wanted
+            .iter()
+            .chain(self.fallback.values())
+            .flat_map(|k| k.channels.iter().flatten().map(|c| c.tex))
+            .collect();
+        let drop: Vec<u64> = self
+            .textures
+            .keys()
+            .filter(|k| !keep.contains(k))
+            .copied()
+            .collect();
+        for k in drop {
+            if let Some(e) = self.textures.remove(&k) {
+                self.delete_texture_state(e.state);
             }
         }
     }
@@ -942,6 +1504,18 @@ impl Renderer {
                     }
                 }
             }
+            // The channel samplers read units 0..3, always: set once here (this also
+            // covers programs loaded from the binary cache, whose uniforms reset).
+            let units: Vec<(&glow::UniformLocation, i32)> = (0..4)
+                .filter_map(|n| locs.get(CHANNEL_UNIFORMS[n]).map(|l| (l, n as i32)))
+                .collect();
+            if !units.is_empty() {
+                gl.use_program(Some(p.prog));
+                for (l, n) in units {
+                    gl.uniform_1_i32(Some(l), n);
+                }
+                gl.use_program(None);
+            }
             Ok(Program { prog: p.prog, locs })
         }
     }
@@ -1032,6 +1606,11 @@ impl Renderer {
                     e.last_used = frame_no;
                 }
             }
+            for c in k.channels.iter().flatten() {
+                if let Some(e) = self.textures.get_mut(&c.tex) {
+                    e.last_used = frame_no;
+                }
+            }
         }
         if let Some(timer) = &mut self.timer {
             timer.begin(&self.gl);
@@ -1042,7 +1621,7 @@ impl Renderer {
         match at {
             At::Shot { shot, local } => {
                 self.draw_scene(
-                    keys[0].scene,
+                    keys[0],
                     &movie.shots[shot],
                     local,
                     Which::A,
@@ -1065,14 +1644,14 @@ impl Renderer {
                     unreachable!()
                 };
                 let from_target = if tr.freeze {
-                    let key = (to, self.generation);
+                    let key = (to, self.generation, keys[0]);
                     if self.freeze_key != Some(key)
                         || self.freeze.as_ref().is_none_or(|f| f.alloc != (w, h))
                     {
                         ensure_target(&self.gl, &mut self.freeze, w, h);
                         let freeze_local = movie.shots[to].start - movie.shots[from].start;
                         self.draw_scene(
-                            keys[0].scene,
+                            keys[0],
                             &movie.shots[from],
                             freeze_local,
                             Which::Freeze,
@@ -1086,7 +1665,7 @@ impl Renderer {
                     Which::Freeze
                 } else {
                     self.draw_scene(
-                        keys[0].scene,
+                        keys[0],
                         &movie.shots[from],
                         from_local,
                         Which::A,
@@ -1098,7 +1677,7 @@ impl Renderer {
                     Which::A
                 };
                 self.draw_scene(
-                    keys[1].scene,
+                    keys[1],
                     &movie.shots[to],
                     to_local,
                     Which::B,
@@ -1187,7 +1766,7 @@ impl Renderer {
     #[allow(clippy::too_many_arguments)]
     fn draw_scene(
         &mut self,
-        prog: u64,
+        keys: ShotKeys,
         shot: &Shot,
         local: f32,
         into: Which,
@@ -1204,7 +1783,7 @@ impl Renderer {
         };
         t.used = (sw, sh);
         let fbo = t.fbo;
-        let Some(p) = self.prog(prog) else {
+        let Some(p) = self.prog(keys.scene) else {
             // failed with no working version: show black
             unsafe {
                 gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
@@ -1248,15 +1827,34 @@ impl Renderer {
             if let Some(l) = p.loc("iDate") {
                 gl.uniform_4_f32(Some(l), 2026.0, 0.0, 1.0, shot.start + local);
             }
-            for (i, ch) in ["iChannel0", "iChannel1", "iChannel2", "iChannel3"]
-                .iter()
-                .enumerate()
-            {
-                if let Some(l) = p.loc(ch) {
-                    gl.active_texture(glow::TEXTURE0 + i as u32);
-                    gl.bind_texture(glow::TEXTURE_2D, Some(self.dummy));
-                    gl.uniform_1_i32(Some(l), i as i32);
+            // Channels: the texture and its sampler on unit n (the iChannelN uniforms
+            // were set to n at link time), or black with resolution 0.
+            let mut res = [0f32; 12];
+            let mut sampled = false;
+            for (n, c) in keys.channels.iter().enumerate() {
+                let ready = c.and_then(|c| match self.textures.get(&c.tex)?.state {
+                    TexState::Ready { tex, w, h, .. } => Some((tex, w, h, self.sampler(c))),
+                    _ => None,
+                });
+                if ready.is_none() && p.loc(CHANNEL_UNIFORMS[n]).is_none() {
+                    continue;
                 }
+                gl.active_texture(glow::TEXTURE0 + n as u32);
+                match ready {
+                    Some((tex, w, h, sampler)) => {
+                        gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+                        gl.bind_sampler(n as u32, Some(sampler));
+                        res[n * 3..n * 3 + 3].copy_from_slice(&[w as f32, h as f32, 1.0]);
+                        sampled = true;
+                    }
+                    None => {
+                        gl.bind_texture(glow::TEXTURE_2D, Some(self.dummy));
+                        gl.bind_sampler(n as u32, None);
+                    }
+                }
+            }
+            if let Some(l) = p.loc("iChannelResolution") {
+                gl.uniform_3_f32_slice(Some(l), &res);
             }
             for (name, a) in &shot.uniforms {
                 if let Some(l) = p.loc(name) {
@@ -1282,7 +1880,23 @@ impl Renderer {
                 }
                 gl.viewport(0, 0, sw, sh);
             }
+            // Sampler objects override texture state on their unit: unbind them, or
+            // the composite pass (and egui) would sample through them.
+            if sampled {
+                for n in 0..4 {
+                    gl.bind_sampler(n, None);
+                }
+            }
+            gl.active_texture(glow::TEXTURE0);
         }
+    }
+
+    fn sampler(&self, c: ChanKey) -> glow::Sampler {
+        self.samplers
+            .iter()
+            .find(|(k, _)| *k == (c.filter, c.wrap))
+            .map(|(_, s)| *s)
+            .expect("a sampler for every (filter, wrap)")
     }
 
     fn composite(&mut self, prog: u64, from: Which, to: Which, progress: f32, w: i32, h: i32) {
@@ -1883,6 +2497,22 @@ pub fn scene_source(dialect: Dialect, shot: &Shot, cues: &str, movie: &Movie) ->
         .build())
 }
 
+/// Which of `iChannel0..3` an assembled scene mentions, outside the header that
+/// declares them (`check` warns when a shot reads a channel it binds nothing to).
+pub fn channels_read(src: &Assembled) -> [bool; 4] {
+    let text = src.text.replacen(SCENE_HEADER, "", 1);
+    let mut out = [false; 4];
+    for (n, name) in CHANNEL_UNIFORMS.iter().enumerate() {
+        out[n] = text.match_indices(name).any(|(i, _)| {
+            let before = text[..i].chars().next_back();
+            let after = text[i + name.len()..].chars().next();
+            let ident = |c: Option<char>| c.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+            !ident(before) && !ident(after)
+        });
+    }
+    out
+}
+
 /// The fragment shader for a transition (a built-in name or a path ending in .glsl).
 pub fn transition_source(
     dialect: Dialect,
@@ -2087,6 +2717,12 @@ impl Drop for Renderer {
                 self.gl.delete_framebuffer(t.fbo);
                 self.gl.delete_texture(t.tex);
             }
+            for (_, e) in std::mem::take(&mut self.textures) {
+                self.delete_texture_state(e.state);
+            }
+            for (_, s) in std::mem::take(&mut self.samplers) {
+                self.gl.delete_sampler(s);
+            }
             self.gl.delete_vertex_array(self.vao);
             self.gl.delete_texture(self.dummy);
         }
@@ -2193,6 +2829,18 @@ fn hash(s: &str) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     s.hash(&mut h);
     h.finish()
+}
+
+/// How soon the playhead at `t` needs `shot` (seconds); behind it counts double (only
+/// needed when scrubbing back).
+fn distance(shot: &Shot, t: f32) -> f32 {
+    if t < shot.start {
+        shot.start - t
+    } else if t > shot.end() {
+        (t - shot.end()) * 2.0
+    } else {
+        0.0
+    }
 }
 
 fn invalid_at(movie: &Movie, at: At) -> bool {

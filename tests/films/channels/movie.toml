@@ -1,0 +1,25 @@
+# Golden-image film for iChannel textures (tests/golden.rs): mipmaps on a receding
+# plane, repeat, nearest, clamp, mirror, vflip, iChannelResolution, an unbound channel,
+# and a frozen transition out of a textured shot.
+shotglass = "0.1.1"
+title = "channels"
+fps = 30
+channels = ["grid", "photo"]   # film-wide default: shot "plane" uses it
+
+[textures]
+grid = "textures/grid.png"     # mipmap, repeat, vflip (the defaults)
+photo = "textures/photo.jpg"
+grid_nearest = { file = "textures/grid.png", filter = "nearest", wrap = "clamp" }
+grid_mirror = { file = "textures/grid.png", filter = "linear", wrap = "mirror", vflip = false }
+
+[[shot]]
+id = "plane"
+scene = "scenes/plane.glsl"
+duration = 3.0
+
+[[shot]]
+id = "panels"
+scene = "scenes/panels.glsl"
+duration = 3.0
+channels = ["grid_nearest", "grid_mirror", "photo"]   # iChannel3 stays black
+transition = { type = "fx/mix.glsl", duration = 1.0, freeze = true }

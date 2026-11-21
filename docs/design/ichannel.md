@@ -1,7 +1,7 @@
 # Design: iChannel textures
 
-Issue: [#22](https://github.com/antonmarsden/shotglass/issues/22). Status: **design agreed**
-(decisions at the end), not implemented. The heavy-assets design (#32) builds on the decisions here.
+Issue: [#22](https://github.com/antonmarsden/shotglass/issues/22). Status: **implemented**
+(decisions at the end; PR 1 and PR 2 of the plan landed together, see "Implementation notes"). The heavy-assets design (#32) builds on the decisions here.
 
 ## Summary
 
@@ -611,3 +611,27 @@ for now; any can be revisited during implementation.
    removes the refusal.
 9. **Missing vs broken files:** a missing file refuses the whole new version (like a
    missing include); a broken or half-saved file falls back to the last working texture.
+
+## Implementation notes
+
+Where the implementation settled something the design left open:
+
+- **One PR, not two.** The syntax/`check` part and the renderer landed together, so there
+  is no "textures arrive in the next version" refusal (decision 8 never shipped).
+- **Every texture gets mipmaps,** whatever its `filter`, and the texture key has no
+  "mipmapped" bit. That is what makes "one file used with `nearest` in one shot and
+  `mipmap` in another is uploaded once" true; the cost is a third more memory for
+  textures that are never minified, and the budget counts it.
+- **`[textures]` and `channels` entries are parsed by hand** from TOML values rather than
+  with an untagged serde enum, so an unknown option names itself
+  (``unknown option `filtr` ``) instead of serde's "did not match any variant".
+- **Missing files and the per-shot budget are checked in `Movie::load`** (with "did you
+  mean"), so the player refuses such a version before the renderer sees it; `set_movie`
+  still refuses a file that vanished in between.
+- **The freeze key also holds the outgoing shot's keys,** so a frozen frame drawn with a
+  fallback texture is redrawn once the edited texture is uploaded.
+- **Headless commands fail on a broken texture** (`load_all` reports it like a compile
+  error) rather than rendering black; the player shows black only without a previous
+  working version, as designed.
+- **Decode warnings** (16-bit, an extension that disagrees with the content) are printed
+  by `check`; the player doesn't show them.
