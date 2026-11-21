@@ -321,7 +321,30 @@ fn expect_same(what: &str, a: &Frame, b: &Frame, tol: u8, frac: f32) -> Result<(
     Ok(())
 }
 
+/// Transitions the fixture films use, as files in the film (`type = "fx/wipe.glsl"`):
+/// shotglass has no built-in looks, and the selftest must not need the network.
+const FX: &[(&str, &str)] = &[
+    (
+        "fx/crossfade.glsl",
+        "vec4 transition(vec2 uv) { return mix(getFromColor(uv), getToColor(uv), progress); }\n",
+    ),
+    (
+        "fx/wipe.glsl",
+        "#ifndef direction\n#define direction vec2(1.0, 0.0)\n#endif\n\
+         #ifndef softness\n#define softness 0.01\n#endif\n\
+         vec4 transition(vec2 uv) {\n\
+         \x20   vec2 d = normalize(direction);\n\
+         \x20   float lo = min(min(0.0, d.x), min(d.y, d.x + d.y));\n\
+         \x20   float hi = max(max(0.0, d.x), max(d.y, d.x + d.y));\n\
+         \x20   float edge = mix(lo - softness, hi + softness, progress);\n\
+         \x20   float m = smoothstep(edge - softness, edge + softness, dot(uv, d));\n\
+         \x20   return mix(getToColor(uv), getFromColor(uv), m);\n\
+         }\n",
+    ),
+];
+
 fn movie(dir: &Path, toml: &str) -> Result<Movie> {
+    write(dir, FX)?;
     std::fs::write(dir.join("movie.toml"), toml)?;
     Movie::load(dir)
 }
@@ -430,13 +453,13 @@ fn transition_endpoints(gl: &Gl, dir: &Path) -> Result<String> {
         ],
     )?;
     let kinds = [
-        ("crossfade", ""),
-        ("fade", ""),
-        ("fade", "params = { hold = 0.3, color = [0.2, 0.4, 0.6] }, "),
-        ("iris", ""),
-        ("iris", "params = { closing = 1.0, center = [0.3, 0.6] }, "),
-        ("dissolve", ""),
-        ("wipe", "params = { direction = [-0.4, 1.0] }, "),
+        ("fx/crossfade.glsl", ""),
+        ("fx/wipe.glsl", ""),
+        ("fx/wipe.glsl", "params = { direction = [-0.4, 1.0] }, "),
+        (
+            "fx/wipe.glsl",
+            "params = { direction = [0.0, -1.0], softness = 0.2 }, ",
+        ),
     ];
     for (kind, params) in kinds {
         let m = movie(
@@ -474,7 +497,7 @@ fn transition_endpoints(gl: &Gl, dir: &Path) -> Result<String> {
         };
         let p0 = shot(&mut r, &m, tr(0.0), 1.0)?;
         let p1 = shot(&mut r, &m, tr(1.0), 1.0)?;
-        // An iris centre pixel can sit exactly on the edge: allow a handful of pixels.
+        // A pixel can sit exactly on a wipe's edge: allow a handful.
         expect_same(&format!("{kind} {params}at progress 0"), &p0, &a, 2, 0.002)?;
         expect_same(&format!("{kind} {params}at progress 1"), &p1, &b, 2, 0.002)?;
     }
@@ -500,7 +523,7 @@ fn crossfade_and_freeze(gl: &Gl, dir: &Path) -> Result<String> {
             dir,
             &format!(
                 "[[shot]]\nid=\"a\"\nscene=\"a.glsl\"\nduration=3\n[[shot]]\nid=\"b\"\nscene=\"b.glsl\"\nduration=3\n\
-                 transition = {{ type = \"crossfade\", duration = 1, ease = \"linear\", freeze = {freeze} }}\n"
+                 transition = {{ type = \"fx/crossfade.glsl\", duration = 1, ease = \"linear\", freeze = {freeze} }}\n"
             ),
         )?;
         let mut r = renderer(gl, &m)?;
@@ -557,7 +580,7 @@ fn render_scale_edges(gl: &Gl, dir: &Path) -> Result<String> {
     let m = movie(
         dir,
         "[[shot]]\nid=\"a\"\nscene=\"a.glsl\"\nduration=3\n[[shot]]\nid=\"b\"\nscene=\"b.glsl\"\nduration=3\n\
-         transition = { type = \"crossfade\", duration = 1, ease = \"linear\" }\n",
+         transition = { type = \"fx/crossfade.glsl\", duration = 1, ease = \"linear\" }\n",
     )?;
     let mut r = renderer(gl, &m)?;
     let solid = |c: [f32; 3]| -> Frame {
@@ -663,7 +686,7 @@ fn readback_into(gl: &Gl, dir: &Path) -> Result<String> {
     let m = movie(
         dir,
         "[[shot]]\nid=\"a\"\nscene=\"a.glsl\"\nduration=2\n[[shot]]\nid=\"b\"\nscene=\"b.glsl\"\nduration=2\n\
-         transition = { type = \"wipe\", duration = 1 }\n",
+         transition = { type = \"fx/wipe.glsl\", duration = 1 }\n",
     )?;
     let defaults = [4, 0, 0, 0];
     let mut plain = renderer(gl, &m)?;
@@ -1209,7 +1232,7 @@ duration = 0.937
 sound = "tone.glsl"
 sound_lead = 0.1
 uniforms.uPitch = 1.5
-transition = { type = "crossfade", duration = 0.4 }
+transition = { type = "fx/crossfade.glsl", duration = 0.4 }
 
 [[shot]]
 id = "c"
@@ -1476,7 +1499,7 @@ duration = 0.8
 id = "b"
 scene = "b.glsl"
 duration = 0.9
-transition = { type = "crossfade", duration = 0.4 }
+transition = { type = "fx/crossfade.glsl", duration = 0.4 }
 "#;
 
 /// Decode a video's frames as RGBA and its audio as 16-bit PCM bytes, with ffmpeg.

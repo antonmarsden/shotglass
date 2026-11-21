@@ -158,8 +158,7 @@ struct MarkerFile {
 #[derive(Clone, Debug)]
 pub struct Transition {
     /// A library transition (`transitions/iris`: `iris.glsl` in the library the film calls
-    /// `transitions`), a path to a .glsl file in the film, or a deprecated built-in name
-    /// (crossfade, fade, iris, dissolve, wipe).
+    /// `transitions`) or a path to a .glsl file in the film.
     pub kind: String,
     pub duration: f32,
     /// Render the outgoing shot once (its frame at the transition start) instead of live.
@@ -493,7 +492,6 @@ impl Movie {
         let path_rule = |what: String, p: &str| -> Result<()> {
             library::check_rel_path(p).map_err(|e| anyhow!("{what}: {e}"))
         };
-        let mut deprecated: Vec<String> = vec![];
         let mut library_specs = vec![];
         for (name, d) in &f.libraries {
             library_specs.push(LibrarySpec::parse(name, d)?);
@@ -592,14 +590,8 @@ impl Movie {
                         }
                         path_rule(format!("{}: transition", ctx()), &file)?;
                     }
-                    TransitionKind::Builtin(name) => {
-                        if !deprecated.contains(&name.to_string())
-                            && crate::gfx::BUILTIN_TRANSITIONS
-                                .iter()
-                                .any(|(n, _)| *n == name && *n != "copy")
-                        {
-                            deprecated.push(name.to_string());
-                        }
+                    TransitionKind::Name(name) => {
+                        bail!("{}: {}", ctx(), bare_transition_error(name, &library_specs))
                     }
                 }
             }
@@ -757,15 +749,10 @@ impl Movie {
                 .collect(),
             duration,
             shotglass: f.shotglass,
-            warnings: deprecated
-                .iter()
-                .map(|n| builtin_transition_warning(n, &library_specs))
-                .chain(
-                    textures
-                        .keys()
-                        .filter(|n| !used.contains(*n))
-                        .map(|n| format!("[textures] {n} isn't used by any shot's channels")),
-                )
+            warnings: textures
+                .keys()
+                .filter(|n| !used.contains(*n))
+                .map(|n| format!("[textures] {n} isn't used by any shot's channels"))
                 .collect(),
             library_specs,
             libraries: vec![],
@@ -1073,8 +1060,9 @@ pub enum TransitionKind<'a> {
     File(&'a str),
     /// A file in a library: (`transitions`, `iris.glsl`) for `transitions/iris`.
     Library(&'a str, String),
-    /// A built-in name (`iris`), deprecated.
-    Builtin(&'a str),
+    /// A bare name (`iris`): not a film transition. The engine uses `copy` internally;
+    /// the built-in looks were removed in favour of the kit's.
+    Name(&'a str),
 }
 
 pub fn transition_kind(kind: &str) -> TransitionKind<'_> {
@@ -1083,12 +1071,12 @@ pub fn transition_kind(kind: &str) -> TransitionKind<'_> {
     } else if let Some((lib, rest)) = kind.split_once('/') {
         TransitionKind::Library(lib, format!("{rest}.glsl"))
     } else {
-        TransitionKind::Builtin(kind)
+        TransitionKind::Name(kind)
     }
 }
 
-/// The deprecation warning for a built-in transition, naming its kit replacement.
-fn builtin_transition_warning(name: &str, specs: &[LibrarySpec]) -> String {
+/// The error for a bare transition name (`iris`), naming its kit replacement.
+fn bare_transition_error(name: &str, specs: &[LibrarySpec]) -> String {
     let kit = specs.iter().find(|s| {
         s.subdir.as_deref() == Some("transitions")
             && s.source
@@ -1097,15 +1085,15 @@ fn builtin_transition_warning(name: &str, specs: &[LibrarySpec]) -> String {
     });
     match kit {
         Some(s) => format!(
-            "transition \"{name}\" is built into this shotglass and will be removed; use \
-             type = \"{}/{name}\" (same parameters) from shotglass-kit",
+            "transition \"{name}\" isn't a library transition or a .glsl file; shotglass has \
+             no built-in transitions: use type = \"{}/{name}\" from shotglass-kit",
             s.name
         ),
         None => format!(
-            "transition \"{name}\" is built into this shotglass and will be removed; use \
-             shotglass-kit's (same parameters): add transitions = {{ source = \
+            "transition \"{name}\" isn't a library transition or a .glsl file; shotglass has \
+             no built-in transitions: add transitions = {{ source = \
              \"https://github.com/antonmarsden/shotglass-kit\", subdir = \"transitions\" }} \
-             to [libraries], then type = \"transitions/{name}\""
+             to [libraries], then use type = \"transitions/{name}\""
         ),
     }
 }
@@ -1140,7 +1128,7 @@ mod tests {
         id = "b"
         scene = "b.glsl"
         duration = 4
-        transition = { type = "crossfade", duration = 1 }
+        transition = { type = "fx/crossfade.glsl", duration = 1 }
         [[shot]]
         id = "c"
         scene = "c.glsl"
@@ -1283,12 +1271,12 @@ mod tests {
             id = "b"
             scene = "b.glsl"
             duration = 2
-            transition = { type = "fade", duration = 1.5 }
+            transition = { type = "fx/fade.glsl", duration = 1.5 }
             [[shot]]
             id = "c"
             scene = "c.glsl"
             duration = 2
-            transition = { type = "fade", duration = 1.0 }
+            transition = { type = "fx/fade.glsl", duration = 1.0 }
         "#;
         let e = Movie::parse(bad, Path::new(".")).unwrap_err().to_string();
         assert!(e.contains("overlaps"), "{e}");
@@ -1309,7 +1297,7 @@ mod tests {
             duration = 4
             sound = "b.glsl"
             sound_lead = 0.5
-            transition = { type = "crossfade", duration = 1, ease = "linear" }
+            transition = { type = "fx/crossfade.glsl", duration = 1, ease = "linear" }
             "#,
             Path::new("."),
         )
@@ -1331,7 +1319,7 @@ mod tests {
                 &format!(
                     "[[shot]]\nid=\"a\"\nscene=\"a.glsl\"\nduration=3\nsound=\"a.glsl\"\n\
                      [[shot]]\nid=\"b\"\nscene=\"b.glsl\"\nduration=3\nsound=\"b.glsl\"\n\
-                     transition = {{ type = \"crossfade\", duration = 1.5, ease = \"{ease}\" }}\n"
+                     transition = {{ type = \"fx/crossfade.glsl\", duration = 1.5, ease = \"{ease}\" }}\n"
                 ),
                 Path::new("."),
             )
@@ -1369,7 +1357,7 @@ mod tests {
                         let room = (prev_dur - prev_in).min(dur);
                         let d = frac * room * 0.95;
                         if d > 0.01 {
-                            s += &format!("transition = {{ type = \"crossfade\", duration = {d}, freeze = {freeze} }}\n");
+                            s += &format!("transition = {{ type = \"fx/crossfade.glsl\", duration = {d}, freeze = {freeze} }}\n");
                             this_in = d;
                         }
                     }
@@ -1468,7 +1456,7 @@ mod tests {
             transition_kind("kit/fx/wipe"),
             TransitionKind::Library("kit", "fx/wipe.glsl".into())
         );
-        assert_eq!(transition_kind("iris"), TransitionKind::Builtin("iris"));
+        assert_eq!(transition_kind("iris"), TransitionKind::Name("iris"));
 
         let kit = "transitions = { source = \"https://github.com/antonmarsden/shotglass-kit\", \
                    subdir = \"transitions\" }\n";
@@ -1496,24 +1484,20 @@ mod tests {
         assert!(e.contains("[libraries] has none"), "{e}");
         let e = format!("{:#}", film(kit, &["transitions/../x"]).unwrap_err());
         assert!(e.contains("climbs"), "{e}");
-        // Built-ins still work, with one warning per name that names the replacement.
-        let m = film("", &["iris", "iris", "wipe"]).unwrap();
-        assert_eq!(m.warnings.len(), 2, "{:?}", m.warnings);
+        // Bare names (the removed built-ins, or the engine's internal "copy") are
+        // refused, and the error names the kit replacement.
+        let e = format!("{:#}", film("", &["iris"]).unwrap_err());
         assert!(
-            m.warnings[0].contains("\"iris\" is built into this shotglass")
-                && m.warnings[0].contains("subdir = \"transitions\"")
-                && m.warnings[0].contains("type = \"transitions/iris\""),
-            "{}",
-            m.warnings[0]
+            e.contains("no built-in transitions")
+                && e.contains("subdir = \"transitions\"")
+                && e.contains("type = \"transitions/iris\""),
+            "{e}"
         );
+        assert!(film(kit, &["copy"]).is_err());
         // With the kit's transitions already declared, it names the film's own local name.
         let fx = kit.replacen("transitions =", "fx =", 1);
-        let m = film(&fx, &["fade"]).unwrap();
-        assert!(
-            m.warnings[0].contains("type = \"fx/fade\""),
-            "{:?}",
-            m.warnings
-        );
+        let e = format!("{:#}", film(&fx, &["fade"]).unwrap_err());
+        assert!(e.contains("type = \"fx/fade\""), "{e}");
     }
 
     #[test]

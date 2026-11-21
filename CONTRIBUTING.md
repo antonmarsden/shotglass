@@ -114,13 +114,35 @@ selftest, golden images and soundtracks) and the strict `check --web --no-gpu` o
 Linux, Windows and macOS, all with the same pinned `RUST_TOOLCHAIN`. macOS is the
 slowest, so it runs only on pushes to `main` (after a merge) and when the workflow is
 started by hand ("Run workflow" on the Actions tab, any branch): do that for a branch
-that changes the renderer or the demo's shaders. None of the machines has a real GPU:
+that changes the renderer or the demo's shaders. Only CI fails a golden test that
+can't fetch the films' libraries; an offline `cargo test` skips it with a message.
+None of the machines has a real GPU:
 
 | | OpenGL | skipped |
 |---|---|---|
 | Linux | Mesa llvmpipe under Xvfb | nothing (also renders and exports the demo) |
 | Windows | Mesa llvmpipe ([mesa-dist-win](https://github.com/pal1000/mesa-dist-win)) | the selftest's video export (no ffmpeg; PNG + WAV export still checked) |
 | macOS | Apple Software Renderer (OpenGL 4.1; the runners have no GPU) | none of the golden tests (they compare against the same llvmpipe references; this renderer's built-in `sin`/`cos` are ~5e-4 off, so the demo computes its camera rotation itself). The selftest's "sound matches exactly" comparisons (chunked, banded, streamed, exported) are reported, not failed: this renderer's sound differs by about 1e-5 with the size of the block drawn (`INEXACT_SOUND_RENDERERS` in `selftest.rs`); everything else in those checks still runs. Also the video export, as on Windows. |
+
+### Kit canary
+
+The tests above use shotglass-kit at the commit pinned in
+`movies/big-shadow/shotglass.lock` (the template test reuses its `transitions` pin), so
+a kit change can't turn CI red on its own. The flip side is that nothing notices drift
+until someone moves the pin. The kit canary (`.github/workflows/canary.yml`, script
+`.github/canary.sh`) does: daily and by hand ("Run workflow" on the Actions tab), never
+on pushes or PRs, so it can't block a merge. On Linux (Mesa llvmpipe under Xvfb) it
+copies the demo and `shotglass new`'s template to a scratch folder, moves their pins to
+the kit's current `main` (`shotglass update` / `shotglass fetch`), and runs
+`check --web --no-gpu` and the same golden strip and soundtrack comparisons as
+`tests/golden.rs`. On failure it uploads the actual and diff images / WAVs and the
+moved locks as `kit-canary-failures`. Locally: `xvfb-run -a .github/canary.sh`.
+
+A red canary means the kit's `main` no longer gives the demo or the template the
+blessed look and sound (or no longer passes the strict check). Either the change is
+intended: bump the pin (`shotglass update movies/big-shadow`) and re-bless in the same
+commit (see below); or it isn't: fix the kit (or the engine, if it broke the kit's
+contract).
 
 ## Golden images
 

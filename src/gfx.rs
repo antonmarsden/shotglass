@@ -16,14 +16,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use toodee::{TooDeeOps, TooDeeOpsMut, TranslateOps};
 
-pub const BUILTIN_TRANSITIONS: &[(&str, &str)] = &[
-    ("copy", include_str!("glsl/transitions/copy.glsl")),
-    ("crossfade", include_str!("glsl/transitions/crossfade.glsl")),
-    ("fade", include_str!("glsl/transitions/fade.glsl")),
-    ("iris", include_str!("glsl/transitions/iris.glsl")),
-    ("dissolve", include_str!("glsl/transitions/dissolve.glsl")),
-    ("wipe", include_str!("glsl/transitions/wipe.glsl")),
-];
+/// The engine's own pass that shows one shot unchanged (`transition_source(.., "copy", ..)`).
+/// Not a transition films can name: their transitions come from libraries or files.
+const COPY: &str = include_str!("glsl/copy.glsl");
 
 const VERTEX: &str = "out vec2 sg_uv;\nvoid main(){\n  vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));\n  sg_uv = p;\n  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);\n}\n";
 
@@ -2549,19 +2544,11 @@ pub fn transition_source(
             &format!("transition \"{kind}\""),
             &format!("#include <{lib}/{file}>\n"),
         )?,
-        TransitionKind::Builtin(_) => {
-            let src = BUILTIN_TRANSITIONS
-                .iter()
-                .find(|(n, _)| *n == kind)
-                .map(|(_, s)| *s)
-                .ok_or_else(|| {
-                    anyhow!(
-                        "unknown transition \"{kind}\"; use a library's (\"transitions/iris\") or \
-                     a file in the film (\"fx/iris.glsl\")"
-                    )
-                })?;
-            b.builtin(kind, src)?
-        }
+        TransitionKind::Name("copy") => b.builtin("copy", COPY)?,
+        TransitionKind::Name(_) => anyhow::bail!(
+            "unknown transition \"{kind}\"; use a library's (\"transitions/iris\") or \
+             a file in the film (\"fx/iris.glsl\")"
+        ),
     };
     Ok(b.footer(TRANSITION_FOOTER).build())
 }

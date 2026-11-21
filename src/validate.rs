@@ -376,24 +376,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn builtin_transitions_pass_everywhere() {
-        let root = dir("transitions");
-        std::fs::write(root.join("scenes/a.glsl"), OK).unwrap();
-        let mut toml = String::from("title = \"transitions\"\n");
-        for (i, (name, _)) in crate::gfx::BUILTIN_TRANSITIONS.iter().enumerate() {
-            toml += &format!("[[shot]]\nid = \"s{i}\"\nscene = \"scenes/a.glsl\"\nduration = 2\n");
-            if i > 0 && *name != "copy" {
-                toml += &format!("transition = {{ type = \"{name}\", duration = 0.5 }}\n");
-            }
-        }
-        let m = Movie::parse(&toml, &root).unwrap();
-        for d in all_dialects() {
-            expect_clean(&m, d);
-        }
-        std::fs::remove_dir_all(&root).ok();
-    }
-
     /// Fetch a film's libraries into the user cache (git and network), as `shotglass
     /// fetch` would, writing its shotglass.lock if it has none. Returns the lock, or None
     /// when offline outside CI: the strict check of kit films is then left to CI.
@@ -560,11 +542,10 @@ float kit_level() {{ return 0.25; }}
             "name = \"me/transitions\"\nversion = \"1.0.0\"\n",
         )
         .unwrap();
-        let wipe = crate::gfx::BUILTIN_TRANSITIONS
-            .iter()
-            .find(|(n, _)| *n == "wipe")
-            .unwrap()
-            .1;
+        let wipe = "#ifndef direction\n#define direction vec2(1.0, 0.0)\n#endif\n\
+                    vec4 transition(vec2 uv) {\n\
+                    \x20   float m = step(progress, dot(uv, normalize(direction)));\n\
+                    \x20   return mix(getToColor(uv), getFromColor(uv), m);\n}\n";
         std::fs::write(lib.join("wipe.glsl"), wipe).unwrap();
         std::fs::write(root.join("scenes/a.glsl"), OK).unwrap();
         let film = |kind: &str| {

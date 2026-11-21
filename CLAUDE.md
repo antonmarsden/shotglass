@@ -34,6 +34,9 @@ cargo fmt && cargo clippy --all-targets -- -D warnings
   Renderer (GL 4.1, no 4.2+ entry points: glow's query getters panicked there); the
   macOS job runs only on pushes to `main` and by hand (workflow_dispatch). Skips
   are listed in CONTRIBUTING.md.
+- `.github/workflows/canary.yml` (daily + by hand, never on PRs) runs `.github/canary.sh`:
+  the demo and template with their pins moved to kit `main`, strict check + golden
+  comparisons. Red = bump the pin and re-bless, or fix the kit.
 - Software OpenGL (llvmpipe) is slow: auto render scale drops to 30% and frame
   timings mean nothing. Judge performance only on a real GPU.
 - The owner tests on Windows with a real GPU. Their working copy is
@@ -60,7 +63,7 @@ cargo fmt && cargo clippy --all-targets -- -D warnings
 | `headless.rs` | hidden-window GL context for CLI commands |
 | `selftest.rs` | GPU/sound checks on fixture films written to a temp dir |
 | `tests/golden.rs`, `tests/golden/` | golden tests: 8-frame 320x180 strips and 8 kHz soundtracks of the demo and the template, and a strip of `tests/films/channels` (textures), vs reference PNGs / WAVs |
-| `glsl/transitions/` | deprecated built-in transitions (the kit has the same ones; films use `<library>/<name>`) |
+| `glsl/copy.glsl` | the engine's internal copy pass (not a transition films can name; theirs come from libraries or files) |
 | `movies/big-shadow/` | demo film; `templates/new/` is what `shotglass new` writes |
 
 ## Invariants (each was a real bug; most have a test)
@@ -119,14 +122,14 @@ cargo fmt && cargo clippy --all-targets -- -D warnings
   accepts invalid GLSL that other drivers reject, so passing locally isn't proof.
 - **The engine provides a contract, not looks.** Uniforms, entry points, the transition interface
   and cue defines are the engine's API (semver). Reusable GLSL belongs in versioned libraries
-  (the shotglass-kit repo, #3–#5), not embedded in the binary; the built-in transitions are
-  in the kit now and deprecated here. Don't add new built-in GLSL.
+  (the shotglass-kit repo, #3–#5), not embedded in the binary. The built-in transitions
+  were removed (the kit has them). Don't add built-in GLSL.
 
 ## Adding things
 
 - **New transition:** it goes in the kit (shotglass-kit `transitions/`), not the engine.
-  Films use it as `type = "<library>/<name>"`. The built-ins in `src/glsl/transitions/`
-  are deprecated (loading a film that uses one warns) and only kept until removal.
+  Films use it as `type = "<library>/<name>"`. A bare name (`type = "iris"`) is an
+  error that names the kit replacement. No compatibility code for old films.
 - **`movie.toml` field:** add it to the serde struct (`deny_unknown_fields`) and the resolved
   struct, validate it in `Movie::parse`, add a unit test, and update the README and
   `templates/new/movie.toml`.
