@@ -10,10 +10,11 @@ shotglass = "0.1"
 [libraries]
 kit = { source = "https://github.com/antonmarsden/shotglass-kit", subdir = "core" }
 transitions = { source = "https://github.com/antonmarsden/shotglass-kit", subdir = "transitions" }
+sound = { source = "https://github.com/antonmarsden/shotglass-kit", subdir = "sound" }
 
 [sound]
 music = "music.glsl"      # runs across the cuts; time = movie time
-mix = "mix.glsl"          # final pass: echo, room, ducking
+mix = "mix.glsl"          # final pass: echo, room, ducking (kit sound/mix.glsl)
 volume = 0.9
 
 # 1. The candle creeps closer and the mouse's shadow grows huge on the wall,
