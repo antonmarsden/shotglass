@@ -1,17 +1,14 @@
-// Shared audio helpers.
+// Shared audio helpers. Notes, scales and instruments come from shotglass-kit/sound,
+// random numbers from shotglass-kit/core's integer hash.
+#include <kit/noise.glsl>
+#include <sound/note.glsl>
+#include <sound/instrument.glsl>
+#include <sound/drum.glsl>
+
 #define TAU 6.28318530718
 
-uint ihash(uint x){ x ^= x >> 16; x *= 0x7feb352du; x ^= x >> 15; x *= 0x846ca68bu; x ^= x >> 16; return x; }
-float rnd(uint x){ return float(ihash(x)) * (1.0 / 4294967295.0); }
-float rnd(int x){ return rnd(uint(x)); }
-
-// pentatonic scale (semitones above the root)
-float penta(int i){
-  int o = i / 5, k = i - o * 5;
-  int s = k == 0 ? 0 : k == 1 ? 3 : k == 2 ? 5 : k == 3 ? 7 : 10;
-  return float(o * 12 + s);
-}
-float note(float semis, float base){ return base * exp2(semis / 12.0); }
+// the film's scale: minor pentatonic (0 3 5 7 10) on MIDI note `root` (57 = A3, 220 Hz)
+float penta_hz(int degree, int root){ return kit_note_hz(kit_scale_minor_pentatonic(degree, root)); }
 
 // a warm drone: a few soft harmonics with slow vibrato
 float drone(float t, float f){

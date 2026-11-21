@@ -176,9 +176,12 @@ compares them with reference PNGs and WAVs in `tests/golden/`.
 
   ```sh
   docker build -f docker/test.Dockerfile -t shotglass-test .
-  docker run --rm -v "$PWD/tests/golden:/src/tests/golden" -e SHOTGLASS_BLESS=1 \
+  docker run --init --rm -v "$PWD/tests/golden:/src/tests/golden" -e SHOTGLASS_BLESS=1 \
       shotglass-test xvfb-run -a cargo test --release --test golden
   ```
+
+  Keep `--init`: without it `xvfb-run` is the container's PID 1, misses Xvfb's
+  "ready" signal and waits forever at 0% CPU.
 
 You can compare any film against a reference of your own the same way:
 
