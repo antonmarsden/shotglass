@@ -91,6 +91,8 @@ pub struct Options {
     pub format: Format,
     /// Audio sample rate.
     pub rate: u32,
+    /// Periods of a `loop = true` film to write, one after another (1 otherwise).
+    pub loops: u64,
 }
 
 /// What was written.
@@ -246,8 +248,10 @@ fn codec_args(format: &Format, encoders: &str, sound: bool) -> Result<Vec<String
 }
 
 /// Synthesise the soundtrack into a 16-bit WAV, exactly as `shotglass wav` does.
-/// Returns the number of stereo frames: `ceil(duration × rate)`, from sample 0.
-pub fn write_wav(r: &mut Renderer, m: &Movie, rate: u32, out: &Path) -> Result<usize> {
+/// Returns the number of stereo frames: `ceil(duration × rate)` from sample 0, or for
+/// a loop film `loops` periods (`Movie::sound_samples` each). A loop film's mix reads
+/// across the seam, so the file itself loops seamlessly.
+pub fn write_wav(r: &mut Renderer, m: &Movie, rate: u32, out: &Path, loops: u64) -> Result<usize> {
     let mut st = Soundtrack::new();
     st.set_movie(r, m, rate).map_err(|errors| {
         anyhow!(
@@ -255,16 +259,20 @@ pub fn write_wav(r: &mut Renderer, m: &Movie, rate: u32, out: &Path) -> Result<u
             errors.iter().map(|e| e.to_string()).collect::<String>()
         )
     })?;
-    let frames = (m.duration * rate as f32).ceil() as usize;
+    let loops = loops.max(1) as usize;
+    let frames = m.sound_samples(rate) * loops;
     let mut w = audio::WavWriter::create(out, frames, rate)
         .with_context(|| format!("couldn't create {}", out.display()))?;
     let mut err = None;
-    st.render_all(r, |d| {
-        if let Err(e) = w.write(d) {
-            err.get_or_insert(e);
-        }
-    })
-    .map_err(|e| anyhow!(e))?;
+    // Every period is the same; synthesising it again keeps memory bounded.
+    for _ in 0..loops {
+        st.render_all(r, |d| {
+            if let Err(e) = w.write(d) {
+                err.get_or_insert(e);
+            }
+        })
+        .map_err(|e| anyhow!(e))?;
+    }
     if let Some(e) = err {
         return Err(e.into());
     }
@@ -344,10 +352,13 @@ pub fn export(
         if !png {
             wav_tmp.0 = Some(wav.clone());
         }
-        audio_frames = write_wav(r, m, opts.rate, &wav)?;
+        audio_frames = write_wav(r, m, opts.rate, &wav, opts.loops)?;
     }
 
-    let total = m.frame_count();
+    if opts.loops > 1 && m.loop_frames.is_none() {
+        bail!("--loops needs a film with loop = true");
+    }
+    let total = m.frame_count() * opts.loops.max(1);
     let mut child_guard = None;
     let mut out_guard = Cleanup(None);
     let sink = if png {
@@ -412,7 +423,7 @@ pub fn export(
             break;
         }
         let t = m.frame_time(n);
-        if r.render(m, w as i32, h as i32, &FrameInfo::at(m, t), true)
+        if r.render(m, w as i32, h as i32, &FrameInfo::frame(m, n), true)
             .is_none()
         {
             failed = Some(anyhow!("frame {n} ({t:.3}s) didn't render"));

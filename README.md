@@ -87,6 +87,7 @@ title = "Big Shadow"
 aspect = [16, 9]
 fps = 30                      # or 29.97, or "30000/1001"; frame stepping, iFrame and export
 # glsl = "430"                # opt in to a later GLSL; see "Portable shaders" (default 330)
+# loop = true                 # play forever, Shadertoy-style; see "Loop films"
 
 [sound]
 music = "music.glsl"          # optional
@@ -326,6 +327,49 @@ picture-only edits don't touch the sound. Until the new chunks are ready, the
 previous version keeps playing. Recursive filters (resonant sweeps, feedback reverb) are the main
 thing GLSL sound can't do cheaply. Multi-tap delays in the mix get you most of
 the way.
+
+### Loop films
+
+`loop = true` makes the film play forever, like a Shadertoy: for screensavers,
+installations or visuals behind music. The whole film repeats, and its duration is
+the period. A single-shot film is the simplest loop. Needs `shotglass = "0.1.2"`.
+
+```toml
+shotglass = "0.1.2"
+loop = true
+fps = 30
+
+[[shot]]
+id = "forever"
+scene = "scenes/forever.glsl"
+duration = 8.0                  # the period: a whole number of frames (240 at 30 fps)
+```
+
+- **Seamless picture.** The period must be a whole number of frames, so the frame
+  after the last is frame 0 (the error names the nearest valid durations). The seam itself is a hard cut from the last shot to the first: the first
+  shot can't have a `transition`. For a seam you can't see, end on the image you
+  start with. `iMovieTime / MOVIE_DURATION` runs from 0 to 1 once per loop, which
+  makes that easy.
+- **Time stays within one period.** `iTime`, `iMovieTime`, `iShotTime`, `iFrame` and
+  the sound shaders' `time` and `samp` are exactly what the first loop gets, however
+  long the film has played. So frame *n* of loop 1000 is frame *n* of loop 1, and
+  float precision never runs out (a plain float clock would step in 1/64 s after
+  36 hours). There's no loop counter for shaders: every loop is identical.
+- **Seamless sound.** Music and shot sounds repeat with the period. The mix reads
+  across the seam, so an echo from the end of the loop rings into its start (into the
+  first play too: every loop sounds the same). The engine doesn't crossfade the music
+  at the seam. Write it so it repeats: make every frequency a whole number of cycles
+  per period, or fade it at both ends. `check` warns when the sound jumps at the seam.
+  A `sound_lead` on the first shot or a `sound_tail` on the last would cross the seam
+  and are refused.
+- **In the player,** "repeat movie" starts on for loop films, and playback runs across
+  the seam without a gap (picture and sound). Turn it off to stop at the end. The
+  timeline shows one period, and the transport counts the loops.
+- **Offline,** `still --at` and `strip --at` take times modulo the period (`--at 30`
+  on an 8 s loop is 6 s), `wav` writes one period, and `export` writes one period, or
+  N with `--loops N`. Because the mix wraps, a single period loops seamlessly when the
+  file itself loops (a looping video or GIF; lossy audio codecs add padding, so for a
+  sample-exact audio loop use the WAV or FLAC).
 
 ### Portable shaders
 
@@ -622,6 +666,7 @@ shotglass wav    <movie> [--out sound.wav] [--rate 48000]
                  [--compare ref.wav [--bless] [--max-rms 0.0015] [--max-peak 0.01]]
                  # --compare: fail if the sound differs from ref.wav (writes sound.diff.wav)
 shotglass export <movie> --out film.webm [--size 1920x1080] [--format webm|av1|ffv1|png|ffmpeg] [--rate 48000]
+                 [--loops N]                               # loop = true films: N periods
 shotglass new    <dir>
 shotglass fetch  <movie>                                   # download libraries, write shotglass.lock
 shotglass update <movie> [library..]                       # move library pins to the newest allowed
@@ -649,7 +694,8 @@ shotglass export movies/big-shadow --out frames/                          # PNG 
   waiting for every shader to compile. It's the same picture `shotglass still`
   renders at that time.
 - **Sample-accurate.** The soundtrack is the same 16-bit PCM `shotglass wav` writes,
-  `duration × rate` samples starting at sample 0. FLAC and WAV keep it bit for
+  `duration × rate` samples starting at sample 0 (a [loop film](#loop-films)'s
+  period, rounded to whole samples, once per `--loops`). FLAC and WAV keep it bit for
   bit. Opus is lossy and has an encoder delay, which WebM records so players skip
   it and stay in sync.
 - **Colour.** Video formats are converted with the BT.709 matrix and tagged BT.709,
@@ -734,14 +780,20 @@ shotglass selftest strips   # only checks whose name contains "strips"
     evicted textures come back identically, frozen transitions use the outgoing
     shot's textures, and uploads ignore and restore stray pixel-unpack state;
   - `export` writes every frame and sample: a PNG sequence always, and FFV1 + FLAC
-    when ffmpeg is installed (decoded and compared with `still` and `wav`).
+    when ffmpeg is installed (decoded and compared with `still` and `wav`);
+  - in a loop film the frame at t + k·period is the frame at t (by frame number, even
+    a million loops in, and by time), and one looped period of sound is the steady
+    state of a long unlooped render: no click at the seam, the echo carries over, the
+    same whatever the chunk size, streamed or not.
 - **Golden images** (`tests/golden.rs`): contact sheets of the demo film, the
-  `shotglass new` template and `tests/films/channels` (iChannel textures: mipmaps,
-  wrap and filter modes, `vflip`) are compared with reference PNGs in `tests/golden/`, so
+  `shotglass new` template, `tests/films/channels` (iChannel textures: mipmaps,
+  wrap and filter modes, `vflip`) and `tests/films/loop` (a `loop = true` film over
+  two periods) are compared with reference PNGs in `tests/golden/`, so
   a change that compiles but looks wrong fails the tests. A small per-pixel
   tolerance absorbs the differences between software OpenGL and real GPUs. To
   update the references on purpose, see [CONTRIBUTING.md](CONTRIBUTING.md#golden-images).
-- **Golden soundtracks** (same file): the soundtracks of both films are compared with
+- **Golden soundtracks** (same file): the soundtracks of the demo, the template and
+  the loop film are compared with
   reference WAVs, window by window (RMS and peak of the difference), and a failure
   names the first time that differs.
 - On Linux without a display, use `xvfb-run -a cargo test` (that's what CI does).

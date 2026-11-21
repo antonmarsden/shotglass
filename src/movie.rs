@@ -72,6 +72,10 @@ struct MovieFile {
     fps: Option<FpsFile>,
     /// Opt in to a later desktop GLSL version: "330" (the default), "410" or "430".
     glsl: Option<String>,
+    /// Play forever: the film repeats with its duration (a whole number of frames) as
+    /// the period, and shaders only ever see time within one period.
+    #[serde(rename = "loop")]
+    looping: Option<bool>,
     sound: Option<SoundFile>,
     #[serde(rename = "shot", default)]
     shots: Vec<ShotFile>,
@@ -244,6 +248,9 @@ pub struct Movie {
     /// Desktop GLSL version the film opted in to (`glsl` in movie.toml); None = the
     /// portable baseline (330 core, or 300 es on OpenGL ES).
     pub glsl: Option<u32>,
+    /// `loop = true`: the film repeats every `n` frames (its whole duration). See
+    /// `loop_period`, `wrap`, `sound_samples`.
+    pub loop_frames: Option<u64>,
     /// Movie-level music/ambience (`mainSound`, movie time).
     pub music: Option<PathBuf>,
     /// Final mix pass (`mainMix`).
@@ -326,22 +333,36 @@ impl Movie {
         v
     }
 
-    /// `check`'s warning for a film that binds textures but doesn't say it needs the
-    /// engine contract that has them (0.1.1): older engines would then fail on an
-    /// "unknown field" instead of asking for a newer shotglass.
+    /// `check`'s warning for a film that uses a feature newer than the engine contract
+    /// it says it needs (textures: 0.1.1, `loop`: 0.1.2): older engines would then fail
+    /// on an "unknown field" instead of asking for a newer shotglass.
     pub fn contract_warning(&self) -> Option<String> {
-        if !self.uses_channels() {
+        let mut features = vec![];
+        let mut need = semver::Version::new(0, 1, 0);
+        if self.uses_channels() {
+            features.push("channels (iChannel textures), which need shotglass 0.1.1");
+            need = semver::Version::new(0, 1, 1);
+        }
+        if self.loop_frames.is_some() {
+            features.push("loop, which needs shotglass 0.1.2");
+            need = semver::Version::new(0, 1, 2);
+        }
+        if features.is_empty() {
             return None;
         }
-        let old = semver::Version::new(0, 1, 0);
+        // Any version below `need` that the film's range allows is one that would fail.
+        let older = [semver::Version::new(0, 1, 0), semver::Version::new(0, 1, 1)];
         let allows_old = match &self.shotglass {
             None => true,
-            Some(r) => library::parse_req(r).is_ok_and(|r| r.matches(&old)),
+            Some(r) => {
+                library::parse_req(r).is_ok_and(|r| older.iter().any(|v| *v < need && r.matches(v)))
+            }
         };
         allows_old.then(|| {
             format!(
-                "this film uses channels (iChannel textures), which need shotglass 0.1.1; write                  shotglass = \"0.1.1\" in movie.toml so older shotglass versions ask for an \
-                 upgrade instead of failing on an unknown field{}",
+                "this film uses {}; write shotglass = \"{need}\" in movie.toml so older \
+                 shotglass versions ask for an upgrade instead of failing on an unknown field{}",
+                features.join(" and "),
                 self.shotglass
                     .as_ref()
                     .map_or(String::new(), |v| format!(" (it says \"{v}\")"))
@@ -742,6 +763,29 @@ impl Movie {
             Some(f) => parse_fps(f)?,
             None => (30, 1),
         };
+        let loop_frames = match f.looping {
+            Some(true) => Some(loop_frames(duration, fps_num, fps_den)?),
+            _ => None,
+        };
+        if loop_frames.is_some() {
+            let first = &shots[0];
+            if first.sound.as_ref().is_some_and(|s| s.lead > 0.0) {
+                bail!(
+                    "shot \"{}\": sound_lead on the first shot of a loop film would cross the \
+                     loop seam, which isn't supported (yet); start the sound inside the shot",
+                    first.id
+                );
+            }
+            let last = shots.last().unwrap();
+            if last.sound.as_ref().is_some_and(|s| s.tail > 0.0) {
+                bail!(
+                    "shot \"{}\": sound_tail on the last shot of a loop film would cross the \
+                     loop seam, which isn't supported (yet); let the sound end inside the shot \
+                     (the mix's echo does ring over the seam)",
+                    last.id
+                );
+            }
+        }
         Ok(Movie {
             root: root.to_path_buf(),
             title: f.title.unwrap_or_else(|| "Untitled".into()),
@@ -750,6 +794,7 @@ impl Movie {
             fps_num,
             fps_den,
             glsl,
+            loop_frames,
             volume: f.sound.as_ref().and_then(|s| s.volume).unwrap_or(1.0),
             music: f
                 .sound
@@ -800,8 +845,12 @@ impl Movie {
         }
     }
 
-    /// Frames in the film: every n with `frame_time(n) < duration`.
+    /// Frames in the film: every n with `frame_time(n) < duration` (one period of a
+    /// loop film).
     pub fn frame_count(&self) -> u64 {
+        if let Some(n) = self.loop_frames {
+            return n;
+        }
         let mut n =
             (self.duration as f64 * self.fps_num as f64 / self.fps_den as f64).ceil() as u64;
         while n > 0 && self.frame_time(n - 1) >= self.duration {
@@ -811,6 +860,38 @@ impl Movie {
             n += 1;
         }
         n
+    }
+
+    /// The exact loop period in seconds (`loop_frames` frames), for loop films.
+    pub fn loop_period(&self) -> Option<f64> {
+        self.loop_frames
+            .map(|n| n as f64 * self.fps_den as f64 / self.fps_num as f64)
+    }
+
+    /// `t` within one period for a loop film (so t + k·period is t); unchanged otherwise.
+    pub fn wrap(&self, t: f32) -> f32 {
+        match self.loop_period() {
+            Some(p) => wrap_time(t as f64, p) as f32,
+            None => t,
+        }
+    }
+
+    /// Frame `n` within one period for a loop film; unchanged otherwise.
+    pub fn wrap_frame(&self, n: u64) -> u64 {
+        match self.loop_frames {
+            Some(f) => n % f,
+            None => n,
+        }
+    }
+
+    /// Samples in the soundtrack at `rate`: `ceil(duration × rate)`, or for a loop film
+    /// exactly one period, rounded to whole samples (the player wraps its clock at this
+    /// many samples, so picture and sound can't drift apart over many loops).
+    pub fn sound_samples(&self, rate: u32) -> usize {
+        match self.loop_period() {
+            Some(p) => ((p * rate as f64).round() as usize).max(1),
+            None => (self.duration * rate as f32).ceil() as usize,
+        }
     }
 
     pub fn at(&self, t: f32) -> At {
@@ -912,6 +993,36 @@ impl Movie {
             }
         }
     }
+}
+
+/// `t` in [0, period): the f64 remainder, kept below the period after rounding.
+pub fn wrap_time(t: f64, period: f64) -> f64 {
+    let w = t.rem_euclid(period);
+    if w >= period { 0.0 } else { w }
+}
+
+/// The frame count of a `loop = true` film: its duration must be a whole number of
+/// frames, so the frame after the last is frame 0.
+fn loop_frames(duration: f32, num: u32, den: u32) -> Result<u64> {
+    let exact = duration as f64 * num as f64 / den as f64;
+    let n = exact.round();
+    if n >= 1.0 && (exact - n).abs() <= 1e-3 {
+        return Ok(n as u64);
+    }
+    let secs = |f: f64| f * den as f64 / num as f64;
+    let (lo, hi) = (exact.floor().max(1.0), exact.ceil().max(1.0));
+    let fps = if den == 1 {
+        num.to_string()
+    } else {
+        format!("{num}/{den}")
+    };
+    bail!(
+        "loop = true needs a film that lasts a whole number of frames (so the frame after the \
+         last is frame 0), but it lasts {duration}s, {exact:.3} frames at {fps} fps; make it \
+         {:.4}s ({lo} frames) or {:.4}s ({hi} frames)",
+        secs(lo),
+        secs(hi)
+    )
 }
 
 /// A `channels` entry or `[textures]` value names a `[textures]` entry (not a path)?
@@ -1954,5 +2065,130 @@ glsl = 450
     fn rejects_unknown_fields() {
         let bad = "[[shot]]\nid=\"a\"\nscene=\"a.glsl\"\nduration=1\nlenght=2\n";
         assert!(Movie::parse(bad, Path::new(".")).is_err());
+    }
+
+    fn loop_film(extra: &str, shots: &str) -> Result<Movie> {
+        Movie::parse(&format!("loop = true\n{extra}\n{shots}"), Path::new("."))
+    }
+
+    #[test]
+    fn loop_field_sets_a_whole_frame_period() {
+        let m = loop_film("", M).unwrap();
+        // 5 + 4 + 3 - 1 (transition) = 11 s = 330 frames at 30 fps
+        assert_eq!(m.loop_frames, Some(330));
+        assert_eq!(m.frame_count(), 330);
+        assert_eq!(m.loop_period(), Some(11.0));
+        assert_eq!(m.sound_samples(48000), 528000);
+        assert_eq!(m.sound_samples(44100), 485100);
+        let m = Movie::parse(M, Path::new(".")).unwrap();
+        assert_eq!(m.loop_frames, None);
+        assert_eq!(m.loop_period(), None);
+        let m = Movie::parse(&format!("loop = false\n{M}"), Path::new(".")).unwrap();
+        assert_eq!(m.loop_frames, None);
+        // NTSC: 300 frames at 30000/1001 = 10.01 s; the period is exact, the samples round.
+        let one = "[[shot]]\nid = \"a\"\nscene = \"a.glsl\"\nduration = 10.01\n";
+        let m = loop_film("fps = \"30000/1001\"", one).unwrap();
+        assert_eq!(m.loop_frames, Some(300));
+        assert!((m.loop_period().unwrap() - 10.01).abs() < 1e-12);
+        assert_eq!(m.sound_samples(48000), 480480);
+    }
+
+    #[test]
+    fn loop_period_must_be_whole_frames() {
+        let one = |d: &str| format!("[[shot]]\nid = \"a\"\nscene = \"a.glsl\"\nduration = {d}\n");
+        let e = loop_film("", &one("2.01")).unwrap_err().to_string();
+        assert!(e.contains("whole number of frames"), "{e}");
+        assert!(e.contains("60.300 frames at 30 fps"), "{e}");
+        assert!(
+            e.contains("2.0000s (60 frames) or 2.0333s (61 frames)"),
+            "{e}"
+        );
+        let e = loop_film("fps = 24", &one("0.01")).unwrap_err().to_string();
+        assert!(e.contains("(1 frames)"), "{e}");
+        // Without loop, any duration is fine.
+        assert!(Movie::parse(&one("2.01"), Path::new(".")).is_ok());
+        // A typo'd value is a type error, not silently ignored.
+        assert!(Movie::parse(&format!("loop = 3\n{}", one("2")), Path::new(".")).is_err());
+    }
+
+    #[test]
+    fn loop_refuses_sound_across_the_seam() {
+        let shots = |a: &str, b: &str| {
+            format!(
+                "[[shot]]\nid = \"a\"\nscene = \"a.glsl\"\nduration = 2\nsound = \"a.glsl\"\n{a}\n\
+                 [[shot]]\nid = \"b\"\nscene = \"b.glsl\"\nduration = 2\nsound = \"b.glsl\"\n{b}\n"
+            )
+        };
+        let e = loop_film("", &shots("sound_lead = 0.5", ""))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("shot \"a\": sound_lead") && e.contains("seam"),
+            "{e}"
+        );
+        let e = loop_film("", &shots("", "sound_tail = 0.5"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("shot \"b\": sound_tail") && e.contains("seam"),
+            "{e}"
+        );
+        // Inside the film (between the shots) they're fine, and so is either without loop.
+        assert!(loop_film("", &shots("sound_tail = 0.5", "sound_lead = 0.5")).is_ok());
+        assert!(
+            Movie::parse(
+                &shots("sound_lead = 0.5", "sound_tail = 0.5"),
+                Path::new(".")
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn loop_time_wraps_to_the_period() {
+        let m = loop_film("", M).unwrap();
+        assert_eq!(m.wrap(0.0), 0.0);
+        assert_eq!(m.wrap(3.25), 3.25);
+        assert_eq!(m.wrap(11.0), 0.0);
+        assert_eq!(m.wrap(14.25), 3.25);
+        assert_eq!(m.wrap(-1.0), 10.0);
+        // Far out, an f32 time is coarse, but it wraps into the period, never onto it.
+        let w = m.wrap(1.0e7);
+        assert!((0.0..11.0).contains(&w), "{w}");
+        assert_eq!(m.wrap_frame(329), 329);
+        assert_eq!(m.wrap_frame(330), 0);
+        assert_eq!(m.wrap_frame(330 * 1000 + 7), 7);
+        // f64: hours in, precise to well under a sample.
+        let p = 11.0;
+        let t = 1000.0 * p + 3.25;
+        assert!((wrap_time(t, p) - 3.25).abs() < 1e-9);
+        assert!((0.0..p).contains(&wrap_time(p * 3.0 - 1e-15, p)));
+        // Frames of loop k land on the frames of loop 0 (a few loops in: an f32 time
+        // 1000 loops in is too coarse for that, which is why the player and export
+        // wrap in f64 or by frame number).
+        for k in [1u64, 2, 3] {
+            for n in [0u64, 1, 165, 329] {
+                let t = m.frame_time(k * 330 + n);
+                assert_eq!(m.frame_at(m.wrap(t)), n as i64, "loop {k} frame {n}");
+            }
+        }
+        // Not a loop film: unchanged.
+        let m = Movie::parse(M, Path::new(".")).unwrap();
+        assert_eq!(m.wrap(14.25), 14.25);
+        assert_eq!(m.wrap_frame(400), 400);
+    }
+
+    #[test]
+    fn loop_needs_contract_0_1_2() {
+        let m = loop_film("", M).unwrap();
+        let w = m.contract_warning().unwrap();
+        assert!(
+            w.contains("loop") && w.contains("shotglass = \"0.1.2\""),
+            "{w}"
+        );
+        let m = loop_film("shotglass = \"0.1.1\"", M).unwrap();
+        assert!(m.contract_warning().unwrap().contains("it says \"0.1.1\""));
+        let m = loop_film("shotglass = \"0.1.2\"", M).unwrap();
+        assert_eq!(m.contract_warning(), None);
     }
 }
