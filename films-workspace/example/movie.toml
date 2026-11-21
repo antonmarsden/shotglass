@@ -1,0 +1,34 @@
+# Example film: placeholder content that shows the workspace's wiring. Copy the
+# structure, not the pictures. Run from the repository root:
+#   shotglass play example            (with SHOTGLASS_LIB_FILMS=../lib set, see README)
+shotglass = "0.1"
+title = "Example"
+aspect = [16, 9]
+fps = 30
+
+[sound]
+music = "music.glsl"
+volume = 0.8
+
+[[shot]]
+id = "rings"
+scene = "scenes/rings.glsl"
+duration = 4.0
+uniforms.uHue = { keys = [[0, 0.0], [4, 0.25]], ease = "smooth" }
+
+[[shot]]
+id = "clouds"
+scene = "scenes/clouds.glsl"
+duration = 4.0
+transition = { type = "transitions/crossfade", duration = 1.0, ease = "smooth" }
+uniforms.uRadius = { keys = [[0, 0.1], [4, 0.45]], ease = "smoother" }
+
+[libraries]
+# shotglass-kit, following main and pinned in shotglass.lock (`shotglass update example`).
+kit = { source = "https://github.com/antonmarsden/shotglass-kit", subdir = "core" }
+sound = { source = "https://github.com/antonmarsden/shotglass-kit", subdir = "sound" }
+transitions = { source = "https://github.com/antonmarsden/shotglass-kit", subdir = "transitions" }
+# The repository's shared lib/. movie.toml can't point outside the film folder, so this
+# path is a placeholder: SHOTGLASS_LIB_FILMS=../lib (or movie.local.toml) supplies the
+# real one. Without it, loading fails with "example/lib ... library.toml" (README).
+films = { path = "lib" }
