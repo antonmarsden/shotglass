@@ -1,6 +1,7 @@
 //! Golden regression tests: renders a contact sheet and the soundtrack of the demo film
 //! and of the `shotglass new` template (and a contact sheet of tests/films/channels, the
-//! iChannel textures film) and compares them with reference PNGs and WAVs
+//! iChannel textures film, and both of tests/films/loop, a `loop = true` film) and
+//! compares them with reference PNGs and WAVs
 //! in tests/golden/, so "compiles but looks (or sounds) wrong" fails `cargo test` (and
 //! CI, on software OpenGL).
 //!
@@ -90,6 +91,11 @@ fn fetch_libraries(movie: &Path) -> bool {
 
 /// `shotglass strip <movie> --compare tests/golden/<name>.png` (or `--bless`).
 fn golden(name: &str, movie: &Path) {
+    golden_frames(name, movie, &["--count", COUNT]);
+}
+
+/// `golden` with these frames (`--count n` or `--at times`).
+fn golden_frames(name: &str, movie: &Path, frames: &[&str]) {
     if !fetch_libraries(movie) {
         return;
     }
@@ -100,8 +106,8 @@ fn golden(name: &str, movie: &Path) {
         movie.as_os_str(),
         "--size".as_ref(),
         SIZE.as_ref(),
-        "--count".as_ref(),
-        COUNT.as_ref(),
+        frames[0].as_ref(),
+        frames[1].as_ref(),
         "--cols".as_ref(),
         COLS.as_ref(),
         "--out".as_ref(),
@@ -196,6 +202,30 @@ fn channels_film() {
         "channels",
         &root().join("tests").join("films").join("channels"),
     );
+}
+
+/// `loop = true`: a 2 s loop film. The strip's second row is two seconds (one period)
+/// after the first, so it must show the same frames; past the end is the start again.
+#[test]
+fn loop_film() {
+    if skip() {
+        return;
+    }
+    golden_frames(
+        "loop",
+        &root().join("tests").join("films").join("loop"),
+        &["--at", "0.1,0.6,1.0,1.9,2.1,2.6,3.0,3.9"],
+    );
+}
+
+/// One period of the loop film's sound: its mix echo rings over the seam, so the
+/// start already carries the echo of the end.
+#[test]
+fn loop_soundtrack() {
+    if skip() {
+        return;
+    }
+    golden_sound("loop", &root().join("tests").join("films").join("loop"));
 }
 
 #[test]

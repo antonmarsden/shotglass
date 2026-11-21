@@ -22,6 +22,17 @@ pub struct ChunkStore {
     pub chunk: usize,
     pub total: usize,
     pub chunks: HashMap<usize, (u64, Arc<Vec<f32>>)>,
+    /// A loop film: the play position wraps, sample `i` is sample `i mod total`.
+    pub wrap: bool,
+}
+
+/// Where a looping play position wraps (samples): a whole number of periods of
+/// `total` samples, at least 2^28 (≈ 1.5 h at 48 kHz), so the 32.32 position never
+/// overflows and the clock can tell which period the sound card is in by comparing
+/// with the system timer (they agree within 0.25 s).
+pub fn wrap_span(total: usize) -> u64 {
+    let total = total.max(1) as u64;
+    total * (1u64 << 28).div_ceil(total)
 }
 
 struct Shared {
@@ -173,8 +184,12 @@ fn fill<T: SizedSample + FromSample<f32>>(
     let rate = f32::from_bits(sh.rate.load(Ordering::Relaxed)) as f64;
     let gain = f32::from_bits(sh.gain.load(Ordering::Relaxed));
     let step = (rate * FRAC) as u64;
+    let wrap = (store.wrap && store.total > 0).then(|| wrap_span(store.total) << 32);
     for frame in data.chunks_mut(channels) {
-        let i = (pos >> 32) as usize;
+        let mut i = (pos >> 32) as usize;
+        if wrap.is_some() {
+            i %= store.total;
+        }
         let (l, r) = if store.chunk > 0 && i < store.total {
             let c = i / store.chunk;
             if cur.is_none_or(|(cc, _)| cc != c) {
@@ -208,6 +223,11 @@ fn fill<T: SizedSample + FromSample<f32>>(
             frame[0] = T::from_sample((l + r) * 0.5);
         }
         pos += step;
+        if let Some(span) = wrap
+            && pos >= span
+        {
+            pos %= span;
+        }
     }
     if missing > 0 {
         sh.underruns.fetch_add(missing, Ordering::Relaxed);
@@ -222,13 +242,21 @@ pub struct Clock {
     audio: Option<AudioOut>,
     playing: bool,
     rate: f32,
-    /// Time while paused; the time at the last play/seek while playing.
-    floor: f32,
+    /// Time while paused; the time at the last play/seek while playing. Seconds, f64
+    /// (playback time isn't wrapped internally, so it must stay precise for hours).
+    floor: f64,
     /// When the last play/seek happened.
     since: Instant,
+    /// The system-timer estimate: (time, when). Moved to the sound card's reading
+    /// whenever that is trusted, so the timer follows the card's slow drift (a loop
+    /// can play for days) and stays a good fallback.
+    base: std::cell::Cell<(f64, Instant)>,
     /// The last time handed out while playing: time never runs backwards, even when
     /// the source switches between the sound card and the system timer.
-    reported: std::cell::Cell<f32>,
+    reported: std::cell::Cell<f64>,
+    /// A loop film: (period in seconds, where the sound card position wraps in
+    /// samples). `time()` is then within one period.
+    period: Option<(f64, u64)>,
 }
 
 impl Clock {
@@ -239,7 +267,63 @@ impl Clock {
             rate: 1.0,
             floor: 0.0,
             since: Instant::now(),
+            base: std::cell::Cell::new((0.0, Instant::now())),
             reported: std::cell::Cell::new(0.0),
+            period: None,
+        }
+    }
+
+    /// Loop every `samples` samples (at `sample_rate()`), or don't (None). While
+    /// looping, the sound card plays across the wrap and `time()` stays within the
+    /// period; the playhead keeps its place within it.
+    pub fn set_loop(&mut self, samples: Option<usize>) {
+        let sr = self.sample_rate() as f64;
+        let new = samples.map(|n| (n.max(1) as f64 / sr, wrap_span(n)));
+        if let Some(a) = &self.audio {
+            let mut st = (**a.shared.store.load()).clone();
+            st.wrap = samples.is_some();
+            if let Some(n) = samples
+                && st.total != n
+            {
+                st.total = n;
+                st.chunks.clear();
+            }
+            a.shared.store.store(Arc::new(st));
+        }
+        if new.map(|p| p.0) == self.period.map(|p| p.0) {
+            return;
+        }
+        let t = self.time() as f64;
+        self.period = new;
+        if self.playing {
+            self.start_at(t);
+        } else {
+            self.floor = self.wrap(t);
+        }
+    }
+
+    pub fn looping(&self) -> bool {
+        self.period.is_some()
+    }
+
+    /// The loop period in samples, if looping.
+    pub fn loop_samples(&self) -> Option<usize> {
+        self.period
+            .map(|(p, _)| (p * self.sample_rate() as f64).round() as usize)
+    }
+
+    /// Whole periods played since the last play/seek (0 when not looping).
+    pub fn loops(&self) -> u64 {
+        match self.period {
+            Some((p, _)) if self.playing => (self.reported.get() / p).floor().max(0.0) as u64,
+            _ => 0,
+        }
+    }
+
+    fn wrap(&self, t: f64) -> f64 {
+        match self.period {
+            Some((p, _)) => crate::movie::wrap_time(t, p),
+            None => t,
         }
     }
 
@@ -279,21 +363,26 @@ impl Clock {
         a.shared.store.store(Arc::new(st));
     }
 
-    /// Forget chunks outside `keep` so memory stays bounded.
-    pub fn drop_chunks_outside(&self, keep: std::ops::Range<usize>) {
+    /// Forget chunks `keep` says no to, so memory stays bounded.
+    pub fn drop_chunks_where(&self, keep: impl Fn(usize) -> bool) {
         let Some(a) = &self.audio else { return };
         let cur = a.shared.store.load();
-        if cur.chunks.keys().all(|c| keep.contains(c)) {
+        if cur.chunks.keys().all(|c| keep(*c)) {
             return;
         }
         let mut st = (**cur).clone();
-        st.chunks.retain(|c, _| keep.contains(c));
+        st.chunks.retain(|c, _| keep(*c));
         a.shared.store.store(Arc::new(st));
     }
 
     pub fn clear_chunks(&self) {
         if let Some(a) = &self.audio {
-            a.shared.store.store(Arc::new(ChunkStore::default()));
+            let old = a.shared.store.load();
+            a.shared.store.store(Arc::new(ChunkStore {
+                wrap: old.wrap,
+                total: if old.wrap { old.total } else { 0 },
+                ..ChunkStore::default()
+            }));
         }
     }
 
@@ -315,28 +404,38 @@ impl Clock {
         self.rate
     }
 
-    /// The movie time being *heard* right now. Never decreases while playing.
+    /// The movie time being *heard* right now. Never decreases while playing, except
+    /// that a loop film's time wraps to 0 at the end of each period.
     pub fn time(&self) -> f32 {
         if !self.playing {
-            return self.floor;
+            return self.wrap(self.floor) as f32;
         }
         let t = self.source_time().max(self.reported.get());
         self.reported.set(t);
-        t
+        self.wrap(t) as f32
     }
 
-    fn source_time(&self) -> f32 {
-        let wall = self.floor + self.since.elapsed().as_secs_f32() * self.rate;
+    /// Unwrapped playback time (seconds since the last play/seek's origin).
+    fn source_time(&self) -> f64 {
+        let (bt, bat) = self.base.get();
+        let wall = bt + bat.elapsed().as_secs_f64() * self.rate as f64;
         let Some(a) = &self.audio else { return wall };
         let last = *a.shared.last.lock().unwrap();
         match last {
             // Use the sound card's position when it has reported since the last seek
             // and agrees with the system clock (a stalled or runaway device doesn't).
             Some((pos, at, latency)) if at >= self.since => {
-                let heard = (pos as f64 / FRAC) / a.sample_rate as f64
+                let sr = a.sample_rate as f64;
+                let mut heard = (pos as f64 / FRAC) / sr
                     + (at.elapsed().as_secs_f64() - latency.as_secs_f64()) * self.rate as f64;
-                let heard = (heard as f32).max(self.floor);
+                // A looping position wraps; put it in the span the timer is in.
+                if let Some((_, span)) = self.period {
+                    let span = span as f64 / sr;
+                    heard += ((wall - heard) / span).round() * span;
+                }
+                let heard = heard.max(self.floor);
                 if (heard - wall).abs() < 0.25 {
+                    self.base.set((heard, Instant::now()));
                     heard
                 } else {
                     wall
@@ -370,12 +469,12 @@ impl Clock {
         if !self.playing {
             return;
         }
-        let t = self.time();
+        let t = self.source_time().max(self.reported.get());
         self.playing = false;
         if let Some(a) = &self.audio {
             a.shared.playing.store(false, Ordering::Release);
         }
-        self.floor = t;
+        self.floor = self.wrap(t);
     }
 
     pub fn toggle(&mut self) {
@@ -387,7 +486,7 @@ impl Clock {
     }
 
     pub fn seek(&mut self, t: f32) {
-        let t = t.max(0.0);
+        let t = self.wrap(t.max(0.0) as f64);
         if self.playing {
             self.start_at(t);
         } else {
@@ -395,21 +494,22 @@ impl Clock {
         }
     }
 
-    fn start_at(&mut self, t: f32) {
+    fn start_at(&mut self, t: f64) {
+        let t = self.wrap(t);
         self.floor = t;
         self.since = Instant::now();
+        self.base.set((t, self.since));
         self.reported.set(t);
         if let Some(a) = &self.audio {
             *a.shared.last.lock().unwrap() = None;
-            a.shared.pos.store(
-                (t as f64 * a.sample_rate as f64 * FRAC) as u64,
-                Ordering::Release,
-            );
+            a.shared
+                .pos
+                .store((t * a.sample_rate as f64 * FRAC) as u64, Ordering::Release);
         }
     }
 
     pub fn set_rate(&mut self, rate: f32) {
-        let t = self.time();
+        let t = self.time() as f64;
         self.rate = rate;
         if let Some(a) = &self.audio {
             a.shared.rate.store(rate.to_bits(), Ordering::Relaxed);
@@ -649,5 +749,95 @@ mod tests {
         let b = dev.callback(50, LATENCY);
         assert!(b.iter().all(|x| *x == 0.0));
         assert_eq!(c.underruns(), 50);
+    }
+
+    #[test]
+    fn callback_plays_across_the_loop_seam() {
+        let (out, dev) = AudioOut::fake(SR);
+        let mut c = Clock::new(Some(out));
+        // A 250-sample loop in chunks of 100 (the last one short): a ramp 0..250.
+        let ramp = |a: usize, b: usize| -> Arc<Vec<f32>> {
+            Arc::new((a..b).flat_map(|i| [i as f32, -(i as f32)]).collect())
+        };
+        c.set_loop(Some(250));
+        for (i, (a, b)) in [(0, 100), (100, 200), (200, 250)].into_iter().enumerate() {
+            c.put_chunk(100, 250, i, 1, ramp(a, b));
+        }
+        c.seek(240.5 / SR as f32);
+        c.play();
+        let v = dev.callback(530, LATENCY);
+        let left: Vec<f32> = v.iter().step_by(2).copied().collect();
+        // 240..249, then the loop again from 0, twice over: no gap, no silence.
+        assert_eq!(left[0], 240.0);
+        let want: Vec<f32> = (240..240 + 530).map(|i| (i % 250) as f32).collect();
+        assert_eq!(left, want);
+        assert_eq!(c.underruns(), 0);
+        // Without the loop the same position plays past the end into silence.
+        c.set_loop(None);
+        c.seek(240.5 / SR as f32);
+        c.play();
+        let v = dev.callback(20, LATENCY);
+        assert_eq!(v[2 * 9], 249.0);
+        assert!(v[2 * 10..].iter().all(|x| *x == 0.0));
+    }
+
+    #[test]
+    fn looping_position_wraps_instead_of_overflowing() {
+        // A position near the 32.32 limit, as after a day of playback: with a loop it
+        // stays within the wrap span (a whole number of periods).
+        assert_eq!(wrap_span(250) % 250, 0);
+        assert!(wrap_span(250) >= 1 << 28);
+        assert_eq!(wrap_span(1 << 30), 1 << 30);
+        let (out, dev) = AudioOut::fake(SR);
+        let mut c = Clock::new(Some(out));
+        c.set_loop(Some(250));
+        c.put_chunk(
+            250,
+            250,
+            0,
+            1,
+            Arc::new((0..250).flat_map(|i| [i as f32, 0.0]).collect()),
+        );
+        let span = wrap_span(250);
+        c.play();
+        let shared = &c.audio.as_ref().unwrap().shared;
+        shared.pos.store((span - 3) << 32, Ordering::Release);
+        let v = dev.callback(6, LATENCY);
+        let left: Vec<f32> = v.iter().step_by(2).copied().collect();
+        let want: Vec<f32> = (0..6).map(|k| ((span - 3 + k) % 250) as f32).collect();
+        assert_eq!(left, want);
+        let pos = c.audio.as_ref().unwrap().shared.pos.load(Ordering::Relaxed) >> 32;
+        assert_eq!(pos, 3);
+    }
+
+    #[test]
+    fn looping_clock_wraps_time_to_the_period() {
+        let mut c = Clock::new(None);
+        c.set_loop(Some(4410)); // 0.1 s at 44.1 kHz (no device)
+        c.seek(0.25);
+        assert!((c.time() - 0.05).abs() < 1e-6, "{}", c.time());
+        c.seek(0.08);
+        let start = Instant::now();
+        c.play();
+        let mut wrapped = false;
+        let mut last = c.time();
+        while start.elapsed() < Duration::from_millis(250) {
+            let t = c.time();
+            assert!((0.0..0.1).contains(&t), "{t}");
+            if t < last {
+                wrapped = true;
+                // Wraps only at the end of a period.
+                assert!(last > 0.07 && t < 0.03, "{last} -> {t}");
+            }
+            last = t;
+            sleep(Duration::from_millis(1));
+        }
+        assert!(wrapped && c.loops() >= 1);
+        c.pause();
+        let held = c.time();
+        assert!((0.0..0.1).contains(&held));
+        // Leaving the loop keeps the place within the period.
+        c.set_loop(None);
+        assert_eq!(c.time(), held);
     }
 }

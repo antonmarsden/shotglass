@@ -50,7 +50,7 @@ cargo fmt && cargo clippy --all-targets -- -D warnings
 | `main.rs` | CLI (clap): play, still, strip, check, wav, export, new, fetch, update, licenses, bundle, selftest |
 | `golden.rs` | `strip`/`wav --compare/--bless`: golden-image comparison (per-pixel tolerance, pixel budget, mean limit, diff image); soundtrack comparison (RMS/peak of the difference per 50 ms window, first differing time), WAV reader |
 | `export.rs` | offline export: frame n at `frame_time(n)`, raw RGBA piped to ffmpeg (or PNGs), WAV muxed in |
-| `movie.rs` | `movie.toml` → `Movie`; timeline (`at(t)`), rational fps (`frame_time`/`frame_at`), cue defines, sound gains/windows, `channels`/`[textures]` → `Shot::channels` |
+| `movie.rs` | `movie.toml` → `Movie`; timeline (`at(t)`), rational fps (`frame_time`/`frame_at`), cue defines, sound gains/windows, `channels`/`[textures]` → `Shot::channels`, `loop` (`loop_frames`, `loop_period`, `wrap`, `sound_samples`) |
 | `texture.rs` | iChannel images, CPU side: PNG/JPEG → RGBA8 (flipped for `vflip`), size limits, GPU memory, error messages (HTML page, Git LFS pointer, half-saved file) |
 | `anim.rs` | constants/keyframes, eases; `glsl_fn` turns keyframes into GLSL for sound shaders |
 | `shader.rs` | source assembly, `#include` (film-relative, `<lib/file>`, include-once), `#line 1 N` per file, driver-log → file:line; `Dialect` (fixed `330 core` / `300 es` baseline, `glsl` opt-in) |
@@ -59,11 +59,11 @@ cargo fmt && cargo clippy --all-targets -- -D warnings
 | `validate.rs` | strict, driver-independent check (glslang) of every assembled shader; `validate_movie(m, dialect)` is the API `check`/`check --web` and the web player use |
 | `gfx.rs` | `Renderer`: lazy prioritised compiles, program cache (disk + LRU), textures (decode thread → banded uploads in `pump` → `glGenerateMipmap`; sampler objects; LRU under a 256 MB budget), off-screen targets, transitions/freeze, strips, GPU timer, audio blocks (submit → PBO + fence → poll/wait) |
 | `sound.rs` | `Soundtrack`: music / per-shot / mix tracks synthesised in cached chunks; `chunk` blocks, `stream` never does |
-| `audio.rs` | cpal output, lock-free `fill` callback, chunk store, master `Clock`, WAV writer |
+| `audio.rs` | cpal output, lock-free `fill` callback, chunk store (wraps for loop films, `wrap_span`), master `Clock` (f64, `set_loop`), WAV writer |
 | `app.rs` | egui player: transport, timeline, panels, live reload, auto scale, sound streaming |
 | `headless.rs` | hidden-window GL context for CLI commands |
 | `selftest.rs` | GPU/sound checks on fixture films written to a temp dir |
-| `tests/golden.rs`, `tests/golden/` | golden tests: 8-frame 320x180 strips and 8 kHz soundtracks of the demo and the template, and a strip of `tests/films/channels` (textures), vs reference PNGs / WAVs |
+| `tests/golden.rs`, `tests/golden/` | golden tests: 8-frame 320x180 strips and 8 kHz soundtracks of the demo and the template, a strip of `tests/films/channels` (textures), and a two-period strip and the soundtrack of `tests/films/loop` (`loop = true`), vs reference PNGs / WAVs |
 | `glsl/copy.glsl` | the engine's internal copy pass (not a transition films can name; theirs come from libraries or files) |
 | `movies/big-shadow/` | demo film; `templates/new/` is what `shotglass new` writes |
 
@@ -92,8 +92,20 @@ cargo fmt && cargo clippy --all-targets -- -D warnings
   mapped where GL 4.4 allows (no map/upload calls); fences are polled in batches
   (`COLLECT_AFTER`). Selftest streams with and without persistent buffers.
 - **The audio callback (`fill`) never blocks or allocates.** Only atomics, `ArcSwap` and `try_lock`.
-- **`Clock::time()` never decreases while playing.** Use the sound card position only when it
-  agrees with the system timer (within 0.25 s).
+- **`Clock::time()` never decreases while playing** (except a loop film's wrap to 0 at the end of
+  a period: the unwrapped f64 time underneath never decreases). Use the sound card position only
+  when it agrees with the system timer (within 0.25 s); when it does, the timer estimate moves to
+  it, so the timer follows the card's drift over hours of looping.
+- **Loop films (`loop = true`): shaders only ever see time within one period.** The period is
+  the duration, a whole number of frames (`loop_frames`); frame n of loop k is frame n of loop 0
+  (`FrameInfo::at` wraps in f64, `FrameInfo::frame` by frame number; never wrap an f32 time far
+  out). The player's clock wraps at `Movie::sound_samples(rate)` samples (one period, rounded),
+  so picture and sound can't drift apart; the sound card position wraps at `wrap_span` (whole
+  periods, ≥ 2^28 samples) so it never overflows. Sound is one period long and the mix reads it
+  circularly (`circular_segments`: before 0 is the end, past the end is the start), so an echo
+  rings over the seam, into the first play too. No transition across the seam; a lead on the
+  first shot or a tail on the last is refused. No loop-count uniform. Selftest "loop films"
+  pins all of this against a long unlooped render.
 - **A broken edit keeps the last working version on screen** (per shot id fallback, which
   remembers programs and textures). Missing files (assembly errors, a missing texture)
   refuse the whole new version; a broken or half-saved image falls back per texture.
