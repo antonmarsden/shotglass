@@ -1,7 +1,7 @@
-//! Libraries: shared GLSL that a film declares by name in `[libraries]` (issue #3).
+//! Libraries: shared GLSL that a project declares by name in `[libraries]` (issue #3).
 //!
-//! - `movie.toml` names each library locally (`kit = { version = "0.4", source = "https://…", subdir = "core" }`),
-//!   and shaders include `<kit/noise.glsl>`. The film picks the name, so two publishers'
+//! - `shotglass.toml` (the project file, see project.rs) names each library locally (`kit = { version = "0.4", source = "https://…", subdir = "core" }`),
+//!   and shaders include `<kit/noise.glsl>`. The project picks the name, so two publishers'
 //!   "kit"s never clash.
 //! - Each library root has a `library.toml` with its canonical name (`shotglass-kit/core`),
 //!   version, the engine contract it needs, peer requirements and licences. A library's own
@@ -9,8 +9,9 @@
 //! - `shotglass fetch` resolves version ranges against git tags, downloads into a per-user
 //!   cache and writes `shotglass.lock` (exact version, tag, subdir, sha256 of the files).
 //!   Loading a film only reads the lock and the cache; it never touches the network.
-//! - Per-machine overrides (`SHOTGLASS_LIB_<NAME>`, `movie.local.toml`) point a library at a
-//!   local folder without putting machine paths in the committed film.
+//! - Per-machine overrides (`SHOTGLASS_LIB_<NAME>`, `shotglass.local.toml`) point a library
+//!   at a local folder without putting machine paths in the committed project.
+//! - A frozen film's lock (`path` entries, written by `freeze`/`bundle`) wins over overrides.
 
 use anyhow::{Context, Result, anyhow, bail};
 use semver::{Version, VersionReq};
@@ -24,7 +25,7 @@ use std::path::{Path, PathBuf};
 pub const CONTRACT: &str = env!("CARGO_PKG_VERSION");
 
 pub const LOCK_FILE: &str = "shotglass.lock";
-pub const LOCAL_FILE: &str = "movie.local.toml";
+pub const LOCAL_FILE: &str = "shotglass.local.toml";
 pub const LIBRARY_FILE: &str = "library.toml";
 
 pub fn contract() -> Version {
@@ -35,7 +36,7 @@ pub fn parse_req(s: &str) -> Result<VersionReq> {
     VersionReq::parse(s.trim()).map_err(|e| anyhow!("\"{s}\" is not a version range ({e})"))
 }
 
-/// `shotglass = "0.4"` in `movie.toml`: refuse with a clear message if this engine's
+/// `shotglass = "0.4"` in `shotglass.toml`: refuse with a clear message if this engine's
 /// contract doesn't satisfy it.
 pub fn check_engine(req: &str) -> Result<()> {
     let r = parse_req(req).context("shotglass")?;
@@ -66,6 +67,12 @@ pub fn check_engine(req: &str) -> Result<()> {
 /// or `..` that climbs above the folder it is relative to). The same `movie.toml` has to
 /// work on desktop and in the web player.
 pub fn check_rel_path(p: &str) -> std::result::Result<(), String> {
+    check_rel_path_in(p, "the film folder")
+}
+
+/// `check_rel_path` for paths relative to another folder (`base`, for messages: "the
+/// project folder").
+pub fn check_rel_path_in(p: &str, base: &str) -> std::result::Result<(), String> {
     if p.is_empty() {
         return Err("empty path".into());
     }
@@ -80,12 +87,12 @@ pub fn check_rel_path(p: &str) -> std::result::Result<(), String> {
     let b = p.as_bytes();
     if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
         return Err(format!(
-            "\"{p}\" starts with a drive letter; paths must be relative to the film folder"
+            "\"{p}\" starts with a drive letter; paths must be relative to {base}"
         ));
     }
     if p.starts_with('/') {
         return Err(format!(
-            "\"{p}\" is absolute; paths must be relative to the film folder"
+            "\"{p}\" is absolute; paths must be relative to {base}"
         ));
     }
     let mut depth = 0i32;
@@ -95,7 +102,7 @@ pub fn check_rel_path(p: &str) -> std::result::Result<(), String> {
             ".." => {
                 depth -= 1;
                 if depth < 0 {
-                    return Err(format!("\"{p}\" climbs above the film folder"));
+                    return Err(format!("\"{p}\" climbs above {base}"));
                 }
             }
             _ => depth += 1,
@@ -173,7 +180,7 @@ fn is_canonical(s: &str) -> bool {
 
 // ------------------------------------------------------------------ declarations
 
-/// One entry of `[libraries]` in `movie.toml`.
+/// One entry of `[libraries]` in `shotglass.toml`.
 #[derive(Deserialize, Clone, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct LibraryDecl {
@@ -185,7 +192,7 @@ pub struct LibraryDecl {
     pub branch: Option<String>,
     /// Folder of the source that is the library root.
     pub subdir: Option<String>,
-    /// A library inside the film's own folder (relative, may not climb out).
+    /// A library inside the project folder (relative, may not climb out).
     pub path: Option<String>,
 }
 
@@ -232,7 +239,7 @@ impl LibrarySpec {
         match (&d.source, &d.path) {
             (Some(_), Some(_)) => bail!("{}: give either source or path, not both", ctx()),
             (None, None) => bail!(
-                "{}: needs a source (https git URL + version) or a path inside the film",
+                "{}: needs a source (https git URL + version) or a path inside the project",
                 ctx()
             ),
             (Some(src), None) => {
@@ -255,7 +262,8 @@ impl LibrarySpec {
                 }
             }
             (None, Some(p)) => {
-                check_rel_path(p).map_err(|e| anyhow!("{}: path {e}", ctx()))?;
+                check_rel_path_in(p, "the project folder")
+                    .map_err(|e| anyhow!("{}: path {e}", ctx()))?;
                 if d.subdir.is_some() {
                     bail!(
                         "{}: subdir only goes with source; put the folder in path",
@@ -316,16 +324,16 @@ struct LibraryToml {
 /// Where a library's files came from (for messages).
 #[derive(Clone, Debug, PartialEq)]
 pub enum Origin {
-    /// `path = "…"` in movie.toml.
+    /// `path = "…"` in shotglass.toml (relative to the project root).
     Path,
     /// `SHOTGLASS_LIB_<NAME>`.
     Env(String),
-    /// `movie.local.toml`.
+    /// `shotglass.local.toml`.
     Local,
     /// The cache, as pinned by shotglass.lock.
     Locked,
-    /// A folder inside the film, as pinned by shotglass.lock (`path`, written by
-    /// `shotglass bundle`): the locked files the film includes, no cache needed.
+    /// A folder inside a frozen film or a bundle, as pinned by shotglass.lock (`path`,
+    /// written by `shotglass freeze`/`bundle`): the files the film includes, no cache needed.
     Bundled(String),
 }
 
@@ -430,15 +438,15 @@ pub fn env_var(name: &str) -> String {
     )
 }
 
-/// Per-machine overrides: `SHOTGLASS_LIB_<NAME>` beats `movie.local.toml`. Override paths
-/// may be absolute; relative ones are relative to the film folder.
+/// Per-machine overrides: `SHOTGLASS_LIB_<NAME>` beats `shotglass.local.toml`. Override
+/// paths may be absolute; relative ones are relative to the project root.
 pub fn overrides(
-    film_root: &Path,
+    project_root: &Path,
     specs: &[LibrarySpec],
     env: &dyn Fn(&str) -> Option<String>,
 ) -> Result<BTreeMap<String, (PathBuf, Origin)>> {
     let mut out = BTreeMap::new();
-    let local = film_root.join(LOCAL_FILE);
+    let local = project_root.join(LOCAL_FILE);
     if local.exists() {
         let text = std::fs::read_to_string(&local)
             .with_context(|| format!("reading {}", local.display()))?;
@@ -447,16 +455,16 @@ pub fn overrides(
         for (name, l) in f.libraries {
             if !specs.iter().any(|s| s.name == name) {
                 bail!(
-                    "{LOCAL_FILE} overrides library \"{name}\", but movie.toml has no such library"
+                    "{LOCAL_FILE} overrides library \"{name}\", but shotglass.toml has no such library"
                 );
             }
-            out.insert(name, (film_root.join(&l.path), Origin::Local));
+            out.insert(name, (project_root.join(&l.path), Origin::Local));
         }
     }
     for s in specs {
         let var = env_var(&s.name);
         if let Some(p) = env(&var).filter(|p| !p.is_empty()) {
-            out.insert(s.name.clone(), (film_root.join(&p), Origin::Env(var)));
+            out.insert(s.name.clone(), (project_root.join(&p), Origin::Env(var)));
         }
     }
     Ok(out)
@@ -476,22 +484,25 @@ pub struct Lock {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct LockEntry {
-    /// Local name from movie.toml.
+    /// Local name from shotglass.toml.
     pub name: String,
     /// Exact version (for a followed branch: what its `library.toml` said when pinned).
     pub version: String,
-    /// The git URL; together with `tag` (or `rev`) this is the resolved location.
+    /// The git URL; together with `tag` (or `rev`) this is the resolved location. Empty
+    /// for a frozen copy of a `path` library (then `path` is set).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub source: String,
     /// The release tag, or for a followed branch the ref: `HEAD` or `refs/heads/<branch>`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub tag: String,
     /// The pinned commit when following a branch instead of tagged releases.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rev: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subdir: Option<String>,
-    /// A bundled copy inside the film folder (relative, forward slashes), written by
-    /// `shotglass bundle`: the library is read from there instead of the cache, and
-    /// `sha256` is the hash of that folder.
+    /// A frozen copy (relative to the project root, forward slashes), written by
+    /// `shotglass freeze`/`bundle`: the library is read from there instead of the cache or
+    /// an override, and `sha256` is the hash of that folder.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
     /// sha256 of the library root's files (see `hash_dir`).
@@ -526,7 +537,14 @@ impl Lock {
                 );
             }
             if let Some(p) = &e.path {
-                check_rel_path(p).map_err(|m| anyhow!("library \"{}\": path {m}", e.name))?;
+                check_rel_path_in(p, "the project folder")
+                    .map_err(|m| anyhow!("library \"{}\": path {m}", e.name))?;
+            }
+            if e.path.is_none() && (e.source.is_empty() || e.tag.is_empty()) {
+                bail!(
+                    "library \"{}\": needs a source and a tag (or a path)",
+                    e.name
+                );
             }
         }
         Ok(l)
@@ -536,13 +554,13 @@ impl Lock {
         let mut l = self.clone();
         l.libraries.sort_by(|a, b| a.name.cmp(&b.name));
         format!(
-            "# Written by `shotglass fetch`/`update`. Commit it with the film.\n{}",
+            "# Written by `shotglass fetch`/`update`. Commit it with the project.\n{}",
             toml::to_string(&l).expect("lock serialises")
         )
     }
 
-    pub fn load(film_root: &Path) -> Result<Option<Lock>> {
-        let p = film_root.join(LOCK_FILE);
+    pub fn load(project_root: &Path) -> Result<Option<Lock>> {
+        let p = project_root.join(LOCK_FILE);
         if !p.exists() {
             return Ok(None);
         }
@@ -559,8 +577,12 @@ impl Lock {
 }
 
 impl LockEntry {
-    /// Still valid for this spec (same source and subdir, version in range)?
+    /// Still valid for this spec (same source and subdir, version in range)? A frozen
+    /// copy of a `path` library fits a `path` spec.
     fn fits(&self, s: &LibrarySpec) -> bool {
+        if s.path.is_some() {
+            return self.source.is_empty() && self.path.is_some();
+        }
         s.source.as_deref() == Some(self.source.as_str())
             && s.subdir == self.subdir
             && match (&s.version, &self.rev) {
@@ -577,6 +599,9 @@ impl LockEntry {
 
     /// For messages: `0.4.2`, or `main@1a2b3c4 (0.1.0)`.
     pub fn pin(&self) -> String {
+        if self.source.is_empty() {
+            return self.version.clone();
+        }
         match &self.rev {
             Some(r) => format!(
                 "{}@{} ({})",
@@ -691,10 +716,11 @@ pub fn cache_path(cache: &Path, source: &str, version: &str) -> PathBuf {
 
 // ------------------------------------------------------------------ resolving
 
-/// Turn a film's declarations into library folders on disk, checking `library.toml`,
+/// Turn a project's declarations into library folders on disk, checking `library.toml`,
 /// versions, the engine contract and peer requirements. Never touches the network.
+/// Frozen copies (lock entries with a `path`) win over overrides: a frozen film never changes.
 pub fn resolve(
-    film_root: &Path,
+    project_root: &Path,
     specs: &[LibrarySpec],
     overrides: &BTreeMap<String, (PathBuf, Origin)>,
     lock: Option<&Lock>,
@@ -702,10 +728,13 @@ pub fn resolve(
 ) -> Result<Vec<Library>> {
     let mut libs = vec![];
     for s in specs {
-        let (root, origin) = if let Some((p, o)) = overrides.get(&s.name) {
+        let frozen = lock
+            .and_then(|l| l.get(&s.name))
+            .is_some_and(|e| e.path.is_some() && e.fits(s));
+        let (root, origin) = if let Some((p, o)) = overrides.get(&s.name).filter(|_| !frozen) {
             (p.clone(), o.clone())
-        } else if let Some(p) = &s.path {
-            (film_root.join(p), Origin::Path)
+        } else if let Some(p) = s.path.as_ref().filter(|_| !frozen) {
+            (project_root.join(p), Origin::Path)
         } else {
             let fetch = "run `shotglass fetch` on the film";
             let e = lock.and_then(|l| l.get(&s.name)).ok_or_else(|| {
@@ -713,15 +742,15 @@ pub fn resolve(
             })?;
             if !e.fits(s) {
                 bail!(
-                    "library \"{}\" in movie.toml no longer matches {LOCK_FILE} ({} {}); \
-                     run `shotglass update` on the film",
+                    "library \"{}\" in shotglass.toml no longer matches {LOCK_FILE} ({} {}); \
+                     run `shotglass update` on the project",
                     s.name,
                     e.source,
                     e.pin()
                 );
             }
             let (root, origin) = match &e.path {
-                Some(p) => (film_root.join(p), Origin::Bundled(p.clone())),
+                Some(p) => (project_root.join(p), Origin::Bundled(p.clone())),
                 None => {
                     let dir = cache_path(cache, &e.source, e.cache_key());
                     let root = match &e.subdir {
@@ -734,7 +763,8 @@ pub fn resolve(
             if !root.is_dir() {
                 match &e.path {
                     Some(p) => bail!(
-                        "library \"{}\" {}: {LOCK_FILE} says it is bundled in \"{p}\", but                          the film has no such folder",
+                        "library \"{}\" {}: {LOCK_FILE} says it is frozen in \"{p}\", but \
+                         there is no such folder",
                         s.name,
                         e.pin()
                     ),
@@ -755,7 +785,7 @@ pub fn resolve(
                     root.display(),
                     e.sha256,
                     if e.path.is_some() {
-                        "the bundled copy was edited"
+                        "the frozen copy was edited"
                     } else {
                         "the cache was edited or the tag moved"
                     }
@@ -768,7 +798,7 @@ pub fn resolve(
             && !r.matches(&lib.version)
         {
             bail!(
-                "library \"{}\": movie.toml asks for version {r}, but {} is {} {}",
+                "library \"{}\": shotglass.toml asks for version {r}, but {} is {} {}",
                 s.name,
                 root.display(),
                 lib.canonical,
@@ -808,7 +838,7 @@ pub fn check_set(libs: &[Library]) -> Result<()> {
         for (peer, req) in &l.requires {
             match libs.iter().find(|p| &p.canonical == peer) {
                 None => bail!(
-                    "library {} needs {peer} {req}; add it to [libraries] in movie.toml \
+                    "library {} needs {peer} {req}; add it to [libraries] in shotglass.toml \
                      (peer libraries are checked, not installed)",
                     l.describe()
                 ),
@@ -929,7 +959,7 @@ pub fn fetch(
     if let FetchMode::Update(names) = mode {
         for n in names {
             if !specs.iter().any(|s| &s.name == n) {
-                bail!("movie.toml has no library \"{n}\"");
+                bail!("shotglass.toml has no library \"{n}\"");
             }
         }
     }
@@ -937,11 +967,22 @@ pub fn fetch(
     let mut log = vec![];
     for s in specs {
         let Some(source) = &s.source else {
-            log.push(format!(
-                "{}: local folder {}",
-                s.name,
-                s.path.as_deref().unwrap_or("")
-            ));
+            match old.and_then(|l| l.get(&s.name)).filter(|e| e.fits(s)) {
+                // A frozen copy of a path library: kept as it is.
+                Some(e) => {
+                    log.push(format!(
+                        "{}: frozen in {} (locked)",
+                        s.name,
+                        e.path.as_deref().unwrap_or("")
+                    ));
+                    lock.libraries.push(e.clone());
+                }
+                None => log.push(format!(
+                    "{}: local folder {}",
+                    s.name,
+                    s.path.as_deref().unwrap_or("")
+                )),
+            }
             continue;
         };
         let prev = old.and_then(|l| l.get(&s.name)).filter(|e| e.fits(s));
@@ -960,9 +1001,9 @@ pub fn fetch(
         };
         let entry = match prev {
             Some(e) if !refresh && e.path.is_some() => {
-                // Bundled inside the film: nothing to download (loading checks the hash).
+                // Frozen inside the film: nothing to download (loading checks the hash).
                 log.push(format!(
-                    "{}: {} bundled in {} (locked)",
+                    "{}: {} frozen in {} (locked)",
                     s.name,
                     e.pin(),
                     e.path.as_deref().unwrap_or("")
@@ -1932,6 +1973,87 @@ mod tests {
             resolve(&film, &sp2, &BTreeMap::new(), None, &film).unwrap_err()
         );
         assert!(e.contains("needs a library.toml"), "{e}");
+        std::fs::remove_dir_all(&film).ok();
+        std::fs::remove_dir_all(&dev).ok();
+    }
+
+    /// A frozen copy (a lock entry with a `path`) wins over overrides, for source and
+    /// `path` libraries alike, is hash-checked, and survives `fetch`.
+    #[test]
+    fn frozen_copies_win_over_overrides() {
+        let film = tmp("frozen-film");
+        let dev = tmp("frozen-dev");
+        let core = libtoml("shotglass-kit/core", "0.4.1", "");
+        let mine = libtoml("me/mine", "0.1.0", "");
+        write(
+            &film,
+            &[
+                ("shotglass-libs/kit/library.toml", &core),
+                ("shotglass-libs/mine/library.toml", &mine),
+            ],
+        );
+        write(&dev, &[("library.toml", &core)]);
+        let sp = specs(&format!(
+            "kit = {{ version = \"0.4\", source = \"{KIT}\", subdir = \"core\" }}\nmine = {{ path = \"shotglass-libs/mine\" }}\n"
+        ));
+        let entry = |name: &str, source: &str, tag: &str, version: &str| LockEntry {
+            name: name.into(),
+            version: version.into(),
+            source: source.into(),
+            tag: tag.into(),
+            rev: None,
+            subdir: (!source.is_empty()).then(|| "core".to_string()),
+            path: Some(format!("shotglass-libs/{name}")),
+            sha256: hash_dir(&film.join("shotglass-libs").join(name)).unwrap(),
+        };
+        let lock = Lock {
+            version: 1,
+            libraries: vec![
+                entry("kit", KIT, "v0.4.1", "0.4.1"),
+                entry("mine", "", "", "0.1.0"),
+            ],
+        };
+        // The lock round-trips without a source or tag for the path library.
+        let lock = Lock::parse(&lock.to_text()).unwrap();
+        assert_eq!(lock.get("mine").unwrap().source, "");
+        assert!(
+            Lock::parse(
+                "version = 1\n[[library]]\nname = \"x\"\nversion = \"1.0.0\"\nsha256 = \"0\"\n"
+            )
+            .is_err()
+        );
+
+        let env = |k: &str| {
+            k.starts_with("SHOTGLASS_LIB_")
+                .then(|| dev.display().to_string())
+        };
+        let o = overrides(&film, &sp, &env).unwrap();
+        assert_eq!(o.len(), 2);
+        let libs = resolve(&film, &sp, &o, Some(&lock), &dev).unwrap();
+        for l in &libs {
+            assert!(matches!(l.origin, Origin::Bundled(_)), "{l:?}");
+            assert_eq!(l.root, film.join("shotglass-libs").join(&l.name));
+        }
+        // Edited frozen copies are refused.
+        write(&film, &[("shotglass-libs/mine/extra.glsl", "float x;\n")]);
+        let e = format!(
+            "{:#}",
+            resolve(&film, &sp, &o, Some(&lock), &dev).unwrap_err()
+        );
+        assert!(e.contains("frozen copy was edited"), "{e}");
+        // fetch keeps both entries without downloading anything.
+        let f = Fake::default();
+        let (again, log) = fetch(
+            &sp,
+            Some(&lock),
+            &f,
+            &dev,
+            &FetchMode::Missing {
+                skip: Default::default(),
+            },
+        )
+        .unwrap();
+        assert_eq!(again, lock, "{log:?}");
         std::fs::remove_dir_all(&film).ok();
         std::fs::remove_dir_all(&dev).ok();
     }

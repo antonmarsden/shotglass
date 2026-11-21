@@ -3,14 +3,6 @@
 title = "Big Shadow"
 aspect = [16, 9]
 fps = 30
-shotglass = "0.1"
-
-# Shared GLSL from shotglass-kit. No version: follow the kit's main branch, pinned to
-# one commit in shotglass.lock (`shotglass update movies/big-shadow` moves the pin).
-[libraries]
-kit = { source = "https://github.com/antonmarsden/shotglass-kit", subdir = "core" }
-transitions = { source = "https://github.com/antonmarsden/shotglass-kit", subdir = "transitions" }
-sound = { source = "https://github.com/antonmarsden/shotglass-kit", subdir = "sound" }
 
 [sound]
 music = "music.glsl"      # runs across the cuts; time = movie time

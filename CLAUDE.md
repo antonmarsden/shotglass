@@ -50,12 +50,13 @@ cargo fmt && cargo clippy --all-targets -- -D warnings
 | `main.rs` | CLI (clap): play, still, strip, check, wav, export, new, fetch, update, licenses, bundle, selftest |
 | `golden.rs` | `strip`/`wav --compare/--bless`: golden-image comparison (per-pixel tolerance, pixel budget, mean limit, diff image); soundtrack comparison (RMS/peak of the difference per 50 ms window, first differing time), WAV reader |
 | `export.rs` | offline export: frame n at `frame_time(n)`, raw RGBA piped to ffmpeg (or PNGs), WAV muxed in |
-| `movie.rs` | `movie.toml` → `Movie`; timeline (`at(t)`), rational fps (`frame_time`/`frame_at`), cue defines, sound gains/windows, `channels`/`[textures]` → `Shot::channels`, `loop` (`loop_frames`, `loop_period`, `wrap`, `sound_samples`) |
+| `movie.rs` | `movie.toml` (+ its project) → `Movie`; timeline (`at(t)`), rational fps (`frame_time`/`frame_at`), cue defines, sound gains/windows, `channels`/`[textures]` → `Shot::channels`, `loop` (`loop_frames`, `loop_period`, `wrap`, `sound_samples`) |
 | `texture.rs` | iChannel images, CPU side: PNG/JPEG → RGBA8 (flipped for `vflip`), size limits, GPU memory, error messages (HTML page, Git LFS pointer, half-saved file) |
 | `anim.rs` | constants/keyframes, eases; `glsl_fn` turns keyframes into GLSL for sound shaders |
 | `shader.rs` | source assembly, `#include` (film-relative, `<lib/file>`, include-once), `#line 1 N` per file, driver-log → file:line; `Dialect` (fixed `330 core` / `300 es` baseline, `glsl` opt-in) |
-| `library.rs` | `[libraries]` specs, `library.toml`, overrides, path rules, `shotglass.lock`, sha256, `Fetcher` (git), peer/contract checks |
-| `bundle.rs` | `licenses` (libraries a film includes, SPDX licences, non-commercial flag) and `bundle` (film + exactly the included locked library files in `shotglass-libs/`, lock `path` entries, `LIBRARY-LICENSES.md`) |
+| `project.rs` | projects (#59): `shotglass.toml` (engine contract + `[libraries]`), nearest one at or above a film, a project's films, film-or-project command targets, `split_fixture`/`write_fixture` for test films written as one text |
+| `library.rs` | `[libraries]` specs, `library.toml`, overrides (`shotglass.local.toml`, `SHOTGLASS_LIB_*`, relative to the project), path rules, `shotglass.lock` (frozen `path` entries win over overrides), sha256, `Fetcher` (git), peer/contract checks |
+| `bundle.rs` | `licenses` (libraries a film includes, SPDX licences, non-commercial flag), `freeze`/`unfreeze` and `bundle` (one writer: exactly the included library files in `shotglass-libs/`, a `shotglass.toml` marked frozen, lock `path` entries; `bundle` adds the film folder and `LIBRARY-LICENSES.md`) |
 | `validate.rs` | strict, driver-independent check (glslang) of every assembled shader; `validate_movie(m, dialect)` is the API `check`/`check --web` and the web player use |
 | `gfx.rs` | `Renderer`: lazy prioritised compiles, program cache (disk + LRU), textures (decode thread → banded uploads in `pump` → `glGenerateMipmap`; sampler objects; LRU under a 256 MB budget), off-screen targets, transitions/freeze, strips, GPU timer, audio blocks (submit → PBO + fence → poll/wait) |
 | `sound.rs` | `Soundtrack`: music / per-shot / mix tracks synthesised in cached chunks; `chunk` blocks, `stream` never does |
@@ -143,6 +144,10 @@ cargo fmt && cargo clippy --all-targets -- -D warnings
 - **New transition:** it goes in the kit (shotglass-kit `transitions/`), not the engine.
   Films use it as `type = "<library>/<name>"`. A bare name (`type = "iris"`) is an
   error that names the kit replacement. No compatibility code for old films.
+- **Libraries and the engine contract live in the project** (`shotglass.toml`), never in
+  `movie.toml`; `shotglass.lock` and overrides sit next to `shotglass.toml`. A frozen
+  film is a project of its own. Test films written as one text go through
+  `project::write_fixture` / `split_fixture`.
 - **`movie.toml` field:** add it to the serde struct (`deny_unknown_fields`) and the resolved
   struct, validate it in `Movie::parse`, add a unit test, and update the README and
   `templates/new/movie.toml`.

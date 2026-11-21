@@ -1,7 +1,6 @@
 # Golden film for loop = true (tests/golden.rs): picture and sound repeat every 2 s
 # (60 frames) forever. The golden strip shows two periods (its second row is the
 # first again); the golden soundtrack is one period, whose echo rings over the seam.
-shotglass = "0.1.2"
 title = "loop"
 fps = 30
 loop = true

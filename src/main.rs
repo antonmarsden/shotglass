@@ -10,6 +10,7 @@ mod golden;
 mod headless;
 mod library;
 mod movie;
+mod project;
 mod selftest;
 mod shader;
 mod sound;
@@ -157,24 +158,32 @@ enum Cmd {
     },
     /// Create a new movie folder from a template.
     New { dir: PathBuf },
-    /// Download the film's libraries and pin them in shotglass.lock (keeps existing pins).
+    /// Download the project's libraries and pin them in shotglass.lock (keeps existing
+    /// pins). Takes a film or a project root.
     Fetch { movie: PathBuf },
-    /// Move libraries in shotglass.lock to the newest version movie.toml allows.
+    /// Move libraries in the project's shotglass.lock to the newest version shotglass.toml
+    /// allows. Takes a film or a project root; every film of the project follows.
     Update {
         movie: PathBuf,
-        /// Library names (local names from movie.toml); all if none.
+        /// Library names (local names from shotglass.toml); all if none.
         names: Vec<String>,
     },
-    /// List the libraries the film includes, with their licences (flags non-commercial ones).
+    /// List the libraries the film includes, with their licences (flags non-commercial
+    /// ones). A project root lists every film.
     Licenses { movie: PathBuf },
     /// Write a self-contained copy of the film: its folder plus exactly the locked library
-    /// files it includes, playable with no network, cache or overrides.
+    /// files it includes, playable with no project, network, cache or overrides.
     Bundle {
         movie: PathBuf,
         /// Output folder (new or empty, outside the film folder).
         #[arg(long)]
         out: PathBuf,
     },
+    /// Freeze a finished film: copy exactly the library files it includes into the film
+    /// (shotglass-libs/), so project, kit and override changes can't change it.
+    Freeze { movie: PathBuf },
+    /// Undo freeze: the film follows its project's libraries again.
+    Unfreeze { movie: PathBuf },
     /// Check the renderer and soundtrack on this GPU and driver with built-in test films.
     Selftest {
         /// Only run checks whose name contains this text.
@@ -207,6 +216,7 @@ fn real_main() -> Result<()> {
     };
     match cmd {
         Cmd::Play { movie, at, scale } => {
+            let movie = project::film(&movie)?;
             let m = load_movie(&movie)?;
             let start = match at {
                 Some(a) => parse_times(&a, &m)?[0],
@@ -265,7 +275,7 @@ fn real_main() -> Result<()> {
             frames,
             web,
             no_gpu,
-        } => check(&movie, &size, frames, web, no_gpu),
+        } => for_each_film(&movie, |f| check(f, &size, frames, web, no_gpu)),
         Cmd::Wav {
             movie,
             out,
@@ -314,22 +324,60 @@ fn real_main() -> Result<()> {
         Cmd::Update { movie, names } => {
             fetch_libraries(&movie, library::FetchMode::Update(names), true)
         }
-        Cmd::Licenses { movie } => bundle::print_licences(&movie),
-        Cmd::Bundle { movie, out } => bundle::run_bundle(&movie, &out),
+        Cmd::Licenses { movie } => for_each_film(&movie, bundle::print_licences),
+        Cmd::Bundle { movie, out } => bundle::run_bundle(&project::film(&movie)?, &out),
+        Cmd::Freeze { movie } => bundle::run_freeze(&project::film(&movie)?),
+        Cmd::Unfreeze { movie } => bundle::run_unfreeze(&project::film(&movie)?),
         Cmd::Selftest { filter } => selftest::run(filter),
     }
+}
+
+/// Run `f` on a film, or on every film of a project root (all of them, even after a
+/// failure; fails if any did).
+fn for_each_film(path: &Path, f: impl Fn(&Path) -> Result<()>) -> Result<()> {
+    let p = match project::target(path)? {
+        project::Target::Film(film) => return f(&film),
+        project::Target::Project(p) => p,
+    };
+    let films = p.films()?;
+    if films.is_empty() {
+        bail!(
+            "project {} has no films yet (folders with a movie.toml)",
+            path.display()
+        );
+    }
+    let mut failed = vec![];
+    for film in &films {
+        println!("== {}", film.display());
+        if let Err(e) = f(film) {
+            eprintln!("error: {e:#}");
+            failed.push(film.display().to_string());
+        }
+        println!();
+    }
+    if !failed.is_empty() {
+        bail!(
+            "{} of {} films failed: {}",
+            failed.len(),
+            films.len(),
+            failed.join(", ")
+        );
+    }
+    println!("all {} films ok", films.len());
+    Ok(())
 }
 
 /// Load a film for a command, first fetching libraries that aren't locked or downloaded
 /// yet (never moving an existing pin).
 fn load_movie(path: &Path) -> Result<Movie> {
+    let path = &project::film(path)?;
     let m = Movie::read(path)?;
     if m.library_specs.iter().any(|s| s.source.is_some()) {
         let env = |k: &str| std::env::var(k).ok();
-        let skip = library::overrides(&m.root, &m.library_specs, &env)?
+        let skip = library::overrides(&m.project, &m.library_specs, &env)?
             .into_keys()
             .collect();
-        fetch_libraries(path, library::FetchMode::Missing { skip }, false)?;
+        fetch_libraries(&m.project, library::FetchMode::Missing { skip }, false)?;
     }
     let m = Movie::load(path)?;
     for w in &m.warnings {
@@ -339,21 +387,32 @@ fn load_movie(path: &Path) -> Result<Movie> {
 }
 
 /// `fetch`, `update`, and the automatic fetch before other commands (`verbose` = false:
-/// only says something when it downloads or changes the lock).
+/// only says something when it downloads or changes the lock). `path` is a film or a
+/// project root; the lock is the project's.
 fn fetch_libraries(path: &Path, mode: library::FetchMode, verbose: bool) -> Result<()> {
-    let m = Movie::read(path)?;
-    if !m.library_specs.iter().any(|s| s.source.is_some()) {
+    let p = match project::target(path)? {
+        project::Target::Film(film) => project::Project::for_film(&film)?,
+        project::Target::Project(p) => p,
+    };
+    if p.frozen && matches!(mode, library::FetchMode::Update(_)) {
+        bail!(
+            "{} is frozen (its libraries are copies in shotglass-libs/ and never change); \
+             `shotglass unfreeze` it first",
+            p.root.display()
+        );
+    }
+    if !p.specs.iter().any(|s| s.source.is_some()) {
         if verbose {
             println!(
                 "{} has no libraries with a source; nothing to fetch",
-                m.title
+                p.root.display()
             );
         }
         return Ok(());
     }
-    let old = library::Lock::load(&m.root)?;
+    let old = library::Lock::load(&p.root)?;
     let (lock, log) = library::fetch(
-        &m.library_specs,
+        &p.specs,
         old.as_ref(),
         &library::Git,
         &library::cache_dir(),
@@ -366,9 +425,9 @@ fn fetch_libraries(path: &Path, mode: library::FetchMode, verbose: bool) -> Resu
         }
     }
     if changed {
-        let p = m.root.join(library::LOCK_FILE);
-        std::fs::write(&p, lock.to_text()).with_context(|| format!("writing {}", p.display()))?;
-        println!("wrote {}", p.display());
+        let f = p.root.join(library::LOCK_FILE);
+        std::fs::write(&f, lock.to_text()).with_context(|| format!("writing {}", f.display()))?;
+        println!("wrote {}", f.display());
     } else if verbose {
         println!("{} is up to date", library::LOCK_FILE);
     }
@@ -740,11 +799,12 @@ fn check(movie: &Path, size: &str, frames: usize, web: bool, no_gpu: bool) -> Re
     );
     for l in &m.libraries {
         let from = match &l.origin {
-            library::Origin::Path => "in the film".to_string(),
+            library::Origin::Path if l.root.starts_with(&m.root) => "the film".to_string(),
+            library::Origin::Path => "the project".to_string(),
             library::Origin::Env(v) => format!("override {v}"),
             library::Origin::Local => format!("override in {}", library::LOCAL_FILE),
             library::Origin::Locked => library::LOCK_FILE.to_string(),
-            library::Origin::Bundled(p) => format!("{} (bundled in {p})", library::LOCK_FILE),
+            library::Origin::Bundled(p) => format!("{} (frozen in {p})", library::LOCK_FILE),
         };
         println!(
             "library {}{}  [{}]  from {from}: {}",
@@ -1095,6 +1155,10 @@ fn export(
 
 const TEMPLATE: &[(&str, &str)] = &[
     ("movie.toml", include_str!("../templates/new/movie.toml")),
+    (
+        "shotglass.toml",
+        include_str!("../templates/new/shotglass.toml"),
+    ),
     (".gitignore", include_str!("../templates/new/gitignore")),
     (
         ".gitattributes",
@@ -1117,7 +1181,7 @@ const TEMPLATE: &[(&str, &str)] = &[
 
 /// The template's `shotglass = "…"` names this engine's contract.
 fn template_text(name: &str, text: &str) -> String {
-    if name != "movie.toml" {
+    if name != project::PROJECT_FILE {
         return text.to_string();
     }
     let v = library::contract();
@@ -1161,12 +1225,18 @@ mod tests {
 
     #[test]
     fn template_parses_and_names_this_engine() {
-        let (_, text) = TEMPLATE.iter().find(|(n, _)| *n == "movie.toml").unwrap();
-        let text = template_text("movie.toml", text);
-        let m = Movie::parse(&text, Path::new(".")).unwrap();
+        let file = |name: &str| {
+            let (_, text) = TEMPLATE.iter().find(|(n, _)| *n == name).unwrap();
+            template_text(name, text)
+        };
+        let root = Path::new(".");
+        let proj = file(project::PROJECT_FILE);
+        let p = project::Project::parse(&proj, root).unwrap();
+        let m = Movie::parse_in(&file("movie.toml"), root, &p).unwrap();
         let v = library::contract();
         assert_eq!(m.shotglass, Some(format!("{}.{}", v.major, v.minor)));
-        assert!(text.contains("# engine contract"));
+        assert!(proj.contains("# engine contract"));
+        assert!(m.library_specs.iter().any(|s| s.name == "transitions"));
     }
 
     #[test]

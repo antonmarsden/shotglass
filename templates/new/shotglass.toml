@@ -1,0 +1,12 @@
+# The project file: the engine contract and the libraries for every film in this folder
+# (here, one film). For several films sharing a lib/ folder, put shotglass.toml in the
+# folder above them instead (see README, "Projects").
+shotglass = "0.1"         # engine contract this film was made for
+
+# Shared GLSL by name; shaders use #include <kit/file.glsl>. See README, "Libraries".
+# `shotglass play` fetches them with git and pins them in shotglass.lock (commit it).
+# No version: follow the kit's main branch until it has releases.
+[libraries]
+transitions = { source = "https://github.com/antonmarsden/shotglass-kit", subdir = "transitions" }
+# kit = { source = "https://github.com/antonmarsden/shotglass-kit", subdir = "core" }   # noise, colour, shapes
+# mine = { path = "lib/mine" }                    # a folder in the project

@@ -488,8 +488,8 @@ mod tests {
             .unwrap();
             Movie::load(&root).unwrap()
         };
-        std::fs::write(
-            root.join("movie.toml"),
+        crate::project::write_fixture(
+            &root,
             "[libraries]\nkit = { path = \"vendor/kit\", version = \"0.4\" }\n\
              [[shot]]\nid = \"a\"\nscene = \"scenes/a.glsl\"\nduration = 1\n",
         )
@@ -549,9 +549,9 @@ float kit_level() {{ return 0.25; }}
         std::fs::write(lib.join("wipe.glsl"), wipe).unwrap();
         std::fs::write(root.join("scenes/a.glsl"), OK).unwrap();
         let film = |kind: &str| {
-            std::fs::write(
-                root.join("movie.toml"),
-                format!(
+            crate::project::write_fixture(
+                &root,
+                &format!(
                     "[libraries]\nfx = {{ path = \"vendor/fx\" }}\n\
                      [[shot]]\nid = \"a\"\nscene = \"scenes/a.glsl\"\nduration = 1\n\
                      [[shot]]\nid = \"b\"\nscene = \"scenes/a.glsl\"\nduration = 1\n\

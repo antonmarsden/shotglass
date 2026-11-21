@@ -1,6 +1,6 @@
 ---
 name: Kit library / library system
-about: Using, fetching, pinning or checking shader libraries ([libraries], library.toml, shotglass.lock)
+about: Using, fetching, pinning or checking shader libraries ([libraries] in shotglass.toml, library.toml, shotglass.lock, freeze)
 labels: lane:kit
 ---
 
