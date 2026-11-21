@@ -1270,20 +1270,22 @@ impl Renderer {
             }
             // A very slow frame is drawn in horizontal strips, flushed one by one, so
             // no single GPU job runs long enough to trip the driver's watchdog
-            // (Windows resets the GPU after ~2 s).
+            // (Windows resets the GPU after ~2 s). Each strip is its own viewport, as
+            // for sound blocks: gl_FragCoord stays window-relative, so the picture is
+            // the same. Not a scissor: the Apple Software Renderer left parts of
+            // scissored strips undrawn (stale rows from the previous frame).
             let tiles = self.tiles.clamp(1, sh.max(1) as u32) as i32;
             if tiles == 1 {
                 gl.draw_arrays(glow::TRIANGLES, 0, 3);
             } else {
-                gl.enable(glow::SCISSOR_TEST);
                 for i in 0..tiles {
                     let y0 = sh * i / tiles;
                     let y1 = sh * (i + 1) / tiles;
-                    gl.scissor(0, y0, sw, y1 - y0);
+                    gl.viewport(0, y0, sw, y1 - y0);
                     gl.draw_arrays(glow::TRIANGLES, 0, 3);
                     gl.flush();
                 }
-                gl.disable(glow::SCISSOR_TEST);
+                gl.viewport(0, 0, sw, sh);
             }
         }
     }
