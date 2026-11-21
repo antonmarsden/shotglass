@@ -168,6 +168,8 @@ pub struct Renderer {
     pub binary_hits: usize,
     /// Strips a scene is drawn in (more when frames are very slow; see draw_scene).
     tiles: u32,
+    /// `set_tiles` fixed the strip count: the GPU timer doesn't change it.
+    tiles_pinned: bool,
     /// When `context_lost` last asked the driver, and how often it has (tests).
     last_error_check: Option<std::time::Instant>,
     pub error_checks: usize,
@@ -335,6 +337,7 @@ impl Renderer {
                 frame_no: 0,
                 binary_hits: 0,
                 tiles: 1,
+                tiles_pinned: false,
                 last_error_check: None,
                 error_checks: 0,
                 audio_banded: false,
@@ -387,9 +390,12 @@ impl Renderer {
         self.audio_banded = on;
     }
 
-    /// Force the number of strips scenes are drawn in (tests).
-    pub fn set_tiles(&mut self, n: u32) {
-        self.tiles = n.max(1);
+    /// Fix the number of strips scenes are drawn in (tests); `None` goes back to
+    /// choosing it from the GPU timer. Without the pin, the next frame's timer
+    /// reading would put a forced count straight back to 1 on a fast driver.
+    pub fn set_tiles(&mut self, n: Option<u32>) {
+        self.tiles_pinned = n.is_some();
+        self.tiles = n.unwrap_or(1).max(1);
     }
 
     /// Compiled (ready) programs currently held.
@@ -1142,7 +1148,8 @@ impl Renderer {
         if let Some(ms) = self.timer.as_mut().and_then(|t| t.poll(&gl)) {
             // Keep each strip under ~100 ms of GPU time.
             let per_tile = ms / self.tiles as f32;
-            if per_tile > 100.0 || (self.tiles > 1 && ms < 50.0 * self.tiles as f32) {
+            let off = per_tile > 100.0 || (self.tiles > 1 && ms < 50.0 * self.tiles as f32);
+            if off && !self.tiles_pinned {
                 self.tiles = ((ms / 100.0).ceil() as u32).clamp(1, 64);
             }
             self.gpu_samples.push_back(ms);
@@ -1263,20 +1270,22 @@ impl Renderer {
             }
             // A very slow frame is drawn in horizontal strips, flushed one by one, so
             // no single GPU job runs long enough to trip the driver's watchdog
-            // (Windows resets the GPU after ~2 s).
+            // (Windows resets the GPU after ~2 s). Each strip is its own viewport, as
+            // for sound blocks: gl_FragCoord stays window-relative, so the picture is
+            // the same. Not a scissor: the Apple Software Renderer left parts of
+            // scissored strips undrawn (stale rows from the previous frame).
             let tiles = self.tiles.clamp(1, sh.max(1) as u32) as i32;
             if tiles == 1 {
                 gl.draw_arrays(glow::TRIANGLES, 0, 3);
             } else {
-                gl.enable(glow::SCISSOR_TEST);
                 for i in 0..tiles {
                     let y0 = sh * i / tiles;
                     let y1 = sh * (i + 1) / tiles;
-                    gl.scissor(0, y0, sw, y1 - y0);
+                    gl.viewport(0, y0, sw, y1 - y0);
                     gl.draw_arrays(glow::TRIANGLES, 0, 3);
                     gl.flush();
                 }
-                gl.disable(glow::SCISSOR_TEST);
+                gl.viewport(0, 0, sw, sh);
             }
         }
     }

@@ -3,6 +3,8 @@ name: CI
 on:
   push:
   pull_request:
+  # "Run workflow" on the Actions tab: runs every job, macOS included, on any branch.
+  workflow_dispatch:
 
 # Rust is pinned so a new release (with new clippy lints) can't turn CI red on its
 # own. To upgrade: bump this, fix any new warnings locally, commit both together.
@@ -94,7 +96,10 @@ jobs:
           ./target/release/shotglass new "$RUNNER_TEMP/template"
           ./target/release/shotglass check "$RUNNER_TEMP/template" --web --no-gpu
 
+  # The slowest job, so only after a merge to main (or when started by hand, e.g. on a
+  # branch that changes the renderer or the demo's shaders).
   macos:
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -105,11 +110,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy -- -D warnings
       # macOS runners have Apple's OpenGL 4.1 (on Metal), so the GPU selftest and the
-      # golden tests run here. The demo's strip is skipped: the references are llvmpipe
-      # renders and Apple's driver rounds the demo's noise differently (about 1% of
-      # pixels). The template's strip and both soundtracks are still compared.
+      # golden tests run here, against the same llvmpipe references.
       - name: Unit tests, GPU selftest, golden images and soundtracks
-        run: cargo test -- --skip demo_film
+        run: cargo test
       - name: Upload the actual and diff images / WAVs of failed golden tests
         if: failure()
         uses: actions/upload-artifact@v4

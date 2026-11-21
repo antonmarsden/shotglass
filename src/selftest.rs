@@ -566,61 +566,52 @@ fn render_scale_edges(gl: &Gl, dir: &Path) -> Result<String> {
 }
 
 fn tiled_drawing(gl: &Gl, dir: &Path) -> Result<String> {
+    // The strip count is pinned (otherwise the GPU timer puts it back to 1 on the
+    // next frame and nothing is tested), the picture changes with time, and every
+    // tiled frame is drawn over a different one: a strip the driver skips shows up as
+    // stale pixels instead of hiding behind an identical previous frame. (The Apple
+    // Software Renderer dropped parts of scissored strips at 320x180 with 40 and 64
+    // strips: the demo's golden strip showed rows from the frame before.)
     write(
         dir,
         &[(
             "s.glsl",
-            &scene("fragColor = vec4(uv, fract(uv.x * 7.0 + uv.y * 3.0), 1.0);"),
+            &scene("fragColor = vec4(uv, fract(uv.x * 7.0 + uv.y * 3.0 + iTime), 1.0);"),
         )],
     )?;
-    let m = movie(dir, "[[shot]]\nid=\"a\"\nscene=\"s.glsl\"\nduration=2\n")?;
-    let mut r = renderer(gl, &m)?;
-    let one = shot(
-        &mut r,
-        &m,
-        At::Shot {
-            shot: 0,
-            local: 0.5,
-        },
-        1.0,
+    let m = movie(
+        dir,
+        "[[shot]]
+id=\"a\"
+scene=\"s.glsl\"
+duration=2
+",
     )?;
-    for tiles in [2, 7, 64] {
-        r.set_tiles(tiles);
+    let mut r = renderer(gl, &m)?;
+    let draw = |r: &mut Renderer, (w, h): (i32, i32), tiles: u32, local: f32, scale: f32| {
+        r.set_tiles(Some(tiles));
+        let t = m.shots[0].start + local;
+        r.render_at(&m, w, h, &info(t, scale), At::Shot { shot: 0, local }, true)
+            .ok_or_else(|| anyhow!("nothing rendered"))?;
+        r.read_output().ok_or_else(|| anyhow!("no output"))
+    };
+    for size in [(W, H), (320, 180)] {
         for scale in [1.0, 0.6] {
-            let got = shot(
-                &mut r,
-                &m,
-                At::Shot {
-                    shot: 0,
-                    local: 0.5,
-                },
-                scale,
-            )?;
-            let want = if scale == 1.0 {
-                one.clone()
-            } else {
-                r.set_tiles(1);
-                let w = shot(
-                    &mut r,
-                    &m,
-                    At::Shot {
-                        shot: 0,
-                        local: 0.5,
-                    },
-                    scale,
+            let want = draw(&mut r, size, 1, 0.5, scale)?;
+            for tiles in [2, 7, 40, 64] {
+                draw(&mut r, size, 1, 1.25, scale)?;
+                let got = draw(&mut r, size, tiles, 0.5, scale)?;
+                expect_same(
+                    &format!("{tiles} strips at {}x{} scale {scale}", size.0, size.1),
+                    &got,
+                    &want,
+                    0,
+                    0.0,
                 )?;
-                r.set_tiles(tiles);
-                w
-            };
-            expect_same(
-                &format!("{tiles} strips at scale {scale}"),
-                &got,
-                &want,
-                0,
-                0.0,
-            )?;
+            }
         }
     }
+    r.set_tiles(None);
     Ok(String::new())
 }
 

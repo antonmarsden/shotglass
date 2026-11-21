@@ -31,7 +31,8 @@ cargo fmt && cargo clippy --all-targets -- -D warnings
 - CI (`.github/workflows/ci.yml`) pins Rust in `RUST_TOOLCHAIN` and runs clippy with
   `-D warnings`. Upgrade the toolchain on purpose and fix new lints in the same commit.
   Linux and Windows run the GPU tests on Mesa llvmpipe, macOS on the Apple Software
-  Renderer (GL 4.1, no 4.2+ entry points: glow's query getters panicked there). Skips
+  Renderer (GL 4.1, no 4.2+ entry points: glow's query getters panicked there); the
+  macOS job runs only on pushes to `main` and by hand (workflow_dispatch). Skips
   are listed in CONTRIBUTING.md.
 - Software OpenGL (llvmpipe) is slow: auto render scale drops to 30% and frame
   timings mean nothing. Judge performance only on a real GPU.
@@ -92,6 +93,12 @@ cargo fmt && cargo clippy --all-targets -- -D warnings
 - **Deterministic frames:** a frame depends only on (movie, t, size, scale), so playback,
   `still` and `export` agree. Frame n is at `movie.frame_time(n)`; `FrameInfo::at` derives
   iFrame with `frame_at`, never `t * fps` (rounding drops frames at 30000/1001).
+- **Slow frames are drawn in viewport strips, never scissored ones** (the Apple Software
+  Renderer leaves parts of scissored strips undrawn: stale rows from the previous frame).
+  Selftest "slow frames drawn in strips" pins the count with `set_tiles(Some(n))`.
+- **Don't trust built-in `sin`/`cos` where an error is magnified** (the Apple Software
+  Renderer's are ~5e-4 off): the demo's `rot()` uses `sincosPrecise` (common.glsl), or
+  its zoomed close-up camera lands on different floor/wall points than on llvmpipe.
 - **Readbacks restore GL pack state** (`PACK_ROW_LENGTH`/`SKIP_*` to 0, alignment 4) and
   check bounds first: `glReadPixels` never sees the slice length. Headless renderers call
   `set_readback(true)` (composite drawn upside down, no CPU flip); the player doesn't.

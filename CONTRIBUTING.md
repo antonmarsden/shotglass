@@ -111,14 +111,16 @@ for the kit (functions, transitions) goes to the
 
 CI (`.github/workflows/ci.yml`) runs fmt, clippy, `cargo test` (unit tests, GPU
 selftest, golden images and soundtracks) and the strict `check --web --no-gpu` on
-Linux, Windows and macOS, all with the same pinned `RUST_TOOLCHAIN`. None of the
-machines has a real GPU:
+Linux, Windows and macOS, all with the same pinned `RUST_TOOLCHAIN`. macOS is the
+slowest, so it runs only on pushes to `main` (after a merge) and when the workflow is
+started by hand ("Run workflow" on the Actions tab, any branch): do that for a branch
+that changes the renderer or the demo's shaders. None of the machines has a real GPU:
 
 | | OpenGL | skipped |
 |---|---|---|
 | Linux | Mesa llvmpipe under Xvfb | nothing (also renders and exports the demo) |
 | Windows | Mesa llvmpipe ([mesa-dist-win](https://github.com/pal1000/mesa-dist-win)) | the selftest's video export (no ffmpeg; PNG + WAV export still checked) |
-| macOS | Apple Software Renderer (OpenGL 4.1; the runners have no GPU) | the demo's golden strip (`--skip demo_film`): the references are llvmpipe renders and this renderer rounds the demo's noise differently in about 1% of pixels. The template's strip and both soundtracks are compared. The selftest's "sound matches exactly" comparisons (chunked, banded, streamed, exported) are reported, not failed: this renderer's sound differs by about 1e-5 with the size of the block drawn (`INEXACT_SOUND_RENDERERS` in `selftest.rs`); everything else in those checks still runs. Also the video export, as on Windows. |
+| macOS | Apple Software Renderer (OpenGL 4.1; the runners have no GPU) | none of the golden tests (they compare against the same llvmpipe references; this renderer's built-in `sin`/`cos` are ~5e-4 off, so the demo computes its camera rotation itself). The selftest's "sound matches exactly" comparisons (chunked, banded, streamed, exported) are reported, not failed: this renderer's sound differs by about 1e-5 with the size of the block drawn (`INEXACT_SOUND_RENDERERS` in `selftest.rs`); everything else in those checks still runs. Also the video export, as on Windows. |
 
 ## Golden images
 
