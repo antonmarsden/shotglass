@@ -8,8 +8,9 @@ not implemented. The heavy-assets design (#32) builds on the decisions here.
 A shot can bind up to four images to `iChannel0..3`, as on Shadertoy. Images are PNG or
 JPEG files from the film folder or from a library, so library images are pinned by the
 sha256 that `shotglass.lock` already records. They are decoded on the CPU by the same Rust
-code on every platform, including the web, and stored as RGBA8. Mipmaps are made on the
-CPU too, so every GPU gets the same texels. Uploads happen ahead of the playhead, a few
+code on every platform, including the web, and stored as RGBA8, flipped on the decode
+thread. Only level 0 is uploaded; the GPU makes the mipmaps (`glGenerateMipmap`), which
+is the fast path, at the price of mip levels that differ slightly between drivers. Uploads happen ahead of the playhead, a few
 megabytes per frame, prioritised the same way as compiles. While playing, a shot whose
 textures aren't uploaded yet is handled like a shot that hasn't compiled: the previous
 frame stays up. So every frame you see is the frame `still` and `export` render. The
@@ -196,9 +197,9 @@ framebuffer, so `srgb = false` (the default) means a pasted shader looks the sam
 Shadertoy.
 
 `srgb = true` uploads as `SRGB8_ALPHA8`, so `texture()` returns linear values and
-filtering happens in linear space (correct for photos you light in linear). The CPU
-mipmaps for such a texture are averaged in linear space too. Both formats exist in GL 3.3
-and WebGL 2.
+filtering happens in linear space (correct for photos you light in linear). Drivers
+generate the mipmaps of an sRGB texture in linear space (GL 3.3 and ES 3.0 both allow
+`glGenerateMipmap` on it). Both formats exist in GL 3.3 and WebGL 2.
 
 ### Size limits
 
@@ -273,14 +274,25 @@ programs.
 Decoding a 4096² PNG takes 100 ms or more, so it never runs on the render thread. One
 worker thread (two if there are many) takes jobs `(TexKey, path, vflip, srgb)` and
 returns `Result<DecodedImage, String>` over a channel. The worker reads the file, decodes,
-converts to RGBA8, flips if `vflip`, and builds the mip chain (2×2 box filter, halving
-with floor down to 1×1; for odd sizes the last row/column is folded into the box;
-in linear space for `srgb`). `pump` collects results without blocking (`try_recv`).
+converts to RGBA8 and flips if `vflip`. `pump` collects results without blocking
+(`try_recv`).
 
-CPU mipmaps instead of `glGenerateMipmap`: drivers are free to filter differently when
-generating mipmaps, so CPU mips make the texels identical on NVIDIA, llvmpipe, the
-Apple renderer and the browser (see [Determinism](#determinism)). They also keep the
-GPU from doing a burst of work on the frame a texture arrives.
+**The flip stays on the CPU.** It costs nothing that matters: the decoder writes rows
+into the RGBA8 buffer anyway, so writing them bottom-up is the same work, on the worker
+thread. GL has no free alternative (no negative `UNPACK_ROW_LENGTH`); flipping on the GPU
+would need an extra render pass, and flipping in the shader would change the contract
+(`texture(iChannel0, uv)` must mean the same thing as on Shadertoy).
+
+**Mipmaps are made on the GPU** with `glGenerateMipmap`, once the last band of level 0
+is submitted. That's the fast path: a third less to upload (64 MB instead of 85 MB for
+4096²), no CPU filtering (tens of ms per 4096² image), the texture is ready sooner, and
+on a real GPU the call costs well under a millisecond of GPU time. It's one command,
+ordered like the uploads, so there's still nothing to wait for. The cost is that the
+mip levels are the driver's: most use a 2×2 box filter, but the spec doesn't say, so
+NVIDIA, llvmpipe, the Apple renderer and browsers may differ slightly at the smaller
+levels (see [Determinism](#determinism)). On a software renderer (llvmpipe in CI) the
+call is slow, but timings there mean nothing anyway. CPU mipmaps stay a possible
+per-texture option later if a film ever needs bit-identical mips across machines.
 
 On wasm there are no threads by default. The web player preloads every file before Play
 anyway (#10), so it decodes there, before playback starts.
@@ -290,12 +302,12 @@ anyway (#10), so it decodes there, before playback starts.
 The per-frame rules from CLAUDE.md apply: no `glGetError`, no reads, no `finish`, no
 waiting on fences on the render path.
 
-- **Allocate** each level once with `tex_image_2d(…, None)` (`RGBA8` or `SRGB8_ALPHA8`).
-  `glTexStorage2D` would be nicer but is GL 4.2 / ES 3.0 only; the allocation path is
-  the same as `ensure_target`'s.
+- **Allocate** level 0 once with `tex_image_2d(…, None)` (`RGBA8` or `SRGB8_ALPHA8`);
+  `glGenerateMipmap` allocates the rest. `glTexStorage2D` would be nicer but is GL 4.2 /
+  ES 3.0 only; the allocation path is the same as `ensure_target`'s.
 - **Upload in bands** with `tex_sub_image_2d` from client memory, at most a budget per
   frame (start at 8 MB of texels, about 1–3 ms of driver memcpy on the dev GPU; tune on
-  the owner's machine). A 4096² texture with mips takes about 11 frames, well inside the
+  the owner's machine). A 4096² texture takes about 8 frames, well inside the
   10 s lookahead. The driver copies client memory before the call returns, so there's
   nothing to wait for; the band size bounds that copy.
 - **Ready means submitted.** GL executes commands in order, so a draw issued after the
@@ -413,9 +425,16 @@ two decoded images wait for upload at once, so CPU memory stays bounded too.
 
 A frame depends only on (movie, t, size, scale). Textures keep that true:
 
-- **Same texels everywhere.** One decoder (Rust, same version on every platform including
-  wasm), RGBA8, flip and mipmaps on the CPU. The GPU gets identical bytes on every
+- **Same level 0 everywhere.** One decoder (Rust, same version on every platform
+  including wasm), RGBA8, flipped on the CPU. The GPU gets identical bytes on every
   machine, and after an eviction and re-upload.
+- **Mip levels are the driver's** (`glGenerateMipmap`, chosen for speed). The same driver
+  makes the same mips every time, so on one machine playback, `still` and `export` still
+  agree, and so does a re-upload after eviction. Across machines the smaller levels can
+  differ slightly; where a frame samples them (minified textures, `filter = "mipmap"`),
+  that adds to the GPU-to-GPU differences below. The golden references are llvmpipe
+  renders checked on llvmpipe, so CI is unaffected; web vs desktop (#2) matches by
+  tolerance, not bit for bit, as it already does for shader maths.
 - **No history.** Texture contents depend on the file and the options only; sampler state
   is set from the movie on every draw; `iChannelTime` is 0 for images.
 - **Playback shows only complete frames.** A shot is drawn only when all of its textures
@@ -459,9 +478,7 @@ texture table (`deny_unknown_fields`); path rules; unused-texture warning;
 gets `channels` and `[textures]`, so "the parser never panics" covers them.
 
 **Unit tests, new `texture.rs`** (CPU side only, no GL): decoding tiny in-memory PNGs
-(grey, grey+alpha, RGB, palette, 16-bit) and a JPEG to RGBA8; `vflip`; the mip chain
-for power-of-two and odd sizes (sizes and box-filtered values); sRGB mips averaged in
-linear space; size and budget errors; the HTML and Git LFS messages; format sniffing
+(grey, grey+alpha, RGB, palette, 16-bit) and a JPEG to RGBA8; `vflip`; size and budget errors; the HTML and Git LFS messages; format sniffing
 with a mismatched extension.
 
 **Selftest checks** (each mutation-checked: break the code, see it fail):
@@ -472,8 +489,9 @@ with a mismatched extension.
 2. *orientation matches Shadertoy:* with the default `vflip`, the image's top-left texel
    lands at the top-left of the frame; with `vflip = false`, at the bottom-left.
 3. *filter and wrap:* `nearest` vs `linear` at a texel boundary; `repeat`, `clamp` and
-   `mirror` at u = 1.25; `mipmap` at a small size returns the CPU mip's value (a
-   checkerboard averaging to grey). One texture used with two samplers is uploaded once.
+   `mirror` at u = 1.25; `mipmap` at a small size reads the generated mips (a
+   checkerboard averaging to grey, within a tolerance since the filter is the driver's;
+   for `srgb = true`, the grey of a linear-space average). One texture used with two samplers is uploaded once.
 4. *playback never blocks on a texture:* a non-blocking render of a shot with a large
    texture returns None until the upload is done, spreads the upload over several frames
    (per-frame budget), and leaves `blocking_texture_loads` at 0; a blocking render draws
@@ -512,7 +530,7 @@ and `validate.rs`, so expect a rebase).
 
 - `movie.rs`: serde fields, resolved `Channel`, validation, unit tests, proptest generator,
   `referenced_files`.
-- `texture.rs`: decode to RGBA8, flip, CPU mips, limits, error messages, unit tests;
+- `texture.rs`: decode to RGBA8, flip, limits, error messages, unit tests;
   `image` gets the `jpeg` feature.
 - `check` (and `--no-gpu`, `--web`): decode every texture, limits, budget per shot,
   unbound-channel lint, contract warning.
@@ -524,7 +542,7 @@ and `validate.rs`, so expect a rebase).
 
 **PR 2: the renderer (the one `gfx.rs` change).**
 
-- `TextureStore`, decode worker, banded uploads in `pump`, sampler objects, binding and
+- `TextureStore`, decode worker, banded uploads in `pump` then `glGenerateMipmap`, sampler objects, binding and
   `iChannelResolution` in `draw_scene`, sampler uniforms set at link, gating in `usable`,
   textures in `ShotKeys`/fallback, eviction and budget, `blocking_texture_loads`.
 - Selftest checks 1–9; golden case `channels`.
