@@ -201,6 +201,14 @@ filtering happens in linear space (correct for photos you light in linear). Driv
 generate the mipmaps of an sRGB texture in linear space (GL 3.3 and ES 3.0 both allow
 `glGenerateMipmap` on it). Both formats exist in GL 3.3 and WebGL 2.
 
+`srgb = true` is only for shaders that encode their own output (for example ending with
+`pow(col, vec3(1.0 / 2.2))`). shotglass's output isn't an sRGB framebuffer, so a shader
+that writes an sRGB-decoded texel straight out shows it too dark. That's why the default
+stays `false`: it's the one setting that's right whatever the shader does. GLSL itself
+has no colour-space rules; engines default colour textures to sRGB because their output
+path encodes too (a linear workflow). shotglass could offer that film-wide later (see
+[Later](#later)).
+
 ### Size limits
 
 - **Per image: at most 4096 × 4096.** Every desktop GPU and practically every WebGL 2
@@ -570,6 +578,11 @@ breaking version 1:
 - Textures in transitions (luma wipes from an image) on units 2–5, and in sound shaders
   (wavetables), if a film needs them. Audio samples are #32's.
 - KTX2 for big or compressed images; a persistently mapped upload PBO.
+- A film-wide linear workflow, e.g. `color = "linear"`: textures default to `srgb = true`
+  and the output is encoded to sRGB (an sRGB target or an encode in the composite pass).
+  That's the engine convention, but it changes more than textures: transitions would blend
+  in linear (a crossfade looks different), and export and the web player's output path
+  are affected. A contract change with its own design.
 
 ## Open questions
 
@@ -577,10 +590,8 @@ breaking version 1:
    `[textures]` and a film-wide default. Alternatives: per-shot keys
    (`iChannel2 = "noise"`), or a table `channels = { 2 = "noise" }`. The array reads most
    like Shadertoy's four slots; is `""` for a gap acceptable?
-2. **Defaults.** `vflip = true`, `srgb = false`, `filter = "mipmap"`, `wrap = "repeat"`, all
-   Shadertoy's, so pastes look right. OK, or should shotglass prefer `srgb = true` for new
-   films (more correct, but pasted shaders that do their own `pow(…, 2.2)` would look
-   washed out)?
+2. **Defaults.** `vflip = true`, `filter = "mipmap"`, `wrap = "repeat"`, all Shadertoy's, so
+   pastes look right. OK? (`srgb = false` is settled: see [Colour](#colour).)
 3. **Contract bump.** 0.1.0 → 0.1.1 (additive, existing `shotglass = "0.1"` films keep
    loading), or 0.2.0 (would refuse every film that says `"0.1"`)?
 4. **Limits.** 4096 px per side and a 256 MB resident budget, not configurable in version 1.
