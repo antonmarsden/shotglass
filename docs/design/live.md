@@ -40,6 +40,8 @@ steps, each one useful on its own:
 4. *(Explore)* **Live sound:** the mic as a bus that sound shaders process with low
    latency, and recorded "takes" that re-render deterministically.
 
+Follow-up issues: phase 1 #53, phase 2 #54, phase 3 #55, phase 4 #56.
+
 The macOS built-in camera goes through AVFoundation, via `nokhwa`'s native backend,
 which is the recommended capture crate on all three OSes.
 
