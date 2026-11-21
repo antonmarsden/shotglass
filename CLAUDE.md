@@ -117,6 +117,8 @@ cargo fmt && cargo clippy --all-targets -- -D warnings
   case to `tests/golden.rs` and bless its reference.
 - **Renderer behaviour:** add a selftest check. Mutation-check it: break the code and make sure
   the check fails.
+- Working in parallel with other sessions: see "Working with AI agents" in CONTRIBUTING.md
+  (one issue per branch; `gfx.rs`, `sound.rs`, `audio.rs` take one change at a time).
 - Keep user-facing docs in README.md. Open work is in GitHub issues: #1 export (follow-ups: PBO readback), #2 web player,
   #3 libraries by name and version, #4 kit core/transitions, #5 the shotglass-kit repo,
   #6 portable GLSL (done: fixed baseline, `glsl` opt-in, strict `check` / `check --web`).
