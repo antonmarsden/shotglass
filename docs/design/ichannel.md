@@ -1,7 +1,7 @@
 # Design: iChannel textures
 
-Issue: [#22](https://github.com/antonmarsden/shotglass/issues/22). Status: **draft for review**,
-not implemented. The heavy-assets design (#32) builds on the decisions here.
+Issue: [#22](https://github.com/antonmarsden/shotglass/issues/22). Status: **design agreed**
+(decisions at the end), not implemented. The heavy-assets design (#32) builds on the decisions here.
 
 ## Summary
 
@@ -149,8 +149,8 @@ keeps them unresolved, like library includes). Texture files join `referenced_fi
   error. No change to the lock format.
 
 That makes "an asset pack" for small images just a library: a folder with a
-`library.toml` and some PNGs. The kit can ship CC0 noise and pattern textures this way
-(see [Open questions](#open-questions)). Large assets that don't belong in git
+`library.toml` and some PNGs. The kit will ship MIT or CC0 noise and pattern textures this way
+(see [Decisions](#decisions)). Large assets that don't belong in git
 (video, long samples) are #32's job: it will add content-addressed packs fetched over
 HTTP with their own lock entries, and textures will be able to come from them too, with
 the same `<name/path>` syntax.
@@ -180,7 +180,7 @@ JPEG ICC profiles are ignored: texels are the stored numbers, as on Shadertoy.
 
 Why only RGBA8: it's what Shadertoy gives shaders, every GL 3.3 / WebGL 2 implementation
 can sample, filter and mipmap it, and one format keeps the upload path simple. 16-bit and
-float data (height maps, LUTs) are an open question.
+float data (height maps, LUTs) wait for a film that needs them (see [Decisions](#decisions)).
 
 **Later: KTX2.** Worth it for big images (GPU-compressed formats: smaller downloads and
 less GPU memory), float data, cubemaps and 3D textures. It needs Basis Universal
@@ -544,9 +544,9 @@ and `validate.rs`, so expect a rebase).
   unbound-channel lint, contract warning.
 - Player watcher: add the image extensions (a reload only re-validates for now).
 - `.gitattributes` for images; template `movie.toml` gets a commented example. No README
-  section yet: the feature doesn't draw anything until PR 2, so a film using `channels`
-  would load and show black. (Alternative: refuse `channels` on load until PR 2; see the
-  open questions.)
+  section yet: the feature doesn't draw anything until PR 2, so loading a film that uses
+  `channels` is refused with "iChannel textures arrive in the next version of shotglass";
+  `check` validates it fully (see [Decisions](#decisions)).
 
 **PR 2: the renderer (the one `gfx.rs` change).**
 
@@ -584,28 +584,30 @@ breaking version 1:
   in linear (a crossfade looks different), and export and the web player's output path
   are affected. A contract change with its own design.
 
-## Open questions
+## Decisions
 
-1. **Syntax.** A positional `channels = [...]` array with `""` for gaps, plus named
-   `[textures]` and a film-wide default. Alternatives: per-shot keys
-   (`iChannel2 = "noise"`), or a table `channels = { 2 = "noise" }`. The array reads most
-   like Shadertoy's four slots; is `""` for a gap acceptable?
-2. **Defaults.** `vflip = true`, `filter = "mipmap"`, `wrap = "repeat"`, all Shadertoy's, so
-   pastes look right. OK? (`srgb = false` is settled: see [Colour](#colour).)
-3. **Contract bump.** 0.1.0 → 0.1.1 (additive, existing `shotglass = "0.1"` films keep
-   loading), or 0.2.0 (would refuse every film that says `"0.1"`)?
-4. **Limits.** 4096 px per side and a 256 MB resident budget, not configurable in version 1.
-   Right numbers?
-5. **16-bit and float images** (height maps, LUTs): keep 8-bit only for now (with a
-   warning), or upload 16-bit PNGs as `RGBA16`? (Not filterable on all WebGL 2
-   implementations; `RGBA16F` from 16-bit is filterable.)
-6. **Golden case.** A dedicated `tests/films/channels/` film (proposed), or put a texture
-   in the demo or the template (changes their look; re-bless)?
-7. **Kit textures.** Should shotglass-kit ship a few CC0 textures (RGBA noise at 64/256/1024,
-   a grey noise, a pattern) as a `textures` library, as the free replacement for Shadertoy's
-   built-in media? That would be a kit issue.
-8. **Between PR 1 and PR 2**, should a film with `channels` load (and show black), or be
-   refused with "iChannel textures arrive in the next version"? Refusing is less
-   surprising if PR 1 ships in a release on its own.
-9. **Missing file = refuse the version** (like a missing include) while **a broken file =
-   per-texture fallback**: agreed?
+These were open questions in the first draft. The owner said to go with the proposals
+for now; any can be revisited during implementation.
+
+1. **Syntax:** the positional `channels = [...]` array (Shadertoy's four slots), `""` for
+   a gap, named `[textures]` and a film-wide default.
+2. **Defaults:** Shadertoy's: `vflip = true`, `filter = "mipmap"`, `wrap = "repeat"`,
+   `srgb = false` (see [Colour](#colour)).
+3. **Contract:** 0.1.0 → 0.1.1. Additive, so films that say `shotglass = "0.1"` keep loading.
+4. **Limits:** 4096 px per side and a 256 MB resident budget, not configurable in version 1.
+5. **16-bit and float images:** 8 bits per channel only for now, with a warning. 16-bit
+   (as `RGBA16F`, which WebGL 2 can filter) waits for a film that needs it.
+6. **Golden case:** a dedicated `tests/films/channels/` film with its own small CC0
+   images made for the test. The demo and the template keep their looks.
+7. **Kit textures:** yes. shotglass-kit ships a `textures` library of MIT or CC0 images
+   (RGBA noise at 64, 256 and 1024, a grey noise, a pattern or two) as the free
+   replacement for Shadertoy's built-in media. Each image's source and licence goes in
+   the library (`library.toml` `licences`, plus a note per file where they differ). This
+   is a kit issue, independent of the engine PRs; until it lands, films use their own
+   images.
+8. **Between PR 1 and PR 2:** a film that uses `channels` is refused on load
+   (`play`, `still`, `strip`, `export`, `wav`) with "iChannel textures arrive in the next
+   version of shotglass". `check` validates it fully, so films can be prepared. PR 2
+   removes the refusal.
+9. **Missing vs broken files:** a missing file refuses the whole new version (like a
+   missing include); a broken or half-saved file falls back to the last working texture.
