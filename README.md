@@ -565,6 +565,39 @@ It wins over `movie.local.toml`. Relative override paths are relative to the fil
 folder. The version range in `movie.toml` still has to match the working copy's
 `library.toml`. Live reload watches library folders, overrides included.
 
+### Licences
+
+`licences` in `library.toml` takes SPDX identifiers. To see what a film actually uses:
+
+```sh
+shotglass licenses <movie>
+```
+
+It lists every library the film includes something from (local name, canonical name,
+version, licences, and where the files come from: source and pin, a folder in the film,
+or an override) and flags non-commercial licences (any `-NC` one, e.g.
+`CC-BY-NC-SA-4.0`): a film that includes one can't be used commercially. Libraries in
+`[libraries]` that nothing includes are named separately, and so are libraries that
+declare no licence.
+
+### Bundling for hosting
+
+```sh
+shotglass bundle <movie> --out site/my-film
+```
+
+writes a self-contained copy of the film to a new (or empty) folder outside it: the film
+folder (without hidden files and `movie.local.toml`), plus, for each locked library,
+exactly the files the film includes (every `#include`d file and library texture), its
+`library.toml` and its licence files (`LICENSE*`, `LICENCE*`, `COPYING*`, `NOTICE*`, from
+the library folder and, for a `subdir`, the repository above it) in
+`shotglass-libs/<name>/`. The bundle's `shotglass.lock` keeps each library's source and
+version and adds `path = "shotglass-libs/<name>"` with the sha256 of that folder, so the
+bundle loads with no network, no cache and no overrides, and never changes; an edited
+bundled file is an error, like an edited cache. `LIBRARY-LICENSES.md` at the top of the
+bundle lists each library's licences and licence files. `movie.toml` is unchanged, and
+`shotglass update` on a bundle moves the libraries back to the cache.
+
 ### Portable paths
 
 The same `movie.toml` has to work on every OS and in a future web player, so paths in
@@ -590,6 +623,8 @@ shotglass export <movie> --out film.webm [--size 1920x1080] [--format webm|av1|f
 shotglass new    <dir>
 shotglass fetch  <movie>                                   # download libraries, write shotglass.lock
 shotglass update <movie> [library..]                       # move library pins to the newest allowed
+shotglass licenses <movie>                                 # libraries the film includes and their licences
+shotglass bundle <movie> --out <dir>                       # self-contained copy with the library files it includes
 shotglass selftest [filter]                                # GPU + sound checks on this machine
 ```
 

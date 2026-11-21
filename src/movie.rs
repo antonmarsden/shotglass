@@ -292,6 +292,19 @@ impl Movie {
         Ok(m)
     }
 
+    /// Load with libraries exactly as `shotglass.lock` pins them (cache or bundled
+    /// copies), ignoring per-machine overrides (`SHOTGLASS_LIB_*`, `movie.local.toml`).
+    /// `bundle` uses it: a bundle carries the locked files, never a working copy.
+    pub fn load_locked(path: &Path, cache: &Path) -> Result<Movie> {
+        let mut m = Movie::read(path)?;
+        m.resolve_libraries_with(&BTreeMap::new(), cache)
+            .with_context(|| format!("in {}", m.root.join("movie.toml").display()))?;
+        m.check_case();
+        m.check_textures()
+            .with_context(|| format!("in {}", m.root.join("movie.toml").display()))?;
+        Ok(m)
+    }
+
     /// Does any shot bind a texture?
     pub fn uses_channels(&self) -> bool {
         self.shots
@@ -403,9 +416,20 @@ impl Movie {
             return Ok(());
         }
         let o = library::overrides(&self.root, &self.library_specs, env)?;
+        self.resolve_libraries_with(&o, cache)
+    }
+
+    fn resolve_libraries_with(
+        &mut self,
+        o: &BTreeMap<String, (PathBuf, library::Origin)>,
+        cache: &Path,
+    ) -> Result<()> {
+        if self.library_specs.is_empty() {
+            return Ok(());
+        }
         let lock = library::Lock::load(&self.root)?;
         self.libraries =
-            library::resolve(&self.root, &self.library_specs, &o, lock.as_ref(), cache)?;
+            library::resolve(&self.root, &self.library_specs, o, lock.as_ref(), cache)?;
         let libs = self.libraries.clone();
         for c in self
             .shots

@@ -3,6 +3,7 @@
 mod anim;
 mod app;
 mod audio;
+mod bundle;
 mod export;
 mod gfx;
 mod golden;
@@ -160,6 +161,16 @@ enum Cmd {
         /// Library names (local names from movie.toml); all if none.
         names: Vec<String>,
     },
+    /// List the libraries the film includes, with their licences (flags non-commercial ones).
+    Licenses { movie: PathBuf },
+    /// Write a self-contained copy of the film: its folder plus exactly the locked library
+    /// files it includes, playable with no network, cache or overrides.
+    Bundle {
+        movie: PathBuf,
+        /// Output folder (new or empty, outside the film folder).
+        #[arg(long)]
+        out: PathBuf,
+    },
     /// Check the renderer and soundtrack on this GPU and driver with built-in test films.
     Selftest {
         /// Only run checks whose name contains this text.
@@ -297,6 +308,8 @@ fn real_main() -> Result<()> {
         Cmd::Update { movie, names } => {
             fetch_libraries(&movie, library::FetchMode::Update(names), true)
         }
+        Cmd::Licenses { movie } => bundle::print_licences(&movie),
+        Cmd::Bundle { movie, out } => bundle::run_bundle(&movie, &out),
         Cmd::Selftest { filter } => selftest::run(filter),
     }
 }
@@ -723,6 +736,7 @@ fn check(movie: &Path, size: &str, frames: usize, web: bool, no_gpu: bool) -> Re
             library::Origin::Env(v) => format!("override {v}"),
             library::Origin::Local => format!("override in {}", library::LOCAL_FILE),
             library::Origin::Locked => library::LOCK_FILE.to_string(),
+            library::Origin::Bundled(p) => format!("{} (bundled in {p})", library::LOCK_FILE),
         };
         println!(
             "library {}{}  [{}]  from {from}: {}",

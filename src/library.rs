@@ -324,6 +324,9 @@ pub enum Origin {
     Local,
     /// The cache, as pinned by shotglass.lock.
     Locked,
+    /// A folder inside the film, as pinned by shotglass.lock (`path`, written by
+    /// `shotglass bundle`): the locked files the film includes, no cache needed.
+    Bundled(String),
 }
 
 /// A resolved library: a folder on disk with a valid `library.toml`.
@@ -486,6 +489,11 @@ pub struct LockEntry {
     pub rev: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subdir: Option<String>,
+    /// A bundled copy inside the film folder (relative, forward slashes), written by
+    /// `shotglass bundle`: the library is read from there instead of the cache, and
+    /// `sha256` is the hash of that folder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
     /// sha256 of the library root's files (see `hash_dir`).
     pub sha256: String,
 }
@@ -516,6 +524,9 @@ impl Lock {
                     "library \"{}\": rev \"{r}\" is not a full commit id",
                     e.name
                 );
+            }
+            if let Some(p) = &e.path {
+                check_rel_path(p).map_err(|m| anyhow!("library \"{}\": path {m}", e.name))?;
             }
         }
         Ok(l)
@@ -709,30 +720,48 @@ pub fn resolve(
                     e.pin()
                 );
             }
-            let dir = cache_path(cache, &e.source, e.cache_key());
-            let root = match &e.subdir {
-                Some(sub) => dir.join(sub),
-                None => dir.clone(),
+            let (root, origin) = match &e.path {
+                Some(p) => (film_root.join(p), Origin::Bundled(p.clone())),
+                None => {
+                    let dir = cache_path(cache, &e.source, e.cache_key());
+                    let root = match &e.subdir {
+                        Some(sub) => dir.join(sub),
+                        None => dir,
+                    };
+                    (root, Origin::Locked)
+                }
             };
             if !root.is_dir() {
-                bail!(
-                    "library \"{}\" {} isn't downloaded on this machine; {fetch}",
-                    s.name,
-                    e.pin()
-                );
+                match &e.path {
+                    Some(p) => bail!(
+                        "library \"{}\" {}: {LOCK_FILE} says it is bundled in \"{p}\", but                          the film has no such folder",
+                        s.name,
+                        e.pin()
+                    ),
+                    None => bail!(
+                        "library \"{}\" {} isn't downloaded on this machine; {fetch}",
+                        s.name,
+                        e.pin()
+                    ),
+                }
             }
             let got = hash_dir(&root)?;
             if got != e.sha256 {
                 bail!(
                     "library \"{}\" {}: files in {} don't match {LOCK_FILE} (sha256 {got}, \
-                     locked {}); the cache was edited or the tag moved",
+                     locked {}); {}",
                     s.name,
                     e.pin(),
                     root.display(),
-                    e.sha256
+                    e.sha256,
+                    if e.path.is_some() {
+                        "the bundled copy was edited"
+                    } else {
+                        "the cache was edited or the tag moved"
+                    }
                 );
             }
-            (root, Origin::Locked)
+            (root, origin)
         };
         let lib = Library::read(&s.name, &root, origin)?;
         if let Some(r) = &s.version
@@ -794,6 +823,62 @@ pub fn check_set(libs: &[Library]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+// ------------------------------------------------------------------ licences
+
+/// A non-commercial licence: an SPDX identifier with an `NC` part (`CC-BY-NC-4.0`,
+/// `CC-BY-NC-SA-3.0`, `CC-BY-NC-ND-4.0`), also inside an expression
+/// (`MIT OR CC-BY-NC-4.0`).
+pub fn is_non_commercial(licence: &str) -> bool {
+    licence
+        .split(|c: char| c.is_whitespace() || c == '(' || c == ')')
+        .any(|id| id.split('-').any(|part| part.eq_ignore_ascii_case("NC")))
+}
+
+/// A licence or notice file by its name: `LICENSE`, `LICENCE-MIT`, `COPYING.txt`,
+/// `NOTICE`, `UNLICENSE`, any case.
+pub fn is_notice_file(name: &str) -> bool {
+    let n = name.to_ascii_uppercase();
+    ["LICENSE", "LICENCE", "COPYING", "NOTICE", "UNLICENSE"]
+        .iter()
+        .any(|p| n.starts_with(p))
+}
+
+/// Licence and notice files that apply to a library: those in its root, then those in each
+/// folder above it up to `top` (the source's root, for a library in a `subdir`). A name
+/// found closer to the library wins. Returns (file name, path).
+pub fn notice_files(root: &Path, top: &Path) -> Vec<(String, PathBuf)> {
+    let mut out: Vec<(String, PathBuf)> = vec![];
+    let mut dir = Some(root);
+    while let Some(d) = dir {
+        let mut here: Vec<(String, PathBuf)> = std::fs::read_dir(d)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+            .map(|e| (e.file_name().to_string_lossy().into_owned(), e.path()))
+            .filter(|(n, _)| is_notice_file(n) && !out.iter().any(|(o, _)| o == n))
+            .collect();
+        here.sort();
+        out.extend(here);
+        if d == top {
+            break;
+        }
+        dir = d.parent().filter(|p| p.starts_with(top));
+    }
+    out
+}
+
+/// The folder a locked library's source was downloaded to (the root of `subdir`), so
+/// licence files at the repository root can be found. Same as `root` without a subdir.
+pub fn source_root(root: &Path, subdir: Option<&str>) -> PathBuf {
+    let depth = subdir.map_or(0, |s| s.split('/').filter(|x| !x.is_empty()).count());
+    let mut top = root.to_path_buf();
+    for _ in 0..depth {
+        top.pop();
+    }
+    top
 }
 
 // ------------------------------------------------------------------ fetching
@@ -874,6 +959,16 @@ pub fn fetch(
             FetchMode::Update(names) => names.is_empty() || names.contains(&s.name),
         };
         let entry = match prev {
+            Some(e) if !refresh && e.path.is_some() => {
+                // Bundled inside the film: nothing to download (loading checks the hash).
+                log.push(format!(
+                    "{}: {} bundled in {} (locked)",
+                    s.name,
+                    e.pin(),
+                    e.path.as_deref().unwrap_or("")
+                ));
+                e.clone()
+            }
             Some(e) if !refresh => {
                 let dir = cache_path(cache, &e.source, e.cache_key());
                 let fresh = !dir.exists();
@@ -932,6 +1027,7 @@ pub fn fetch(
                     tag: refname,
                     rev: Some(rev),
                     subdir: s.subdir.clone(),
+                    path: None,
                     sha256: hash_dir(&root)?,
                 };
                 log.push(pin_change(&s.name, prev, &e));
@@ -973,6 +1069,7 @@ pub fn fetch(
                     tag,
                     rev: None,
                     subdir: s.subdir.clone(),
+                    path: None,
                     sha256: hash_dir(&root)?,
                 };
                 log.push(pin_change(&s.name, prev, &e));
@@ -1421,6 +1518,7 @@ mod tests {
                     tag: "HEAD".into(),
                     rev: Some("e".repeat(40)),
                     subdir: Some("core".into()),
+                    path: None,
                     sha256: "ef".repeat(32),
                 },
                 LockEntry {
@@ -1430,6 +1528,7 @@ mod tests {
                     tag: "v0.3.1".into(),
                     rev: None,
                     subdir: Some("sounds".into()),
+                    path: Some("shotglass-libs/sfx".into()),
                     sha256: "ab".repeat(32),
                 },
                 LockEntry {
@@ -1439,6 +1538,7 @@ mod tests {
                     tag: "1.2.0".into(),
                     rev: None,
                     subdir: None,
+                    path: None,
                     sha256: "cd".repeat(32),
                 },
             ],
