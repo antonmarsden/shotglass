@@ -8,8 +8,6 @@ on:
   schedule:
     - cron: "17 4 * * *" # daily
   workflow_dispatch:
-  push: # TEMPORARY: verify on this branch (dispatch needs the file on main); remove before merge
-    branches: [claude/jolly-wozniak-et33y4]
 
 env:
   RUST_TOOLCHAIN: "1.100.0" # keep in step with ci.yml
