@@ -1,0 +1,2 @@
+# Engine contract: this film uses a feature that needs shotglass 0.1.2.
+shotglass = "0.1.2"

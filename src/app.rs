@@ -146,6 +146,8 @@ struct Player {
     watcher: Option<notify::RecommendedWatcher>,
     /// Library folders outside the film folder that the watcher also follows.
     watched_libs: Vec<PathBuf>,
+    /// The project root, when it isn't the film folder (watched, not recursively).
+    watched_project: Option<PathBuf>,
     rx: Receiver<()>,
     reload_at: Option<Instant>,
     reloads: u32,
@@ -254,6 +256,7 @@ impl Player {
             sound_info,
             watcher,
             watched_libs: vec![],
+            watched_project: None,
             rx,
             reload_at: None,
             reloads: 0,
@@ -470,7 +473,9 @@ impl Player {
     }
 
     /// Live reload follows library folders too (in-film paths are already covered by
-    /// watching the film folder; overrides and the cache usually live elsewhere).
+    /// watching the film folder; project libraries, overrides and the cache usually live
+    /// elsewhere), and the project root's own files (`shotglass.toml`,
+    /// `shotglass.local.toml`, `shotglass.lock`) when the project is above the film.
     fn watch_libraries(&mut self, m: &Movie) {
         use notify::Watcher;
         let Some(w) = self.watcher.as_mut() else {
@@ -483,6 +488,18 @@ impl Player {
             .map(|l| std::path::absolute(&l.root).unwrap_or_else(|_| l.root.clone()))
             .filter(|p| !p.starts_with(&film))
             .collect();
+        let project = std::path::absolute(&m.project).unwrap_or_else(|_| m.project.clone());
+        let project = Some(project).filter(|p| *p != film);
+        if self.watched_project != project {
+            if let Some(old) = &self.watched_project {
+                let _ = w.unwatch(old);
+            }
+            if let Some(p) = &project {
+                // Not recursive: the other films below it are none of this film's business.
+                let _ = w.watch(p, notify::RecursiveMode::NonRecursive);
+            }
+            self.watched_project = project;
+        }
         for p in &self.watched_libs {
             if !want.contains(p) {
                 let _ = w.unwatch(p);

@@ -351,9 +351,11 @@ const FX: &[(&str, &str)] = &[
     ),
 ];
 
+/// Write a fixture film (one text: `shotglass = …` and `[libraries]` go to its
+/// shotglass.toml) and load it.
 fn movie(dir: &Path, toml: &str) -> Result<Movie> {
     write(dir, FX)?;
-    std::fs::write(dir.join("movie.toml"), toml)?;
+    crate::project::write_fixture(dir, toml)?;
     Movie::load(dir)
 }
 

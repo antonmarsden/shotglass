@@ -1,7 +1,8 @@
 //! `movie.toml` parsing and the timeline: which shot (or transition) is on screen at time t.
 
 use crate::anim::{Anim, Ease, vector};
-use crate::library::{self, Library, LibraryDecl, LibrarySpec};
+use crate::library::{self, Library, LibrarySpec};
+use crate::project::{self, Project};
 use crate::texture::{Filter, Wrap};
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
@@ -62,8 +63,6 @@ fn parse_fps(f: FpsFile) -> Result<(u32, u32)> {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct MovieFile {
-    /// Engine contract this film needs, e.g. "0.4".
-    shotglass: Option<String>,
     title: Option<String>,
     /// Width:height, e.g. [16, 9]. Default 16:9.
     aspect: Option<[f32; 2]>,
@@ -81,9 +80,6 @@ struct MovieFile {
     shots: Vec<ShotFile>,
     #[serde(rename = "marker", default)]
     markers: Vec<MarkerFile>,
-    /// Shared GLSL by local name: `kit = { version = "0.4", source = "https://…", subdir = "core" }`.
-    #[serde(default)]
-    libraries: BTreeMap<String, LibraryDecl>,
     /// Film-wide iChannel0..3 for every shot that doesn't set its own `channels`.
     channels: Option<Vec<toml::Value>>,
     /// Named textures: `brick = "textures/brick.png"` or `{ file = "…", filter = … }`.
@@ -237,7 +233,11 @@ pub struct Marker {
 
 #[derive(Clone, Debug)]
 pub struct Movie {
+    /// The film folder.
     pub root: PathBuf,
+    /// The project root (`shotglass.toml`): libraries, `shotglass.lock` and overrides
+    /// live there. The film folder itself for a one-film, frozen or bare project.
+    pub project: PathBuf,
     pub title: String,
     pub aspect: f32,
     /// `fps_num / fps_den` as a float, for playback and uniforms.
@@ -260,9 +260,9 @@ pub struct Movie {
     pub shots: Vec<Shot>,
     pub markers: Vec<Marker>,
     pub duration: f32,
-    /// `shotglass = "…"`: the engine contract range the film was made for.
+    /// `shotglass = "…"` in the project: the engine contract range the film was made for.
     pub shotglass: Option<String>,
-    /// `[libraries]` as declared (validated, not yet looked up on disk).
+    /// The project's `[libraries]` as declared (validated, not yet looked up on disk).
     pub library_specs: Vec<LibrarySpec>,
     /// Libraries found on disk; filled by `load` (empty after a bare `parse`).
     pub libraries: Vec<Library>,
@@ -299,9 +299,9 @@ impl Movie {
         Ok(m)
     }
 
-    /// Load with libraries exactly as `shotglass.lock` pins them (cache or bundled
-    /// copies), ignoring per-machine overrides (`SHOTGLASS_LIB_*`, `movie.local.toml`).
-    /// `bundle` uses it: a bundle carries the locked files, never a working copy.
+    /// Load with libraries exactly as `shotglass.lock` pins them (cache or frozen
+    /// copies), ignoring per-machine overrides (`SHOTGLASS_LIB_*`, `shotglass.local.toml`).
+    /// `freeze` and `bundle` use it: they carry the locked files, never a working copy.
     pub fn load_locked(path: &Path, cache: &Path) -> Result<Movie> {
         let mut m = Movie::read(path)?;
         m.resolve_libraries_with(&BTreeMap::new(), cache)
@@ -360,7 +360,7 @@ impl Movie {
         };
         allows_old.then(|| {
             format!(
-                "this film uses {}; write shotglass = \"{need}\" in movie.toml so older \
+                "this film uses {}; write shotglass = \"{need}\" in shotglass.toml so older \
                  shotglass versions ask for an upgrade instead of failing on an unknown field{}",
                 features.join(" and "),
                 self.shotglass
@@ -413,21 +413,25 @@ impl Movie {
         Ok(())
     }
 
-    /// Read and validate `movie.toml` without looking libraries up on disk.
+    /// Read and validate `movie.toml` (and its project's `shotglass.toml`) without
+    /// looking libraries up on disk.
     pub fn read(path: &Path) -> Result<Movie> {
         let file = if path.is_dir() {
-            path.join("movie.toml")
+            path.join(project::MOVIE_FILE)
         } else {
             path.to_path_buf()
         };
         let root = file.parent().map(Path::to_path_buf).unwrap_or_default();
+        // The project first: its engine check speaks before movie.toml's unknown fields.
+        let project = Project::for_film(&root)?;
         let text = std::fs::read_to_string(&file)
             .with_context(|| format!("reading {}", file.display()))?;
-        Movie::parse(&text, &root).with_context(|| format!("in {}", file.display()))
+        Movie::parse_in(&text, &root, &project).with_context(|| format!("in {}", file.display()))
     }
 
-    /// Find the declared libraries on disk: local overrides (`env`, `movie.local.toml`),
-    /// in-film paths, or the cache as pinned by `shotglass.lock`. No network.
+    /// Find the project's libraries on disk: frozen copies, local overrides (`env`,
+    /// `shotglass.local.toml`), project paths, or the cache as pinned by `shotglass.lock`.
+    /// No network.
     pub fn resolve_libraries(
         &mut self,
         env: &dyn Fn(&str) -> Option<String>,
@@ -436,7 +440,7 @@ impl Movie {
         if self.library_specs.is_empty() {
             return Ok(());
         }
-        let o = library::overrides(&self.root, &self.library_specs, env)?;
+        let o = library::overrides(&self.project, &self.library_specs, env)?;
         self.resolve_libraries_with(&o, cache)
     }
 
@@ -448,9 +452,9 @@ impl Movie {
         if self.library_specs.is_empty() {
             return Ok(());
         }
-        let lock = library::Lock::load(&self.root)?;
+        let lock = library::Lock::load(&self.project)?;
         self.libraries =
-            library::resolve(&self.root, &self.library_specs, o, lock.as_ref(), cache)?;
+            library::resolve(&self.project, &self.library_specs, o, lock.as_ref(), cache)?;
         let libs = self.libraries.clone();
         for c in self
             .shots
@@ -522,25 +526,35 @@ impl Movie {
         }
     }
 
+    /// Parse a film that is a project of its own with no `shotglass.toml` (no libraries).
+    #[cfg(test)]
     pub fn parse(text: &str, root: &Path) -> Result<Movie> {
-        // Check the engine contract first: a newer film may use fields this engine
-        // doesn't know, and "upgrade shotglass" is the useful message then.
-        match toml::from_str::<toml::Table>(text)
-            .ok()
-            .and_then(|t| t.get("shotglass").cloned())
-        {
-            Some(toml::Value::String(v)) => library::check_engine(&v)?,
-            Some(_) => bail!("shotglass must be a version string, e.g. shotglass = \"0.1\""),
-            None => {}
+        Movie::parse_in(text, root, &Project::bare(root))
+    }
+
+    /// Parse `movie.toml`'s text for the film at `root` in `project`.
+    pub fn parse_in(text: &str, root: &Path, project: &Project) -> Result<Movie> {
+        // What moved to the project file gets a pointer rather than "unknown field".
+        if let Ok(t) = toml::from_str::<toml::Table>(text) {
+            for (key, what) in [
+                ("shotglass", "the engine contract (shotglass = \"…\")"),
+                ("libraries", "[libraries]"),
+            ] {
+                if t.contains_key(key) {
+                    bail!(
+                        "{what} goes in {}, the project file (next to movie.toml, or in a \
+                         folder above it for libraries shared by several films), not in \
+                         movie.toml",
+                        project::PROJECT_FILE
+                    );
+                }
+            }
         }
         let f: MovieFile = toml::from_str(text)?;
         let path_rule = |what: String, p: &str| -> Result<()> {
             library::check_rel_path(p).map_err(|e| anyhow!("{what}: {e}"))
         };
-        let mut library_specs = vec![];
-        for (name, d) in &f.libraries {
-            library_specs.push(LibrarySpec::parse(name, d)?);
-        }
+        let library_specs = project.specs.clone();
         if let Some(snd) = &f.sound {
             if let Some(p) = &snd.music {
                 path_rule("[sound] music".into(), p)?;
@@ -817,7 +831,7 @@ impl Movie {
                 })
                 .collect(),
             duration,
-            shotglass: f.shotglass,
+            shotglass: project.shotglass.clone(),
             warnings: textures
                 .keys()
                 .filter(|n| !used.contains(*n))
@@ -825,6 +839,7 @@ impl Movie {
                 .collect(),
             library_specs,
             libraries: vec![],
+            project: project.root.clone(),
         })
     }
 
@@ -1228,7 +1243,7 @@ fn bare_transition_error(name: &str, specs: &[LibrarySpec]) -> String {
             "transition \"{name}\" isn't a library transition or a .glsl file; shotglass has \
              no built-in transitions: add transitions = {{ source = \
              \"https://github.com/antonmarsden/shotglass-kit\", subdir = \"transitions\" }} \
-             to [libraries], then use type = \"transitions/{name}\""
+             to [libraries] in shotglass.toml, then use type = \"transitions/{name}\""
         ),
     }
 }
@@ -1253,6 +1268,14 @@ fn is_ident(s: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// Parse a test film written as one text: `shotglass = …` and `[libraries]` go to
+    /// the project file (see `project::split_fixture`), the rest to movie.toml.
+    fn fixture(text: &str, root: &Path) -> Result<Movie> {
+        let (p, m) = crate::project::split_fixture(text);
+        let project = crate::project::Project::parse(&p, root)?;
+        Movie::parse_in(&m, root, &project)
+    }
+
     const M: &str = r#"
         title = "t"
         [[shot]]
@@ -1271,7 +1294,7 @@ mod tests {
     "#;
 
     fn with_fps(fps: &str) -> Result<Movie> {
-        Movie::parse(&format!("fps = {fps}\n{M}"), Path::new("."))
+        fixture(&format!("fps = {fps}\n{M}"), Path::new("."))
     }
 
     #[test]
@@ -1286,7 +1309,7 @@ mod tests {
         assert_eq!(rate("12.5"), (25, 2));
         assert_eq!(rate("\"50/2\""), (25, 1));
         assert_eq!(rate("\" 60 \""), (60, 1));
-        assert_eq!(Movie::parse(M, Path::new(".")).unwrap().fps_den, 1);
+        assert_eq!(fixture(M, Path::new(".")).unwrap().fps_den, 1);
         for bad in [
             "0", "-30", "0.5", "\"30/0\"", "\"x\"", "\"1/2\"", "29.9701", "5000",
         ] {
@@ -1323,7 +1346,7 @@ mod tests {
 
     #[test]
     fn layout_overlaps_transitions() {
-        let m = Movie::parse(M, Path::new(".")).unwrap();
+        let m = fixture(M, Path::new(".")).unwrap();
         let starts: Vec<f32> = m.shots.iter().map(|s| s.start).collect();
         assert_eq!(starts, vec![0.0, 4.0, 8.0]);
         assert_eq!(m.duration, 11.0);
@@ -1331,7 +1354,7 @@ mod tests {
 
     #[test]
     fn at_resolves_shots_and_transitions() {
-        let m = Movie::parse(M, Path::new(".")).unwrap();
+        let m = fixture(M, Path::new(".")).unwrap();
         assert_eq!(
             m.at(1.0),
             At::Shot {
@@ -1388,7 +1411,7 @@ mod tests {
 
     #[test]
     fn cues_are_defines() {
-        let m = Movie::parse(M, Path::new(".")).unwrap();
+        let m = fixture(M, Path::new(".")).unwrap();
         let d = m.cue_defines();
         assert!(d.contains("#define CUE_B_START 4.0"));
         assert!(d.contains("#define CUE_B_SETTLED 5.0"));
@@ -1413,13 +1436,13 @@ mod tests {
             duration = 2
             transition = { type = "fx/fade.glsl", duration = 1.0 }
         "#;
-        let e = Movie::parse(bad, Path::new(".")).unwrap_err().to_string();
+        let e = fixture(bad, Path::new(".")).unwrap_err().to_string();
         assert!(e.contains("overlaps"), "{e}");
     }
 
     #[test]
     fn shot_sound_follows_transitions() {
-        let m = Movie::parse(
+        let m = fixture(
             r#"
             [[shot]]
             id = "a"
@@ -1450,7 +1473,7 @@ mod tests {
     #[test]
     fn transition_fades_keep_constant_power() {
         for ease in ["linear", "smooth", "inout"] {
-            let m = Movie::parse(
+            let m = fixture(
                 &format!(
                     "[[shot]]\nid=\"a\"\nscene=\"a.glsl\"\nduration=3\nsound=\"a.glsl\"\n\
                      [[shot]]\nid=\"b\"\nscene=\"b.glsl\"\nduration=3\nsound=\"b.glsl\"\n\
@@ -1564,17 +1587,17 @@ mod tests {
         let v = crate::library::contract();
         let ok = format!("shotglass = \"{}.{}\"\n{SHOT}", v.major, v.minor);
         assert_eq!(
-            Movie::parse(&ok, Path::new(".")).unwrap().shotglass,
+            fixture(&ok, Path::new(".")).unwrap().shotglass,
             Some(format!("{}.{}", v.major, v.minor))
         );
         // A film from the future may use fields we don't know; the engine message wins.
         let future = format!("shotglass = \"99.1\"\nnew_thing = 3\n{SHOT}");
-        let e = format!("{:#}", Movie::parse(&future, Path::new(".")).unwrap_err());
+        let e = format!("{:#}", fixture(&future, Path::new(".")).unwrap_err());
         assert!(
             e.contains("needs shotglass 99.1") && e.contains("newer"),
             "{e}"
         );
-        assert!(Movie::parse(&format!("shotglass = 0.4\n{SHOT}"), Path::new(".")).is_err());
+        assert!(fixture(&format!("shotglass = 0.4\n{SHOT}"), Path::new(".")).is_err());
     }
 
     #[test]
@@ -1603,7 +1626,7 @@ mod tests {
                      transition = {{ type = \"{k}\", duration = 0.5 }}\n"
                 );
             }
-            Movie::parse(&t, Path::new("."))
+            fixture(&t, Path::new("."))
         };
         // Library transitions: no warning, and nothing in the film to watch for them.
         let m = film(kit, &["transitions/iris", "transitions/fade"]).unwrap();
@@ -1637,7 +1660,7 @@ mod tests {
 
     #[test]
     fn libraries_are_declared_by_local_name() {
-        let m = Movie::parse(
+        let m = fixture(
             &format!(
                 "[libraries]\n\
                  kit = {{ version = \"0.4\", source = \"https://github.com/antonmarsden/shotglass-kit\", subdir = \"core\" }}\n\
@@ -1652,11 +1675,9 @@ mod tests {
         assert_eq!(m.library_specs[1].path.as_deref(), Some("lib/mykit"));
         assert!(m.libraries.is_empty(), "parse doesn't touch the disk");
         let bad = format!("[libraries]\nkit = {{ path = \"../kit\" }}\n{SHOT}");
-        assert!(
-            format!("{:#}", Movie::parse(&bad, Path::new(".")).unwrap_err()).contains("climbs")
-        );
+        assert!(format!("{:#}", fixture(&bad, Path::new(".")).unwrap_err()).contains("climbs"));
         let bad = format!("[libraries]\nkit = {{ path = \"kit\", url = \"x\" }}\n{SHOT}");
-        assert!(Movie::parse(&bad, Path::new(".")).is_err());
+        assert!(fixture(&bad, Path::new(".")).is_err());
     }
 
     #[test]
@@ -1674,11 +1695,11 @@ mod tests {
             ),
         ] {
             let text = format!("{SHOT}[[shot]]\nid = \"b\"\nduration = 1\n{line}\n");
-            let e = format!("{:#}", Movie::parse(&text, Path::new(".")).unwrap_err());
+            let e = format!("{:#}", fixture(&text, Path::new(".")).unwrap_err());
             assert!(e.contains(why) && e.contains("shot \"b\""), "{line}: {e}");
         }
         let text = format!("[sound]\nmusic = \"D:\\\\m.glsl\"\n{SHOT}");
-        let e = format!("{:#}", Movie::parse(&text, Path::new(".")).unwrap_err());
+        let e = format!("{:#}", fixture(&text, Path::new(".")).unwrap_err());
         assert!(
             e.contains("[sound] music") && e.contains("backslash"),
             "{e}"
@@ -1686,7 +1707,7 @@ mod tests {
         // Paths that climb and come back down inside the film are fine.
         let text =
             format!("{SHOT}[[shot]]\nid = \"b\"\nduration = 1\nscene = \"scenes/../b.glsl\"\n");
-        assert!(Movie::parse(&text, Path::new(".")).is_ok());
+        assert!(fixture(&text, Path::new(".")).is_ok());
     }
 
     #[test]
@@ -1701,8 +1722,8 @@ mod tests {
             "name = \"me/mykit\"\nversion = \"0.2.0\"\nlicences = [\"MIT\"]\n",
         )
         .unwrap();
-        std::fs::write(
-            dir.join("movie.toml"),
+        crate::project::write_fixture(
+            &dir,
             "[libraries]\nmine = { path = \"lib/mykit\", version = \"0.2\" }\n\
              [[shot]]\nid = \"a\"\nscene = \"scenes/a.glsl\"\nduration = 1\n",
         )
@@ -1733,9 +1754,9 @@ glsl = 430
         )
         .unwrap();
         let toml = |glsl: &str| {
-            std::fs::write(
-                dir.join("movie.toml"),
-                format!(
+            crate::project::write_fixture(
+                &dir,
+                &format!(
                     "{glsl}[libraries]
 fx = {{ path = \"lib/compute\" }}
                      [[shot]]
@@ -1781,16 +1802,16 @@ glsl = 450
     #[test]
     fn glsl_opt_in() {
         let shot = "[[shot]]\nid=\"a\"\nscene=\"a.glsl\"\nduration=1\n";
-        assert_eq!(Movie::parse(shot, Path::new(".")).unwrap().glsl, None);
+        assert_eq!(fixture(shot, Path::new(".")).unwrap().glsl, None);
         for v in ["330", "410", "430"] {
-            let m = Movie::parse(&format!("glsl = \"{v}\"\n{shot}"), Path::new(".")).unwrap();
+            let m = fixture(&format!("glsl = \"{v}\"\n{shot}"), Path::new(".")).unwrap();
             assert_eq!(m.glsl, Some(v.parse().unwrap()));
         }
         for bad in ["\"450\"", "\"300 es\"", "\"\"", "430"] {
-            let e = Movie::parse(&format!("glsl = {bad}\n{shot}"), Path::new("."));
+            let e = fixture(&format!("glsl = {bad}\n{shot}"), Path::new("."));
             assert!(e.is_err(), "glsl = {bad} should be refused");
         }
-        let e = Movie::parse(&format!("glsl = \"460\"\n{shot}"), Path::new("."))
+        let e = fixture(&format!("glsl = \"460\"\n{shot}"), Path::new("."))
             .unwrap_err()
             .to_string();
         assert!(e.contains("\"410\" or \"430\""), "{e}");
@@ -1803,7 +1824,7 @@ glsl = 450
         for (i, extra) in shots.iter().enumerate() {
             t += &format!("[[shot]]\nid = \"s{i}\"\nscene = \"a.glsl\"\nduration = 1\n{extra}\n");
         }
-        Movie::parse(&t, Path::new("/film"))
+        fixture(&t, Path::new("/film"))
     }
 
     fn err(r: Result<Movie>) -> String {
@@ -1888,7 +1909,7 @@ glsl = 450
             "channels = [] binds nothing"
         );
         // Without any channels, nothing is bound and the film is unchanged.
-        let m = Movie::parse(M, Path::new(".")).unwrap();
+        let m = fixture(M, Path::new(".")).unwrap();
         assert!(!m.uses_channels() && m.contract_warning().is_none());
     }
 
@@ -2026,9 +2047,9 @@ glsl = 450
         img("lib/kit/textures/noise.png", 4, 4);
         img("textures/stars.png", 2, 2);
         let film = |channels: &str| {
-            std::fs::write(
-                dir.join("movie.toml"),
-                format!("[libraries]\nkit = {{ path = \"lib/kit\" }}\n[[shot]]\nid = \"sky\"\nscene = \"a.glsl\"\nduration = 1\nchannels = {channels}\n"),
+            crate::project::write_fixture(
+                &dir,
+                &format!("[libraries]\nkit = {{ path = \"lib/kit\" }}\n[[shot]]\nid = \"sky\"\nscene = \"a.glsl\"\nduration = 1\nchannels = {channels}\n"),
             )
             .unwrap();
             Movie::load(&dir)
@@ -2064,11 +2085,11 @@ glsl = 450
     #[test]
     fn rejects_unknown_fields() {
         let bad = "[[shot]]\nid=\"a\"\nscene=\"a.glsl\"\nduration=1\nlenght=2\n";
-        assert!(Movie::parse(bad, Path::new(".")).is_err());
+        assert!(fixture(bad, Path::new(".")).is_err());
     }
 
     fn loop_film(extra: &str, shots: &str) -> Result<Movie> {
-        Movie::parse(&format!("loop = true\n{extra}\n{shots}"), Path::new("."))
+        fixture(&format!("loop = true\n{extra}\n{shots}"), Path::new("."))
     }
 
     #[test]
@@ -2080,10 +2101,10 @@ glsl = 450
         assert_eq!(m.loop_period(), Some(11.0));
         assert_eq!(m.sound_samples(48000), 528000);
         assert_eq!(m.sound_samples(44100), 485100);
-        let m = Movie::parse(M, Path::new(".")).unwrap();
+        let m = fixture(M, Path::new(".")).unwrap();
         assert_eq!(m.loop_frames, None);
         assert_eq!(m.loop_period(), None);
-        let m = Movie::parse(&format!("loop = false\n{M}"), Path::new(".")).unwrap();
+        let m = fixture(&format!("loop = false\n{M}"), Path::new(".")).unwrap();
         assert_eq!(m.loop_frames, None);
         // NTSC: 300 frames at 30000/1001 = 10.01 s; the period is exact, the samples round.
         let one = "[[shot]]\nid = \"a\"\nscene = \"a.glsl\"\nduration = 10.01\n";
@@ -2106,9 +2127,9 @@ glsl = 450
         let e = loop_film("fps = 24", &one("0.01")).unwrap_err().to_string();
         assert!(e.contains("(1 frames)"), "{e}");
         // Without loop, any duration is fine.
-        assert!(Movie::parse(&one("2.01"), Path::new(".")).is_ok());
+        assert!(fixture(&one("2.01"), Path::new(".")).is_ok());
         // A typo'd value is a type error, not silently ignored.
-        assert!(Movie::parse(&format!("loop = 3\n{}", one("2")), Path::new(".")).is_err());
+        assert!(fixture(&format!("loop = 3\n{}", one("2")), Path::new(".")).is_err());
     }
 
     #[test]
@@ -2136,7 +2157,7 @@ glsl = 450
         // Inside the film (between the shots) they're fine, and so is either without loop.
         assert!(loop_film("", &shots("sound_tail = 0.5", "sound_lead = 0.5")).is_ok());
         assert!(
-            Movie::parse(
+            fixture(
                 &shots("sound_lead = 0.5", "sound_tail = 0.5"),
                 Path::new(".")
             )
@@ -2173,7 +2194,7 @@ glsl = 450
             }
         }
         // Not a loop film: unchanged.
-        let m = Movie::parse(M, Path::new(".")).unwrap();
+        let m = fixture(M, Path::new(".")).unwrap();
         assert_eq!(m.wrap(14.25), 14.25);
         assert_eq!(m.wrap_frame(400), 400);
     }

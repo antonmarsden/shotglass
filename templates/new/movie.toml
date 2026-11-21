@@ -1,11 +1,11 @@
 # A new shotglass movie. Save any file while `shotglass play` is open and it reloads.
-shotglass = "0.1"         # engine contract this film was made for
+# Libraries and the engine contract are in shotglass.toml, next to this file.
 title = "My short"
 aspect = [16, 9]
 fps = 30                  # or 29.97, or "30000/1001"
 # Shaders compile as GLSL 3.30 everywhere, so the film runs on any OpenGL 3.3 machine.
 # glsl = "430"           # opt in to a later GLSL ("410" or "430"); fewer machines run it
-# loop = true             # play forever (needs shotglass = "0.1.2"); see README, "Loop films"
+# loop = true             # play forever (shotglass = "0.1.2" in shotglass.toml); see README, "Loop films"
 
 [sound]
 music = "music.glsl"      # vec2 mainSound(int samp, float time); time = movie time
@@ -18,14 +18,14 @@ scene = "scenes/first.glsl"
 duration = 5.0
 # Uniforms are declared for you. Constants, vectors, or keyframes in shot-local seconds.
 uniforms.uHue = { keys = [[0, 0.0], [5, 0.3]], ease = "smooth" }
-# Images on iChannel0..3 (PNG or JPEG; needs shotglass = "0.1.1"). See README, "Textures".
+# Images on iChannel0..3 (PNG or JPEG; shotglass = "0.1.1" in shotglass.toml). See README, "Textures".
 # channels = ["textures/brick.png", "", { file = "textures/grid.png", filter = "nearest", wrap = "clamp" }]
 
 [[shot]]
 id = "second"
 scene = "scenes/second.glsl"
 duration = 5.0
-# The transition *into* this shot, from shotglass-kit (see [libraries] below):
+# The transition *into* this shot, from shotglass-kit (see [libraries] in shotglass.toml):
 # transitions/crossfade, fade, iris, dissolve, wipe. Or a file of your own: "fx/my.glsl".
 transition = { type = "transitions/iris", duration = 1.2, freeze = true, params = { center = [0.5, 0.5] } }
 # This shot's own sound: time is shot-local. sound_lead / sound_tail (seconds)
@@ -36,11 +36,3 @@ sound = "sfx/chime.glsl"
 # [textures]
 # brick = "textures/brick.png"
 # noise = { file = "<kit/textures/noise.png>", filter = "linear" }   # from a library
-
-# Shared GLSL by name; shaders use #include <kit/file.glsl>. See README, "Libraries".
-# `shotglass play` fetches them with git and pins them in shotglass.lock (commit it).
-# No version: follow the kit's main branch until it has releases.
-[libraries]
-transitions = { source = "https://github.com/antonmarsden/shotglass-kit", subdir = "transitions" }
-# kit = { source = "https://github.com/antonmarsden/shotglass-kit", subdir = "core" }   # noise, colour, shapes
-# mine = { path = "lib/mine" }

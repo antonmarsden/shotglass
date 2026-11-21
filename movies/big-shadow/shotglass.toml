@@ -1,0 +1,9 @@
+# Big Shadow is a project of its own: the engine contract and the libraries it uses.
+shotglass = "0.1"
+
+# Shared GLSL from shotglass-kit. No version: follow the kit's main branch, pinned to
+# one commit in shotglass.lock (`shotglass update movies/big-shadow` moves the pin).
+[libraries]
+kit = { source = "https://github.com/antonmarsden/shotglass-kit", subdir = "core" }
+transitions = { source = "https://github.com/antonmarsden/shotglass-kit", subdir = "transitions" }
+sound = { source = "https://github.com/antonmarsden/shotglass-kit", subdir = "sound" }

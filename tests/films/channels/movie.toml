@@ -1,7 +1,6 @@
 # Golden-image film for iChannel textures (tests/golden.rs): mipmaps on a receding
 # plane, repeat, nearest, clamp, mirror, vflip, iChannelResolution, an unbound channel,
 # and a frozen transition out of a textured shot.
-shotglass = "0.1.1"
 title = "channels"
 fps = 30
 channels = ["grid", "photo"]   # film-wide default: shot "plane" uses it
