@@ -17,6 +17,96 @@ cargo run -- check movies/big-shadow --web --no-gpu
 OpenGL, `SHOTGLASS_SKIP_GPU_TESTS=1` skips the last two; CI still runs them (see
 below).
 
+Faster loops while you work:
+
+```sh
+cargo run -- selftest                 # just the GPU + sound checks; `selftest strips` filters by name
+cargo run -- check movies/big-shadow --size 320x180 --frames 1   # compile and render one frame
+```
+
+### Look at the picture
+
+Tests pass on pictures they can't judge. When a change could alter what a film looks
+like, render a contact sheet and open it:
+
+```sh
+cargo run -- strip movies/big-shadow --count 8 --out target/tmp/strip.png
+cargo run -- still movies/big-shadow --at 12.5,moon --out target/tmp/stills    # frames at times or shot ids
+cargo run -- wav   movies/big-shadow --out target/tmp/sound.wav                 # the sound
+```
+
+A strip is `--count` frames spread evenly over the film, in rows of `--cols` (4),
+left to right, top to bottom, each at `--size` (the golden tests use 8 at 320x180);
+`--at` picks the times yourself. Compare it with the same command run on `main`, or
+with `tests/golden/*.png`. For timing and frame rate, use a real GPU: software OpenGL
+drops the render scale to 30% and its timings mean nothing.
+
+## Pull requests
+
+The [PR template](.github/pull_request_template.md) has a checklist. In short:
+
+- one issue per PR; say which (`Closes #N`);
+- a test for the change: a unit test, a selftest check for renderer behaviour (break
+  the code and make sure it fails), or a golden case for a new look;
+- every shader in the repo passes `check --web`;
+- name each [invariant in CLAUDE.md](CLAUDE.md#invariants-each-was-a-real-bug-most-have-a-test)
+  your change touches, and how you kept it;
+- golden references re-blessed in the same commit only when the change is meant to
+  look or sound different, never to make an unexplained diff go away.
+
+The owner tests every change to the renderer, sound or player on Windows with a real
+GPU before merging: CI has no GPU, and the dev GPU (NVIDIA) behaves differently from
+the software renderers CI uses.
+
+## Licensing
+
+Contributions are accepted under the project's licence: by opening a pull request you
+agree that your contribution is licensed under both Apache-2.0 and MIT, like the rest
+of shotglass (inbound = outbound). No sign-off line (DCO) is needed.
+
+Only contribute code you wrote or that you know is compatible. Shadertoy's default
+licence, CC BY-NC-SA, is **non-commercial** and can't come into the engine, the
+template or the demo. A permissively licensed snippet (MIT, Apache-2.0, public
+domain, CC0) is fine if you name its source and licence in the file.
+
+## Working with AI agents
+
+Much of shotglass is written by coding agents (Claude Code) working from issues and
+tested by the owner on a real GPU. If you work that way too:
+
+- **One issue per session.** Start each session from an issue with a clear "done
+  when", and keep unrelated fixes for their own issue. [CLAUDE.md](CLAUDE.md) is the
+  agent's map; update it in the same PR when the code it describes changes.
+- **One branch (or worktree) per issue**, named `claude/<topic>`, so sessions never
+  share a working copy. `git worktree add ../shotglass-<topic> -b claude/<topic>`
+  gives each its own folder.
+- **Lanes.** Sessions can run in parallel when they touch different lanes:
+
+  | safe in parallel | one change at a time |
+  |---|---|
+  | `app.rs` (player UI), `export.rs`, `library.rs`, `main.rs` subcommands, docs, kit libraries (another repo) | `gfx.rs`, `sound.rs`, `audio.rs` |
+
+  The right-hand files hold the invariants about blocking, GPU syncs, the audio
+  callback and bit-exact sound; two concurrent changes there interact in ways neither
+  session's tests see. Finish, review and merge one before starting the next.
+  `movie.rs`, `shader.rs` and `selftest.rs` are shared by many changes: expect
+  conflicts and rebase rather than merge by hand.
+- **Fresh-context review before the real-GPU test.** When the session says it's done,
+  review the diff in a new session (`/code-review`, or a plain "review this branch
+  against CLAUDE.md's invariants") that hasn't seen the reasoning behind it. Fix what
+  it finds, then ask the owner to pull the branch and test on the real GPU.
+- **Agents push, the owner pulls.** An agent in a remote or cloud session pushes its
+  branch and asks the owner to `git pull`; it doesn't run git commands that write in
+  the owner's working copy from a device shell.
+
+## Issues
+
+Use the templates: [bug](.github/ISSUE_TEMPLATE/bug.md) (with OS, GPU, driver and the
+output of `shotglass selftest`), [feature](.github/ISSUE_TEMPLATE/feature.md), or
+[library](.github/ISSUE_TEMPLATE/library.md) for the library system. New shader code
+for the kit (functions, transitions) goes to the
+[shotglass-kit issues](https://github.com/antonmarsden/shotglass-kit/issues).
+
 ## CI
 
 CI (`.github/workflows/ci.yml`) runs fmt, clippy, `cargo test` (unit tests, GPU
