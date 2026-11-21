@@ -157,19 +157,35 @@ float calcAO(vec3 p, vec3 n){
   return clamp(1.0-3.0*occ, 0.0, 1.0);
 }
 
-vec3 albedo(vec3 p, float m, vec3 n){
+// A dark line of half-width a at distance d, seen through a pixel footprint w:
+// widened by the footprint and faded so its total darkness stays the same. Lines
+// thinner than a pixel would otherwise flicker on and off with the tiniest change in
+// the hit point (and land on different pixels on different drivers).
+float seamLine(float d, float a, float w){
+  return (1.0-smoothstep(0.0, a+w, d))*a/(a+w);
+}
+
+// fp: the size of a pixel at p (world units, across the ray); rd: the view ray.
+vec3 albedo(vec3 p, float m, vec3 n, float fp, vec3 rd){
   if(m < 1.5){                                     // wooden floor boards running to the wall
-    float bw = 0.16;
+    float bw = 0.16, bl = 1.4;                     // board width, board length
+    float wx = fp;                                 // footprint across the boards
+    float wz = fp/max(abs(rd.y), 0.05);            // and along them (grazing: stretched)
     float id = floor(p.x/bw);
     float gx = fract(p.x/bw);
     float zoff = kit_hash(ivec2(int(id), 6))*3.0;
-    float bid = floor((p.z+zoff)/1.4);
+    float u = (p.z+zoff)/bl;
+    float k = floor(u+0.5);                        // the nearest board end
+    float sz = (u-k)*bl;                           // signed distance to it
     float grain = kit_fbm(vec2(p.x*30.0, p.z*2.0+id*7.0), 4);
     vec3 c = mix(vec3(0.28,0.16,0.08), vec3(0.42,0.26,0.13), grain);
-    c *= 0.8+0.35*kit_hash(ivec2(int(id), int(bid)));
-    float gap = smoothstep(0.0,0.02,gx)*smoothstep(1.0,0.98,gx)
-              * smoothstep(0.0,0.006,abs(fract((p.z+zoff)/1.4)-0.0)*1.4);
-    return c*mix(0.25,1.0,gap);
+    // each board's shade, blended across its end over the footprint
+    float shade = mix(kit_hash(ivec2(int(id), int(k)-1)), kit_hash(ivec2(int(id), int(k))),
+                      smoothstep(-wz, wz, sz));
+    c *= 0.8+0.35*shade;
+    float dark = max(seamLine(min(gx, 1.0-gx)*bw, 0.0032, wx),
+                     seamLine(abs(sz), 0.003, wz));
+    return c*(1.0-0.75*dark);
   }
   if(m < 2.5){                                     // plaster wall
     float n1 = kit_fbm(p.xy*6.0, 4);
@@ -210,6 +226,12 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord){
     t += h.x*0.9;
     if(t > 30.0) break;
   }
+  // The floor and the wall are planes: put the hit exactly on them. Where the march
+  // stops within its tolerance depends on the driver's rounding, and where the view
+  // grazes a plane that slides the hit point a long way (different grain, different
+  // shadow).
+  if(m > 0.0 && m < 1.5 && rd.y < -1e-4) t = -ro.y/rd.y;
+  else if(m > 1.5 && m < 2.5 && rd.z < -1e-4) t = -ro.z/rd.z;
 
   vec3 L = lightPos();
   vec3 flameCol = vec3(1.0,0.60,0.26);
@@ -219,7 +241,8 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord){
   if(m > 0.0){
     vec3 p = ro+rd*t;
     vec3 n = calcNormal(p);
-    vec3 alb = albedo(p, m, n);
+    float fp = t*2.0/(iResolution.y*1.45*uZoom);   // pixel size at the hit
+    vec3 alb = albedo(p, m, n, fp, rd);
     vec3 ld = L-p; float dl = length(ld); ld /= dl;
 
     float dif = max(dot(n, ld), 0.0);

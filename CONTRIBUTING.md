@@ -118,7 +118,7 @@ machines has a real GPU:
 |---|---|---|
 | Linux | Mesa llvmpipe under Xvfb | nothing (also renders and exports the demo) |
 | Windows | Mesa llvmpipe ([mesa-dist-win](https://github.com/pal1000/mesa-dist-win)) | the selftest's video export (no ffmpeg; PNG + WAV export still checked) |
-| macOS | Apple Software Renderer (OpenGL 4.1; the runners have no GPU) | the demo's golden strip (`--skip demo_film`): the references are llvmpipe renders, and in the close-up the floor's plank seams (thinner than a pixel) land on different pixels here: about 0.8% of pixels differ, over the 0.1% budget. The template's strip and both soundtracks are compared. The selftest's "sound matches exactly" comparisons (chunked, banded, streamed, exported) are reported, not failed: this renderer's sound differs by about 1e-5 with the size of the block drawn (`INEXACT_SOUND_RENDERERS` in `selftest.rs`); everything else in those checks still runs. Also the video export, as on Windows. |
+| macOS | Apple Software Renderer (OpenGL 4.1; the runners have no GPU) | none of the golden tests (they compare against the same llvmpipe references; this renderer's built-in `sin`/`cos` are ~5e-4 off, so the demo computes its camera rotation itself). The selftest's "sound matches exactly" comparisons (chunked, banded, streamed, exported) are reported, not failed: this renderer's sound differs by about 1e-5 with the size of the block drawn (`INEXACT_SOUND_RENDERERS` in `selftest.rs`); everything else in those checks still runs. Also the video export, as on Windows. |
 
 ## Golden images
 
