@@ -40,7 +40,7 @@ cargo fmt && cargo clippy --all-targets -- -D warnings
 - Software OpenGL (llvmpipe) is slow: auto render scale drops to 30% and frame
   timings mean nothing. Judge performance only on a real GPU.
 - The owner tests on Windows with a real GPU. Their working copy is
-  `C:\software\shotglass` (CRLF checkout). Push to GitHub and ask them to `git pull`.
+  `C:\software\shotglass` (LF: `.gitattributes` sets `eol=lf`). Push to GitHub and ask them to `git pull`.
   Don't run git commands that write in that folder from the device shell.
 
 ## Map

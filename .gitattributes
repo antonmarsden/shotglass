@@ -1,7 +1,13 @@
-# Images are binary: never convert line endings (CRLF checkouts included).
+# Text files are LF in every checkout, whatever core.autocrlf says (Windows included),
+# so the files on disk match the repository and the CI machines byte for byte.
+* text=auto eol=lf
+
+# Images and sound are binary: never convert line endings.
 *.png binary
 *.PNG binary
 *.jpg binary
 *.JPG binary
 *.jpeg binary
 *.JPEG binary
+*.wav binary
+*.WAV binary
