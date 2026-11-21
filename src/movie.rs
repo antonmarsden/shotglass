@@ -2,6 +2,7 @@
 
 use crate::anim::{Anim, Ease, vector};
 use crate::library::{self, Library, LibraryDecl, LibrarySpec};
+use crate::texture::{Filter, Wrap};
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -79,6 +80,11 @@ struct MovieFile {
     /// Shared GLSL by local name: `kit = { version = "0.4", source = "https://…", subdir = "core" }`.
     #[serde(default)]
     libraries: BTreeMap<String, LibraryDecl>,
+    /// Film-wide iChannel0..3 for every shot that doesn't set its own `channels`.
+    channels: Option<Vec<toml::Value>>,
+    /// Named textures: `brick = "textures/brick.png"` or `{ file = "…", filter = … }`.
+    #[serde(default)]
+    textures: BTreeMap<String, toml::Value>,
 }
 
 #[derive(Deserialize)]
@@ -123,6 +129,8 @@ struct ShotFile {
     /// Let the sound ring on this many seconds after the shot (an L-cut).
     sound_tail: Option<f32>,
     sound_gain: Option<f32>,
+    /// Images on iChannel0..3: names from [textures], paths, `<lib/path>`, tables, "".
+    channels: Option<Vec<toml::Value>>,
 }
 
 #[derive(Deserialize)]
@@ -169,6 +177,25 @@ pub struct ShotSound {
     pub gain: f32,
 }
 
+/// An image bound to an iChannel.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Channel {
+    /// The file: film root (or, once `resolve_libraries` ran, library root) joined with `rel`.
+    pub file: PathBuf,
+    /// As written, for messages: "textures/brick.png", "kit/textures/noise.png".
+    pub label: String,
+    /// The library's local name for `<lib/path>` textures.
+    pub library: Option<String>,
+    /// The path inside the film folder or the library.
+    pub rel: String,
+    pub filter: Filter,
+    pub wrap: Wrap,
+    /// Rows reversed on decode, so the image is upright with `fragCoord / iResolution.xy`.
+    pub vflip: bool,
+    /// Uploaded as SRGB8_ALPHA8: `texture()` returns linear values.
+    pub srgb: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct Shot {
     pub id: String,
@@ -181,6 +208,8 @@ pub struct Shot {
     pub uniforms: Vec<(String, Anim)>,
     pub transition_in: Option<Transition>,
     pub sound: Option<ShotSound>,
+    /// What iChannel0..3 carry (None: black, `iChannelResolution` 0).
+    pub channels: [Option<Channel>; 4],
 }
 
 impl Shot {
@@ -259,7 +288,96 @@ impl Movie {
         m.resolve_libraries(&|k| std::env::var(k).ok(), &library::cache_dir())
             .with_context(|| format!("in {}", m.root.join("movie.toml").display()))?;
         m.check_case();
+        m.check_textures()
+            .with_context(|| format!("in {}", m.root.join("movie.toml").display()))?;
         Ok(m)
+    }
+
+    /// Does any shot bind a texture?
+    pub fn uses_channels(&self) -> bool {
+        self.shots
+            .iter()
+            .any(|s| s.channels.iter().any(Option::is_some))
+    }
+
+    /// Every distinct texture (by file and how its texels are made), in shot order.
+    pub fn textures(&self) -> Vec<&Channel> {
+        let mut v: Vec<&Channel> = vec![];
+        for c in self.shots.iter().flat_map(|s| s.channels.iter().flatten()) {
+            if !v
+                .iter()
+                .any(|o| o.file == c.file && o.vflip == c.vflip && o.srgb == c.srgb)
+            {
+                v.push(c);
+            }
+        }
+        v
+    }
+
+    /// `check`'s warning for a film that binds textures but doesn't say it needs the
+    /// engine contract that has them (0.1.1): older engines would then fail on an
+    /// "unknown field" instead of asking for a newer shotglass.
+    pub fn contract_warning(&self) -> Option<String> {
+        if !self.uses_channels() {
+            return None;
+        }
+        let old = semver::Version::new(0, 1, 0);
+        let allows_old = match &self.shotglass {
+            None => true,
+            Some(r) => library::parse_req(r).is_ok_and(|r| r.matches(&old)),
+        };
+        allows_old.then(|| {
+            format!(
+                "this film uses channels (iChannel textures), which need shotglass 0.1.1; write                  shotglass = \"0.1.1\" in movie.toml so older shotglass versions ask for an \
+                 upgrade instead of failing on an unknown field{}",
+                self.shotglass
+                    .as_ref()
+                    .map_or(String::new(), |v| format!(" (it says \"{v}\")"))
+            )
+        })
+    }
+
+    /// Every texture file exists (a missing one refuses the version, like a missing
+    /// `#include`), and no shot needs more texture memory than the budget.
+    fn check_textures(&self) -> Result<()> {
+        for s in &self.shots {
+            for (n, c) in s.channels.iter().enumerate() {
+                let Some(c) = c else { continue };
+                if c.file.is_file() {
+                    continue;
+                }
+                let base = match &c.library {
+                    Some(lib) => self
+                        .libraries
+                        .iter()
+                        .find(|l| &l.name == lib)
+                        .map(|l| l.root.clone()),
+                    None => Some(self.root.clone()),
+                };
+                let hint = base
+                    .and_then(|b| crate::texture::did_you_mean(&b, &c.rel))
+                    .map_or(String::new(), |m| match &c.library {
+                        Some(lib) => format!(" (did you mean \"{lib}/{m}\"?)"),
+                        None => format!(" (did you mean \"{m}\"?)"),
+                    });
+                bail!(
+                    "shot \"{}\": channels[{n}]: \"{}\" not found{hint}",
+                    s.id,
+                    c.label
+                );
+            }
+            let (total, parts) = crate::texture::shot_memory(&s.channels);
+            if total > crate::texture::BUDGET {
+                bail!(
+                    "shot \"{}\": its textures need {}, more than the {} budget: {}",
+                    s.id,
+                    crate::texture::describe_bytes(total),
+                    crate::texture::describe_bytes(crate::texture::BUDGET),
+                    parts.join(", ")
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Read and validate `movie.toml` without looking libraries up on disk.
@@ -289,6 +407,18 @@ impl Movie {
         let lock = library::Lock::load(&self.root)?;
         self.libraries =
             library::resolve(&self.root, &self.library_specs, &o, lock.as_ref(), cache)?;
+        let libs = self.libraries.clone();
+        for c in self
+            .shots
+            .iter_mut()
+            .flat_map(|s| s.channels.iter_mut().flatten())
+        {
+            if let Some(lib) = &c.library
+                && let Some(l) = libs.iter().find(|l| &l.name == lib)
+            {
+                c.file = l.root.join(&c.rel);
+            }
+        }
         let film = self
             .glsl
             .unwrap_or(crate::shader::Dialect::BASELINE.version);
@@ -307,7 +437,8 @@ impl Movie {
         Ok(())
     }
 
-    /// Files the edit refers to directly (scenes, sounds, transition files).
+    /// Files the edit refers to directly (scenes, sounds, transition files, textures in
+    /// the film folder).
     pub fn referenced_files(&self) -> Vec<PathBuf> {
         let mut v: Vec<PathBuf> = self.music.iter().chain(self.mix.iter()).cloned().collect();
         for s in &self.shots {
@@ -317,6 +448,11 @@ impl Movie {
                 && let TransitionKind::File(p) = transition_kind(&t.kind)
             {
                 v.push(self.root.join(p));
+            }
+            for c in s.channels.iter().flatten() {
+                if c.library.is_none() {
+                    v.push(c.file.clone());
+                }
             }
         }
         v.sort();
@@ -373,10 +509,51 @@ impl Movie {
         if f.shots.is_empty() {
             bail!("a movie needs at least one [[shot]]");
         }
+        let mut textures: BTreeMap<String, Channel> = BTreeMap::new();
+        for (name, v) in &f.textures {
+            let what = format!("[textures] {name}");
+            if !is_ident(name) {
+                bail!(
+                    "{what}: a texture name may only use letters, digits and _ (and not start with a digit)"
+                );
+            }
+            match texture_spec(&what, v, None, &library_specs, root)? {
+                Some(c) => textures.insert(name.clone(), c),
+                None => bail!("{what}: \"\" names no file"),
+            };
+        }
+        let mut used: std::collections::HashSet<String> = Default::default();
+        let mut channel_list = |what: &str, list: &[toml::Value]| -> Result<[Option<Channel>; 4]> {
+            if list.len() > 4 {
+                bail!(
+                    "{what}channels has {} entries; there are 4 (iChannel0..3)",
+                    list.len()
+                );
+            }
+            let mut out: [Option<Channel>; 4] = Default::default();
+            for (n, v) in list.iter().enumerate() {
+                let ctx = format!("{what}channels[{n}]");
+                if let toml::Value::String(s) = v
+                    && is_texture_name(s)
+                {
+                    used.insert(s.clone());
+                }
+                out[n] = texture_spec(&ctx, v, Some(&textures), &library_specs, root)?;
+            }
+            Ok(out)
+        };
+        let default_channels = match &f.channels {
+            Some(list) => channel_list("", list)?,
+            None => Default::default(),
+        };
         let mut shots: Vec<Shot> = Vec::new();
         let mut ids = std::collections::HashSet::new();
         for (index, s) in f.shots.into_iter().enumerate() {
             let ctx = || format!("shot \"{}\"", s.id);
+            let channels = match &s.channels {
+                Some(list) => channel_list(&format!("{}: ", ctx()), list)?,
+                None => default_channels.clone(),
+            };
             if !ids.insert(s.id.clone()) {
                 bail!("duplicate shot id \"{}\"", s.id);
             }
@@ -517,6 +694,7 @@ impl Movie {
                 gain: s.sound_gain.unwrap_or(1.0),
             });
             shots.push(Shot {
+                channels,
                 sound,
                 id: s.id,
                 index,
@@ -582,6 +760,12 @@ impl Movie {
             warnings: deprecated
                 .iter()
                 .map(|n| builtin_transition_warning(n, &library_specs))
+                .chain(
+                    textures
+                        .keys()
+                        .filter(|n| !used.contains(*n))
+                        .map(|n| format!("[textures] {n} isn't used by any shot's channels")),
+                )
                 .collect(),
             library_specs,
             libraries: vec![],
@@ -716,6 +900,169 @@ impl Movie {
                 (s.start, s.end())
             }
         }
+    }
+}
+
+/// A `channels` entry or `[textures]` value names a `[textures]` entry (not a path)?
+fn is_texture_name(s: &str) -> bool {
+    !s.is_empty() && !s.contains('.') && !s.contains('/') && !s.starts_with('<')
+}
+
+/// Resolve one `channels` entry (with `names`) or `[textures]` value (without):
+/// "" (nothing), a `[textures]` name, a film path, `<lib/path>`, or a table with `file`
+/// and options. Library paths stay relative until `resolve_libraries`.
+fn texture_spec(
+    what: &str,
+    v: &toml::Value,
+    names: Option<&BTreeMap<String, Channel>>,
+    specs: &[LibrarySpec],
+    root: &Path,
+) -> Result<Option<Channel>> {
+    let file_channel = |s: &str| -> Result<Channel> {
+        let (library, rel, label) = match s.strip_prefix('<') {
+            Some(inner) => {
+                let Some(inner) = inner.strip_suffix('>') else {
+                    bail!("{what}: \"{s}\" opens with < but doesn't end with >");
+                };
+                let Some((lib, rel)) = inner.split_once('/') else {
+                    bail!(
+                        "{what}: \"{s}\" needs a library name and a path, like \"<kit/textures/noise.png>\""
+                    );
+                };
+                if !specs.iter().any(|l| l.name == lib) {
+                    bail!(
+                        "{what}: \"{s}\" names library \"{lib}\", but [libraries] has {}",
+                        if specs.is_empty() {
+                            "none".to_string()
+                        } else {
+                            specs
+                                .iter()
+                                .map(|l| format!("\"{}\"", l.name))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        }
+                    );
+                }
+                (Some(lib.to_string()), rel.to_string(), inner.to_string())
+            }
+            None => (None, s.to_string(), s.to_string()),
+        };
+        library::check_rel_path(&rel).map_err(|e| anyhow!("{what}: {e}"))?;
+        if !crate::texture::has_image_extension(&rel) {
+            bail!("{what}: {label}: shotglass reads PNG and JPEG images (.png, .jpg, .jpeg)");
+        }
+        Ok(Channel {
+            file: if library.is_some() {
+                PathBuf::from(&rel)
+            } else {
+                root.join(&rel)
+            },
+            label,
+            library,
+            rel,
+            filter: Filter::Mipmap,
+            wrap: Wrap::Repeat,
+            vflip: true,
+            srgb: false,
+        })
+    };
+    match v {
+        toml::Value::String(s) if s.is_empty() => {
+            if names.is_none() {
+                bail!("{what}: \"\" names no file");
+            }
+            Ok(None)
+        }
+        toml::Value::String(s) if is_texture_name(s) => {
+            let Some(names) = names else {
+                bail!(
+                    "{what}: \"{s}\" isn't a file; give a path like \"textures/{s}.png\" or \
+                     \"<kit/textures/{s}.png>\""
+                );
+            };
+            match names.get(s) {
+                Some(c) => Ok(Some(c.clone())),
+                None => bail!(
+                    "{what}: no texture called \"{s}\" in [textures] ({})",
+                    if names.is_empty() {
+                        "there are none".to_string()
+                    } else {
+                        format!(
+                            "there are {}",
+                            names
+                                .keys()
+                                .map(|k| format!("\"{k}\""))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    }
+                ),
+            }
+        }
+        toml::Value::String(s) => file_channel(s).map(Some),
+        toml::Value::Table(t) => {
+            let mut c = match t.get("file") {
+                Some(toml::Value::String(s)) if !s.is_empty() && !is_texture_name(s) => {
+                    file_channel(s)?
+                }
+                Some(toml::Value::String(s)) => bail!(
+                    "{what}: file = \"{s}\" must be a path to a .png or .jpg (names from \
+                     [textures] can't have options)"
+                ),
+                Some(_) => bail!("{what}: file must be a string"),
+                None => bail!("{what}: a texture table needs file = \"…\""),
+            };
+            for (k, val) in t {
+                let word = |names: &[&str]| -> Result<String> {
+                    match val {
+                        toml::Value::String(s) => Ok(s.clone()),
+                        _ => bail!(
+                            "{what}: {k} must be one of {}",
+                            names
+                                .iter()
+                                .map(|n| format!("\"{n}\""))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                    }
+                };
+                let flag = || -> Result<bool> {
+                    val.as_bool()
+                        .ok_or_else(|| anyhow!("{what}: {k} must be true or false"))
+                };
+                let not_one_of = |s: &str, names: &[&str]| {
+                    anyhow!(
+                        "{what}: {k} \"{s}\" isn't one of {}",
+                        names
+                            .iter()
+                            .map(|n| format!("\"{n}\""))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                };
+                match k.as_str() {
+                    "file" => {}
+                    "filter" => {
+                        let s = word(Filter::NAMES)?;
+                        c.filter =
+                            Filter::parse(&s).ok_or_else(|| not_one_of(&s, Filter::NAMES))?;
+                    }
+                    "wrap" => {
+                        let s = word(Wrap::NAMES)?;
+                        c.wrap = Wrap::parse(&s).ok_or_else(|| not_one_of(&s, Wrap::NAMES))?;
+                    }
+                    "vflip" => c.vflip = flag()?,
+                    "srgb" => c.srgb = flag()?,
+                    other => bail!(
+                        "{what}: unknown option `{other}` (a texture has file, filter, wrap, vflip and srgb)"
+                    ),
+                }
+            }
+            Ok(Some(c))
+        }
+        _ => bail!(
+            "{what}: expected a texture name, a path, \"<library/path>\", a table {{ file = \"…\" }} or \"\""
+        ),
     }
 }
 
@@ -1006,11 +1353,16 @@ mod tests {
         /// A random but valid timeline: durations, optional transitions that fit.
         fn timeline() -> impl Strategy<Value = String> {
             prop::collection::vec((0.2f32..6.0, prop::option::of(0.05f32..1.0), any::<bool>()), 1..12).prop_map(|shots| {
-                let mut s = String::new();
+                let mut s = String::from("channels = [\"noise\"]\n[textures]\nnoise = { file = \"t/noise.png\", srgb = true }\n");
                 let mut prev_in = 0.0f32;
                 let mut prev_dur = 0.0f32;
                 for (i, (dur, tr, freeze)) in shots.into_iter().enumerate() {
                     s += &format!("[[shot]]\nid=\"s{i}\"\nscene=\"x.glsl\"\nduration={dur}\n");
+                    match i % 3 {
+                        1 => s += "channels = [\"noise\", \"\", \"t/a.png\"]\n",
+                        2 => s += "channels = [{ file = \"t/b.jpg\", filter = \"nearest\", wrap = \"clamp\" }]\n",
+                        _ => {}
+                    }
                     let mut this_in = 0.0;
                     if let (Some(frac), true) = (tr, i > 0) {
                         // keep it legal: fits both shots and doesn't overlap the previous one
@@ -1323,6 +1675,271 @@ glsl = 450
             .unwrap_err()
             .to_string();
         assert!(e.contains("\"410\" or \"430\""), "{e}");
+    }
+
+    fn channels_film(top: &str, textures: &str, shots: &[&str]) -> Result<Movie> {
+        let mut t =
+            format!("{top}[libraries]\nkit = {{ path = \"lib/kit\" }}\n[textures]\n{textures}");
+        let shots = if shots.is_empty() { &[""][..] } else { shots };
+        for (i, extra) in shots.iter().enumerate() {
+            t += &format!("[[shot]]\nid = \"s{i}\"\nscene = \"a.glsl\"\nduration = 1\n{extra}\n");
+        }
+        Movie::parse(&t, Path::new("/film"))
+    }
+
+    fn err(r: Result<Movie>) -> String {
+        format!("{:#}", r.unwrap_err())
+    }
+
+    #[test]
+    fn channels_short_and_long_forms() {
+        let m = channels_film(
+            "",
+            "noise = \"<kit/textures/noise.png>\"\n\
+             grid = { file = \"textures/grid.png\", filter = \"nearest\", wrap = \"mirror\" }\n\
+             moon = { file = \"textures/moon.JPG\", wrap = \"clamp\", srgb = true, vflip = false }\n",
+            &["channels = [\"grid\", \"noise\", \"\", \"moon\"]",
+              "channels = [\"\", \"textures/stars.png\", { file = \"<kit/logo.jpeg>\", wrap = \"clamp\" }]"],
+        )
+        .unwrap();
+        let c = &m.shots[0].channels;
+        let grid = c[0].as_ref().unwrap();
+        assert_eq!(grid.file, PathBuf::from("/film/textures/grid.png"));
+        assert_eq!(
+            (grid.filter, grid.wrap, grid.vflip, grid.srgb),
+            (Filter::Nearest, Wrap::Mirror, true, false)
+        );
+        let noise = c[1].as_ref().unwrap();
+        assert_eq!(noise.library.as_deref(), Some("kit"));
+        assert_eq!(noise.label, "kit/textures/noise.png");
+        assert_eq!(noise.rel, "textures/noise.png");
+        assert_eq!(
+            (noise.filter, noise.wrap),
+            (Filter::Mipmap, Wrap::Repeat),
+            "Shadertoy's defaults"
+        );
+        assert!(c[2].is_none());
+        let moon = c[3].as_ref().unwrap();
+        assert_eq!(
+            (moon.wrap, moon.srgb, moon.vflip),
+            (Wrap::Clamp, true, false)
+        );
+        let c = &m.shots[1].channels;
+        assert!(c[0].is_none() && c[3].is_none());
+        assert_eq!(c[1].as_ref().unwrap().label, "textures/stars.png");
+        assert_eq!(c[2].as_ref().unwrap().wrap, Wrap::Clamp);
+        assert!(m.uses_channels());
+        assert!(m.warnings.is_empty(), "{:?}", m.warnings);
+        // Film textures are referenced files (case check, web preload); library ones aren't.
+        let files = m.referenced_files();
+        assert!(files.contains(&PathBuf::from("/film/textures/grid.png")));
+        assert!(files.contains(&PathBuf::from("/film/textures/stars.png")));
+        assert!(!files.iter().any(|f| f.to_string_lossy().contains("noise")));
+        // A plain kit/… path (no brackets) is in the film folder, as for #include "…".
+        let m = channels_film("", "", &["channels = [\"kit/textures/noise.png\"]"]).unwrap();
+        let c = m.shots[0].channels[0].as_ref().unwrap();
+        assert_eq!(
+            (c.library.as_ref(), c.file.clone()),
+            (None, PathBuf::from("/film/kit/textures/noise.png"))
+        );
+    }
+
+    #[test]
+    fn film_default_channels_and_replacement() {
+        let m = channels_film(
+            "channels = [\"noise\"]\n",
+            "noise = \"t/noise.png\"\nbrick = \"t/brick.png\"\n",
+            &["", "channels = [\"brick\"]", "channels = []"],
+        )
+        .unwrap();
+        let label = |i: usize, n: usize| m.shots[i].channels[n].as_ref().map(|c| c.label.clone());
+        assert_eq!(
+            label(0, 0).as_deref(),
+            Some("t/noise.png"),
+            "default applies"
+        );
+        assert_eq!(
+            label(1, 0).as_deref(),
+            Some("t/brick.png"),
+            "replaced, not merged"
+        );
+        assert_eq!(label(1, 1), None);
+        assert!(
+            m.shots[2].channels.iter().all(Option::is_none),
+            "channels = [] binds nothing"
+        );
+        // Without any channels, nothing is bound and the film is unchanged.
+        let m = Movie::parse(M, Path::new(".")).unwrap();
+        assert!(!m.uses_channels() && m.contract_warning().is_none());
+    }
+
+    #[test]
+    fn channels_are_validated() {
+        let e = err(channels_film(
+            "",
+            "",
+            &["channels = [\"\", \"\", \"\", \"\", \"\"]"],
+        ));
+        assert!(
+            e.contains("shot \"s0\": channels has 5 entries; there are 4 (iChannel0..3)"),
+            "{e}"
+        );
+        let e = err(channels_film(
+            "",
+            "brick = \"b.png\"\nnoise = \"n.png\"\ngrid = \"g.png\"\n",
+            &["channels = [\"brick\", \"noize\"]"],
+        ));
+        assert!(
+            e.contains("shot \"s0\": channels[1]: no texture called \"noize\" in [textures] (there are \"brick\", \"grid\", \"noise\")"),
+            "{e}"
+        );
+        let e = err(channels_film("", "", &["channels = [\"noise\"]"]));
+        assert!(e.contains("there are none"), "{e}");
+        let e = err(channels_film("", "noise = \"<kat/t/noise.png>\"\n", &[]));
+        assert!(
+            e.contains("[textures] noise: \"<kat/t/noise.png>\" names library \"kat\", but [libraries] has \"kit\""),
+            "{e}"
+        );
+        let e = err(channels_film(
+            "",
+            "",
+            &["channels = [\"textures/sky.webp\"]"],
+        ));
+        assert!(
+            e.contains("channels[0]: textures/sky.webp: shotglass reads PNG and JPEG"),
+            "{e}"
+        );
+        let e = err(channels_film(
+            "",
+            "grid = { file = \"g.png\", filter = \"point\" }\n",
+            &[],
+        ));
+        assert!(
+            e.contains(
+                "[textures] grid: filter \"point\" isn't one of \"mipmap\", \"linear\", \"nearest\""
+            ),
+            "{e}"
+        );
+        let e = err(channels_film(
+            "",
+            "grid = { file = \"g.png\", wrap = \"tile\" }\n",
+            &[],
+        ));
+        assert!(
+            e.contains("wrap \"tile\" isn't one of \"repeat\", \"clamp\", \"mirror\""),
+            "{e}"
+        );
+        let e = err(channels_film(
+            "",
+            "grid = { file = \"g.png\", vflip = \"yes\" }\n",
+            &[],
+        ));
+        assert!(e.contains("vflip must be true or false"), "{e}");
+        // Unknown fields in a texture table (deny_unknown_fields, by hand).
+        let e = err(channels_film(
+            "",
+            "grid = { file = \"g.png\", filtr = \"nearest\" }\n",
+            &[],
+        ));
+        assert!(e.contains("unknown option `filtr`"), "{e}");
+        let e = err(channels_film(
+            "",
+            "",
+            &["channels = [{ filter = \"nearest\" }]"],
+        ));
+        assert!(e.contains("needs file"), "{e}");
+        // Path rules, as for every other path.
+        for (bad, why) in [
+            ("../x.png", "climbs"),
+            ("/x.png", "absolute"),
+            ("t\\\\x.png", "backslash"),
+            ("<kit/../../x.png>", "climbs"),
+        ] {
+            let e = err(channels_film("", "", &[&format!("channels = [\"{bad}\"]")]));
+            assert!(e.contains(why) && e.contains("channels[0]"), "{bad}: {e}");
+        }
+        // Names are identifiers; [textures] values are files, not names.
+        let e = err(channels_film("", "\"my-tex\" = \"a.png\"\n", &[]));
+        assert!(e.contains("[textures] my-tex"), "{e}");
+        let e = err(channels_film("", "a = \"noise\"\n", &[]));
+        assert!(e.contains("isn't a file"), "{e}");
+        let e = err(channels_film("", "", &["channels = [3]"]));
+        assert!(e.contains("expected a texture name"), "{e}");
+        // Shot-level unknown fields are still refused.
+        assert!(channels_film("", "", &["channel = [\"a.png\"]"]).is_err());
+    }
+
+    #[test]
+    fn unused_textures_warn_and_contract_is_checked() {
+        let m = channels_film(
+            "",
+            "noise = \"n.png\"\nspare = \"s.png\"\n",
+            &["channels = [\"noise\"]"],
+        )
+        .unwrap();
+        assert_eq!(
+            m.warnings,
+            vec!["[textures] spare isn't used by any shot's channels".to_string()]
+        );
+        let w = m.contract_warning().unwrap();
+        assert!(w.contains("shotglass = \"0.1.1\""), "{w}");
+        let m = channels_film("shotglass = \"0.1\"\n", "", &["channels = [\"n.png\"]"]).unwrap();
+        assert!(m.contract_warning().unwrap().contains("it says \"0.1\""));
+        let m = channels_film("shotglass = \"0.1.1\"\n", "", &["channels = [\"n.png\"]"]).unwrap();
+        assert_eq!(m.contract_warning(), None);
+    }
+
+    #[test]
+    fn load_checks_texture_files_and_resolves_library_ones() {
+        let dir = std::env::temp_dir().join(format!("shotglass-movie-tex-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("lib/kit/textures")).unwrap();
+        std::fs::create_dir_all(dir.join("textures")).unwrap();
+        std::fs::write(dir.join("a.glsl"), "").unwrap();
+        std::fs::write(
+            dir.join("lib/kit/library.toml"),
+            "name = \"me/kit\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        let img = |p: &str, w: u32, h: u32| {
+            image::RgbaImage::new(w, h).save(dir.join(p)).unwrap();
+        };
+        img("lib/kit/textures/noise.png", 4, 4);
+        img("textures/stars.png", 2, 2);
+        let film = |channels: &str| {
+            std::fs::write(
+                dir.join("movie.toml"),
+                format!("[libraries]\nkit = {{ path = \"lib/kit\" }}\n[[shot]]\nid = \"sky\"\nscene = \"a.glsl\"\nduration = 1\nchannels = {channels}\n"),
+            )
+            .unwrap();
+            Movie::load(&dir)
+        };
+        let m = film("[\"<kit/textures/noise.png>\", \"textures/stars.png\"]").unwrap();
+        assert_eq!(
+            m.shots[0].channels[0].as_ref().unwrap().file,
+            dir.join("lib/kit/textures/noise.png")
+        );
+        assert_eq!(m.textures().len(), 2);
+        let e = format!(
+            "{:#}",
+            film("[\"\", \"\", \"textures/strs.png\"]").unwrap_err()
+        );
+        assert!(
+            e.contains("shot \"sky\": channels[2]: \"textures/strs.png\" not found (did you mean \"textures/stars.png\"?)"),
+            "{e}"
+        );
+        let e = format!("{:#}", film("[\"<kit/textures/nois.png>\"]").unwrap_err());
+        assert!(e.contains("did you mean \"kit/textures/noise.png\""), "{e}");
+        // A case-only match is the usual case warning.
+        let m = film("[\"textures/Stars.png\"]");
+        if let Ok(m) = m {
+            assert!(
+                m.warnings.iter().any(|w| w.contains("Stars.png")),
+                "{:?}",
+                m.warnings
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

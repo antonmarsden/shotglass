@@ -138,7 +138,7 @@ These uniforms are available:
 | `iResolution`, `iTime`, `iTimeDelta`, `iFrame`, `iFrameRate`, `iDate`, `iMouse` | as on Shadertoy. `iTime` is the shot's own clock (plus `time_offset`) |
 | `iShotTime`, `iShotDuration`, `iShotProgress` | shot-local seconds, the shot's length, and 0→1 over the shot |
 | `iMovieTime` | seconds since the start of the movie |
-| `iChannel0..3` | declared so pasted code compiles; they are bound to black for now |
+| `iChannel0..3`, `iChannelResolution[4]` | images from the shot's `channels` (see [Textures](#textures)); an unbound channel reads black and its resolution is 0. `iChannelTime` is 0 |
 | your `uniforms.*` | declared automatically from `movie.toml` |
 | `CUE_<ID>_START`, `CUE_<ID>_SETTLED`, `CUE_<ID>_END`, `MOVIE_DURATION` | `#define`s from the edit (`SETTLED` = the incoming transition has finished) |
 
@@ -146,6 +146,72 @@ These uniforms are available:
 `#include <name/file.glsl>` takes `file.glsl` from the library the film calls `name`
 (see [Libraries](#libraries)). Each file is included at most once per shader, so
 shared helpers can include each other freely.
+
+### Textures
+
+A shot can bind up to four PNG or JPEG images to `iChannel0..3`, as on Shadertoy
+(needs `shotglass = "0.1.1"`):
+
+```toml
+shotglass = "0.1.1"
+channels = ["noise"]            # film-wide default for shots without their own (before any table)
+
+[textures]                      # named once, used by any shot
+noise = "<kit/textures/noise-rgba-256.png>"   # from the library the film calls "kit"
+brick = "textures/brick.png"                  # from the film folder
+grid  = { file = "textures/grid.png", filter = "nearest" }
+moon  = { file = "textures/moon.jpg", wrap = "clamp", srgb = true }
+
+[[shot]]
+id = "wall"
+scene = "scenes/wall.glsl"
+duration = 9.0
+channels = ["brick", "noise"]                 # iChannel0 = brick, iChannel1 = noise
+
+[[shot]]
+id = "sky"
+scene = "scenes/sky.glsl"
+duration = 6.0
+channels = ["", "noise", "textures/stars.png", { file = "textures/logo.png", wrap = "clamp" }]
+```
+
+Each entry of `channels` is a name from `[textures]`, a path in the film folder, a
+`<library/path>` (pinned by `shotglass.lock` like the library's GLSL), a table
+`{ file = "…", … }` with options, or `""` (black). A shot's `channels` replaces the
+film-wide default entirely; `channels = []` binds nothing.
+
+| option | values | default |
+|---|---|---|
+| `filter` | `"mipmap"` (trilinear), `"linear"`, `"nearest"` | `"mipmap"` |
+| `wrap` | `"repeat"`, `"clamp"`, `"mirror"` (both axes) | `"repeat"` |
+| `vflip` | `true`: upright when sampled with `fragCoord / iResolution.xy` | `true` |
+| `srgb` | `true`: `texture()` returns linear values (the GPU decodes sRGB) | `false` |
+
+The defaults are Shadertoy's, so pasted shaders look the same. `iChannelResolution[n]` is
+`vec3(width, height, 1.0)` of the image as stored. Leave `srgb` off unless the shader
+encodes its own output (ends with something like `pow(col, vec3(1.0 / 2.2))`): shotglass
+writes the shader's numbers to the screen as they are, so a linear texel written straight
+out looks too dark.
+
+- Images are decoded to 8-bit RGBA by the same code everywhere (16-bit images are rounded,
+  with a warning; colour profiles are ignored). The GPU makes the mipmaps.
+- At most 4096×4096 per image (`check --web` warns above 2048, the limit on some phones),
+  and 256 MB of texture memory per shot.
+- Textures load in the background ahead of the playhead, like shader compiles: while
+  playing, a shot whose textures aren't uploaded yet keeps the previous frame up, so you
+  only ever see frames that `still` and `export` would render.
+- Save an image while the player is open and it reloads, without recompiling anything. A
+  half-saved or broken image keeps the last working version on screen (the error shows);
+  a missing file refuses the edit, like a missing `#include`.
+- `check` decodes every texture (also with `--no-gpu`), prints sizes and memory, and warns
+  when a scene reads an `iChannel` its shot binds nothing to.
+
+Shadertoy's built-in textures (its noise, "Organic", "Abstract" and so on) aren't licensed
+for redistribution, so shotglass doesn't ship them. Use your own images, CC0 ones (e.g.
+from Poly Haven or ambientCG), or the textures in shotglass-kit once they're released.
+Commit images with the film; `.gitattributes` with `*.png binary` keeps git from touching
+them (`shotglass new` writes one). A Git LFS pointer committed by mistake gets its own
+error message.
 
 ### Transitions
 
@@ -611,10 +677,20 @@ shotglass selftest strips   # only checks whose name contains "strips"
     blocking render bit for bit.
   - reading a frame into part of a bigger image lands exactly in place, leaves the
     rest alone and restores OpenGL's pixel-pack state;
+  - texture channels bind the right image to the right unit, upright as on Shadertoy
+    (or flipped with `vflip = false`), with `iChannelResolution`; filter, wrap,
+    mipmaps and sRGB follow `movie.toml`, and a file used with several samplers is
+    uploaded once;
+  - playback never loads a texture on the spot: uploads are spread over frames and
+    the shot appears only once its textures are complete; a broken image keeps the
+    last working one, a missing one refuses the edit, an image edit compiles nothing;
+    evicted textures come back identically, frozen transitions use the outgoing
+    shot's textures, and uploads ignore and restore stray pixel-unpack state;
   - `export` writes every frame and sample: a PNG sequence always, and FFV1 + FLAC
     when ffmpeg is installed (decoded and compared with `still` and `wav`).
-- **Golden images** (`tests/golden.rs`): contact sheets of the demo film and the
-  `shotglass new` template are compared with reference PNGs in `tests/golden/`, so
+- **Golden images** (`tests/golden.rs`): contact sheets of the demo film, the
+  `shotglass new` template and `tests/films/channels` (iChannel textures: mipmaps,
+  wrap and filter modes, `vflip`) are compared with reference PNGs in `tests/golden/`, so
   a change that compiles but looks wrong fails the tests. A small per-pixel
   tolerance absorbs the differences between software OpenGL and real GPUs. To
   update the references on purpose, see [CONTRIBUTING.md](CONTRIBUTING.md#golden-images).

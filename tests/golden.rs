@@ -1,5 +1,6 @@
 //! Golden regression tests: renders a contact sheet and the soundtrack of the demo film
-//! and of the `shotglass new` template and compares them with reference PNGs and WAVs
+//! and of the `shotglass new` template (and a contact sheet of tests/films/channels, the
+//! iChannel textures film) and compares them with reference PNGs and WAVs
 //! in tests/golden/, so "compiles but looks (or sounds) wrong" fails `cargo test` (and
 //! CI, on software OpenGL).
 //!
@@ -155,6 +156,19 @@ fn new_template() {
         return;
     }
     golden("template", &template_film("template-film"));
+}
+
+/// iChannel textures: a small film with a checked-in 64×64 PNG and JPEG (mipmaps,
+/// repeat, nearest, clamp, mirror, vflip, iChannelResolution, a frozen transition).
+#[test]
+fn channels_film() {
+    if skip() {
+        return;
+    }
+    golden(
+        "channels",
+        &root().join("tests").join("films").join("channels"),
+    );
 }
 
 #[test]

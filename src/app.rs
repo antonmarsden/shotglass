@@ -67,7 +67,10 @@ impl Stall {
 struct Marks {
     rendered: bool,
     gpu_ms: Option<f32>,
+    /// Housekeeping in `pump`: compiles and texture uploads.
     compile_ms: f32,
+    /// ... of which texture work (collecting decodes, uploading bands).
+    texture_ms: f32,
     sound_ms: f32,
     sound: crate::sound::StreamStats,
 }
@@ -201,7 +204,20 @@ impl Player {
                     && ev.paths.iter().any(|p| {
                         matches!(
                             p.extension().and_then(|e| e.to_str()),
-                            Some("glsl" | "toml" | "lock" | "frag" | "inc" | "h")
+                            Some(
+                                "glsl"
+                                    | "toml"
+                                    | "lock"
+                                    | "frag"
+                                    | "inc"
+                                    | "h"
+                                    | "png"
+                                    | "jpg"
+                                    | "jpeg"
+                                    | "PNG"
+                                    | "JPG"
+                                    | "JPEG"
+                            )
                         )
                     });
                 if relevant {
@@ -1297,6 +1313,9 @@ impl eframe::App for Player {
         }
         let compile_ms = work.elapsed().as_secs_f32() * 1000.0;
         self.perf.pending.compile_ms += compile_ms;
+        if self.movie.is_some() {
+            self.perf.pending.texture_ms += self.renderer.texture_ms;
+        }
         self.perf.stall = Stall::worse(
             self.perf.stall.take(),
             (compile_ms > 3.0).then_some(Stall {
@@ -1389,11 +1408,19 @@ impl eframe::App for Player {
                     );
                 }
             let (ready, total) = self.renderer.progress();
+            let (loaded, textures) = self.renderer.texture_progress();
+            let mut busy = vec![];
             if ready < total {
+                busy.push(format!("compiling shaders {ready}/{total}"));
+            }
+            if loaded < textures {
+                busy.push(format!("loading textures {loaded}/{textures}"));
+            }
+            if !busy.is_empty() {
                 ui.painter().text(
                     view.right_top() + Vec2::new(-10.0, 10.0),
                     egui::Align2::RIGHT_TOP,
-                    format!("compiling shaders {ready}/{total}"),
+                    busy.join("  ·  "),
                     egui::FontId::proportional(12.0),
                     Color32::from_white_alpha(160),
                 );
@@ -1423,7 +1450,8 @@ impl eframe::App for Player {
         });
         self.check_gpu(gap);
         let (ready, total) = self.renderer.progress();
-        if self.clock.playing() || ready < total {
+        let (loaded, textures) = self.renderer.texture_progress();
+        if self.clock.playing() || ready < total || loaded < textures {
             ctx.request_repaint();
         } else {
             ctx.request_repaint_after(Duration::from_millis(120));
@@ -1580,7 +1608,7 @@ fn graph(
                     text += &format!(", scene gpu {g:.1} ms");
                 }
                 text += &format!(
-                    "\n{}sound {:.1} ms (queued {}, collected {}), compile {:.1} ms",
+                    "\n{}sound {:.1} ms (queued {}, collected {}), compile {:.1} ms (textures {:.1} ms)",
                     if m.rendered {
                         "rendered a film frame\n"
                     } else {
@@ -1589,7 +1617,8 @@ fn graph(
                     m.sound_ms,
                     m.sound.submitted,
                     m.sound.collected,
-                    m.compile_ms
+                    m.compile_ms,
+                    m.texture_ms
                 );
             }
             resp.on_hover_text(text);

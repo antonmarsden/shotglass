@@ -1,0 +1,7 @@
+# Images are binary: never convert line endings (CRLF checkouts included).
+*.png binary
+*.PNG binary
+*.jpg binary
+*.JPG binary
+*.jpeg binary
+*.JPEG binary
