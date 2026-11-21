@@ -2,7 +2,7 @@
 # OpenGL, the same way CI does. Reproducible on any machine:
 #
 #   docker build -f docker/test.Dockerfile -t shotglass-test .
-#   docker run --rm shotglass-test
+#   docker run --init --rm shotglass-test   (--init: xvfb-run as PID 1 hangs)
 #
 # This tests shotglass's logic, not your GPU driver: for that, run
 # `cargo test` (or `shotglass selftest`) natively on Windows.

@@ -746,7 +746,7 @@ shotglass selftest strips   # only checks whose name contains "strips"
   names the first time that differs.
 - On Linux without a display, use `xvfb-run -a cargo test` (that's what CI does).
   Set `SHOTGLASS_SKIP_GPU_TESTS=1` to skip the selftest and the golden tests.
-- **Docker:** `docker build -f docker/test.Dockerfile -t shotglass-test . && docker run --rm shotglass-test`
+- **Docker:** `docker build -f docker/test.Dockerfile -t shotglass-test . && docker run --init --rm shotglass-test`
   runs the same suite on software OpenGL, reproducibly. It tests shotglass, not your
   driver. GPU access from a Linux container on Docker Desktop goes through WSL2's
   Direct3D 12 bridge (`--device /dev/dxg`, `-v /usr/lib/wsl:/usr/lib/wsl`,
