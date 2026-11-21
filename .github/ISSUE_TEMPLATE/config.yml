@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: New kit code (functions, transitions, effects)
+    url: https://github.com/antonmarsden/shotglass-kit/issues/new/choose
+    about: Reusable GLSL lives in the shotglass-kit repo, not the engine.

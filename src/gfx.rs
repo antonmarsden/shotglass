@@ -2229,6 +2229,16 @@ fn rel(p: &Path, root: &Path) -> String {
         .replace('\\', "/")
 }
 
+/// Read a query object's value. glow's `get_query_parameter_u32`/`_u64` call the
+/// EXT entry points unless GL 4.5 is present, and panic on macOS (GL 4.1), which
+/// has only the core ones; the `_with_offset` getter checks the core function.
+/// No GL_QUERY_BUFFER is ever bound, so the "offset" is a pointer to `v`.
+fn query_u64(gl: &glow::Context, q: glow::Query, pname: u32) -> u64 {
+    let mut v: u64 = 0;
+    unsafe { gl.get_query_parameter_u64_with_offset(q, pname, &mut v as *mut u64 as usize) };
+    v
+}
+
 /// GPU time per frame from GL_TIME_ELAPSED queries (results arrive a few frames late).
 struct GpuTimer {
     pending: std::collections::VecDeque<glow::Query>,
@@ -2264,11 +2274,11 @@ impl GpuTimer {
     fn poll(&mut self, gl: &glow::Context) -> Option<f32> {
         let mut fresh = None;
         while let Some(&q) = self.pending.front() {
-            let ready = unsafe { gl.get_query_parameter_u32(q, glow::QUERY_RESULT_AVAILABLE) } != 0;
+            let ready = query_u64(gl, q, glow::QUERY_RESULT_AVAILABLE) != 0;
             if !ready {
                 break;
             }
-            let ns = unsafe { gl.get_query_parameter_u32(q, glow::QUERY_RESULT) };
+            let ns = query_u64(gl, q, glow::QUERY_RESULT);
             fresh = Some(ns as f32 / 1.0e6);
             self.pending.pop_front();
             self.free.push(q);

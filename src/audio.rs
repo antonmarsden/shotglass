@@ -527,10 +527,17 @@ mod tests {
     #[test]
     fn no_device_follows_the_system_timer() {
         let mut c = Clock::new(None);
+        let start = Instant::now();
         c.play();
         sleep(Duration::from_millis(100));
         let t = c.time();
-        assert!((0.08..0.2).contains(&t), "{t}");
+        // A busy CI machine can oversleep a lot (macOS: 100 ms took 220): bound t by
+        // the time that really passed, not the time asked for.
+        let elapsed = start.elapsed().as_secs_f32();
+        assert!(
+            (0.09..=elapsed + 0.01).contains(&t),
+            "{t} after {elapsed} s"
+        );
         c.pause();
         let held = c.time();
         sleep(Duration::from_millis(30));
@@ -614,10 +621,15 @@ mod tests {
     fn half_speed_runs_at_half_speed() {
         let mut c = Clock::new(None);
         c.set_rate(0.5);
+        let start = Instant::now();
         c.play();
         sleep(Duration::from_millis(200));
         let t = c.time();
-        assert!((0.08..0.15).contains(&t), "{t}");
+        let elapsed = start.elapsed().as_secs_f32();
+        assert!(
+            (0.09..=elapsed / 2.0 + 0.01).contains(&t),
+            "{t} after {elapsed} s"
+        );
     }
 
     #[test]

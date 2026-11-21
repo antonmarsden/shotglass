@@ -642,6 +642,11 @@ shotglass selftest strips   # only checks whose name contains "strips"
 - **Bad input** in `movie.toml` is reported, never a crash (fuzzed by the
   property tests).
 
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md): build and test commands, golden images,
+the PR checklist, licensing, and how to work on shotglass with AI coding agents.
+
 ## Licence
 
 Licensed under either of [Apache License 2.0](LICENSE-APACHE) or

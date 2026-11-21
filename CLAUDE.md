@@ -30,6 +30,9 @@ cargo fmt && cargo clippy --all-targets -- -D warnings
   `transitions` pin), so moving that pin can need a re-bless too.
 - CI (`.github/workflows/ci.yml`) pins Rust in `RUST_TOOLCHAIN` and runs clippy with
   `-D warnings`. Upgrade the toolchain on purpose and fix new lints in the same commit.
+  Linux and Windows run the GPU tests on Mesa llvmpipe, macOS on the Apple Software
+  Renderer (GL 4.1, no 4.2+ entry points: glow's query getters panicked there). Skips
+  are listed in CONTRIBUTING.md.
 - Software OpenGL (llvmpipe) is slow: auto render scale drops to 30% and frame
   timings mean nothing. Judge performance only on a real GPU.
 - The owner tests on Windows with a real GPU. Their working copy is
@@ -84,7 +87,8 @@ cargo fmt && cargo clippy --all-targets -- -D warnings
 - **A broken edit keeps the last working version on screen** (per shot id fallback). Missing
   files (assembly errors) refuse the whole new version.
 - **Sound is identical whatever the chunk size,** and banded vs single draws give the same
-  output, and streamed (async) vs blocking synthesis agree bit for bit. The mix may read at most `mix_lookback` back and 50 ms ahead.
+  output, and streamed (async) vs blocking synthesis agree bit for bit (the selftest only reports, not fails, a mismatch on
+  `INEXACT_SOUND_RENDERERS`: the Apple Software Renderer is ~1e-5 off). The mix may read at most `mix_lookback` back and 50 ms ahead.
 - **Deterministic frames:** a frame depends only on (movie, t, size, scale), so playback,
   `still` and `export` agree. Frame n is at `movie.frame_time(n)`; `FrameInfo::at` derives
   iFrame with `frame_at`, never `t * fps` (rounding drops frames at 30000/1001).
@@ -113,6 +117,8 @@ cargo fmt && cargo clippy --all-targets -- -D warnings
   case to `tests/golden.rs` and bless its reference.
 - **Renderer behaviour:** add a selftest check. Mutation-check it: break the code and make sure
   the check fails.
+- Working in parallel with other sessions: see "Working with AI agents" in CONTRIBUTING.md
+  (one issue per branch; `gfx.rs`, `sound.rs`, `audio.rs` take one change at a time).
 - Keep user-facing docs in README.md. Open work is in GitHub issues: #1 export (follow-ups: PBO readback), #2 web player,
   #3 libraries by name and version, #4 kit core/transitions, #5 the shotglass-kit repo,
   #6 portable GLSL (done: fixed baseline, `glsl` opt-in, strict `check` / `check --web`).
