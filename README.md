@@ -177,10 +177,8 @@ transitions = { source = "https://github.com/antonmarsden/shotglass-kit", subdir
 | `transitions/dissolve` | `scale = 9`, `softness = 0.08` |
 | `transitions/wipe` | `direction = [1,0]`, `softness = 0.01` |
 
-**Deprecated:** the same five are still built into shotglass as `type = "iris"` and so
-on, with the same parameters and pixels. They keep working for now, but loading a film
-that uses them prints a warning naming the kit replacement, and they will be removed
-(the engine provides the transition interface, not the looks).
+shotglass itself has no built-in transitions: the engine provides the transition
+interface, and the looks come from libraries or your own files.
 
 A custom transition is a `.glsl` file in the film, referenced by path, e.g. `type = "fx/heart.glsl"`:
 
@@ -602,8 +600,8 @@ shotglass selftest strips   # only checks whose name contains "strips"
   the render-scale logic and the master clock (against a simulated sound card that
   can lag, stall or run away). Random timelines and malformed `movie.toml` files
   are generated too, to check the parser never panics. The strict GLSL checker is
-  tested on non-portable snippets, and the demo film, the `shotglass new` template
-  and the built-in transitions must pass it at every `glsl` version and as GLSL ES.
+  tested on non-portable snippets, and the demo film and the `shotglass new` template
+  must pass it at every `glsl` version and as GLSL ES.
 - **`selftest`** writes small fixture films to a temporary folder (each must also
   pass the strict GLSL check, at the baseline and as GLSL ES) and checks on the
   actual GPU and driver that:

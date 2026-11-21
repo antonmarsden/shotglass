@@ -59,7 +59,7 @@ cargo fmt && cargo clippy --all-targets -- -D warnings
 | `headless.rs` | hidden-window GL context for CLI commands |
 | `selftest.rs` | GPU/sound checks on fixture films written to a temp dir |
 | `tests/golden.rs`, `tests/golden/` | golden tests: 8-frame 320x180 strips and 8 kHz soundtracks of the demo and the template vs reference PNGs / WAVs |
-| `glsl/transitions/` | deprecated built-in transitions (the kit has the same ones; films use `<library>/<name>`) |
+| `glsl/copy.glsl` | the engine's internal copy pass (not a transition films can name; theirs come from libraries or files) |
 | `movies/big-shadow/` | demo film; `templates/new/` is what `shotglass new` writes |
 
 ## Invariants (each was a real bug; most have a test)
@@ -109,14 +109,14 @@ cargo fmt && cargo clippy --all-targets -- -D warnings
   accepts invalid GLSL that other drivers reject, so passing locally isn't proof.
 - **The engine provides a contract, not looks.** Uniforms, entry points, the transition interface
   and cue defines are the engine's API (semver). Reusable GLSL belongs in versioned libraries
-  (the shotglass-kit repo, #3–#5), not embedded in the binary; the built-in transitions are
-  in the kit now and deprecated here. Don't add new built-in GLSL.
+  (the shotglass-kit repo, #3–#5), not embedded in the binary. The built-in transitions
+  were removed (the kit has them). Don't add built-in GLSL.
 
 ## Adding things
 
 - **New transition:** it goes in the kit (shotglass-kit `transitions/`), not the engine.
-  Films use it as `type = "<library>/<name>"`. The built-ins in `src/glsl/transitions/`
-  are deprecated (loading a film that uses one warns) and only kept until removal.
+  Films use it as `type = "<library>/<name>"`. A bare name (`type = "iris"`) is an
+  error that names the kit replacement. No compatibility code for old films.
 - **`movie.toml` field:** add it to the serde struct (`deny_unknown_fields`) and the resolved
   struct, validate it in `Movie::parse`, add a unit test, and update the README and
   `templates/new/movie.toml`.
