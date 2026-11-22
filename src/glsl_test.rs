@@ -349,6 +349,9 @@ const KIND_VALUE: u32 = 1;
 const KIND_FLOATS: u32 = 2;
 const KIND_INTS: u32 = 3;
 const KIND_BOOLS: u32 = 4;
+const KIND_UINTS: u32 = 5;
+/// Kinds from this one on record their values as integer bits (exact, any size).
+const KIND_FIRST_BITS: u32 = KIND_INTS;
 
 /// The test prelude: the `expect*` assertions (engine contract, semver) and the state
 /// the dispatcher reads back. Only test shaders get it, never films.
@@ -361,11 +364,20 @@ pub fn prelude() -> String {
          int sgtest_comps = 0;\n\
          vec4 sgtest_actual = vec4(0.0);\n\
          vec4 sgtest_expected = vec4(0.0);\n\
+         uvec4 sgtest_abits = uvec4(0u);\n\
+         uvec4 sgtest_ebits = uvec4(0u);\n\
          void sgtest_record(int id, bool ok, int kind, int comps, vec4 a, vec4 e) {\n\
          \x20   sgtest_count += 1;\n\
          \x20   if (!ok && sgtest_fail == 0) {\n\
          \x20       sgtest_fail = id; sgtest_kind = kind; sgtest_comps = comps;\n\
          \x20       sgtest_actual = a; sgtest_expected = e;\n\
+         \x20   }\n\
+         }\n\
+         void sgtest_record_bits(int id, bool ok, int kind, int comps, uvec4 a, uvec4 e) {\n\
+         \x20   sgtest_count += 1;\n\
+         \x20   if (!ok && sgtest_fail == 0) {\n\
+         \x20       sgtest_fail = id; sgtest_kind = kind; sgtest_comps = comps;\n\
+         \x20       sgtest_abits = a; sgtest_ebits = e;\n\
          \x20   }\n\
          }\n",
     );
@@ -375,14 +387,21 @@ pub fn prelude() -> String {
     );
     let _ = writeln!(
         s,
-        "void expect_eq(int id, bool a, bool b) {{ sgtest_record(id, a == b, {KIND_BOOLS}, 1, vec4(a ? 1.0 : 0.0, 0.0, 0.0, 0.0), vec4(b ? 1.0 : 0.0, 0.0, 0.0, 0.0)); }}"
+        "void expect_eq(int id, bool a, bool b) {{ sgtest_record_bits(id, a == b, {KIND_BOOLS}, 1, uvec4(a ? 1u : 0u, 0u, 0u, 0u), uvec4(b ? 1u : 0u, 0u, 0u, 0u)); }}"
     );
-    for (t, it, n) in [
-        ("float", "int", 1),
-        ("vec2", "ivec2", 2),
-        ("vec3", "ivec3", 3),
-        ("vec4", "ivec4", 4),
+    for (t, it, ut, n) in [
+        ("float", "int", "uint", 1),
+        ("vec2", "ivec2", "uvec2", 2),
+        ("vec3", "ivec3", "uvec3", 3),
+        ("vec4", "ivec4", "uvec4", 4),
     ] {
+        // An int or uint vector as uvec4 bits (uint(int) keeps the bit pattern).
+        let u4 = |x: &str| match n {
+            1 => format!("uvec4(uint({x}), 0u, 0u, 0u)"),
+            2 => format!("uvec4(uvec2({x}), 0u, 0u)"),
+            3 => format!("uvec4(uvec3({x}), 0u)"),
+            _ => format!("uvec4({x})"),
+        };
         let v4 = |x: &str| match n {
             1 => format!("vec4({x}, 0.0, 0.0, 0.0)"),
             2 => format!("vec4({x}, 0.0, 0.0)"),
@@ -422,16 +441,15 @@ pub fn prelude() -> String {
             "void expect_eq(int id, {t} a, {t} b) {{ {}; }}",
             rec(eq("a", "b"), KIND_FLOATS, "a", "b")
         );
-        let _ = writeln!(
-            s,
-            "void expect_eq(int id, {it} a, {it} b) {{ {}; }}",
-            rec(
+        for (ty, kind) in [(it, KIND_INTS), (ut, KIND_UINTS)] {
+            let _ = writeln!(
+                s,
+                "void expect_eq(int id, {ty} a, {ty} b) {{ sgtest_record_bits(id, {}, {kind}, {n}, {}, {}); }}",
                 eq("a", "b"),
-                KIND_INTS,
-                &format!("{t}(a)"),
-                &format!("{t}(b)")
-            )
-        );
+                u4("a"),
+                u4("b")
+            );
+        }
         let near = format!(
             "{} && {} && {}",
             fin("a"),
@@ -489,10 +507,14 @@ pub fn dispatcher(tests: &[TestFn]) -> String {
             t.name
         );
     }
-    s += "    sgtest_out0 = uvec4(1u, uint(sgtest_fail), uint(sgtest_count), uint(sgtest_comps + 8 * sgtest_kind));\n\
-          \x20   sgtest_out1 = floatBitsToUint(sgtest_actual);\n\
-          \x20   sgtest_out2 = floatBitsToUint(sgtest_expected);\n\
-          }\n";
+    let _ = write!(
+        s,
+        "    sgtest_out0 = uvec4(1u, uint(sgtest_fail), uint(sgtest_count), uint(sgtest_comps + 8 * sgtest_kind));\n\
+         \x20   bool bits = sgtest_kind >= {KIND_FIRST_BITS};\n\
+         \x20   sgtest_out1 = bits ? sgtest_abits : floatBitsToUint(sgtest_actual);\n\
+         \x20   sgtest_out2 = bits ? sgtest_ebits : floatBitsToUint(sgtest_expected);\n\
+         }}\n"
+    );
     s
 }
 
@@ -563,8 +585,9 @@ pub struct Failure {
     pub id: u32,
     pub kind: u32,
     pub comps: u32,
-    pub actual: [f32; 4],
-    pub expected: [f32; 4],
+    /// The values' bits: floats, or ints / uints / bools for those kinds.
+    pub actual: [u32; 4],
+    pub expected: [u32; 4],
 }
 
 /// Read the first target (`(drawn, failed id, count, comps + 8·kind)` per sample) into an
@@ -600,18 +623,19 @@ pub fn decode(
             id: px[1],
             kind: px[3] / 8,
             comps: px[3] % 8,
-            actual: a.map(f32::from_bits),
-            expected: e.map(f32::from_bits),
+            actual: a,
+            expected: e,
         });
     }
     o
 }
 
-fn show_values(v: &[f32; 4], comps: u32, kind: u32) -> String {
-    let one = |x: f32| match kind {
-        KIND_INTS => format!("{}", x as i64),
-        KIND_BOOLS => (if x != 0.0 { "true" } else { "false" }).to_string(),
-        _ => format!("{x:?}"),
+fn show_values(v: &[u32; 4], comps: u32, kind: u32) -> String {
+    let one = |x: u32| match kind {
+        KIND_INTS => format!("{}", x as i32),
+        KIND_UINTS => format!("{x}"),
+        KIND_BOOLS => (if x != 0 { "true" } else { "false" }).to_string(),
+        _ => format!("{:?}", f32::from_bits(x)),
     };
     let n = comps.clamp(1, 4) as usize;
     if n == 1 {
@@ -1176,7 +1200,7 @@ void test_a() {
         assert_eq!((o.failed, o.empty, o.undrawn), (2, 1, 0));
         let f = o.first.clone().unwrap();
         assert_eq!((f.sample, f.id, f.kind, f.comps), (2, 2, KIND_FLOATS, 2));
-        assert_eq!(f.actual[0], 1.5);
+        assert_eq!(f32::from_bits(f.actual[0]), 1.5);
         assert!(!o.passed());
         // All samples empty: "ran no assertions"; undrawn samples fail too.
         let o = decode(&[[1, 0, 0, 0]; 3], 3, |_| unreachable!());
@@ -1202,8 +1226,8 @@ void test_a() {
                 id: 1,
                 kind: KIND_FLOATS,
                 comps: 2,
-                actual: [0.5, f32::NAN, 0.0, 0.0],
-                expected: [0.5, 1.0, 0.0, 0.0],
+                actual: [0.5, f32::NAN, 0.0, 0.0].map(f32::to_bits),
+                expected: [0.5, 1.0, 0.0, 0.0].map(f32::to_bits),
             }),
         };
         let a = vec![Assertion {
@@ -1218,6 +1242,46 @@ void test_a() {
             format!("at p = ({step:?}, {step:?}): got (0.5, NaN), expected (0.5, 1.0)")
         );
         assert_eq!(d[2], "3 of 65536 samples failed");
+        // Integers are shown exactly, whatever their size.
+        let t = scan_tests("void test_i() {}\n").unwrap().remove(0);
+        let a_one = vec![Assertion {
+            line: 1,
+            text: "expect_eq(a, b)".into(),
+        }];
+        let show = |kind, comps, a: [u32; 4], e: [u32; 4]| {
+            let o = Outcome {
+                samples: 1,
+                failed: 1,
+                empty: 0,
+                undrawn: 0,
+                first: Some(Failure {
+                    sample: 0,
+                    id: 1,
+                    kind,
+                    comps,
+                    actual: a,
+                    expected: e,
+                }),
+            };
+            describe(&t, &o, &a_one, "t.test.glsl")[1].clone()
+        };
+        assert_eq!(
+            show(KIND_UINTS, 1, [u32::MAX, 0, 0, 0], [u32::MAX - 1, 0, 0, 0]),
+            "got 4294967295, expected 4294967294"
+        );
+        assert_eq!(
+            show(
+                KIND_INTS,
+                2,
+                [(-2147483647i32) as u32, 16777217, 0, 0],
+                [0, 16777216, 0, 0]
+            ),
+            "got (-2147483647, 16777217), expected (0, 16777216)"
+        );
+        assert_eq!(
+            show(KIND_BOOLS, 1, [1, 0, 0, 0], [0, 0, 0, 0]),
+            "got true, expected false"
+        );
     }
 
     #[test]
@@ -1231,7 +1295,8 @@ void test_a() {
              expect(true); expect(true, 1.0); expect(true, vec3(1.0));\n\
              expect_eq(1, 1); expect_eq(ivec2(1), ivec2(1)); expect_eq(true, true); expect_eq(vec4(1.0), vec4(1.0));\n\
              expect_near(1.0, 1.0, 0.1); expect_near(vec2(1.0), vec2(1.0), 0.1);\n\
-             expect_rel(vec3(1.0), vec3(1.0), 0.1); expect_finite(vec4(1.0));\n}\n\
+             expect_rel(vec3(1.0), vec3(1.0), 0.1); expect_finite(vec4(1.0));\n\
+             expect_eq(1u, 1u); expect_eq(uvec3(2u), uvec3(2u)); expect_eq(ivec4(-1), ivec4(-1));\n}\n\
              void test_p(float t) { expect(t >= 0.0); }\n\
              void test_q(vec2 p) { expect(p.x >= 0.0); }\n\
              void test_r(vec3 c) { expect(c.z >= 0.0); }\n",
@@ -1246,7 +1311,7 @@ void test_a() {
         for d in [Dialect::BASELINE, Dialect::WEB, Dialect::desktop(Some(430))] {
             let p = prepare(&f, d).unwrap();
             assert_eq!(p.tests.len(), 4);
-            assert_eq!(p.assertions.len(), 14);
+            assert_eq!(p.assertions.len(), 17);
             #[cfg(feature = "strict-glsl")]
             if let Err(e) = validate(&p.asm, Stage::Fragment) {
                 panic!("{d}: {e:?}\n{}", p.asm.text);

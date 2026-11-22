@@ -392,8 +392,10 @@ fn test_glsl(target: &Path, filter: Option<String>) -> Result<()> {
         Default::default();
     let mut files = vec![];
     for path in paths {
+        // A file in the current folder has the empty path as its parent: use ".".
         let dir = path
             .parent()
+            .filter(|p| !p.as_os_str().is_empty())
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."));
         let root = project::find_root(&dir).unwrap_or(dir);
