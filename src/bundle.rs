@@ -53,9 +53,14 @@ pub fn used_files(m: &Movie) -> (BTreeMap<String, BTreeSet<String>>, Vec<String>
             }
         }
     }
-    for c in m.shots.iter().flat_map(|s| s.channels.iter().flatten()) {
-        if let Some(lib) = &c.library {
-            used.entry(lib.clone()).or_default().insert(c.rel.clone());
+    for f in m
+        .shots
+        .iter()
+        .flat_map(|s| s.channels.iter().flatten())
+        .flat_map(crate::movie::Channel::files)
+    {
+        if let Some(lib) = &f.library {
+            used.entry(lib.clone()).or_default().insert(f.rel.clone());
         }
     }
     (used, errors)

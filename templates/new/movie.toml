@@ -18,7 +18,8 @@ scene = "scenes/first.glsl"
 duration = 5.0
 # Uniforms are declared for you. Constants, vectors, or keyframes in shot-local seconds.
 uniforms.uHue = { keys = [[0, 0.0], [5, 0.3]], ease = "smooth" }
-# Images on iChannel0..3 (PNG or JPEG; shotglass = "0.1.1" in shotglass.toml). See README, "Textures".
+# Images or texts on iChannel0..7 (PNG or JPEG; shotglass = "0.1.1" in shotglass.toml, "0.1.3"
+# for text or channels 4–7). See README, "Textures".
 # channels = ["textures/brick.png", "", { file = "textures/grid.png", filter = "nearest", wrap = "clamp" }]
 
 [[shot]]
@@ -32,6 +33,12 @@ transition = { type = "transitions/iris", duration = 1.2, freeze = true, params 
 # start it early or let it ring on; otherwise it fades with the transitions.
 sound = "sfx/chime.glsl"
 
+# Text, bound to channels like a texture (shotglass = "0.1.3"; see README, "Text"):
+# [fonts]
+# body = { file = "fonts/MyFont.ttf", licence = "OFL-1.1" }
+# [texts]
+# title = { text = "My Film", font = "body", size = 128 }
+#
 # Named textures, for images several shots use or that have options:
 # [textures]
 # brick = "textures/brick.png"

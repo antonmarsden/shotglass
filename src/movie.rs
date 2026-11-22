@@ -85,6 +85,13 @@ struct MovieFile {
     /// Named textures: `brick = "textures/brick.png"` or `{ file = "…", filter = … }`.
     #[serde(default)]
     textures: BTreeMap<String, toml::Value>,
+    /// Named fonts for `[texts]`: `body = "fonts/Inter.ttf"` or `{ file, index, variations,
+    /// fallback, licence }`.
+    #[serde(default)]
+    fonts: BTreeMap<String, toml::Value>,
+    /// Named text blocks, bound to channels like textures: `{ text = "…", font = "body", … }`.
+    #[serde(default)]
+    texts: BTreeMap<String, toml::Value>,
 }
 
 #[derive(Deserialize)]
@@ -177,8 +184,9 @@ pub struct ShotSound {
 }
 
 /// How many iChannels a shot has: `iChannel0..N_CHANNELS-1`. The scene header in
-/// `gfx.rs` declares exactly these; text phase 1 (#68) raises both to 8 together.
-pub const N_CHANNELS: usize = 4;
+/// `gfx.rs` declares exactly these (with `iChannelResolution`/`iChannelTime`/
+/// `iChannelMeta` arrays of this size). Never bake the number into a file format.
+pub const N_CHANNELS: usize = 8;
 
 /// What a `channels` entry or `[textures]` value names, from its spelling alone. The
 /// one place that tells the kinds apart (README "Channel sources"):
@@ -256,23 +264,178 @@ fn not_yet(what: &str, s: &str, kind: &str) -> anyhow::Error {
     anyhow!("{what}: \"{s}\" is {is}; {arrives}")
 }
 
-/// An image bound to an iChannel.
+/// A file a channel reads: an image, a font, a text file. In the film folder or a library.
 #[derive(Clone, Debug, PartialEq)]
-pub struct Channel {
-    /// The file: film root (or, once `resolve_libraries` ran, library root) joined with `rel`.
+pub struct FileRef {
+    /// Film root (or, once `resolve_libraries` ran, library root) joined with `rel`.
     pub file: PathBuf,
     /// As written, for messages: "textures/brick.png", "kit/textures/noise.png".
     pub label: String,
-    /// The library's local name for `<lib/path>` textures.
+    /// The library's local name for `<lib/path>` files.
     pub library: Option<String>,
     /// The path inside the film folder or the library.
     pub rel: String,
+}
+
+/// A font as `[fonts]` names it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FontRef {
+    pub name: String,
+    pub file: FileRef,
+    /// The face in a collection (`.ttc`).
+    pub index: u32,
+    /// Fixed variation-axis values: `{ wght = 700 }`.
+    pub variations: Vec<(String, f32)>,
+    /// SPDX licence of a film-folder font, for `licenses` (library fonts use the
+    /// library's `licences`).
+    pub licence: Option<String>,
+}
+
+/// What a text block says.
+#[derive(Clone, Debug, PartialEq)]
+pub enum TextBody {
+    Inline(String),
+    /// A UTF-8 file, read when the block is laid out (live-reloaded like an image).
+    File(FileRef),
+}
+
+/// A `[texts]` entry: words, fonts (primary first, then the fallback chain) and layout.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TextSource {
+    pub name: String,
+    pub body: TextBody,
+    pub fonts: Vec<FontRef>,
+    pub style: crate::text::TextStyle,
+}
+
+impl TextSource {
+    /// The words, read from the file if the text has one.
+    pub fn read_text(&self) -> Result<String> {
+        match &self.body {
+            TextBody::Inline(s) => Ok(s.clone()),
+            TextBody::File(f) => {
+                let bytes = std::fs::read(&f.file)
+                    .with_context(|| format!("text \"{}\": can't read {}", self.name, f.label))?;
+                let s = String::from_utf8(bytes)
+                    .map_err(|_| anyhow!("text \"{}\": {} isn't UTF-8", self.name, f.label))?;
+                // One trailing newline is the editor's, not a blank last line.
+                Ok(s.strip_suffix('\n').unwrap_or(&s).replace("\r\n", "\n"))
+            }
+        }
+    }
+
+    /// Load the fonts and lay the text out (what `check` and the renderer both do).
+    pub fn layout(&self) -> Result<(crate::text::Layout, Vec<crate::text::Font>)> {
+        let fonts = self
+            .fonts
+            .iter()
+            .map(|f| {
+                crate::text::Font::load(&crate::text::FontSpec {
+                    file: f.file.file.clone(),
+                    label: f.file.label.clone(),
+                    index: f.index,
+                    variations: f.variations.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let text = self.read_text()?;
+        let refs: Vec<&crate::text::Font> = fonts.iter().collect();
+        let layout = crate::text::layout(&text, &refs, &self.style)
+            .with_context(|| format!("text \"{}\"", self.name))?;
+        if !layout.missing.is_empty() {
+            let chars: Vec<String> = layout
+                .missing
+                .iter()
+                .map(|c| format!("'{c}' (U+{:04X})", *c as u32))
+                .collect();
+            bail!(
+                "text \"{}\": no font in its chain ({}) has {}; add a font that does to \
+                 fallback = [...]",
+                self.name,
+                self.fonts
+                    .iter()
+                    .map(|f| f.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                chars.join(", ")
+            );
+        }
+        Ok((layout, fonts))
+    }
+}
+
+/// What a channel shows.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Source {
+    Image(FileRef),
+    Text(Box<TextSource>),
+}
+
+/// What an iChannel is bound to, and how it's sampled.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Channel {
+    pub source: Source,
     pub filter: Filter,
     pub wrap: Wrap,
     /// Rows reversed on decode, so the image is upright with `fragCoord / iResolution.xy`.
     pub vflip: bool,
     /// Uploaded as SRGB8_ALPHA8: `texture()` returns linear values.
     pub srgb: bool,
+}
+
+impl Channel {
+    /// Every file the channel reads: the image, or a text's file and fonts.
+    pub fn files(&self) -> Vec<&FileRef> {
+        match &self.source {
+            Source::Image(f) => vec![f],
+            Source::Text(t) => {
+                let mut v: Vec<&FileRef> = vec![];
+                if let TextBody::File(f) = &t.body {
+                    v.push(f);
+                }
+                v.extend(t.fonts.iter().map(|f| &f.file));
+                v
+            }
+        }
+    }
+
+    pub fn files_mut(&mut self) -> Vec<&mut FileRef> {
+        match &mut self.source {
+            Source::Image(f) => vec![f],
+            Source::Text(t) => {
+                let t = &mut **t;
+                let mut v: Vec<&mut FileRef> = vec![];
+                if let TextBody::File(f) = &mut t.body {
+                    v.push(f);
+                }
+                v.extend(t.fonts.iter_mut().map(|f| &mut f.file));
+                v
+            }
+        }
+    }
+
+    /// For messages: the image's path, or `text "title"`.
+    pub fn label(&self) -> String {
+        match &self.source {
+            Source::Image(f) => f.label.clone(),
+            Source::Text(t) => format!("text \"{}\"", t.name),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn image(&self) -> Option<&FileRef> {
+        match &self.source {
+            Source::Image(f) => Some(f),
+            Source::Text(_) => None,
+        }
+    }
+
+    pub fn text(&self) -> Option<&TextSource> {
+        match &self.source {
+            Source::Text(t) => Some(t),
+            Source::Image(_) => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -405,7 +568,7 @@ impl Movie {
         for c in self.shots.iter().flat_map(|s| s.channels.iter().flatten()) {
             if !v
                 .iter()
-                .any(|o| o.file == c.file && o.vflip == c.vflip && o.srgb == c.srgb)
+                .any(|o| o.source == c.source && o.vflip == c.vflip && o.srgb == c.srgb)
             {
                 v.push(c);
             }
@@ -414,7 +577,8 @@ impl Movie {
     }
 
     /// `check`'s warning for a film that uses a feature newer than the engine contract
-    /// it says it needs (textures: 0.1.1, `loop`: 0.1.2): older engines would then fail
+    /// it says it needs (textures: 0.1.1, `loop`: 0.1.2, text and iChannel4..7: 0.1.3):
+    /// older engines would then fail
     /// on an "unknown field" instead of asking for a newer shotglass.
     pub fn contract_warning(&self) -> Option<String> {
         let mut features = vec![];
@@ -427,11 +591,28 @@ impl Movie {
             features.push("loop, which needs shotglass 0.1.2");
             need = semver::Version::new(0, 1, 2);
         }
+        let channels = self.shots.iter().flat_map(|s| s.channels.iter().flatten());
+        if channels.clone().any(|c| c.text().is_some()) {
+            features.push("text ([fonts] and [texts]), which needs shotglass 0.1.3");
+            need = semver::Version::new(0, 1, 3);
+        }
+        if self
+            .shots
+            .iter()
+            .any(|s| s.channels[4..].iter().any(Option::is_some))
+        {
+            features.push("iChannel4..7, which need shotglass 0.1.3");
+            need = semver::Version::new(0, 1, 3);
+        }
         if features.is_empty() {
             return None;
         }
         // Any version below `need` that the film's range allows is one that would fail.
-        let older = [semver::Version::new(0, 1, 0), semver::Version::new(0, 1, 1)];
+        let older = [
+            semver::Version::new(0, 1, 0),
+            semver::Version::new(0, 1, 1),
+            semver::Version::new(0, 1, 2),
+        ];
         let allows_old = match &self.shotglass {
             None => true,
             Some(r) => {
@@ -456,28 +637,45 @@ impl Movie {
         for s in &self.shots {
             for (n, c) in s.channels.iter().enumerate() {
                 let Some(c) = c else { continue };
-                if c.file.is_file() {
-                    continue;
+                for f in c.files() {
+                    if f.file.is_file() {
+                        continue;
+                    }
+                    let base = match &f.library {
+                        Some(lib) => self
+                            .libraries
+                            .iter()
+                            .find(|l| &l.name == lib)
+                            .map(|l| l.root.clone()),
+                        None => Some(self.root.clone()),
+                    };
+                    let hint = base
+                        .and_then(|b| crate::texture::did_you_mean(&b, &f.rel))
+                        .map_or(String::new(), |m| match &f.library {
+                            Some(lib) => format!(" (did you mean \"{lib}/{m}\"?)"),
+                            None => format!(" (did you mean \"{m}\"?)"),
+                        });
+                    match c.text() {
+                        None => bail!(
+                            "shot \"{}\": channels[{n}]: \"{}\" not found{hint}",
+                            s.id,
+                            f.label
+                        ),
+                        Some(t) => bail!(
+                            "shot \"{}\": channels[{n}]: text \"{}\": \"{}\" not found{hint}",
+                            s.id,
+                            t.name,
+                            f.label
+                        ),
+                    }
                 }
-                let base = match &c.library {
-                    Some(lib) => self
-                        .libraries
-                        .iter()
-                        .find(|l| &l.name == lib)
-                        .map(|l| l.root.clone()),
-                    None => Some(self.root.clone()),
-                };
-                let hint = base
-                    .and_then(|b| crate::texture::did_you_mean(&b, &c.rel))
-                    .map_or(String::new(), |m| match &c.library {
-                        Some(lib) => format!(" (did you mean \"{lib}/{m}\"?)"),
-                        None => format!(" (did you mean \"{m}\"?)"),
-                    });
-                bail!(
-                    "shot \"{}\": channels[{n}]: \"{}\" not found{hint}",
-                    s.id,
-                    c.label
-                );
+            }
+            // Texts lay out now (the fonts exist): missing glyphs, max_lines and block
+            // size are edit mistakes that refuse the version, like a missing file.
+            for c in s.channels.iter().flatten() {
+                if let Some(t) = c.text() {
+                    t.layout().with_context(|| format!("shot \"{}\"", s.id))?;
+                }
             }
             let (total, parts) = crate::texture::shot_memory(&s.channels);
             if total > crate::texture::BUDGET {
@@ -536,15 +734,16 @@ impl Movie {
         self.libraries =
             library::resolve(&self.project, &self.library_specs, o, lock.as_ref(), cache)?;
         let libs = self.libraries.clone();
-        for c in self
+        for f in self
             .shots
             .iter_mut()
             .flat_map(|s| s.channels.iter_mut().flatten())
+            .flat_map(Channel::files_mut)
         {
-            if let Some(lib) = &c.library
+            if let Some(lib) = &f.library
                 && let Some(l) = libs.iter().find(|l| &l.name == lib)
             {
-                c.file = l.root.join(&c.rel);
+                f.file = l.root.join(&f.rel);
             }
         }
         let film = self
@@ -577,9 +776,9 @@ impl Movie {
             {
                 v.push(self.root.join(p));
             }
-            for c in s.channels.iter().flatten() {
-                if c.library.is_none() {
-                    v.push(c.file.clone());
+            for f in s.channels.iter().flatten().flat_map(Channel::files) {
+                if f.library.is_none() {
+                    v.push(f.file.clone());
                 }
             }
         }
@@ -659,6 +858,50 @@ impl Movie {
                 None => bail!("{what}: \"\" names no file"),
             };
         }
+        // [fonts], then [texts] (which name fonts); texts share the channel namespace.
+        let mut fonts: BTreeMap<String, (FontRef, Vec<String>)> = BTreeMap::new();
+        for (name, v) in &f.fonts {
+            let what = format!("[fonts] {name}");
+            if !is_ident(name) {
+                bail!(
+                    "{what}: a font name may only use letters, digits and _ (and not start with a digit)"
+                );
+            }
+            fonts.insert(
+                name.clone(),
+                font_spec(&what, name, v, &library_specs, root)?,
+            );
+        }
+        for (name, (_, fallback)) in &fonts {
+            for fb in fallback {
+                if !fonts.contains_key(fb) {
+                    bail!(
+                        "[fonts] {name}: fallback \"{fb}\" isn't in [fonts] (there are {})",
+                        quoted_list(fonts.keys())
+                    );
+                }
+            }
+        }
+        let mut names = textures.clone();
+        for (name, v) in &f.texts {
+            let what = format!("[texts] {name}");
+            if !is_ident(name) {
+                bail!(
+                    "{what}: a text name may only use letters, digits and _ (and not start with a digit)"
+                );
+            }
+            if textures.contains_key(name) {
+                bail!(
+                    "{what}: [textures] has a \"{name}\" too; textures and texts share names \
+                     (channels name either)"
+                );
+            }
+            names.insert(
+                name.clone(),
+                text_spec(&what, name, v, &fonts, &library_specs, root)?,
+            );
+        }
+        let textures = names;
         let mut used: std::collections::HashSet<String> = Default::default();
         let mut channel_list =
             |what: &str, list: &[toml::Value]| -> Result<[Option<Channel>; N_CHANNELS]> {
@@ -917,7 +1160,12 @@ impl Movie {
             warnings: textures
                 .keys()
                 .filter(|n| !used.contains(*n))
-                .map(|n| format!("[textures] {n} isn't used by any shot's channels"))
+                .map(|n| match textures[n].source {
+                    Source::Text(_) => format!("[texts] {n} isn't used by any shot's channels"),
+                    Source::Image(_) => {
+                        format!("[textures] {n} isn't used by any shot's channels")
+                    }
+                })
                 .collect(),
             library_specs,
             libraries: vec![],
@@ -1122,6 +1370,359 @@ fn loop_frames(duration: f32, num: u32, den: u32) -> Result<u64> {
     )
 }
 
+fn quoted_list<'a>(names: impl Iterator<Item = &'a String>) -> String {
+    let v: Vec<String> = names.map(|n| format!("\"{n}\"")).collect();
+    if v.is_empty() {
+        "none".to_string()
+    } else {
+        v.join(", ")
+    }
+}
+
+/// Extensions read as fonts (any case).
+const FONT_EXTENSIONS: &[&str] = &["ttf", "otf", "ttc"];
+
+/// One `[fonts]` value: a path / `<lib/path>`, or `{ file, index, variations, fallback,
+/// licence }`. Returns the font and its fallback names (checked by the caller).
+fn font_spec(
+    what: &str,
+    name: &str,
+    v: &toml::Value,
+    specs: &[LibrarySpec],
+    root: &Path,
+) -> Result<(FontRef, Vec<String>)> {
+    let path = |s: &str| -> Result<FileRef> {
+        let f = file_ref(what, s, specs, root)?;
+        let ext = f.rel.rsplit_once('.').map_or("", |(_, e)| e);
+        if ext.eq_ignore_ascii_case("woff") || ext.eq_ignore_ascii_case("woff2") {
+            bail!(
+                "{what}: {}: WOFF/WOFF2 fonts aren't read; convert it to TTF or OTF",
+                f.label
+            );
+        }
+        if !FONT_EXTENSIONS.iter().any(|e| ext.eq_ignore_ascii_case(e)) {
+            bail!(
+                "{what}: {}: shotglass reads TrueType and OpenType fonts (.ttf, .otf, .ttc)",
+                f.label
+            );
+        }
+        Ok(f)
+    };
+    let mut font = FontRef {
+        name: name.to_string(),
+        file: FileRef {
+            file: PathBuf::new(),
+            label: String::new(),
+            library: None,
+            rel: String::new(),
+        },
+        index: 0,
+        variations: vec![],
+        licence: None,
+    };
+    let mut fallback = vec![];
+    match v {
+        toml::Value::String(s) => font.file = path(s)?,
+        toml::Value::Table(t) => {
+            match t.get("file") {
+                Some(toml::Value::String(s)) => font.file = path(s)?,
+                Some(_) => bail!("{what}: file must be a string"),
+                None => bail!("{what}: a font table needs file = \"…\""),
+            }
+            for (k, val) in t {
+                match k.as_str() {
+                    "file" => {}
+                    "index" => {
+                        font.index = val
+                            .as_integer()
+                            .and_then(|i| u32::try_from(i).ok())
+                            .ok_or_else(|| anyhow!("{what}: index must be a whole number ≥ 0"))?
+                    }
+                    "variations" => {
+                        let Some(axes) = val.as_table() else {
+                            bail!("{what}: variations must be a table like {{ wght = 700 }}");
+                        };
+                        for (tag, value) in axes {
+                            if tag.len() != 4 || !tag.is_ascii() {
+                                bail!(
+                                    "{what}: variations: \"{tag}\" isn't an axis tag (four letters, like wght)"
+                                );
+                            }
+                            let value = value
+                                .as_float()
+                                .or_else(|| value.as_integer().map(|i| i as f64))
+                                .ok_or_else(|| {
+                                    anyhow!("{what}: variations: {tag} must be a number")
+                                })?;
+                            font.variations.push((tag.clone(), value as f32));
+                        }
+                    }
+                    "fallback" => {
+                        let list = val.as_array().ok_or_else(|| {
+                            anyhow!("{what}: fallback must be a list of [fonts] names")
+                        })?;
+                        for f in list {
+                            let Some(f) = f.as_str() else {
+                                bail!("{what}: fallback must be a list of [fonts] names");
+                            };
+                            fallback.push(f.to_string());
+                        }
+                    }
+                    "licence" | "license" => {
+                        font.licence = Some(
+                            val.as_str()
+                                .ok_or_else(|| {
+                                    anyhow!("{what}: licence must be an SPDX id like \"OFL-1.1\"")
+                                })?
+                                .to_string(),
+                        )
+                    }
+                    other => bail!(
+                        "{what}: unknown option `{other}` (a font has file, index, variations, fallback and licence)"
+                    ),
+                }
+            }
+        }
+        _ => bail!("{what}: expected a path or a table {{ file = \"…\" }}"),
+    }
+    Ok((font, fallback))
+}
+
+/// The fonts a text uses: its font, then the fallback chain depth first, each once.
+fn font_chain(start: &str, fonts: &BTreeMap<String, (FontRef, Vec<String>)>) -> Vec<FontRef> {
+    let mut out: Vec<FontRef> = vec![];
+    let mut stack = vec![start.to_string()];
+    while let Some(n) = stack.pop() {
+        if out.iter().any(|f| f.name == n) {
+            continue;
+        }
+        let (font, fallback) = &fonts[&n];
+        out.push(font.clone());
+        stack.extend(fallback.iter().rev().cloned());
+    }
+    out
+}
+
+/// One `[texts]` value: `{ text | file, font, size, width, align, line_height,
+/// letter_spacing, max_lines, direction, features, sdf_spread, filter, wrap, vflip }`.
+fn text_spec(
+    what: &str,
+    name: &str,
+    v: &toml::Value,
+    fonts: &BTreeMap<String, (FontRef, Vec<String>)>,
+    specs: &[LibrarySpec],
+    root: &Path,
+) -> Result<Channel> {
+    use crate::text::{Align, Direction, TextStyle};
+    let Some(t) = v.as_table() else {
+        bail!("{what}: a text is a table like {{ text = \"Hello\", font = \"body\", size = 96 }}");
+    };
+    for later in ["glyphs", "subtitles", "set"] {
+        if t.contains_key(later) {
+            bail!("{what}: {later} is for glyph runs, which arrive with text phase 2");
+        }
+    }
+    let body = match (t.get("text"), t.get("file")) {
+        (Some(_), Some(_)) => bail!("{what}: give text = \"…\" or file = \"…\", not both"),
+        (Some(toml::Value::String(s)), None) => TextBody::Inline(s.clone()),
+        (None, Some(toml::Value::String(s))) => TextBody::File(file_ref(what, s, specs, root)?),
+        (Some(_), None) | (None, Some(_)) => bail!("{what}: text and file must be strings"),
+        (None, None) => bail!("{what}: a text needs text = \"…\" or file = \"…\" (UTF-8)"),
+    };
+    let font = match t.get("font") {
+        Some(toml::Value::String(f)) => f.clone(),
+        Some(_) => bail!("{what}: font must be the name of a [fonts] entry"),
+        None => bail!("{what}: a text needs font = \"…\" (a name from [fonts])"),
+    };
+    if !fonts.contains_key(&font) {
+        bail!(
+            "{what}: font \"{font}\" isn't in [fonts] (there are {})",
+            quoted_list(fonts.keys())
+        );
+    }
+    let mut style = TextStyle::default();
+    let mut channel = Channel {
+        source: Source::Image(FileRef {
+            file: PathBuf::new(),
+            label: String::new(),
+            library: None,
+            rel: String::new(),
+        }),
+        filter: Filter::Linear,
+        wrap: Wrap::Clamp,
+        vflip: true,
+        srgb: false,
+    };
+    let number = |k: &str, val: &toml::Value| -> Result<f32> {
+        val.as_float()
+            .or_else(|| val.as_integer().map(|i| i as f64))
+            .map(|x| x as f32)
+            .filter(|x| x.is_finite())
+            .ok_or_else(|| anyhow!("{what}: {k} must be a number"))
+    };
+    let word = |k: &str, val: &toml::Value, names: &[&str]| -> Result<String> {
+        val.as_str().map(str::to_string).ok_or_else(|| {
+            anyhow!(
+                "{what}: {k} must be one of {}",
+                names
+                    .iter()
+                    .map(|n| format!("\"{n}\""))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })
+    };
+    let one_of = |k: &str, s: &str, names: &[&str]| {
+        anyhow!(
+            "{what}: {k} \"{s}\" isn't one of {}",
+            names
+                .iter()
+                .map(|n| format!("\"{n}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    for (k, val) in t {
+        match k.as_str() {
+            "text" | "file" | "font" => {}
+            "size" => {
+                style.size = number(k, val)?;
+                if !(4.0..=1024.0).contains(&style.size) {
+                    bail!("{what}: size must be 4–1024 (texture pixels per em)");
+                }
+            }
+            "width" => {
+                let w = number(k, val)?;
+                if !(1.0..=4096.0).contains(&w) {
+                    bail!("{what}: width must be 1–4096 (pixels)");
+                }
+                style.width = Some(w);
+            }
+            "align" => {
+                let s = word(k, val, Align::NAMES)?;
+                style.align = Align::parse(&s).ok_or_else(|| one_of(k, &s, Align::NAMES))?;
+            }
+            "line_height" => {
+                style.line_height = number(k, val)?;
+                if !(0.1..=10.0).contains(&style.line_height) {
+                    bail!("{what}: line_height must be 0.1–10 (ems)");
+                }
+            }
+            "letter_spacing" => {
+                style.letter_spacing = number(k, val)?;
+                if !(-1.0..=10.0).contains(&style.letter_spacing) {
+                    bail!("{what}: letter_spacing must be -1–10 (ems)");
+                }
+            }
+            "max_lines" => {
+                style.max_lines = Some(
+                    val.as_integer()
+                        .filter(|&n| n >= 1)
+                        .ok_or_else(|| anyhow!("{what}: max_lines must be a whole number ≥ 1"))?
+                        as usize,
+                )
+            }
+            "direction" => {
+                let s = word(k, val, Direction::NAMES)?;
+                style.direction =
+                    Direction::parse(&s).ok_or_else(|| one_of(k, &s, Direction::NAMES))?;
+            }
+            "features" => {
+                let list = val.as_array().ok_or_else(|| {
+                    anyhow!("{what}: features must be a list like [\"ss01\", \"-liga\"]")
+                })?;
+                for f in list {
+                    let f = f
+                        .as_str()
+                        .ok_or_else(|| anyhow!("{what}: features must be a list of strings"))?;
+                    if f.parse::<rustybuzz::Feature>().is_err() {
+                        bail!(
+                            "{what}: \"{f}\" isn't an OpenType feature (like \"ss01\", \"-liga\" or \"tnum\")"
+                        );
+                    }
+                    style.features.push(f.to_string());
+                }
+            }
+            "sdf_spread" => {
+                style.spread = number(k, val)?;
+                if !(1.0..=64.0).contains(&style.spread) {
+                    bail!("{what}: sdf_spread must be 1–64 (pixels)");
+                }
+            }
+            "filter" => {
+                let s = word(k, val, Filter::NAMES)?;
+                channel.filter = Filter::parse(&s).ok_or_else(|| one_of(k, &s, Filter::NAMES))?;
+            }
+            "wrap" => {
+                let s = word(k, val, Wrap::NAMES)?;
+                channel.wrap = Wrap::parse(&s).ok_or_else(|| one_of(k, &s, Wrap::NAMES))?;
+            }
+            "vflip" => {
+                channel.vflip = val
+                    .as_bool()
+                    .ok_or_else(|| anyhow!("{what}: vflip must be true or false"))?
+            }
+            "srgb" => bail!("{what}: srgb is for images; a text's channels are data"),
+            other => bail!(
+                "{what}: unknown option `{other}` (a text has text or file, font, size, width, \
+                 align, line_height, letter_spacing, max_lines, direction, features, sdf_spread, \
+                 filter, wrap and vflip)"
+            ),
+        }
+    }
+    channel.source = Source::Text(Box::new(TextSource {
+        name: name.to_string(),
+        body,
+        fonts: font_chain(&font, fonts),
+        style,
+    }));
+    Ok(channel)
+}
+
+/// A film path or `<lib/path>`, checked against the path rules. Library paths stay
+/// relative until `resolve_libraries`.
+fn file_ref(what: &str, s: &str, specs: &[LibrarySpec], root: &Path) -> Result<FileRef> {
+    let (library, rel, label) = match s.strip_prefix('<') {
+        Some(inner) => {
+            let Some(inner) = inner.strip_suffix('>') else {
+                bail!("{what}: \"{s}\" opens with < but doesn't end with >");
+            };
+            let Some((lib, rel)) = inner.split_once('/') else {
+                bail!(
+                    "{what}: \"{s}\" needs a library name and a path, like \"<kit/textures/noise.png>\""
+                );
+            };
+            if !specs.iter().any(|l| l.name == lib) {
+                bail!(
+                    "{what}: \"{s}\" names library \"{lib}\", but [libraries] has {}",
+                    if specs.is_empty() {
+                        "none".to_string()
+                    } else {
+                        specs
+                            .iter()
+                            .map(|l| format!("\"{}\"", l.name))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    }
+                );
+            }
+            (Some(lib.to_string()), rel.to_string(), inner.to_string())
+        }
+        None => (None, s.to_string(), s.to_string()),
+    };
+    library::check_rel_path(&rel).map_err(|e| anyhow!("{what}: {e}"))?;
+    Ok(FileRef {
+        file: if library.is_some() {
+            PathBuf::from(&rel)
+        } else {
+            root.join(&rel)
+        },
+        label,
+        library,
+        rel,
+    })
+}
+
 /// A `channels` entry or `[textures]` value names a `[textures]` entry (not a path)?
 fn is_texture_name(s: &str) -> bool {
     !s.is_empty()
@@ -1142,47 +1743,15 @@ fn texture_spec(
     root: &Path,
 ) -> Result<Option<Channel>> {
     let file_channel = |s: &str| -> Result<Channel> {
-        let (library, rel, label) = match s.strip_prefix('<') {
-            Some(inner) => {
-                let Some(inner) = inner.strip_suffix('>') else {
-                    bail!("{what}: \"{s}\" opens with < but doesn't end with >");
-                };
-                let Some((lib, rel)) = inner.split_once('/') else {
-                    bail!(
-                        "{what}: \"{s}\" needs a library name and a path, like \"<kit/textures/noise.png>\""
-                    );
-                };
-                if !specs.iter().any(|l| l.name == lib) {
-                    bail!(
-                        "{what}: \"{s}\" names library \"{lib}\", but [libraries] has {}",
-                        if specs.is_empty() {
-                            "none".to_string()
-                        } else {
-                            specs
-                                .iter()
-                                .map(|l| format!("\"{}\"", l.name))
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        }
-                    );
-                }
-                (Some(lib.to_string()), rel.to_string(), inner.to_string())
-            }
-            None => (None, s.to_string(), s.to_string()),
-        };
-        library::check_rel_path(&rel).map_err(|e| anyhow!("{what}: {e}"))?;
-        if !crate::texture::has_image_extension(&rel) {
-            bail!("{what}: {label}: shotglass reads PNG and JPEG images (.png, .jpg, .jpeg)");
+        let f = file_ref(what, s, specs, root)?;
+        if !crate::texture::has_image_extension(&f.rel) {
+            bail!(
+                "{what}: {}: shotglass reads PNG and JPEG images (.png, .jpg, .jpeg)",
+                f.label
+            );
         }
         Ok(Channel {
-            file: if library.is_some() {
-                PathBuf::from(&rel)
-            } else {
-                root.join(&rel)
-            },
-            label,
-            library,
-            rel,
+            source: Source::Image(f),
             filter: Filter::Mipmap,
             wrap: Wrap::Repeat,
             vflip: true,
@@ -1259,7 +1828,7 @@ fn texture_spec(
                 match names.get(s) {
                     Some(c) => Ok(Some(c.clone())),
                     None => bail!(
-                        "{what}: no texture called \"{s}\" in [textures] ({})",
+                        "{what}: no [textures] or [texts] entry called \"{s}\" ({})",
                         if names.is_empty() {
                             "there are none".to_string()
                         } else {
@@ -1298,22 +1867,41 @@ fn texture_spec(
                 Some(&"frames") => return Err(not_yet(what, &shown("frames"), "sequence")),
                 Some(&"video") => return Err(not_yet(what, &shown("video"), "video")),
                 Some(&"texture") => return Err(not_yet(what, &shown("texture"), "retime")),
-                Some(&"text") => return Err(not_yet(what, &shown("text"), "text")),
                 _ => {}
             }
-            let mut c = match t.get("file") {
-                Some(toml::Value::String(s)) if !s.is_empty() && !is_texture_name(s) => {
-                    file_source(s)?
+            if t.contains_key("part") {
+                bail!(
+                    "{what}: part = {} is a glyph run's table; glyph runs arrive with text \
+                     phase 2",
+                    t["part"]
+                );
+            }
+            let mut c = if let Some(v) = t.get("text") {
+                let Some(name) = v.as_str() else {
+                    bail!("{what}: text must be the name of a [texts] entry");
+                };
+                match names.and_then(|n| n.get(name)) {
+                    Some(c) if c.text().is_some() => c.clone(),
+                    _ if names.is_none() => {
+                        bail!("{what}: text = \"{name}\": [textures] entries are images")
+                    }
+                    _ => bail!("{what}: text = \"{name}\": no [texts] entry called \"{name}\""),
                 }
-                Some(toml::Value::String(s)) => bail!(
-                    "{what}: file = \"{s}\" must be a path to a .png or .jpg (names from \
+            } else {
+                match t.get("file") {
+                    Some(toml::Value::String(s)) if !s.is_empty() && !is_texture_name(s) => {
+                        file_source(s)?
+                    }
+                    Some(toml::Value::String(s)) => bail!(
+                        "{what}: file = \"{s}\" must be a path to a .png or .jpg (names from \
                      [textures] can't have options)"
-                ),
-                Some(_) => bail!("{what}: file must be a string"),
-                None => bail!(
-                    "{what}: a channel table needs file = \"…\" (an image; frames, video, \
-                     texture and text come later)"
-                ),
+                    ),
+                    Some(_) => bail!("{what}: file must be a string"),
+                    None => bail!(
+                        "{what}: a channel table needs file = \"…\" (an image) or text = \"…\" \
+                     (a [texts] entry); frames, video and texture come later"
+                    ),
+                }
             };
             for (k, val) in t {
                 let word = |names: &[&str]| -> Result<String> {
@@ -1344,7 +1932,7 @@ fn texture_spec(
                     )
                 };
                 match k.as_str() {
-                    "file" => {}
+                    "file" | "text" => {}
                     "filter" => {
                         let s = word(Filter::NAMES)?;
                         c.filter =
@@ -1355,6 +1943,9 @@ fn texture_spec(
                         c.wrap = Wrap::parse(&s).ok_or_else(|| not_one_of(&s, Wrap::NAMES))?;
                     }
                     "vflip" => c.vflip = flag()?,
+                    "srgb" if c.text().is_some() => {
+                        bail!("{what}: srgb is for images; a text's channels are data")
+                    }
                     "srgb" => c.srgb = flag()?,
                     other => bail!(
                         "{what}: unknown option `{other}` (a texture has file, filter, wrap, vflip and srgb)"
@@ -2026,15 +2617,18 @@ glsl = 450
         .unwrap();
         let c = &m.shots[0].channels;
         let grid = c[0].as_ref().unwrap();
-        assert_eq!(grid.file, PathBuf::from("/film/textures/grid.png"));
+        assert_eq!(
+            grid.image().unwrap().file,
+            PathBuf::from("/film/textures/grid.png")
+        );
         assert_eq!(
             (grid.filter, grid.wrap, grid.vflip, grid.srgb),
             (Filter::Nearest, Wrap::Mirror, true, false)
         );
         let noise = c[1].as_ref().unwrap();
-        assert_eq!(noise.library.as_deref(), Some("kit"));
-        assert_eq!(noise.label, "kit/textures/noise.png");
-        assert_eq!(noise.rel, "textures/noise.png");
+        assert_eq!(noise.image().unwrap().library.as_deref(), Some("kit"));
+        assert_eq!(noise.label(), "kit/textures/noise.png");
+        assert_eq!(noise.image().unwrap().rel, "textures/noise.png");
         assert_eq!(
             (noise.filter, noise.wrap),
             (Filter::Mipmap, Wrap::Repeat),
@@ -2048,7 +2642,7 @@ glsl = 450
         );
         let c = &m.shots[1].channels;
         assert!(c[0].is_none() && c[3].is_none());
-        assert_eq!(c[1].as_ref().unwrap().label, "textures/stars.png");
+        assert_eq!(c[1].as_ref().unwrap().label(), "textures/stars.png");
         assert_eq!(c[2].as_ref().unwrap().wrap, Wrap::Clamp);
         assert!(m.uses_channels());
         assert!(m.warnings.is_empty(), "{:?}", m.warnings);
@@ -2061,7 +2655,10 @@ glsl = 450
         let m = channels_film("", "", &["channels = [\"kit/textures/noise.png\"]"]).unwrap();
         let c = m.shots[0].channels[0].as_ref().unwrap();
         assert_eq!(
-            (c.library.as_ref(), c.file.clone()),
+            (
+                c.image().unwrap().library.as_ref(),
+                c.image().unwrap().file.clone()
+            ),
             (None, PathBuf::from("/film/kit/textures/noise.png"))
         );
     }
@@ -2074,7 +2671,7 @@ glsl = 450
             &["", "channels = [\"brick\"]", "channels = []"],
         )
         .unwrap();
-        let label = |i: usize, n: usize| m.shots[i].channels[n].as_ref().map(|c| c.label.clone());
+        let label = |i: usize, n: usize| m.shots[i].channels[n].as_ref().map(|c| c.label());
         assert_eq!(
             label(0, 0).as_deref(),
             Some("t/noise.png"),
@@ -2100,10 +2697,10 @@ glsl = 450
         let e = err(channels_film(
             "",
             "",
-            &["channels = [\"\", \"\", \"\", \"\", \"\"]"],
+            &["channels = [\"\", \"\", \"\", \"\", \"\", \"\", \"\", \"\", \"\"]"],
         ));
         assert!(
-            e.contains("shot \"s0\": channels has 5 entries; there are 4 (iChannel0..3)"),
+            e.contains("shot \"s0\": channels has 9 entries; there are 8 (iChannel0..7)"),
             "{e}"
         );
         let e = err(channels_film(
@@ -2112,7 +2709,7 @@ glsl = 450
             &["channels = [\"brick\", \"noize\"]"],
         ));
         assert!(
-            e.contains("shot \"s0\": channels[1]: no texture called \"noize\" in [textures] (there are \"brick\", \"grid\", \"noise\")"),
+            e.contains("shot \"s0\": channels[1]: no [textures] or [texts] entry called \"noize\" (there are \"brick\", \"grid\", \"noise\")"),
             "{e}"
         );
         let e = err(channels_film("", "", &["channels = [\"noise\"]"]));
@@ -2251,7 +2848,7 @@ glsl = 450
             ),
             (
                 r#"{ text = "credits", part = "glyphs" }"#,
-                r#""credits" is a text block; text arrives with [fonts] and [texts] in shotglass 0.1.3"#,
+                "part = \"glyphs\" is a glyph run's table; glyph runs arrive with text phase 2",
             ),
             (r#"{ file = "a.mp4" }"#, "is a video; video files arrive"),
         ] {
@@ -2292,6 +2889,212 @@ glsl = 450
         assert!(
             e.contains("[textures] fog: \"r/fog_####.png\" is an image sequence"),
             "{e}"
+        );
+    }
+
+    fn texts_film(fonts: &str, texts: &str, shots: &[&str]) -> Result<Movie> {
+        let mut t = format!(
+            "[libraries]\nkit = {{ path = \"lib/kit\" }}\n[textures]\nbrick = \"t/brick.png\"\n[fonts]\n{fonts}[texts]\n{texts}"
+        );
+        let shots = if shots.is_empty() { &[""][..] } else { shots };
+        for (i, extra) in shots.iter().enumerate() {
+            t += &format!("[[shot]]\nid = \"s{i}\"\nscene = \"a.glsl\"\nduration = 1\n{extra}\n");
+        }
+        fixture(&t, Path::new("/film"))
+    }
+
+    #[test]
+    fn fonts_and_texts_parse() {
+        let m = texts_film(
+            "body = \"fonts/Body.ttf\"\nbold = { file = \"<kit/fonts/Var.ttf>\", variations = { wght = 700 }, fallback = [\"body\", \"hebrew\"], licence = \"OFL-1.1\" }\nhebrew = { file = \"fonts/Hebrew.otf\", index = 1 }\n",
+            "title = { text = \"Big Shadow\", font = \"bold\", size = 160, align = \"center\", width = 1400, line_height = 1.25, letter_spacing = 0.05, max_lines = 2, direction = \"auto\", features = [\"ss01\", \"-liga\"], sdf_spread = 12 }\ncredits = { file = \"credits.txt\", font = \"body\" }\n",
+            &["channels = [\"title\", \"brick\", { text = \"credits\", wrap = \"repeat\" }, \"\", \"\", \"\", \"\", \"title\"]"],
+        )
+        .unwrap();
+        let c = &m.shots[0].channels;
+        let title = c[0].as_ref().unwrap();
+        let t = title.text().unwrap();
+        assert_eq!(t.name, "title");
+        assert_eq!(t.body, TextBody::Inline("Big Shadow".into()));
+        // The chain: the font, then its fallbacks depth first.
+        let chain: Vec<&str> = t.fonts.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(chain, ["bold", "body", "hebrew"]);
+        assert_eq!(t.fonts[0].variations, vec![("wght".to_string(), 700.0)]);
+        assert_eq!(t.fonts[0].file.library.as_deref(), Some("kit"));
+        assert_eq!(t.fonts[0].licence.as_deref(), Some("OFL-1.1"));
+        assert_eq!(t.fonts[2].index, 1);
+        assert_eq!(t.fonts[1].file.file, PathBuf::from("/film/fonts/Body.ttf"));
+        let s = &t.style;
+        assert_eq!(
+            (s.size, s.width, s.line_height, s.letter_spacing, s.spread),
+            (160.0, Some(1400.0), 1.25, 0.05, 12.0)
+        );
+        assert_eq!(
+            (s.align, s.max_lines, s.direction),
+            (
+                crate::text::Align::Center,
+                Some(2),
+                crate::text::Direction::Auto
+            )
+        );
+        assert_eq!(s.features, ["ss01", "-liga"]);
+        // Text defaults suit text: linear, clamp, upright.
+        assert_eq!(
+            (title.filter, title.wrap, title.vflip, title.srgb),
+            (Filter::Linear, Wrap::Clamp, true, false)
+        );
+        assert_eq!(title.label(), "text \"title\"");
+        // Images and texts mix; a table can re-sample a text; channel 7 is usable.
+        assert!(c[1].as_ref().unwrap().image().is_some());
+        let credits = c[2].as_ref().unwrap();
+        assert_eq!(credits.wrap, Wrap::Repeat);
+        assert!(
+            matches!(&credits.text().unwrap().body, TextBody::File(f) if f.label == "credits.txt")
+        );
+        assert_eq!(c[7].as_ref(), Some(title));
+        // Files a text reads: its file and every font.
+        let files: Vec<&str> = credits.files().iter().map(|f| f.label.as_str()).collect();
+        assert_eq!(files, ["credits.txt", "fonts/Body.ttf"]);
+        // Text and channels 4..7 need 0.1.3.
+        let w = m.contract_warning().unwrap();
+        assert!(
+            w.contains("text ([fonts] and [texts]), which needs shotglass 0.1.3"),
+            "{w}"
+        );
+        assert!(
+            w.contains("iChannel4..7, which need shotglass 0.1.3"),
+            "{w}"
+        );
+        assert!(w.contains("shotglass = \"0.1.3\""), "{w}");
+    }
+
+    #[test]
+    fn fonts_and_texts_are_validated() {
+        let body = "body = \"fonts/Body.ttf\"\n";
+        let text_err = |texts: &str| err(texts_film(body, texts, &[]));
+        for (texts, says) in [
+            (
+                "t = { font = \"body\" }\n",
+                "a text needs text = \"…\" or file = \"…\"",
+            ),
+            (
+                "t = { text = \"a\", file = \"a.txt\", font = \"body\" }\n",
+                "not both",
+            ),
+            ("t = { text = \"a\" }\n", "a text needs font = \"…\""),
+            (
+                "t = { text = \"a\", font = \"bodyy\" }\n",
+                "font \"bodyy\" isn't in [fonts] (there are \"body\")",
+            ),
+            (
+                "t = { text = \"a\", font = \"body\", size = 2 }\n",
+                "size must be 4–1024",
+            ),
+            (
+                "t = { text = \"a\", font = \"body\", width = 0 }\n",
+                "width must be 1–4096",
+            ),
+            (
+                "t = { text = \"a\", font = \"body\", align = \"justify\" }\n",
+                "align \"justify\" isn't one of \"left\", \"center\", \"right\", \"start\", \"end\"",
+            ),
+            (
+                "t = { text = \"a\", font = \"body\", direction = \"ttb\" }\n",
+                "direction \"ttb\" isn't one of",
+            ),
+            (
+                "t = { text = \"a\", font = \"body\", max_lines = 0 }\n",
+                "max_lines must be a whole number ≥ 1",
+            ),
+            (
+                "t = { text = \"a\", font = \"body\", features = [\"not a feature!\"] }\n",
+                "isn't an OpenType feature",
+            ),
+            (
+                "t = { text = \"a\", font = \"body\", srgb = true }\n",
+                "srgb is for images",
+            ),
+            (
+                "t = { text = \"a\", font = \"body\", colour = \"red\" }\n",
+                "unknown option `colour`",
+            ),
+            (
+                "t = { text = \"a\", font = \"body\", glyphs = true }\n",
+                "glyph runs, which arrive with text phase 2",
+            ),
+            ("t = \"Hello\"\n", "a text is a table"),
+            (
+                "brick = { text = \"a\", font = \"body\" }\n",
+                "[texts] brick: [textures] has a \"brick\" too",
+            ),
+            (
+                "my-text = { text = \"a\", font = \"body\" }\n",
+                "a text name may only use letters",
+            ),
+        ] {
+            let e = text_err(texts);
+            assert!(e.contains(says), "{texts}: {e}");
+        }
+        for (fonts, says) in [
+            ("f = \"fonts/a.woff2\"\n", "WOFF/WOFF2 fonts aren't read"),
+            (
+                "f = \"fonts/a.png\"\n",
+                "shotglass reads TrueType and OpenType fonts",
+            ),
+            (
+                "f = { file = \"a.ttf\", fallback = [\"nope\"] }\n",
+                "fallback \"nope\" isn't in [fonts]",
+            ),
+            (
+                "f = { file = \"a.ttf\", variations = { weight = 7 } }\n",
+                "\"weight\" isn't an axis tag",
+            ),
+            (
+                "f = { file = \"a.ttf\", index = -1 }\n",
+                "index must be a whole number ≥ 0",
+            ),
+            (
+                "f = { file = \"a.ttf\", size = 3 }\n",
+                "unknown option `size`",
+            ),
+            ("f = { index = 1 }\n", "a font table needs file"),
+            ("f = \"../a.ttf\"\n", "climbs"),
+        ] {
+            let e = err(texts_film(fonts, "", &[]));
+            assert!(e.contains(says), "{fonts}: {e}");
+        }
+        // A fallback cycle is fine: each font once.
+        let m = texts_film(
+            "a = { file = \"a.ttf\", fallback = [\"b\"] }\nb = { file = \"b.ttf\", fallback = [\"a\"] }\n",
+            "t = { text = \"x\", font = \"a\" }\n",
+            &["channels = [\"t\"]"],
+        )
+        .unwrap();
+        let t = m.shots[0].channels[0].as_ref().unwrap().text().unwrap();
+        let names: Vec<&str> = t.fonts.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["a", "b"]);
+        // Channel tables: text names a [texts] entry; srgb stays refused.
+        let one = "t = { text = \"a\", font = \"body\" }\n";
+        let e = err(texts_film(
+            body,
+            one,
+            &["channels = [{ text = \"brick\" }]"],
+        ));
+        assert!(
+            e.contains("text = \"brick\": no [texts] entry called \"brick\""),
+            "{e}"
+        );
+        let e = err(texts_film(
+            body,
+            one,
+            &["channels = [{ text = \"t\", srgb = true }]"],
+        ));
+        assert!(e.contains("srgb is for images"), "{e}");
+        // Unused texts are pointed out like unused textures.
+        let m = texts_film(body, one, &["channels = [\"brick\"]"]).unwrap();
+        assert_eq!(
+            m.warnings,
+            vec!["[texts] t isn't used by any shot's channels".to_string()]
         );
     }
 
@@ -2342,7 +3145,12 @@ glsl = 450
         };
         let m = film("[\"<kit/textures/noise.png>\", \"textures/stars.png\"]").unwrap();
         assert_eq!(
-            m.shots[0].channels[0].as_ref().unwrap().file,
+            m.shots[0].channels[0]
+                .as_ref()
+                .unwrap()
+                .image()
+                .unwrap()
+                .file,
             dir.join("lib/kit/textures/noise.png")
         );
         assert_eq!(m.textures().len(), 2);

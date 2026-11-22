@@ -50,8 +50,9 @@ cargo fmt && cargo clippy --all-targets -- -D warnings
 | `main.rs` | CLI (clap): play, still, strip, check, wav, export, new, fetch, update, licenses, bundle, freeze, unfreeze, test, selftest |
 | `golden.rs` | `strip`/`wav --compare/--bless`: golden-image comparison (per-pixel tolerance, pixel budget, mean limit, diff image); soundtrack comparison (RMS/peak of the difference per 50 ms window, first differing time), WAV reader |
 | `export.rs` | offline export: frame n at `frame_time(n)`, raw RGBA piped to ffmpeg (or PNGs), WAV muxed in |
-| `movie.rs` | `movie.toml` (+ its project) → `Movie`; timeline (`at(t)`), rational fps (`frame_time`/`frame_at`), cue defines, sound gains/windows, `channels`/`[textures]` → `Shot::channels`, `loop` (`loop_frames`, `loop_period`, `wrap`, `sound_samples`) |
-| `texture.rs` | iChannel images, CPU side: PNG/JPEG → RGBA8 (flipped for `vflip`), size limits, GPU memory, error messages (HTML page, Git LFS pointer, half-saved file) |
+| `movie.rs` | `movie.toml` (+ its project) → `Movie`; timeline (`at(t)`), rational fps (`frame_time`/`frame_at`), cue defines, sound gains/windows, `channels`/`[textures]`/`[fonts]`/`[texts]` → `Shot::channels` (`Channel { source: Image(FileRef) \| Text(TextSource) }`, `files()` = every file it reads), `loop` (`loop_frames`, `loop_period`, `wrap`, `sound_samples`) |
+| `texture.rs` | iChannel textures, CPU side: PNG/JPEG → RGBA8 (flipped for `vflip`), `load_text` (layout + raster → RGBA8 + `meta`), size limits, GPU memory, error messages (HTML page, Git LFS pointer, half-saved file) |
+| `text.rs` | text (#68): fonts (ttf-parser; no system fonts, no hinting), shaping (rustybuzz), bidi per paragraph, greedy UAX #14 breaking, layout → `Layout` (glyphs, size, `meta` = iChannelMeta); raster: 4×4 coverage (R, A) + exact EDT signed distance on a 2×2 grid (G); fixture fonts in `tests/films/text/fonts` |
 | `anim.rs` | constants/keyframes, eases; `glsl_fn` turns keyframes into GLSL for sound shaders |
 | `shader.rs` | source assembly, `#include` (film-relative, `<lib/file>`, include-once), `#line 1 N` per file, driver-log → file:line; `Dialect` (fixed `330 core` / `300 es` baseline, `glsl` opt-in) |
 | `project.rs` | projects (#59): `shotglass.toml` (engine contract + `[libraries]`), nearest one at or above a film, a project's films, film-or-project command targets, `split_fixture`/`write_fixture` for test films written as one text |
@@ -65,7 +66,7 @@ cargo fmt && cargo clippy --all-targets -- -D warnings
 | `app.rs` | egui player: transport, timeline, panels, live reload, auto scale, sound streaming |
 | `headless.rs` | hidden-window GL context for CLI commands |
 | `selftest.rs` | GPU/sound checks on fixture films written to a temp dir |
-| `tests/golden.rs`, `tests/golden/` | golden tests: 8-frame 320x180 strips and 8 kHz soundtracks of the demo and the template, a strip of `tests/films/channels` (textures), and a two-period strip and the soundtrack of `tests/films/loop` (`loop = true`), vs reference PNGs / WAVs |
+| `tests/golden.rs`, `tests/golden/` | golden tests: 8-frame 320x180 strips and 8 kHz soundtracks of the demo and the template, a strip of `tests/films/channels` (textures), a strip of `tests/films/text` (text blocks, distance field, RTL, iChannel6/7), and a two-period strip and the soundtrack of `tests/films/loop` (`loop = true`), vs reference PNGs / WAVs |
 | `glsl/copy.glsl` | the engine's internal copy pass (not a transition films can name; theirs come from libraries or files) |
 | `movies/big-shadow/` | demo film; `templates/new/` is what `shotglass new` writes |
 
@@ -126,7 +127,7 @@ cargo fmt && cargo clippy --all-targets -- -D warnings
 - **Texture uploads set and restore GL unpack state** (`UNPACK_ALIGNMENT` 1 for the band, then 4;
   row length/skips 0) and unbind `PIXEL_UNPACK_BUFFER` first: the sound path binds it, and a
   client-memory upload with it bound reads a buffer offset. The scene pass unbinds its
-  sampler objects after drawing (they'd override the composite pass and egui on units 0–3).
+  sampler objects after drawing (they'd override the composite pass and egui on units 0–7).
 - **Readbacks restore GL pack state** (`PACK_ROW_LENGTH`/`SKIP_*` to 0, alignment 4) and
   check bounds first: `glReadPixels` never sees the slice length. Headless renderers call
   `set_readback(true)` (composite drawn upside down, no CPU flip); the player doesn't.
@@ -146,7 +147,15 @@ cargo fmt && cargo clippy --all-targets -- -D warnings
 - **Channel entries are classified in one place**, `movie::ChannelSource::of`, by spelling
   (`""`, `@output`, `[textures]` name, image / `####` sequence / video path); kinds not built
   yet are refused with the version that brings them. The count is `movie::N_CHANNELS`
-  (4 today; #68 raises it to 8 together with the scene header in `gfx.rs`).
+  (8: `iChannel0..7`, `iChannelResolution`/`iChannelTime`/`iChannelMeta[8]` in the scene
+  header). Engine-internal units in the scene pass go above the channels (layers: 8–9).
+  Never bake the count into a file format or data layout.
+- **Text blocks are deterministic and laid out off the render thread.** Bytes depend only on
+  the font files, the `[texts]` entry and the engine (no system fonts, no hinting, plain
+  IEEE maths, exact EDT; `text::tests::raster_is_pinned` pins a sha256: bump it on purpose,
+  like a golden). They rasterise on the decode worker like images decode; `Movie::load`
+  lays every text out once, so missing glyphs, `max_lines` and oversize blocks refuse the
+  edit. A text edit never recompiles (selftest "text textures").
 
 ## Adding things
 

@@ -1,6 +1,6 @@
 [package]
 name = "shotglass"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 description = "Compose short films and cartoons from GLSL shaders: shots, transitions and GPU-synthesised sound on one scrubbable timeline."
 license = "MIT OR Apache-2.0"
@@ -24,11 +24,17 @@ glutin-winit = "0.5"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
 notify = "8.2.2"
 raw-window-handle = "0.6"
+# Text (#68): font parsing and shaping (pure-Rust HarfBuzz port), bidi, line breaking.
+rustybuzz = "0.20.1"
 semver = "1.0.28"
 serde = { version = "1.0.229", features = ["derive"] }
 sha2 = "0.11.1"
 toml = "1.2.1"
 toodee = "0.8"
+ttf-parser = "0.25.1"
+unicode-bidi = "0.3.18"
+unicode-linebreak = "0.1.5"
+unicode-segmentation = "1.13.3"
 ctrlc = "3.5"
 winit = "0.30"
 

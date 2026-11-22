@@ -224,6 +224,13 @@ impl Player {
                                     | "PNG"
                                     | "JPG"
                                     | "JPEG"
+                                    | "ttf"
+                                    | "otf"
+                                    | "ttc"
+                                    | "TTF"
+                                    | "OTF"
+                                    | "TTC"
+                                    | "txt"
                             )
                         )
                     });

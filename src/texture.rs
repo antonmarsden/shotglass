@@ -64,6 +64,9 @@ pub struct DecodedImage {
     /// Things worth saying that don't stop the image from being used (16-bit data, an
     /// extension that doesn't match the content).
     pub warnings: Vec<String>,
+    /// `iChannelMeta` for this texture: a text block's (em, first baseline, line pitch,
+    /// padding) in texels; zeros for images.
+    pub meta: [f32; 4],
 }
 
 /// The extensions shotglass reads (any case).
@@ -157,17 +160,47 @@ pub fn decode(bytes: &[u8], label: &str, vflip: bool) -> Result<DecodedImage, St
     let (w, h) = (rgba.width() as usize, rgba.height() as usize);
     let mut data = rgba.into_raw();
     if vflip {
-        let row = w * 4;
-        for y in 0..h / 2 {
-            let (top, bottom) = data.split_at_mut((h - 1 - y) * row);
-            top[y * row..(y + 1) * row].swap_with_slice(&mut bottom[..row]);
-        }
+        flip_rows(&mut data, w, h);
     }
     Ok(DecodedImage {
         width: w,
         height: h,
         rgba: data,
         warnings,
+        meta: [0.0; 4],
+    })
+}
+
+/// Reverse the rows of an RGBA8 image in place (top row first ↔ bottom row first).
+fn flip_rows(data: &mut [u8], w: usize, h: usize) {
+    let row = w * 4;
+    for y in 0..h / 2 {
+        let (top, bottom) = data.split_at_mut((h - 1 - y) * row);
+        top[y * row..(y + 1) * row].swap_with_slice(&mut bottom[..row]);
+    }
+}
+
+/// Lay out and rasterise a text block (#68), oriented like an image (`vflip` puts the
+/// top line at v = 1, upright with `fragCoord / iResolution.xy`). Runs on the decode
+/// worker: tens of milliseconds for a large block.
+pub fn load_text(t: &crate::movie::TextSource, vflip: bool) -> Result<DecodedImage, String> {
+    let (layout, fonts) = t.layout().map_err(|e| format!("{e:#}"))?;
+    let refs: Vec<&crate::text::Font> = fonts.iter().collect();
+    let img = crate::text::rasterize(&layout, &refs, t.style.spread);
+    let mut rgba = img.rgba;
+    if vflip {
+        flip_rows(&mut rgba, img.width, img.height);
+    }
+    Ok(DecodedImage {
+        width: img.width,
+        height: img.height,
+        rgba,
+        warnings: layout
+            .warnings
+            .iter()
+            .map(|w| format!("text \"{}\": {w}", t.name))
+            .collect(),
+        meta: layout.meta,
     })
 }
 
@@ -181,26 +214,30 @@ pub fn dimensions(path: &Path) -> Option<(usize, usize)> {
     Some((w as usize, h as usize))
 }
 
-/// Texture memory a shot's channels need at once (each file once, read from the
-/// image headers), and a description per file for messages. Unreadable files count 0:
-/// their decode error is reported where they're used.
+/// Texture memory a shot's channels need at once (each texture once: image sizes from
+/// their headers, text blocks from their layout), and a description per texture for
+/// messages. Unreadable files count 0: their error is reported where they're used.
 pub fn shot_memory(
     channels: &[Option<crate::movie::Channel>; crate::movie::N_CHANNELS],
 ) -> (usize, Vec<String>) {
-    let mut seen: Vec<&Path> = vec![];
+    let mut seen: Vec<&crate::movie::Source> = vec![];
     let mut total = 0;
     let mut parts = vec![];
     for c in channels.iter().flatten() {
-        if seen.contains(&c.file.as_path()) {
+        if seen.contains(&&c.source) {
             continue;
         }
-        seen.push(&c.file);
-        if let Some((w, h)) = dimensions(&c.file) {
+        seen.push(&c.source);
+        let size = match &c.source {
+            crate::movie::Source::Image(f) => dimensions(&f.file),
+            crate::movie::Source::Text(t) => t.layout().ok().map(|(l, _)| (l.width, l.height)),
+        };
+        if let Some((w, h)) = size {
             let b = gpu_bytes(w, h);
             total += b;
             parts.push(format!(
                 "{} {} ({w}×{h} with mipmaps)",
-                c.label,
+                c.label(),
                 describe_bytes(b)
             ));
         }
