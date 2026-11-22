@@ -799,7 +799,7 @@ per component.
 |---|---|
 | `expect(bool cond)` | `cond` |
 | `expect(bool cond, T value)` | `cond`; shows `value` on failure |
-| `expect_eq(T a, T b)` | `a == b` exactly; also `int`, `ivec2`–`ivec4` and `bool` |
+| `expect_eq(T a, T b)` | `a == b` exactly; also `int`, `ivec2`–`ivec4`, `uint`, `uvec2`–`uvec4` and `bool` (integers are reported exactly, whatever their size) |
 | `expect_near(T a, T b, float tol)` | `abs(a - b) <= tol`, and both are finite |
 | `expect_rel(T a, T b, float rel)` | `abs(a - b) <= rel * max(abs(a), abs(b))`, and both are finite |
 | `expect_finite(T x)` | no NaN or infinity |

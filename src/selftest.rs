@@ -221,7 +221,7 @@ fn write(dir: &Path, files: &[(&str, &str)]) -> Result<()> {
 /// `shotglass test` on a fixture project (a path library and one test file): the exact
 /// report pins the first failure per test, its input and values, NaN handling, grid
 /// endpoints, banded draws (140 000 samples: three bands), "ran no assertions" and
-/// expect_rel, on this driver.
+/// expect_rel, and integers (uint, large int) shown exactly, on this driver.
 fn glsl_tests(gl: &Gl, dir: &Path) -> Result<String> {
     use crate::glsl_test::{TestFile, run};
     write(
@@ -265,7 +265,9 @@ fn glsl_tests(gl: &Gl, dir: &Path) -> Result<String> {
                  void test_rel() {\n\
                  \x20   expect_rel(100.0, 101.0, 0.02);\n\
                  \x20   expect_rel(vec2(1.0, 0.0), vec2(1.0, 1e-3), 0.5);\n\
-                 }\n",
+                 }\n\
+                 void test_uint() { expect_eq(uvec2(7u, 0xffffffffu), uvec2(7u, 0xfffffffeu)); }\n\
+                 void test_bigint() { expect_eq(-16777217, -16777216); }\n",
             ),
         ],
     )?;
@@ -311,6 +313,12 @@ unit/fx.test.glsl
   FAIL  test_rel
         unit/fx.test.glsl:20: expect_rel(vec2(1.0, 0.0), vec2(1.0, 1e-3), 0.5)
         got (1.0, 0.0), expected (1.0, 0.001)
+  FAIL  test_uint
+        unit/fx.test.glsl:22: expect_eq(uvec2(7u, 0xffffffffu), uvec2(7u, 0xfffffffeu))
+        got (7, 4294967295), expected (7, 4294967294)
+  FAIL  test_bigint
+        unit/fx.test.glsl:23: expect_eq(-16777217, -16777216)
+        got -16777217, expected -16777216
 ";
     let Some((broken, report)) = report.split_once("unit/fx.test.glsl\n") else {
         bail!("the file after a broken one didn't run:\n{report}");
@@ -325,8 +333,8 @@ unit/fx.test.glsl
     if report != expected {
         bail!("report differs:\n--- expected\n{expected}--- got\n{report}");
     }
-    if (sum.passed, sum.failed, sum.broken) != (2, 7, 1) {
-        bail!("summary {sum:?}, expected 2 passed, 7 failed, 1 broken");
+    if (sum.passed, sum.failed, sum.broken) != (2, 9, 1) {
+        bail!("summary {sum:?}, expected 2 passed, 9 failed, 1 broken");
     }
     Ok(format!("{} samples", sum.samples))
 }
