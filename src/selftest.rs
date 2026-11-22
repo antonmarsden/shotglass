@@ -126,6 +126,14 @@ const CHECKS: &[Check] = &[
         run: layers_scale,
     },
     Check {
+        name: "layers: blend passes, @picture and @<layer> (an earlier layer's own output)",
+        run: layers_blend_and_refs,
+    },
+    Check {
+        name: "layers: hidden layers (mute/solo) leave the picture, and their readers see black",
+        run: layers_hidden,
+    },
+    Check {
         name: "chunked sound matches a single-pass render",
         run: sound_chunk_equivalence,
     },
@@ -2231,6 +2239,14 @@ fn layers_compose(gl: &Gl, dir: &Path) -> Result<String> {
          [[layer]]\nid=\"fade\"\nscene=\"fade.glsl\"\nfrom=2.0\nto=4.0\nfade=[1.0, 1.0]\n",
     )?;
     let mut r = renderer(gl, &m)?;
+    // @input is another pass's picture, not a texture: nothing to load, nothing pending
+    // (the player's "loading textures" would otherwise never finish).
+    if r.texture_progress() != (0, 0) {
+        bail!(
+            "an @input channel counts as a texture: {:?}",
+            r.texture_progress()
+        );
+    }
     let at = |r: &mut Renderer, t: f32| shot(r, &m, at_shot(0, t), 1.0);
     // Before any layer: the picture as it is.
     expect_px("no layer", &at(&mut r, 0.25)?, 80, 45, [51, 102, 153], 1)?;
@@ -2354,6 +2370,126 @@ fn layers_scale(gl: &Gl, dir: &Path) -> Result<String> {
         1,
     )?;
     expect_px("auto at render scale 0.5", &half, 80, 70, [0, 80, 0], 1)?;
+    Ok(String::new())
+}
+
+/// A film-local multiply blend, written against the blend interface: the layer arrives
+/// premultiplied with its opacity applied, so unpremultiply, multiply, mix by coverage.
+const MULTIPLY: &str = "vec4 blend(vec2 uv) {\n  vec4 b = getBase(uv);\n  vec4 l = getLayer(uv);\n  vec3 m = b.rgb * l.rgb / max(l.a, 1e-5);\n  return vec4(mix(b.rgb, m, l.a), 1.0);\n}\n";
+
+fn layers_blend_and_refs(gl: &Gl, dir: &Path) -> Result<String> {
+    write(
+        dir,
+        &[
+            ("s.glsl", &scene("fragColor = vec4(0.2, 0.4, 0.6, 1.0);")),
+            (
+                "green.glsl",
+                &scene("fragColor = vec4(0.5, 1.0, 0.5, 1.0);"),
+            ),
+            ("white.glsl", &scene("fragColor = vec4(1.0);")),
+            (
+                "pic.glsl",
+                &scene(
+                    "fragColor = vec4(texture(iChannel0, fragCoord / iChannelResolution[0].xy).rgb, 1.0);",
+                ),
+            ),
+            ("red.glsl", &scene("fragColor = vec4(1.0, 0.0, 0.0, 1.0);")),
+            (
+                "copy.glsl",
+                &scene(
+                    "fragColor = vec4(iChannelResolution[1].x / 255.0, texture(iChannel1, uv).r, 0.0, 1.0);",
+                ),
+            ),
+            ("fx/multiply.glsl", MULTIPLY),
+        ],
+    )?;
+    let m = movie(
+        dir,
+        "shotglass = \"0.1.5\"\n[[shot]]\nid=\"a\"\nscene=\"s.glsl\"\nduration=5\n\
+         [[layer]]\nid=\"mul\"\nscene=\"green.glsl\"\nto=1.0\nblend=\"fx/multiply.glsl\"\n\
+         [[layer]]\nid=\"half\"\nscene=\"green.glsl\"\nfrom=1.0\nto=2.0\nopacity=0.5\nblend=\"fx/multiply.glsl\"\n\
+         [[layer]]\nid=\"white\"\nscene=\"white.glsl\"\nfrom=2.0\nto=3.0\n\
+         [[layer]]\nid=\"pic\"\nscene=\"pic.glsl\"\nfrom=2.0\nto=3.0\nchannels=[\"@picture\"]\n\
+         [[layer]]\nid=\"src\"\nscene=\"red.glsl\"\nfrom=3.0\nto=4.0\nscale=0.5\nopacity=0.0\n\
+         [[layer]]\nid=\"copy\"\nscene=\"copy.glsl\"\nfrom=3.0\nto=5.0\nchannels=[\"\", \"@src\"]\n",
+    )?;
+    let mut r = renderer(gl, &m)?;
+    let at = |r: &mut Renderer, t: f32| shot(r, &m, at_shot(0, t), 1.0);
+    // Multiply at opacity 1: (0.2, 0.4, 0.6) × (0.5, 1, 0.5).
+    expect_px(
+        "multiply blend",
+        &at(&mut r, 0.5)?,
+        80,
+        45,
+        [26, 102, 77],
+        1,
+    )?;
+    // At opacity 0.5 the blend sees alpha 0.5: halfway between the base and the product.
+    expect_px(
+        "multiply at opacity 0.5",
+        &at(&mut r, 1.5)?,
+        80,
+        45,
+        [38, 102, 115],
+        1,
+    )?;
+    // @picture sees the picture track past the white layer below.
+    expect_px(
+        "@picture under a white layer",
+        &at(&mut r, 2.5)?,
+        80,
+        45,
+        [51, 102, 153],
+        1,
+    )?;
+    // @src: the earlier layer's own output (red), though it composites at opacity 0,
+    // at its own size (scale 0.5 of 160 = 80).
+    expect_px("@<layer>", &at(&mut r, 3.5)?, 80, 45, [80, 255, 0], 1)?;
+    // After src's span: copy still runs and reads black, resolution 0.
+    expect_px(
+        "@<layer> while it's inactive",
+        &at(&mut r, 4.5)?,
+        80,
+        45,
+        [0, 0, 0],
+        1,
+    )?;
+    Ok(String::new())
+}
+
+fn layers_hidden(gl: &Gl, dir: &Path) -> Result<String> {
+    write(
+        dir,
+        &[
+            ("s.glsl", &scene("fragColor = vec4(0.2, 0.4, 0.6, 1.0);")),
+            ("red.glsl", &scene("fragColor = vec4(1.0, 0.0, 0.0, 1.0);")),
+            (
+                "copy.glsl",
+                &scene(
+                    "fragColor = vec4(0.0, texture(iChannel0, uv).r, 0.0, uv.x < 0.5 ? 1.0 : 0.0);",
+                ),
+            ),
+        ],
+    )?;
+    let m = movie(
+        dir,
+        "shotglass = \"0.1.5\"\n[[shot]]\nid=\"a\"\nscene=\"s.glsl\"\nduration=1\n\
+         [[layer]]\nid=\"red\"\nscene=\"red.glsl\"\n\
+         [[layer]]\nid=\"copy\"\nscene=\"copy.glsl\"\nchannels=[\"@red\"]\n",
+    )?;
+    let mut r = renderer(gl, &m)?;
+    let both = shot(&mut r, &m, at_shot(0, 0.5), 1.0)?;
+    expect_px("both layers: copy (left)", &both, 20, 45, [0, 255, 0], 1)?;
+    expect_px("both layers: red (right)", &both, 140, 45, [255, 0, 0], 1)?;
+    // Mute "red": the picture shows through on the right; copy reads black on the left.
+    r.set_hidden_layers(["red".to_string()].into());
+    let muted = shot(&mut r, &m, at_shot(0, 0.5), 1.0)?;
+    expect_px("red muted: copy reads black", &muted, 20, 45, [0, 0, 0], 1)?;
+    expect_px("red muted: the picture", &muted, 140, 45, [51, 102, 153], 1)?;
+    // Unmuted again: the same frame as before.
+    r.set_hidden_layers(Default::default());
+    let back = shot(&mut r, &m, at_shot(0, 0.5), 1.0)?;
+    expect_same("after unmuting", &back, &both, 0, 0.0)?;
     Ok(String::new())
 }
 

@@ -1,0 +1,2 @@
+# Engine contract: blend modes, @picture and @<layer> need shotglass 0.1.5.
+shotglass = "0.1.5"

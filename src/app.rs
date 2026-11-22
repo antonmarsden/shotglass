@@ -167,6 +167,10 @@ struct Player {
     loop_film: bool,
     volume: f32,
     muted: bool,
+    /// Layers left out of the preview (#72): muted ones, or all but the soloed one.
+    /// Export and the CLI never hide anything; the transport warns while any is.
+    layer_mute: std::collections::HashSet<String>,
+    layer_solo: Option<String>,
     last_input: Instant,
     show_panel: bool,
     scrub_resume: Option<bool>,
@@ -296,6 +300,8 @@ impl Player {
             loop_film: false,
             volume: 0.8,
             muted: false,
+            layer_mute: Default::default(),
+            layer_solo: None,
             last_input: Instant::now(),
             show_panel: true,
             scrub_resume: None,
@@ -322,6 +328,7 @@ impl Player {
         }
         match self.renderer.set_movie(&m) {
             Ok(()) => {
+                self.renderer.set_hidden_layers(self.hidden_in(&m));
                 self.shader_errors.clear();
                 self.sound_errors.clear();
                 // Compile what's on screen right now; the rest follows in the background.
@@ -961,6 +968,11 @@ impl Player {
                     .monospace()
                     .size(14.0),
             );
+            if !self.hidden_layers().is_empty() {
+                ui.separator();
+                ui.label(RichText::new("layers muted").color(Color32::from_rgb(255, 190, 90)))
+                    .on_hover_text("some layers are muted or another is soloed: the preview differs from still and export");
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let mut vol = self.volume;
                 ui.add(egui::Slider::new(&mut vol, 0.0..=1.0).show_value(false)).on_hover_text("volume");
@@ -978,10 +990,76 @@ impl Player {
         });
     }
 
+    /// The layers left out of the preview: all but the soloed one, else the muted ones.
+    fn hidden_layers(&self) -> std::collections::HashSet<String> {
+        match &self.movie {
+            Some(m) => self.hidden_in(m),
+            None => Default::default(),
+        }
+    }
+
+    fn hidden_in(&self, m: &Movie) -> std::collections::HashSet<String> {
+        match &self.layer_solo {
+            Some(solo) if m.layers.iter().any(|l| &l.id == solo) => m
+                .layers
+                .iter()
+                .filter(|l| &l.id != solo)
+                .map(|l| l.id.clone())
+                .collect(),
+            _ => m
+                .layers
+                .iter()
+                .filter(|l| self.layer_mute.contains(&l.id))
+                .map(|l| l.id.clone())
+                .collect(),
+        }
+    }
+
+    /// Mute (M) and solo (S) per layer, under the timeline.
+    fn layer_controls(&mut self, ui: &mut egui::Ui) {
+        let Some(m) = self.movie.clone() else { return };
+        if m.layers.is_empty() {
+            return;
+        }
+        let before = self.hidden_layers();
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("layers").small().weak());
+            for l in &m.layers {
+                ui.label(RichText::new(&l.id).small());
+                let muted = self.layer_mute.contains(&l.id);
+                if ui
+                    .selectable_label(muted, "M")
+                    .on_hover_text("mute this layer in the preview")
+                    .clicked()
+                {
+                    if muted {
+                        self.layer_mute.remove(&l.id);
+                    } else {
+                        self.layer_mute.insert(l.id.clone());
+                    }
+                }
+                let solo = self.layer_solo.as_deref() == Some(l.id.as_str());
+                if ui
+                    .selectable_label(solo, "S")
+                    .on_hover_text("show only this layer in the preview")
+                    .clicked()
+                {
+                    self.layer_solo = if solo { None } else { Some(l.id.clone()) };
+                }
+                ui.add_space(6.0);
+            }
+        });
+        let after = self.hidden_layers();
+        if after != before {
+            self.renderer.set_hidden_layers(after);
+        }
+    }
+
     fn timeline(&mut self, ui: &mut egui::Ui) {
         let Some(m) = self.movie.clone() else { return };
+        let rows = m.layers.len() as f32;
         let (rect, resp) = ui.allocate_exact_size(
-            Vec2::new(ui.available_width(), 86.0),
+            Vec2::new(ui.available_width(), 86.0 + 12.0 * rows),
             Sense::click_and_drag(),
         );
         let p = ui.painter_at(rect);
@@ -1100,6 +1178,40 @@ impl Player {
                     label,
                     egui::FontId::proportional(11.0),
                     Color32::from_rgb(255, 210, 150),
+                );
+            }
+        }
+        // layers (#72): one row each under the shots, bottom of the stack first; the
+        // fades are the lighter ends. Hidden layers (muted, or not the soloed one) grey.
+        let hidden = self.hidden_layers();
+        for (i, l) in m.layers.iter().enumerate() {
+            let y = rect.top() + 82.0 + 12.0 * i as f32;
+            let r =
+                Rect::from_min_max(Pos2::new(x_of(l.start), y), Pos2::new(x_of(l.end), y + 9.0));
+            let on = !hidden.contains(&l.id);
+            let c = if on {
+                Color32::from_rgb(170, 120, 210)
+            } else {
+                Color32::from_gray(70)
+            };
+            p.rect_filled(r, 2.0, c);
+            for (a, b) in [(l.start, l.start + l.fade.0), (l.end - l.fade.1, l.end)] {
+                if b > a {
+                    let f = Rect::from_min_max(Pos2::new(x_of(a), y), Pos2::new(x_of(b), y + 9.0));
+                    p.rect_filled(f, 2.0, Color32::from_white_alpha(50));
+                }
+            }
+            if r.width() > 7.0 * l.id.len() as f32 + 6.0 {
+                p.text(
+                    Pos2::new(r.left() + 3.0, y + 4.5),
+                    egui::Align2::LEFT_CENTER,
+                    &l.id,
+                    egui::FontId::proportional(9.5),
+                    if on {
+                        Color32::WHITE
+                    } else {
+                        Color32::from_gray(150)
+                    },
                 );
             }
         }
@@ -1413,6 +1525,7 @@ impl eframe::App for Player {
             ui.add_space(4.0);
             self.transport(ui);
             self.timeline(ui);
+            self.layer_controls(ui);
             ui.add_space(4.0);
         });
         if self.show_panel {

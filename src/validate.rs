@@ -8,7 +8,9 @@
 //!
 //! The entry point for other tools (the web player, #2) is [`validate_movie`].
 
-use crate::gfx::{ShaderError, layer_source, scene_source, transition_source, vertex_source};
+use crate::gfx::{
+    ShaderError, blend_source, layer_source, scene_source, transition_source, vertex_source,
+};
 use crate::movie::Movie;
 use crate::shader::{Assembled, Dialect, remap_log};
 use crate::sound::{mix_source, music_source, shot_sound_source};
@@ -86,6 +88,12 @@ pub fn movie_sources(m: &Movie, d: Dialect) -> Vec<Source> {
             crate::movie::LayerScene::Pass(k) => format!("layer \"{}\" ({k})", layer.id),
         };
         frag(what, layer_source(d, layer, &cues, m));
+        if let Some(b) = &layer.blend {
+            frag(
+                format!("blend of layer \"{}\" ({b})", layer.id),
+                blend_source(d, layer, b, &cues, m),
+            );
+        }
     }
     if let Some(p) = &m.music {
         frag(format!("music ({})", rel(p)), music_source(d, m, &cues, p));
@@ -475,6 +483,18 @@ mod tests {
         let m = Movie::load(&root).unwrap();
         assert!(m.warnings.is_empty(), "{:?}", m.warnings);
         assert!(!m.layers.is_empty() && m.contract_warning().is_none());
+        for d in all_dialects() {
+            expect_clean(&m, d);
+        }
+    }
+
+    /// The golden film for blends and layer references has no libraries.
+    #[test]
+    fn blends_film_passes_everywhere() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/films/blends");
+        let m = Movie::load(&root).unwrap();
+        assert!(m.warnings.is_empty(), "{:?}", m.warnings);
+        assert!(m.layers.iter().any(|l| l.blend.is_some()) && m.contract_warning().is_none());
         for d in all_dialects() {
             expect_clean(&m, d);
         }

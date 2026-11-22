@@ -231,7 +231,7 @@ pub fn shot_memory(
         let size = match &c.source {
             crate::movie::Source::Image(f) => dimensions(&f.file),
             crate::movie::Source::Text(t) => t.layout().ok().map(|(l, _)| (l.width, l.height)),
-            crate::movie::Source::Input => None,
+            _ => None, // another pass's picture, not a texture
         };
         if let Some((w, h)) = size {
             let b = gpu_bytes(w, h);

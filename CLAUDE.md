@@ -61,14 +61,14 @@ cargo fmt && cargo clippy --all-targets -- -D warnings
 | `bundle.rs` | `licenses` (libraries a film includes, SPDX licences, non-commercial flag; film-folder fonts with their `licence`), `freeze`/`unfreeze` and `bundle` (one writer: exactly the included library files in `shotglass-libs/`, a `shotglass.toml` marked frozen, lock `path` entries; `bundle` adds the film folder and `LIBRARY-LICENSES.md`) |
 | `glsl_test.rs` | `shotglass test` (#63): `*.test.glsl` discovery, `test_*` scan (`Param`, `Grid`, `// samples:`), `number_assertions` (id inserted into each `expect*(` call), the test prelude (engine contract), dispatcher (pixel → test sample, RGBA32UI MRT results), banded draws, decode → first failure per test |
 | `validate.rs` | strict, driver-independent check (glslang) of every assembled shader; `validate_movie(m, dialect)` is the API `check`/`check --web` and the web player use |
-| `gfx.rs` | `Renderer`: lazy prioritised compiles, program cache (disk + LRU), textures (decode thread → banded uploads in `pump` → `glGenerateMipmap`; sampler objects; LRU under a 256 MB budget), off-screen targets, transitions/freeze, layers (picture → `work[0]`; each active layer drawn into `layer` at its scale, then the over pass into the other `work`; final copy; `@input` = `INPUT_TEX`; layers follow shots in `wanted`), strips, GPU timer, audio blocks (submit → PBO + fence → poll/wait) |
+| `gfx.rs` | `Renderer`: lazy prioritised compiles, program cache (disk + LRU), textures (decode thread → banded uploads in `pump` → `glGenerateMipmap`; sampler objects; LRU under a 256 MB budget), off-screen targets, transitions/freeze, layers (picture → `picture`; each active layer drawn into `layer` at its scale, or its own exact-size `held[j]` when a later layer reads it, then the over pass or its blend pass (in `ShotKeys::trans`) into a `work` picture; final copy; pass keys `INPUT_TEX`/`PICTURE_TEX`/`LAYER_TEX - j`; layers follow shots in `wanted`; `set_hidden_layers` for the player's mute/solo), strips, GPU timer, audio blocks (submit → PBO + fence → poll/wait) |
 | `sound.rs` | `Soundtrack`: music / per-shot / mix tracks synthesised in cached chunks; `chunk` blocks, `stream` never does |
 | `audio.rs` | cpal output, lock-free `fill` callback, chunk store (wraps for loop films, `wrap_span`), master `Clock` (f64, `set_loop`), WAV writer |
 | `app.rs` | egui player: transport, timeline, panels, live reload, auto scale, sound streaming |
 | `headless.rs` | hidden-window GL context for CLI commands |
 | `selftest.rs` | GPU/sound checks on fixture films written to a temp dir |
-| `tests/golden.rs`, `tests/golden/` | golden tests: 8-frame 320x180 strips and 8 kHz soundtracks of the demo and the template, a strip of `tests/films/channels` (textures), a strip of `tests/films/text` (text blocks, distance field, RTL, iChannel6/7), a strip of `tests/films/layers` (spans, fades, fixed scale, `@input`), and a two-period strip and the soundtrack of `tests/films/loop` (`loop = true`), vs reference PNGs / WAVs |
-| `glsl/copy.glsl`, `glsl/over.glsl` | the engine's internal copy pass and layer composite (premultiplied over); not transitions films can name |
+| `tests/golden.rs`, `tests/golden/` | golden tests: 8-frame 320x180 strips and 8 kHz soundtracks of the demo and the template, a strip of `tests/films/channels` (textures), a strip of `tests/films/text` (text blocks, distance field, RTL, iChannel6/7), a strip of `tests/films/layers` (spans, fades, fixed scale, `@input`), a strip of `tests/films/blends` (blend passes, `@picture`, `@<layer>`), and a two-period strip and the soundtrack of `tests/films/loop` (`loop = true`), vs reference PNGs / WAVs |
+| `glsl/copy.glsl`, `glsl/over.glsl` | the engine's internal copy pass and layer composite (premultiplied over, × opacity); not transitions films can name |
 | `movies/big-shadow/` | demo film; `templates/new/` is what `shotglass new` writes |
 
 ## Invariants (each was a real bug; most have a test)
@@ -143,8 +143,9 @@ cargo fmt && cargo clippy --all-targets -- -D warnings
   were removed (the kit has them). Don't add built-in GLSL. The exceptions are contract,
   not looks: the `shotglass test` prelude (`glsl_test::prelude`: the `expect*`
   assertions, only test shaders get it), and, from layers (#69), the layer footer
-  (premultiply × opacity, premultiplied source-over, matte multiply, `SG_HAS_*` defines),
-  which defines what a layer at opacity o *is*. Every other blend mode and effect is kit GLSL.
+  (premultiply), the over pass (premultiplied source-over × opacity), the blend header
+  (`getBase`/`getLayer`/`opacity`), matte multiply and `SG_HAS_*` defines, which define
+  what a layer at opacity o *is*. Every other blend mode and effect is kit GLSL.
 - **Channel entries are classified in one place**, `movie::ChannelSource::of`, by spelling
   (`""`, `@output`, `[textures]` name, image / `####` sequence / video path); kinds not built
   yet are refused with the version that brings them. The count is `movie::N_CHANNELS`
@@ -154,8 +155,11 @@ cargo fmt && cargo clippy --all-targets -- -D warnings
 - **Layers: a frame shows only when every active layer is ready** (`usable` for each, plus the
   over program), never the picture without a layer `still` would draw (selftest "layers:
   playback waits…"). Films without layers take exactly the old path (no extra passes, same
-  cues, same goldens). `@input` binds the full-size working picture (exact size); layer
-  footers premultiply × opacity (engine GLSL by ruling, #67).
+  cues, same goldens). `@input`/`@picture` bind full-size pictures, `@<layer>` a held target of
+  exactly that layer's size; a pass that isn't drawn this frame (inactive, hidden) reads black.
+  Opacity is applied by the composite, not the footer, so `@<layer>` sees the layer itself
+  (an `opacity = 0` helper pass works). Hidden layers are a preview-only thing: export never
+  sets them (selftest "layers: hidden…").
 - **Text blocks are deterministic and laid out off the render thread.** Bytes depend only on
   the font files, the `[texts]` entry and the engine (no system fonts, no hinting, plain
   IEEE maths, exact EDT; `text::tests::raster_is_pinned` pins a sha256: bump it on purpose,
