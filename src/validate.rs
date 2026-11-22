@@ -8,7 +8,7 @@
 //!
 //! The entry point for other tools (the web player, #2) is [`validate_movie`].
 
-use crate::gfx::{ShaderError, scene_source, transition_source, vertex_source};
+use crate::gfx::{ShaderError, layer_source, scene_source, transition_source, vertex_source};
 use crate::movie::Movie;
 use crate::shader::{Assembled, Dialect, remap_log};
 use crate::sound::{mix_source, music_source, shot_sound_source};
@@ -73,6 +73,19 @@ pub fn movie_sources(m: &Movie, d: Dialect) -> Vec<Source> {
             format!("shot \"{}\" ({})", shot.id, rel(&shot.scene)),
             scene_source(d, shot, &cues, m),
         );
+    }
+    if !m.layers.is_empty() {
+        frag(
+            "layer composite".into(),
+            transition_source(d, "over", &[], &cues, m),
+        );
+    }
+    for layer in &m.layers {
+        let what = match &layer.scene {
+            crate::movie::LayerScene::File(p) => format!("layer \"{}\" ({})", layer.id, rel(p)),
+            crate::movie::LayerScene::Pass(k) => format!("layer \"{}\" ({k})", layer.id),
+        };
+        frag(what, layer_source(d, layer, &cues, m));
     }
     if let Some(p) = &m.music {
         frag(format!("music ({})", rel(p)), music_source(d, m, &cues, p));
@@ -450,6 +463,18 @@ mod tests {
         let m = Movie::load(&root).unwrap();
         assert!(m.warnings.is_empty(), "{:?}", m.warnings);
         assert!(m.uses_channels() && m.contract_warning().is_none());
+        for d in all_dialects() {
+            expect_clean(&m, d);
+        }
+    }
+
+    /// The golden film for layers has no libraries (its transition is a film file).
+    #[test]
+    fn layers_film_passes_everywhere() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/films/layers");
+        let m = Movie::load(&root).unwrap();
+        assert!(m.warnings.is_empty(), "{:?}", m.warnings);
+        assert!(!m.layers.is_empty() && m.contract_warning().is_none());
         for d in all_dialects() {
             expect_clean(&m, d);
         }

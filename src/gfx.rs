@@ -6,7 +6,7 @@
 
 use crate::anim::Anim;
 use crate::movie::TransitionKind;
-use crate::movie::{At, Movie, N_CHANNELS, Shot, glsl_float};
+use crate::movie::{At, Layer, LayerScene, Movie, N_CHANNELS, Shot, glsl_float};
 use crate::shader::{Assembled, Builder, Dialect, DriverGlsl, remap_log};
 use crate::texture::{DecodedImage, Filter, Wrap};
 use anyhow::{Result, anyhow};
@@ -19,6 +19,17 @@ use toodee::{TooDeeOps, TooDeeOpsMut, TranslateOps};
 /// The engine's own pass that shows one shot unchanged (`transition_source(.., "copy", ..)`).
 /// Not a transition films can name: their transitions come from libraries or files.
 const COPY: &str = include_str!("glsl/copy.glsl");
+/// The engine's layer composite: premultiplied source-over (#69).
+const OVER: &str = include_str!("glsl/over.glsl");
+
+/// A layer's footer (#69): `mainImage` writes straight alpha (alpha 1 unless it writes
+/// one); the stored layer is premultiplied and multiplied by the layer's opacity.
+/// Engine GLSL by the owner's ruling (#67): it defines what a layer at opacity o is.
+const LAYER_FOOTER: &str = "void main(){\n  vec4 c = vec4(0.0, 0.0, 0.0, 1.0);\n  mainImage(c, gl_FragCoord.xy);\n  float a = clamp(c.a, 0.0, 1.0) * sg_opacity;\n  shotglass_out = vec4(c.rgb * a, a);\n}";
+
+/// The `ChanKey::tex` of an `@input` channel: the working picture below the layer,
+/// bound by the frame, not a texture in the store.
+const INPUT_TEX: u64 = u64::MAX;
 
 const VERTEX: &str = "out vec2 sg_uv;\nvoid main(){\n  vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));\n  sg_uv = p;\n  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);\n}\n";
 
@@ -263,7 +274,8 @@ pub struct Renderer {
     /// Every program source we know about, keyed by a hash of its full text.
     programs: HashMap<u64, Entry>,
     copy: Option<u64>,
-    /// Programs for each shot of the current movie version.
+    over: Option<u64>,
+    /// Programs for each shot of the current movie version, then each layer.
     wanted: Vec<ShotKeys>,
     wanted_ids: Vec<String>,
     /// Last working programs per shot id, shown while a new version compiles or fails.
@@ -310,6 +322,10 @@ pub struct Renderer {
     b: Option<Target>,
     freeze: Option<Target>,
     out: Option<Target>,
+    /// Layers (#69): two full-size working pictures (the picture so far, and the next)
+    /// and the scratch target a layer draws into at its scale.
+    work: [Option<Target>; 2],
+    layer: Option<Target>,
     /// Draw the output upside down for readback (`set_readback`), and whether the
     /// current output was drawn that way.
     flip_output: bool,
@@ -484,6 +500,7 @@ impl Renderer {
                 dummy,
                 programs: HashMap::new(),
                 copy: None,
+                over: None,
                 wanted: vec![],
                 wanted_ids: vec![],
                 fallback: HashMap::new(),
@@ -514,6 +531,8 @@ impl Renderer {
                 b: None,
                 freeze: None,
                 out: None,
+                work: [None, None],
+                layer: None,
                 flip_output: false,
                 out_flipped: false,
                 freeze_key: None,
@@ -606,6 +625,79 @@ impl Renderer {
     /// Switch to a new version of the movie. Sources are assembled now (so a missing
     /// file is reported at once); compiling happens later, nearest the playhead first.
     /// On error nothing changes.
+    /// Texture keys for a shot's or layer's channels, adding new textures to the store
+    /// (`Idle`). A missing file is an error for `what`; `@input` gets `INPUT_TEX`.
+    fn channel_keys(
+        &mut self,
+        what: &str,
+        channels: &[Option<crate::movie::Channel>; N_CHANNELS],
+        tex_errors: &mut Vec<ShaderError>,
+    ) -> [Option<ChanKey>; N_CHANNELS] {
+        let mut keys = [None; N_CHANNELS];
+        for (n, c) in channels.iter().enumerate() {
+            let Some(c) = c else { continue };
+            if c.source == crate::movie::Source::Input {
+                keys[n] = Some(ChanKey {
+                    tex: INPUT_TEX,
+                    filter: c.filter,
+                    wrap: c.wrap,
+                });
+                continue;
+            }
+            // The key covers every file the texture reads (path, size, mtime) and
+            // how its texels are made, so an edit to any of them reloads it.
+            let mut stamp = String::new();
+            let mut missing = None;
+            for f in c.files() {
+                match std::fs::metadata(&f.file) {
+                    Ok(md) => {
+                        let mtime = md
+                            .modified()
+                            .ok()
+                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                            .map_or(0, |d| d.as_nanos());
+                        stamp += &format!("{}\0{}\0{mtime}\0", f.file.display(), md.len());
+                    }
+                    Err(e) => {
+                        missing = Some(format!("\"{}\": {e}", f.label));
+                        break;
+                    }
+                }
+            }
+            if let Some(m) = missing {
+                tex_errors.push(ShaderError {
+                    what: "movie.toml".into(),
+                    messages: vec![format!("{what}: channels[{n}]: {m}")],
+                });
+                continue;
+            }
+            let source = match &c.source {
+                crate::movie::Source::Image(f) => TexSource::File(f.file.clone()),
+                crate::movie::Source::Text(t) => TexSource::Text(t.clone()),
+                crate::movie::Source::Input => unreachable!("handled above"),
+            };
+            let made = match &c.source {
+                crate::movie::Source::Image(_) | crate::movie::Source::Input => String::new(),
+                crate::movie::Source::Text(t) => format!("{t:?}"),
+            };
+            let tex = hash(&format!("{stamp}{made}\0{}\0{}", c.vflip, c.srgb));
+            self.textures.entry(tex).or_insert(TexEntry {
+                source,
+                label: c.label(),
+                vflip: c.vflip,
+                srgb: c.srgb,
+                state: TexState::Idle,
+                last_used: 0,
+            });
+            keys[n] = Some(ChanKey {
+                tex,
+                filter: c.filter,
+                wrap: c.wrap,
+            });
+        }
+        keys
+    }
+
     pub fn set_movie(&mut self, movie: &Movie) -> std::result::Result<(), Vec<ShaderError>> {
         let dialect = self.dialect_for(movie).map_err(|e| {
             vec![ShaderError {
@@ -661,59 +753,11 @@ impl Renderer {
                 }
                 None => Some(None),
             };
-            let mut channels = [None; N_CHANNELS];
-            for (n, c) in shot.channels.iter().enumerate() {
-                let Some(c) = c else { continue };
-                // The key covers every file the texture reads (path, size, mtime) and
-                // how its texels are made, so an edit to any of them reloads it.
-                let mut stamp = String::new();
-                let mut missing = None;
-                for f in c.files() {
-                    match std::fs::metadata(&f.file) {
-                        Ok(md) => {
-                            let mtime = md
-                                .modified()
-                                .ok()
-                                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                                .map_or(0, |d| d.as_nanos());
-                            stamp += &format!("{}\0{}\0{mtime}\0", f.file.display(), md.len());
-                        }
-                        Err(e) => {
-                            missing = Some(format!("\"{}\": {e}", f.label));
-                            break;
-                        }
-                    }
-                }
-                if let Some(m) = missing {
-                    tex_errors.push(ShaderError {
-                        what: "movie.toml".into(),
-                        messages: vec![format!("shot \"{}\": channels[{n}]: {m}", shot.id)],
-                    });
-                    continue;
-                }
-                let source = match &c.source {
-                    crate::movie::Source::Image(f) => TexSource::File(f.file.clone()),
-                    crate::movie::Source::Text(t) => TexSource::Text(t.clone()),
-                };
-                let made = match &c.source {
-                    crate::movie::Source::Image(_) => String::new(),
-                    crate::movie::Source::Text(t) => format!("{t:?}"),
-                };
-                let tex = hash(&format!("{stamp}{made}\0{}\0{}", c.vflip, c.srgb));
-                self.textures.entry(tex).or_insert(TexEntry {
-                    source,
-                    label: c.label(),
-                    vflip: c.vflip,
-                    srgb: c.srgb,
-                    state: TexState::Idle,
-                    last_used: 0,
-                });
-                channels[n] = Some(ChanKey {
-                    tex,
-                    filter: c.filter,
-                    wrap: c.wrap,
-                });
-            }
+            let channels = self.channel_keys(
+                &format!("shot \"{}\"", shot.id),
+                &shot.channels,
+                &mut tex_errors,
+            );
             if let (Some(scene), Some(trans)) = (scene, trans) {
                 wanted.push(ShotKeys {
                     scene,
@@ -722,6 +766,33 @@ impl Renderer {
                 });
             }
         }
+        // Layers (#69): their programs and channels follow the shots in `wanted`.
+        for layer in &movie.layers {
+            let src = layer_source(dialect, layer, &cues, movie);
+            let what = match &layer.scene {
+                LayerScene::File(p) => format!("layer \"{}\" ({})", layer.id, rel(p, &movie.root)),
+                LayerScene::Pass(k) => format!("layer \"{}\" ({k})", layer.id),
+            };
+            let scene = add(self, what, src);
+            let channels = self.channel_keys(
+                &format!("layer \"{}\"", layer.id),
+                &layer.channels,
+                &mut tex_errors,
+            );
+            if let Some(scene) = scene {
+                wanted.push(ShotKeys {
+                    scene,
+                    trans: None,
+                    channels,
+                });
+            }
+        }
+        let over = if movie.layers.is_empty() {
+            None
+        } else {
+            let src = transition_source(dialect, "over", &[], &cues, movie);
+            add(self, "layer composite".into(), src)
+        };
         errors.extend(tex_errors);
         warnings.dedup();
         self.warnings = warnings;
@@ -737,9 +808,16 @@ impl Renderer {
         }
         self.dialect = dialect;
         self.wanted = wanted;
-        self.wanted_ids = movie.shots.iter().map(|s| s.id.clone()).collect();
-        self.fallback
-            .retain(|id, _| movie.shots.iter().any(|s| &s.id == id));
+        self.wanted_ids = movie
+            .shots
+            .iter()
+            .map(|s| s.id.clone())
+            .chain(movie.layers.iter().map(|l| l.id.clone()))
+            .collect();
+        self.fallback.retain(|id, _| {
+            movie.shots.iter().any(|s| &s.id == id) || movie.layers.iter().any(|l| &l.id == id)
+        });
+        self.over = over;
         self.copy = copy;
         if let Some(c) = copy {
             self.compile_now(c);
@@ -797,6 +875,7 @@ impl Renderer {
             .flat_map(|k| [Some(k.scene), k.trans])
             .flatten()
             .chain(self.copy)
+            .chain(self.over)
         {
             if let Some(Entry {
                 state: State::Failed(m),
@@ -956,6 +1035,20 @@ impl Renderer {
             };
             let d = distance(movie, shot, t);
             v.extend(k.channels.iter().flatten().map(|c| (c.tex, d)));
+        }
+        let n = movie.shots.len();
+        for (j, layer) in movie.layers.iter().enumerate() {
+            let Some(k) = self.wanted.get(n + j) else {
+                continue;
+            };
+            let d = layer_distance(movie, layer, t);
+            v.extend(
+                k.channels
+                    .iter()
+                    .flatten()
+                    .filter(|c| c.tex != INPUT_TEX)
+                    .map(|c| (c.tex, d)),
+            );
         }
         v.sort_by(|a, b| a.1.total_cmp(&b.1));
         let mut seen = std::collections::HashSet::new();
@@ -1172,10 +1265,11 @@ impl Renderer {
     }
 
     fn texture_ready(&self, k: u64) -> bool {
-        matches!(
-            self.textures.get(&k).map(|e| &e.state),
-            Some(TexState::Ready { .. })
-        )
+        k == INPUT_TEX
+            || matches!(
+                self.textures.get(&k).map(|e| &e.state),
+                Some(TexState::Ready { .. })
+            )
     }
 
     /// Keep resident texture memory under the budget: drop the least recently used
@@ -1242,6 +1336,23 @@ impl Renderer {
             v.push((k.scene, d));
             if let Some(tr) = k.trans {
                 v.push((tr, d));
+            }
+        }
+        let n = movie.shots.len();
+        for (j, layer) in movie.layers.iter().enumerate() {
+            if let Some(k) = self.wanted.get(n + j) {
+                v.push((k.scene, layer_distance(movie, layer, t)));
+            }
+        }
+        // The layer composite is needed as soon as any layer is near.
+        if let Some(o) = self.over {
+            let d = movie
+                .layers
+                .iter()
+                .map(|l| layer_distance(movie, l, t))
+                .fold(f32::INFINITY, f32::min);
+            if d.is_finite() {
+                v.push((o, d));
             }
         }
         v.sort_by(|a, b| a.1.total_cmp(&b.1));
@@ -1346,7 +1457,8 @@ impl Renderer {
     }
 
     fn collect_garbage(&mut self) {
-        let mut keep: std::collections::HashSet<u64> = self.copy.into_iter().collect();
+        let mut keep: std::collections::HashSet<u64> =
+            self.copy.into_iter().chain(self.over).collect();
         for k in self.wanted.iter().chain(self.fallback.values()) {
             keep.insert(k.scene);
             if let Some(t) = k.trans {
@@ -1406,6 +1518,7 @@ impl Renderer {
             .filter(|(k, _)| {
                 !near.contains(k)
                     && Some(*k) != self.copy
+                    && Some(*k) != self.over
                     && !self
                         .fallback
                         .values()
@@ -1655,8 +1768,26 @@ impl Renderer {
         for &i in &needed {
             keys.push(self.usable(i, blocking)?);
         }
+        // Layers (#69): a frame is usable only when every active layer is, so playback
+        // never shows a frame without a layer that `still` and `export` would draw.
+        let n_shots = movie.shots.len();
+        let active = movie.layers_at(info.t);
+        let mut layer_keys = vec![];
+        for &(j, _) in &active {
+            layer_keys.push(self.usable(n_shots + j, blocking)?);
+        }
+        let over = if active.is_empty() {
+            None
+        } else {
+            let o = self.over?;
+            if blocking {
+                self.compile_now(o);
+            }
+            self.prog(o)?;
+            Some(o)
+        };
         let frame_no = self.frame_no;
-        for k in &keys {
+        for k in keys.iter().chain(&layer_keys) {
             for x in [Some(k.scene), k.trans].into_iter().flatten() {
                 if let Some(e) = self.programs.get_mut(&x) {
                     e.last_used = frame_no;
@@ -1674,11 +1805,18 @@ impl Renderer {
         ensure_target(&self.gl, &mut self.a, w, h);
         ensure_target(&self.gl, &mut self.b, w, h);
         ensure_target(&self.gl, &mut self.out, w, h);
+        // With layers, the picture track goes into a working picture first.
+        let pic_dest = over.map(|_| Which::Work(0));
+        if over.is_some() {
+            ensure_target(&self.gl, &mut self.work[0], w, h);
+            ensure_target(&self.gl, &mut self.work[1], w, h);
+            ensure_target(&self.gl, &mut self.layer, w, h);
+        }
         match at {
             At::Shot { shot, local } => {
                 self.draw_scene(
                     keys[0],
-                    &movie.shots[shot],
+                    &Item::shot(&movie.shots[shot], local),
                     local,
                     Which::A,
                     sw,
@@ -1686,7 +1824,7 @@ impl Renderer {
                     info,
                     movie,
                 );
-                self.composite(copy, Which::A, Which::A, 0.0, w, h);
+                self.composite_into(copy, Which::A, Which::A, 0.0, w, h, pic_dest);
             }
             At::Transition {
                 from,
@@ -1708,7 +1846,7 @@ impl Renderer {
                         let freeze_local = movie.shots[to].start - movie.shots[from].start;
                         self.draw_scene(
                             keys[0],
-                            &movie.shots[from],
+                            &Item::shot(&movie.shots[from], freeze_local),
                             freeze_local,
                             Which::Freeze,
                             sw,
@@ -1722,7 +1860,7 @@ impl Renderer {
                 } else {
                     self.draw_scene(
                         keys[0],
-                        &movie.shots[from],
+                        &Item::shot(&movie.shots[from], from_local),
                         from_local,
                         Which::A,
                         sw,
@@ -1734,7 +1872,7 @@ impl Renderer {
                 };
                 self.draw_scene(
                     keys[1],
-                    &movie.shots[to],
+                    &Item::shot(&movie.shots[to], to_local),
                     to_local,
                     Which::B,
                     sw,
@@ -1747,8 +1885,46 @@ impl Renderer {
                     .trans
                     .filter(|k| self.prog(*k).is_some())
                     .unwrap_or(copy);
-                self.composite(tp, from_target, Which::B, eased, w, h);
+                self.composite_into(tp, from_target, Which::B, eased, w, h, pic_dest);
             }
+        }
+        if let Some(over) = over {
+            // Each layer bottom to top: draw it at its scale (premultiplied, opacity
+            // applied), then composite it over the picture so far into the other
+            // working picture. The last one is copied to the output.
+            let mut cur = 0;
+            for (&(j, local), k) in active.iter().zip(&layer_keys) {
+                let layer = &movie.layers[j];
+                let (lw, lh) = match layer.scale {
+                    None => (sw, sh),
+                    Some(s) => (
+                        ((w as f32 * s).round() as i32).clamp(1, w),
+                        ((h as f32 * s).round() as i32).clamp(1, h),
+                    ),
+                };
+                let below = self.work[cur].as_ref().unwrap().tex;
+                let item = Item {
+                    start: layer.start,
+                    duration: layer.duration(),
+                    itime: layer.scene_time(local),
+                    uniforms: &layer.uniforms,
+                    opacity: Some(layer.opacity_at(local)),
+                    input: Some((below, w as usize, h as usize)),
+                };
+                self.draw_scene(*k, &item, local, Which::Layer, lw, lh, info, movie);
+                let next = 1 - cur;
+                self.composite_into(
+                    over,
+                    Which::Work(cur),
+                    Which::Layer,
+                    0.0,
+                    w,
+                    h,
+                    Some(Which::Work(next)),
+                );
+                cur = next;
+            }
+            self.composite(copy, Which::Work(cur), Which::Work(cur), 0.0, w, h);
         }
         if let Some(timer) = &mut self.timer {
             timer.end(&self.gl);
@@ -1816,6 +1992,18 @@ impl Renderer {
             Which::A => self.a.as_ref().unwrap(),
             Which::B => self.b.as_ref().unwrap(),
             Which::Freeze => self.freeze.as_ref().unwrap(),
+            Which::Work(i) => self.work[i].as_ref().unwrap(),
+            Which::Layer => self.layer.as_ref().unwrap(),
+        }
+    }
+
+    fn target_mut(&mut self, w: Which) -> &mut Target {
+        match w {
+            Which::A => self.a.as_mut().unwrap(),
+            Which::B => self.b.as_mut().unwrap(),
+            Which::Freeze => self.freeze.as_mut().unwrap(),
+            Which::Work(i) => self.work[i].as_mut().unwrap(),
+            Which::Layer => self.layer.as_mut().unwrap(),
         }
     }
 
@@ -1823,7 +2011,7 @@ impl Renderer {
     fn draw_scene(
         &mut self,
         keys: ShotKeys,
-        shot: &Shot,
+        item: &Item<'_>,
         local: f32,
         into: Which,
         sw: i32,
@@ -1832,19 +2020,16 @@ impl Renderer {
         movie: &Movie,
     ) {
         let gl = self.gl.clone();
-        let t = match into {
-            Which::A => self.a.as_mut().unwrap(),
-            Which::B => self.b.as_mut().unwrap(),
-            Which::Freeze => self.freeze.as_mut().unwrap(),
-        };
+        let t = self.target_mut(into);
         t.used = (sw, sh);
         let fbo = t.fbo;
         let Some(p) = self.prog(keys.scene) else {
-            // failed with no working version: show black
+            // Failed with no working version: a shot shows black, a layer nothing.
+            let a = if item.opacity.is_some() { 0.0 } else { 1.0 };
             unsafe {
                 gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
                 gl.viewport(0, 0, sw, sh);
-                gl.clear_color(0.0, 0.0, 0.0, 1.0);
+                gl.clear_color(0.0, 0.0, 0.0, a);
                 gl.clear(glow::COLOR_BUFFER_BIT);
             }
             return;
@@ -1866,14 +2051,17 @@ impl Renderer {
             if let Some(l) = p.loc("iResolution") {
                 gl.uniform_3_f32(Some(l), sw as f32, sh as f32, 1.0);
             }
-            f1("iTime", shot.scene_time(local));
+            f1("iTime", item.itime);
             f1("iTimeDelta", info.dt);
             f1("iFrameRate", movie.fps);
             f1("iSampleRate", 44100.0);
-            f1("iMovieTime", shot.start + local);
+            f1("iMovieTime", item.start + local);
             f1("iShotTime", local);
-            f1("iShotDuration", shot.duration);
-            f1("iShotProgress", (local / shot.duration).clamp(0.0, 1.0));
+            f1("iShotDuration", item.duration);
+            f1("iShotProgress", (local / item.duration).clamp(0.0, 1.0));
+            if let Some(o) = item.opacity {
+                f1("sg_opacity", o);
+            }
             if let Some(l) = p.loc("iFrame") {
                 gl.uniform_1_i32(Some(l), info.frame);
             }
@@ -1881,7 +2069,7 @@ impl Renderer {
                 gl.uniform_4_f32(Some(l), 0.0, 0.0, 0.0, 0.0);
             }
             if let Some(l) = p.loc("iDate") {
-                gl.uniform_4_f32(Some(l), 2026.0, 0.0, 1.0, shot.start + local);
+                gl.uniform_4_f32(Some(l), 2026.0, 0.0, 1.0, item.start + local);
             }
             // Channels: the texture and its sampler on unit n (the iChannelN uniforms
             // were set to n at link time), or black with resolution 0.
@@ -1889,11 +2077,18 @@ impl Renderer {
             let mut meta = [0f32; 4 * N_CHANNELS];
             let mut sampled = false;
             for (n, c) in keys.channels.iter().enumerate() {
-                let ready = c.and_then(|c| match self.textures.get(&c.tex)?.state {
-                    TexState::Ready {
-                        tex, w, h, meta, ..
-                    } => Some((tex, w, h, meta, self.sampler(c))),
-                    _ => None,
+                let ready = c.and_then(|c| {
+                    if c.tex == INPUT_TEX {
+                        // The picture below the layer, exactly its size.
+                        let (tex, w, h) = item.input?;
+                        return Some((tex, w, h, [0.0; 4], self.sampler(c)));
+                    }
+                    match self.textures.get(&c.tex)?.state {
+                        TexState::Ready {
+                            tex, w, h, meta, ..
+                        } => Some((tex, w, h, meta, self.sampler(c))),
+                        _ => None,
+                    }
                 });
                 if ready.is_none() && p.loc(CHANNEL_UNIFORMS[n]).is_none() {
                     continue;
@@ -1919,7 +2114,7 @@ impl Renderer {
             if let Some(l) = p.loc("iChannelMeta") {
                 gl.uniform_4_f32_slice(Some(l), &meta);
             }
-            for (name, a) in &shot.uniforms {
+            for (name, a) in item.uniforms {
                 if let Some(l) = p.loc(name) {
                     set_anim(&gl, l, a, local);
                 }
@@ -1963,6 +2158,22 @@ impl Renderer {
     }
 
     fn composite(&mut self, prog: u64, from: Which, to: Which, progress: f32, w: i32, h: i32) {
+        self.composite_into(prog, from, to, progress, w, h, None);
+    }
+
+    /// `composite`, into a layer working picture (`dest`, never flipped) or, with
+    /// None, into the output (flipped for readback when asked).
+    #[allow(clippy::too_many_arguments)]
+    fn composite_into(
+        &mut self,
+        prog: u64,
+        from: Which,
+        to: Which,
+        progress: f32,
+        w: i32,
+        h: i32,
+        dest: Option<Which>,
+    ) {
         let gl = self.gl.clone();
         let (ft, tt) = (self.target(from), self.target(to));
         let scale = |t: &Target| {
@@ -1979,8 +2190,18 @@ impl Renderer {
         };
         let (fs, fm, ftex) = (scale(ft), maxv(ft), ft.tex);
         let (ts, tm, ttex) = (scale(tt), maxv(tt), tt.tex);
-        let out = self.out.as_ref().unwrap().fbo;
-        self.out_flipped = self.flip_output;
+        let flip = dest.is_none() && self.flip_output;
+        let out = match dest {
+            None => {
+                self.out_flipped = self.flip_output;
+                self.out.as_ref().unwrap().fbo
+            }
+            Some(d) => {
+                let t = self.target_mut(d);
+                t.used = (w, h);
+                t.fbo
+            }
+        };
         let Some(p) = self.prog(prog) else { return };
         unsafe {
             gl.bind_framebuffer(glow::FRAMEBUFFER, Some(out));
@@ -2014,7 +2235,7 @@ impl Renderer {
                 gl.uniform_1_f32(Some(l), w as f32 / h as f32);
             }
             if let Some(l) = p.loc("sg_flip") {
-                gl.uniform_1_i32(Some(l), self.flip_output as i32);
+                gl.uniform_1_i32(Some(l), flip as i32);
             }
             gl.draw_arrays(glow::TRIANGLES, 0, 3);
             gl.active_texture(glow::TEXTURE1);
@@ -2560,6 +2781,54 @@ pub fn scene_source(dialect: Dialect, shot: &Shot, cues: &str, movie: &Movie) ->
         .build())
 }
 
+/// The fragment shader for a layer (#69): the scene header plus the layer's
+/// opacity, its uniforms (with `SG_HAS_<name>` defines, so a library pass can default
+/// the ones a film leaves out), its params as `#define`s, the cues, then the scene
+/// (a film file or a library pass) and the layer footer.
+pub fn layer_source(
+    dialect: Dialect,
+    layer: &Layer,
+    cues: &str,
+    movie: &Movie,
+) -> Result<Assembled> {
+    let root = &movie.root;
+    let mut header = SCENE_HEADER.to_string();
+    header += "uniform float sg_opacity;\n";
+    for (name, a) in &layer.uniforms {
+        header += &format!("uniform {} {name};\n#define SG_HAS_{name}\n", a.glsl_type());
+    }
+    for (name, v) in &layer.params {
+        let val = match v.len() {
+            1 => glsl_float(v[0]),
+            n => format!(
+                "vec{n}({})",
+                v.iter()
+                    .map(|x| glsl_float(*x))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        };
+        header += &format!("#define {name} {val}\n");
+    }
+    header += cues;
+    let b = Builder::new(dialect, &header, root).libraries(&movie.libraries);
+    let b = match &layer.scene {
+        LayerScene::File(p) => b.file(p)?,
+        LayerScene::Pass(kind) => match crate::movie::transition_kind(kind) {
+            TransitionKind::File(p) => b.file(&root.join(p))?,
+            TransitionKind::Library(lib, file) => b.generated(
+                &format!("layer pass \"{kind}\""),
+                &format!("#include <{lib}/{file}>\n"),
+            )?,
+            TransitionKind::Name(_) => anyhow::bail!(
+                "layer \"{}\": type \"{kind}\" needs a library or a .glsl file",
+                layer.id
+            ),
+        },
+    };
+    Ok(b.footer(LAYER_FOOTER).build())
+}
+
 /// Which of `iChannel0..7` an assembled scene mentions, outside the header that
 /// declares them (`check` warns when a shot reads a channel it binds nothing to).
 pub fn channels_read(src: &Assembled) -> [bool; N_CHANNELS] {
@@ -2608,6 +2877,7 @@ pub fn transition_source(
             &format!("#include <{lib}/{file}>\n"),
         )?,
         TransitionKind::Name("copy") => b.builtin("copy", COPY)?,
+        TransitionKind::Name("over") => b.builtin("over", OVER)?,
         TransitionKind::Name(_) => anyhow::bail!(
             "unknown transition \"{kind}\"; use a library's (\"transitions/iris\") or \
              a file in the film (\"fx/iris.glsl\")"
@@ -2797,6 +3067,37 @@ enum Which {
     A,
     B,
     Freeze,
+    /// A layer working picture (#69): the picture so far, or the next one.
+    Work(usize),
+    /// Where a layer draws, at its scale.
+    Layer,
+}
+
+/// What `draw_scene` needs from a shot or a layer: its clock, uniforms and, for a
+/// layer, its opacity and the picture below it (for `@input`).
+struct Item<'a> {
+    /// Movie time at local 0 (`iMovieTime = start + local`).
+    start: f32,
+    duration: f32,
+    /// iTime at this frame.
+    itime: f32,
+    uniforms: &'a [(String, Anim)],
+    /// Some for a layer: the footer multiplies by it.
+    opacity: Option<f32>,
+    input: Option<(glow::Texture, usize, usize)>,
+}
+
+impl<'a> Item<'a> {
+    fn shot(shot: &'a Shot, local: f32) -> Item<'a> {
+        Item {
+            start: shot.start,
+            duration: shot.duration,
+            itime: shot.scene_time(local),
+            uniforms: &shot.uniforms,
+            opacity: None,
+            input: None,
+        }
+    }
 }
 
 fn sanitize(x: f32) -> f32 {
@@ -2903,6 +3204,23 @@ fn distance(movie: &Movie, shot: &Shot, t: f32) -> f32 {
     match movie.loop_period() {
         Some(p) => d.min(distance_once(shot, t - p as f32)),
         None => d,
+    }
+}
+
+/// How far `t` is from a layer's span (0 inside it), like `distance` for shots.
+fn layer_distance(movie: &Movie, layer: &Layer, t: f32) -> f32 {
+    let once = |t: f32| {
+        if t < layer.start {
+            layer.start - t
+        } else if t >= layer.end {
+            (t - layer.end) * 2.0
+        } else {
+            0.0
+        }
+    };
+    match movie.loop_period() {
+        Some(p) => once(t).min(once(t - p as f32)),
+        None => once(t),
     }
 }
 

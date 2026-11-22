@@ -33,6 +33,14 @@ transition = { type = "transitions/iris", duration = 1.2, freeze = true, params 
 # start it early or let it ring on; otherwise it fades with the transitions.
 sound = "sfx/chime.glsl"
 
+# A layer over a span of the film (shotglass = "0.1.4"; see README, "Layers"):
+# [[layer]]
+# id = "title"
+# scene = "layers/title.glsl"   # mainImage writes vec4(colour, alpha)
+# from = "first"
+# to = "second.settled"
+# fade = [0.5, 0.5]
+#
 # Text, bound to channels like a texture (shotglass = "0.1.3"; see README, "Text"):
 # [fonts]
 # body = { file = "fonts/MyFont.ttf", licence = "OFL-1.1" }

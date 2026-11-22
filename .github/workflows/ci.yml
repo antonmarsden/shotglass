@@ -53,6 +53,7 @@ jobs:
           ./target/release/shotglass check movies/big-shadow --web --no-gpu
           ./target/release/shotglass check tests/films/channels --web --no-gpu
           ./target/release/shotglass check tests/films/text --web --no-gpu
+          ./target/release/shotglass check tests/films/layers --web --no-gpu
           ./target/release/shotglass check tests/films/loop --web --no-gpu
           ./target/release/shotglass new "$RUNNER_TEMP/template"
           ./target/release/shotglass check "$RUNNER_TEMP/template" --web --no-gpu

@@ -214,14 +214,14 @@ shotglass tells what an entry is from how it's written, the same way everywhere:
 | `"textures/brick.png"`, `"<kit/textures/noise.png>"` | an image (`.png`, `.jpg`, `.jpeg`) |
 | `"renders/fog_####.png"` (one run of `#` in the file name) | an image sequence, `#` = frame number |
 | `"footage/surf.mp4"` (`.mp4`, `.m4v`, `.mov`, `.mkv`, `.webm`, `.avi`) | a video |
-| `"@input"`, `"@title"` | another pass's picture (layers) |
+| `"@input"` | on a [layer](#layers): the picture below it (`"@title"`, another layer's picture, comes later) |
 | `{ file = "…", … }` | an image with options |
 | `{ text = "title", … }` | a `[texts]` entry with sampling options (`filter`, `wrap`, `vflip`) |
 
-Names come from `[textures]` and `[texts]`, which share one namespace. Images and text
-bind today. The other kinds are recognised so a film that uses one gets a clear message
-naming the shotglass version that brings it (layers and `@` sources in 0.1.4, image
-sequences in 0.1.5, then video), instead of an unrelated error.
+Names come from `[textures]` and `[texts]`, which share one namespace. Images, text and
+`@input` bind today. The other kinds are recognised so a film that uses one gets a clear
+message saying when it arrives (image sequences in 0.1.5, then video; `@picture` and
+`@<layer>` with layers phase 2), instead of an unrelated error.
 
 | option | values | default |
 |---|---|---|
@@ -379,6 +379,56 @@ into the `#ifndef` / `#define` form shown above.
 transition starts, and holds it. Only the incoming shot renders live, so the
 transition costs about the same as a normal frame. This works well for wipes and
 irises. Leave it off for slow dissolves, where a still frame looks dead.
+
+### Layers
+
+Layers sit above the shots: a title over a span that crosses cuts and dissolves, a logo
+for the whole film, a grade or grain over everything (needs `shotglass = "0.1.4"`).
+A layer is a scene shader like a shot's, drawn over everything below it while it's
+active, bottom to top in file order:
+
+```toml
+[[layer]]
+id = "title"
+scene = "layers/title.glsl"     # mainImage writes vec4(colour, alpha)
+from = "moon"                   # with shot "moon"
+to = "closeup.settled"          # until the transition into "closeup" has finished
+fade = [0.4, 0.6]               # fade in / out, seconds
+scale = 1                       # full resolution: crisp text whatever the render scale
+channels = ["title"]            # a [texts] entry, as on shots
+
+[[layer]]
+id = "grade"
+type = "fx/grade"               # a library pass, named like a transition
+opacity = 0.7                   # a 70%-strength grade
+channels = ["@input"]           # iChannel0 = the picture below this layer
+params = { lift = [0.02, 0.0, 0.04] }
+uniforms.uExposure = { keys = [[0, -2.0], [3, 0.0]] }
+```
+
+- **Alpha:** `mainImage` writes straight alpha, the Shadertoy way; a layer that writes
+  none is opaque. shotglass premultiplies, applies `opacity`, and composites it over
+  what's below (source-over). A layer that reads `@input` and writes an opaque result is
+  a filter (grade, vignette, letterbox); at `opacity = 0.5` it's a half-strength one.
+- **Span:** `from` / `to` are movie seconds or `"<shot>"`, `"<shot>.start"`,
+  `".settled"`, `".end"` (an earlier layer has `.start` and `.end`), optionally
+  `+ s` / `- s`: `from = "moon + 0.5"`. A bare shot id is its start for `from` and its
+  end for `to`. Without them the layer covers the whole film. A loop film's layers stay
+  inside one period.
+- **Time:** inside a layer, `iTime` (with `time_offset`/`time_scale`), `iShotTime`,
+  `iShotDuration` and `iShotProgress` are the layer's own, from 0 at `from`;
+  `iMovieTime` is the film's. Keyframes (`uniforms.*`, `opacity`) are in layer-local
+  seconds. Cue defines gain `CUE_<LAYER>_START` / `_END`, so sound can follow a title.
+- **Scale:** `"auto"` (default) follows the player's render scale like shots; a number
+  is a fixed fraction of the output (`1` for text, `0.5` for a cheap grain), the same in
+  `still` and `export`.
+- **`type` passes** get their `params` as `#define`s and `#define SG_HAS_<name>` for each
+  uniform the film sets, so a library pass can give the rest defaults
+  (`#ifndef SG_HAS_uExposure` … `const float uExposure = 0.0;`).
+- A frame shows only when every active layer is ready (like a shot's programs and
+  textures), and a broken layer edit keeps its last working version on screen.
+- Only `blend = "over"` for now; blend modes, `@picture`/`@<layer>`, comps and mattes
+  come in later phases (see `docs/design/layers-compositing.md`).
 
 ### Sound
 

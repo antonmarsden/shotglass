@@ -1,0 +1,2 @@
+# Engine contract: layers need shotglass 0.1.4.
+shotglass = "0.1.4"
