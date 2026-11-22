@@ -1309,6 +1309,9 @@ impl Player {
         let after = self.hidden_layers();
         if after != before {
             self.renderer.set_hidden_layers(after);
+            // The cached frame was drawn with the old set: redraw it even when paused.
+            self.rendered_key = None;
+            ui.ctx().request_repaint();
         }
     }
 
