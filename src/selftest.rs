@@ -130,6 +130,10 @@ const CHECKS: &[Check] = &[
         run: export_lossless,
     },
     Check {
+        name: "shotglass test: assertions, property grids and failure reports",
+        run: glsl_tests,
+    },
+    Check {
         name: "loop films: the frame at t + k·period is the frame at t",
         run: loop_picture,
     },
@@ -212,6 +216,119 @@ fn write(dir: &Path, files: &[(&str, &str)]) -> Result<()> {
         std::fs::write(p, text)?;
     }
     Ok(())
+}
+
+/// `shotglass test` on a fixture project (a path library and one test file): the exact
+/// report pins the first failure per test, its input and values, NaN handling, grid
+/// endpoints, banded draws (140 000 samples: three bands), "ran no assertions" and
+/// expect_rel, on this driver.
+fn glsl_tests(gl: &Gl, dir: &Path) -> Result<String> {
+    use crate::glsl_test::{TestFile, run};
+    write(
+        dir,
+        &[
+            (
+                "shotglass.toml",
+                "shotglass = \"0.1\"\n[libraries]\nfx = { path = \"lib\" }\n",
+            ),
+            (
+                "lib/library.toml",
+                "name = \"selftest/fx\"\nversion = \"0.1.0\"\nlicences = [\"MIT\"]\n",
+            ),
+            (
+                "lib/fx.glsl",
+                "float fx_double(float x) { return 2.0 * x; }\n",
+            ),
+            (
+                "unit/broken.test.glsl",
+                "#include <fx/fx.glsl>\n\nvoid test_typo() { expect(fx_doubel(1.0) == 2.0); }\n",
+            ),
+            (
+                "unit/fx.test.glsl",
+                "#include <fx/fx.glsl>\n\
+                 void test_pass() { expect_near(fx_double(1.5), 3.0, 0.0); expect_eq(ivec2(1, 2), ivec2(1, 2)); }\n\
+                 void test_first_failure() {\n\
+                 \x20   expect(true); expect_eq(1, 2); expect_eq(3, 4);\n\
+                 }\n\
+                 // samples: 11\n\
+                 void test_threshold(float t) {\n\
+                 \x20   expect(fx_double(t) < 1.5, fx_double(t));\n\
+                 }\n\
+                 void test_nan(vec2 p) {\n\
+                 \x20   expect_finite(vec2(1.0, uintBitsToFloat(0x7fc00000u + uint(p.x * 0.0))));\n\
+                 }\n\
+                 void test_nan1(float t) { expect_finite(uintBitsToFloat(0x7fc00000u + uint(t * 0.0))); }\n\
+                 void test_corner(vec3 c) { expect(!(c.x == 1.0 && c.y == 1.0 && c.z == 1.0), c); }\n\
+                 // samples: 140000\n\
+                 void test_bands(float t) { expect(t >= 0.0 && t <= 1.0); }\n\
+                 void test_empty(float t) { if (t > 2.0) expect(false); }\n\
+                 void test_rel() {\n\
+                 \x20   expect_rel(100.0, 101.0, 0.02);\n\
+                 \x20   expect_rel(vec2(1.0, 0.0), vec2(1.0, 1e-3), 0.5);\n\
+                 }\n",
+            ),
+        ],
+    )?;
+    let p = crate::project::Project::read(dir)?;
+    let libs = crate::library::resolve(dir, &p.specs, &Default::default(), None, dir)?;
+    // The broken file comes first: the fixture file must still run after it.
+    let files = ["unit/broken.test.glsl", "unit/fx.test.glsl"].map(|f| TestFile {
+        path: dir.join(f),
+        root: dir.to_path_buf(),
+        libs: libs.clone(),
+        display: f.into(),
+    });
+    let mut report = String::new();
+    let sum = run(gl, &files, None, &mut |l| {
+        report += l;
+        report.push('\n');
+    })?;
+    let expected = "\
+unit/fx.test.glsl
+  ok    test_pass
+  FAIL  test_first_failure
+        unit/fx.test.glsl:4: expect_eq(1, 2)
+        got 1, expected 2
+  FAIL  test_threshold (11 samples)
+        unit/fx.test.glsl:8: expect(fx_double(t) < 1.5, fx_double(t))
+        at t = 0.8: got 1.6
+        3 of 11 samples failed
+  FAIL  test_nan (65536 samples)
+        unit/fx.test.glsl:11: expect_finite(vec2(1.0, uintBitsToFloat(0x7fc00000u + uint(p.x * 0.0))))
+        at p = (0.0, 0.0): got (1.0, NaN)
+        65536 of 65536 samples failed
+  FAIL  test_nan1 (4096 samples)
+        unit/fx.test.glsl:13: expect_finite(uintBitsToFloat(0x7fc00000u + uint(t * 0.0)))
+        at t = 0.0: got NaN
+        4096 of 4096 samples failed
+  FAIL  test_corner (262144 samples)
+        unit/fx.test.glsl:14: expect(!(c.x == 1.0 && c.y == 1.0 && c.z == 1.0), c)
+        at c = (1.0, 1.0, 1.0): got (1.0, 1.0, 1.0)
+        1 of 262144 samples failed
+  ok    test_bands (140000 samples)
+  FAIL  test_empty (4096 samples)
+        unit/fx.test.glsl:17: test_empty ran no assertions
+  FAIL  test_rel
+        unit/fx.test.glsl:20: expect_rel(vec2(1.0, 0.0), vec2(1.0, 1e-3), 0.5)
+        got (1.0, 0.0), expected (1.0, 0.001)
+";
+    let Some((broken, report)) = report.split_once("unit/fx.test.glsl\n") else {
+        bail!("the file after a broken one didn't run:\n{report}");
+    };
+    let report = format!("unit/fx.test.glsl\n{report}");
+    if !(broken.starts_with("unit/broken.test.glsl\n")
+        && broken.contains("unit/broken.test.glsl:3: ")
+        && broken.contains("fx_doubel"))
+    {
+        bail!("a compile error should name unit/broken.test.glsl:3, got:\n{broken}");
+    }
+    if report != expected {
+        bail!("report differs:\n--- expected\n{expected}--- got\n{report}");
+    }
+    if (sum.passed, sum.failed, sum.broken) != (2, 7, 1) {
+        bail!("summary {sum:?}, expected 2 passed, 7 failed, 1 broken");
+    }
+    Ok(format!("{} samples", sum.samples))
 }
 
 fn scene(body: &str) -> String {
