@@ -124,8 +124,16 @@ pub fn licence_report(m: &Movie) -> Result<LicenceReport> {
         };
         rows.push(LicenceRow {
             name: l.name.clone(),
-            canonical: l.canonical.clone(),
-            version: l.version.to_string(),
+            canonical: match &l.google {
+                Some(f) => format!("Google Fonts \"{f}\""),
+                None => l.canonical.clone(),
+            },
+            // A font family has no version; its pin is in `source`.
+            version: if l.google.is_some() {
+                String::new()
+            } else {
+                l.version.to_string()
+            },
             non_commercial: l.licences.iter().any(|x| library::is_non_commercial(x)),
             licences: l.licences.clone(),
             source,
@@ -161,10 +169,14 @@ pub fn print_licences(movie: &Path) -> Result<()> {
     }
     for row in &r.rows {
         println!(
-            "\n{}  ({} {})\n    licences: {}{}\n    source:   {}\n    files:    {} included",
+            "\n{}  ({}{})\n    licences: {}{}\n    source:   {}\n    files:    {} included",
             row.name,
             row.canonical,
-            row.version,
+            if row.version.is_empty() {
+                String::new()
+            } else {
+                format!(" {}", row.version)
+            },
             if row.licences.is_empty() {
                 "none declared".to_string()
             } else {
@@ -283,7 +295,14 @@ fn write_frozen(
     );
     // What the film includes, plus the peers those libraries require (transitively):
     // loading checks peer requirements, so a frozen film must still declare them.
-    let mut keep: BTreeSet<&str> = used.keys().map(String::as_str).collect();
+    // Libraries movie.toml names a file of stay declared even if nothing uses them (an
+    // unused [fonts] entry): parsing checks the name. They're frozen with no files but
+    // their identity and licence.
+    let mut keep: BTreeSet<&str> = used
+        .keys()
+        .map(String::as_str)
+        .chain(m.library_refs.iter().map(String::as_str))
+        .collect();
     loop {
         let before = keep.len();
         for l in &m.libraries {
@@ -315,10 +334,12 @@ fn write_frozen(
             l.licences.join(", ")
         };
         let mut section = format!(
-            "\n## {} ({} {})\n\n- Licences: {licences}{}\n",
+            "\n## {} ({})\n\n- Licences: {licences}{}\n",
             l.name,
-            l.canonical,
-            l.version,
+            match &l.google {
+                Some(f) => format!("Google Fonts \"{f}\""),
+                None => format!("{} {}", l.canonical, l.version),
+            },
             if nc { " (non-commercial)" } else { "" }
         );
         let mut decl = toml::Table::new();
@@ -348,6 +369,7 @@ fn write_frozen(
                 rev: None,
                 subdir: None,
                 path: None,
+                google: None,
                 sha256: String::new(),
             },
             _ => bail!(
@@ -356,8 +378,11 @@ fn write_frozen(
                 library::LOCK_FILE
             ),
         };
-        match &spec.source {
-            Some(src) => {
+        match (&spec.google, &spec.source) {
+            (Some(family), _) => {
+                decl.insert("google".into(), family.clone().into());
+            }
+            (None, Some(src)) => {
                 decl.insert("source".into(), src.clone().into());
                 if let Some(v) = &spec.version {
                     decl.insert("version".into(), v.to_string().into());
@@ -369,7 +394,7 @@ fn write_frozen(
                     decl.insert("subdir".into(), sd.clone().into());
                 }
             }
-            None => {
+            (None, None) => {
                 decl.insert("path".into(), rel_dir.clone().into());
             }
         }
@@ -380,10 +405,12 @@ fn write_frozen(
         };
         let to_dir = dest.join(&rel_dir);
         let mut files: BTreeMap<String, PathBuf> = BTreeMap::new();
-        files.insert(
-            library::LIBRARY_FILE.to_string(),
-            l.root.join(library::LIBRARY_FILE),
-        );
+        // A library's identity: library.toml, or a Google Fonts family's METADATA.pb.
+        for id in [library::LIBRARY_FILE, "METADATA.pb"] {
+            if l.root.join(id).is_file() {
+                files.insert(id.to_string(), l.root.join(id));
+            }
+        }
         for f in used.get(&l.name).into_iter().flatten() {
             files.insert(f.clone(), l.root.join(f));
         }
@@ -640,7 +667,7 @@ pub fn bundle(movie: &Path, out: &Path, cache: &Path) -> Result<Bundled> {
 /// `freeze`/`bundle` can copy the locked files.
 fn fetch_all(movie: &Path) -> Result<Movie> {
     let m = Movie::read(movie)?;
-    if m.library_specs.iter().any(|s| s.source.is_some()) {
+    if m.library_specs.iter().any(|s| s.fetched()) {
         crate::fetch_libraries(
             &m.project,
             library::FetchMode::Missing {
@@ -832,6 +859,7 @@ mod tests {
                 rev: None,
                 subdir: Some("core".into()),
                 path: None,
+                google: None,
                 sha256: library::hash_dir(&core).unwrap(),
             }],
         };

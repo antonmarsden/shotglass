@@ -44,10 +44,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum FontsCmd {
-    /// Fetch font families from Google Fonts (github.com/google/fonts) into the film:
-    /// the files, their licence and where they came from go in fonts/<family>/, and
-    /// movie.toml gets a [fonts] entry per file with its licence. Needs git; only this
-    /// command uses the network, the film then plays from its own folder.
+    /// Use Google Fonts families (github.com/google/fonts) in the film: each becomes a
+    /// library in the project's shotglass.toml (`name = { google = "Family" }`), fetched
+    /// and pinned in shotglass.lock like any library, and movie.toml gets a [fonts]
+    /// entry per file ("<name/File.ttf>"). Needs git, like `fetch`.
     Add {
         /// Family names as fonts.google.com shows them ("Lobster", "Atkinson Hyperlegible").
         #[arg(required = true)]
@@ -55,9 +55,6 @@ enum FontsCmd {
         /// The film (a folder with movie.toml).
         #[arg(long, default_value = ".")]
         film: PathBuf,
-        /// A google/fonts commit to take the files from (default: the newest).
-        #[arg(long)]
-        rev: Option<String>,
     },
 }
 
@@ -193,8 +190,8 @@ enum Cmd {
     /// List the libraries the film includes, with their licences (flags non-commercial
     /// ones), and the film's own fonts. A project root lists every film.
     Licenses { movie: PathBuf },
-    /// Fonts for [fonts]: `shotglass fonts add "Lobster"` fetches families from Google
-    /// Fonts into the film's fonts/ folder and adds their entries to movie.toml.
+    /// Fonts for [fonts]: `shotglass fonts add "Lobster"` declares Google Fonts families
+    /// as libraries, fetches and pins them, and adds their entries to movie.toml.
     Fonts {
         #[command(subcommand)]
         cmd: FontsCmd,
@@ -363,13 +360,8 @@ fn real_main() -> Result<()> {
         }
         Cmd::Licenses { movie } => for_each_film(&movie, bundle::print_licences),
         Cmd::Fonts {
-            cmd:
-                FontsCmd::Add {
-                    families,
-                    film,
-                    rev,
-                },
-        } => fonts::run_add(&project::film(&film)?, &families, rev.as_deref()),
+            cmd: FontsCmd::Add { families, film },
+        } => fonts::run_add(&project::film(&film)?, &families),
         Cmd::Bundle { movie, out } => bundle::run_bundle(&project::film(&movie)?, &out),
         Cmd::Freeze { movie } => bundle::run_freeze(&project::film(&movie)?),
         Cmd::Unfreeze { movie } => bundle::run_unfreeze(&project::film(&movie)?),
@@ -504,7 +496,7 @@ fn project_libraries(root: &Path) -> Result<Vec<library::Library>> {
     }
     let env = |k: &str| std::env::var(k).ok();
     let o = library::overrides(&p.root, &p.specs, &env)?;
-    if p.specs.iter().any(|s| s.source.is_some()) {
+    if p.specs.iter().any(|s| s.fetched()) {
         let skip = o.keys().cloned().collect();
         fetch_libraries(&p.root, library::FetchMode::Missing { skip }, false)?;
     }
@@ -517,7 +509,7 @@ fn project_libraries(root: &Path) -> Result<Vec<library::Library>> {
 fn load_movie(path: &Path) -> Result<Movie> {
     let path = &project::film(path)?;
     let m = Movie::read(path)?;
-    if m.library_specs.iter().any(|s| s.source.is_some()) {
+    if m.library_specs.iter().any(|s| s.fetched()) {
         let env = |k: &str| std::env::var(k).ok();
         let skip = library::overrides(&m.project, &m.library_specs, &env)?
             .into_keys()
@@ -546,7 +538,7 @@ fn fetch_libraries(path: &Path, mode: library::FetchMode, verbose: bool) -> Resu
             p.root.display()
         );
     }
-    if !p.specs.iter().any(|s| s.source.is_some()) {
+    if !p.specs.iter().any(|s| s.fetched()) {
         if verbose {
             println!(
                 "{} has no libraries with a source; nothing to fetch",

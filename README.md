@@ -310,35 +310,41 @@ Changing the words or the style makes a new texture and never recompiles a shade
 
 #### Getting fonts
 
-Fetch any family from [Google Fonts](https://fonts.google.com) by name:
+Any [Google Fonts](https://fonts.google.com) family is a library: declare it by name in
+the project and name its files in `[fonts]`, like any library file.
 
 ```sh
-shotglass fonts add "Lobster" "Atkinson Hyperlegible" --film movies/my-film
+shotglass fonts add "Lobster" "Inter" --film movies/my-film
 ```
 
-This copies the family's font files into the film's `fonts/<family>/` folder, with
-their licence file, `METADATA.pb` and a `SOURCE.txt` naming the google/fonts commit they
-came from, and adds an entry per file to `[fonts]` in `movie.toml` with its licence:
+writes both for you, fetches the families and pins them:
 
 ```toml
+# shotglass.toml
+[libraries]
+lobster = { google = "Lobster" }
+inter = { google = "Inter" }
+
+# movie.toml
 [fonts]
-lobster = { file = "fonts/lobster/Lobster-Regular.ttf", licence = "OFL-1.1" }
-atkinsonhyperlegible_bold = { file = "fonts/atkinsonhyperlegible/AtkinsonHyperlegible-Bold.ttf", licence = "OFL-1.1" }
+lobster = "<lobster/Lobster-Regular.ttf>"
+inter = "<inter/Inter[opsz,wght].ttf>"
+inter_italic = "<inter/Inter-Italic[opsz,wght].ttf>"
 ```
 
-- Names are as fonts.google.com shows them. Entries are named after the family, plus the
-  weight and `_italic` for the other styles; variable fonts get one entry per file
-  (`Inter[opsz,wght].ttf` is saved as `Inter-Variable.ttf`) and the command prints
-  their axes, for `variations`.
-- Licences come from where Google Fonts keeps the family: nearly all are SIL OFL 1.1, a
-  few Apache 2.0 or the Ubuntu Font Licence. All allow using the fonts in a film and
-  passing them on unmodified; `shotglass licenses` lists them.
-- Only this command uses the network (it needs git, like `fetch`; it downloads just
-  those families). Commit the `fonts/` folder with the film: playback, `export`,
-  `bundle` and `freeze` use the copies, so the film looks the same everywhere.
-  `--rev <commit>` takes the files from a given google/fonts commit.
-- Any other TTF/OTF works too: put it in the film and name it in `[fonts]`, with its
-  `licence`.
+- They behave exactly like libraries: any command fetches what's missing (git, only that
+  family's folder of google/fonts), `shotglass.lock` pins the commit and a hash of the
+  files so every machine gets the same glyphs, `shotglass update inter` moves the pin on
+  purpose, `SHOTGLASS_LIB_INTER` points at a local copy, and `freeze`/`bundle` copy in
+  exactly the font files a film uses, with their licence. Commit `shotglass.lock`;
+  there's no need to commit font files.
+- Entries are named after the family, plus the weight and `_italic` for other styles;
+  `fonts add` prints a variable font's axes, for `variations`. Rename entries as you like.
+- Licences come from where Google Fonts keeps the family: nearly all SIL OFL 1.1, a few
+  Apache 2.0 or the Ubuntu Font Licence; all allow using the fonts in a film and passing
+  them on unmodified. `shotglass licenses` lists each family with its licence.
+- Any other TTF/OTF works too: put it in the film (or a library) and name it in
+  `[fonts]`, with its `licence`.
 
 | `[fonts]` option | values |
 |---|---|
@@ -746,6 +752,7 @@ sfx  = { version = "0.3", source = "https://github.com/antonmarsden/shotglass-ki
 toon = { version = "1.2", source = "https://github.com/someone/toon-kit" }
 edge = { source = "https://github.com/someone/fx-kit" }   # no version: follow the default branch
 mine = { path = "lib/mykit" }            # a library inside the project folder
+lobster = { google = "Lobster" }         # a Google Fonts family (see "Getting fonts")
 ```
 
 ```glsl
@@ -1011,7 +1018,7 @@ shotglass new    <dir>
 shotglass fetch  <movie>                                   # download libraries, write shotglass.lock
 shotglass update <movie> [library..]                       # move library pins to the newest allowed
 shotglass licenses <movie>                                 # libraries the film includes, film fonts, and their licences
-shotglass fonts add "Family" [..] [--film <dir>] [--rev <commit>]  # fetch Google Fonts families into the film
+shotglass fonts add "Family" [..] [--film <dir>]           # Google Fonts families as libraries, plus [fonts] entries
 shotglass bundle <movie> --out <dir>                       # self-contained copy with the library files it includes
 shotglass freeze <movie>                                   # copy the library files it includes into the film
 shotglass unfreeze <movie>                                 # follow the project's libraries again
