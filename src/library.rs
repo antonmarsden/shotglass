@@ -1031,6 +1031,9 @@ pub trait Fetcher {
     fn google_source(&self) -> String {
         crate::fonts::google_source()
     }
+    /// A download is starting (`play` and the other commands fetch what's missing before
+    /// they start, which can take a few seconds): say what. Silent unless overridden.
+    fn progress(&self, _what: &str) {}
 }
 
 /// `v1.2.3` or `1.2.3`.
@@ -1142,6 +1145,11 @@ pub fn fetch(
                 let dir = cache_path(cache, &e.source, &e.cache_key());
                 let fresh = !dir.exists();
                 if fresh {
+                    fetcher.progress(&format!(
+                        "fetching library \"{}\" {} from {source}…",
+                        s.name,
+                        e.pin()
+                    ));
                     download(fetcher, source, &e.tag, e.rev.as_deref(), None, &dir)?;
                 }
                 let root = lib_root(&dir, &e.subdir, &s.name)?;
@@ -1185,6 +1193,11 @@ pub fn fetch(
                 }
                 let dir = cache_path(cache, source, &rev);
                 if !dir.exists() {
+                    fetcher.progress(&format!(
+                        "fetching library \"{}\" ({refname} at {}) from {source}…",
+                        s.name,
+                        &rev[..7]
+                    ));
                     download(fetcher, source, &refname, Some(&rev), None, &dir)?;
                 }
                 let root = lib_root(&dir, &s.subdir, &s.name)?;
@@ -1229,6 +1242,10 @@ pub fn fetch(
                 })?;
                 let dir = cache_path(cache, source, &v.to_string());
                 if !dir.exists() {
+                    fetcher.progress(&format!(
+                        "fetching library \"{}\" {v} from {source}…",
+                        s.name
+                    ));
                     download(fetcher, source, &tag, None, None, &dir)?;
                 }
                 let root = lib_root(&dir, &s.subdir, &s.name)?;
@@ -1279,6 +1296,10 @@ fn fetch_google(
             let sub = e.subdir.clone().unwrap_or_default();
             let fresh = !dir.exists();
             if fresh {
+                fetcher.progress(&format!(
+                    "fetching font \"{family}\" from Google Fonts ({})…",
+                    e.pin()
+                ));
                 download(
                     fetcher,
                     &e.source,
@@ -1316,6 +1337,7 @@ fn fetch_google(
         }
         _ => {
             let source = fetcher.google_source();
+            fetcher.progress(&format!("fetching font \"{family}\" from Google Fonts…"));
             let rev = fetcher.head(&source, "HEAD").with_context(|| {
                 format!(
                     "library \"{}\": looking up the newest commit of {source}",
@@ -1467,6 +1489,10 @@ impl Git {
 }
 
 impl Fetcher for Git {
+    fn progress(&self, what: &str) {
+        eprintln!("{what}");
+    }
+
     fn download_sparse(&self, source: &str, rev: &str, dirs: &[String], dest: &Path) -> Result<()> {
         if !is_commit_id(rev) {
             bail!("\"{rev}\" is not a full commit id");
@@ -1988,6 +2014,8 @@ mod tests {
         /// (source, ref) → commit; commits are stored in `repos` like tags.
         heads: RefCell<BTreeMap<(String, String), String>>,
         downloads: RefCell<usize>,
+        /// What `progress` was told, in order.
+        progress: RefCell<Vec<String>>,
     }
 
     impl Fake {
@@ -2015,6 +2043,9 @@ mod tests {
     }
 
     impl Fetcher for Fake {
+        fn progress(&self, what: &str) {
+            self.progress.borrow_mut().push(what.to_string());
+        }
         fn head(&self, source: &str, refname: &str) -> Result<String> {
             self.heads
                 .borrow()
@@ -2104,6 +2135,16 @@ mod tests {
             "{log:?}"
         );
         assert_eq!(*f.downloads.borrow(), 2);
+        // Each download is announced as it starts (play prints this while it waits): kit
+        // 0.4.0 and sfx 0.3.0 are two releases, so two downloads and two messages.
+        let said = f.progress.borrow().clone();
+        assert_eq!(said.len(), 2, "{said:?}");
+        assert!(
+            said.iter()
+                .any(|m| m.starts_with("fetching library \"kit\" 0.4.0 from")),
+            "{said:?}"
+        );
+        assert!(said.iter().all(|m| m.ends_with('…')), "{said:?}");
 
         // Resolving uses only the lock and the cache; local names map to canonical names
         // and subdirs pick the library root.
