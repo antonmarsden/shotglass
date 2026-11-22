@@ -138,9 +138,15 @@ cargo fmt && cargo clippy --all-targets -- -D warnings
 - **The engine provides a contract, not looks.** Uniforms, entry points, the transition interface
   and cue defines are the engine's API (semver). Reusable GLSL belongs in versioned libraries
   (the shotglass-kit repo, #3–#5), not embedded in the binary. The built-in transitions
-  were removed (the kit has them). Don't add built-in GLSL. The one exception is the
-  `shotglass test` prelude (`glsl_test::prelude`: the `expect*` assertions), which is
-  contract, not looks, and only test shaders get it.
+  were removed (the kit has them). Don't add built-in GLSL. The exceptions are contract,
+  not looks: the `shotglass test` prelude (`glsl_test::prelude`: the `expect*`
+  assertions, only test shaders get it), and, from layers (#69), the layer footer
+  (premultiply × opacity, premultiplied source-over, matte multiply, `SG_HAS_*` defines),
+  which defines what a layer at opacity o *is*. Every other blend mode and effect is kit GLSL.
+- **Channel entries are classified in one place**, `movie::ChannelSource::of`, by spelling
+  (`""`, `@output`, `[textures]` name, image / `####` sequence / video path); kinds not built
+  yet are refused with the version that brings them. The count is `movie::N_CHANNELS`
+  (4 today; #68 raises it to 8 together with the scene header in `gfx.rs`).
 
 ## Adding things
 

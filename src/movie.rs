@@ -80,7 +80,7 @@ struct MovieFile {
     shots: Vec<ShotFile>,
     #[serde(rename = "marker", default)]
     markers: Vec<MarkerFile>,
-    /// Film-wide iChannel0..3 for every shot that doesn't set its own `channels`.
+    /// Film-wide channels for every shot that doesn't set its own `channels`.
     channels: Option<Vec<toml::Value>>,
     /// Named textures: `brick = "textures/brick.png"` or `{ file = "…", filter = … }`.
     #[serde(default)]
@@ -129,7 +129,7 @@ struct ShotFile {
     /// Let the sound ring on this many seconds after the shot (an L-cut).
     sound_tail: Option<f32>,
     sound_gain: Option<f32>,
-    /// Images on iChannel0..3: names from [textures], paths, `<lib/path>`, tables, "".
+    /// Channel sources for iChannel0..: names from [textures], paths, `<lib/path>`, tables, "".
     channels: Option<Vec<toml::Value>>,
 }
 
@@ -176,6 +176,86 @@ pub struct ShotSound {
     pub gain: f32,
 }
 
+/// How many iChannels a shot has: `iChannel0..N_CHANNELS-1`. The scene header in
+/// `gfx.rs` declares exactly these; text phase 1 (#68) raises both to 8 together.
+pub const N_CHANNELS: usize = 4;
+
+/// What a `channels` entry or `[textures]` value names, from its spelling alone. The
+/// one place that tells the kinds apart (README "Channel sources"):
+///
+/// - `""` binds nothing;
+/// - `@word` is another pass's picture (`@input`, `@picture`, `@<layer>`, `@<comp>`);
+/// - a word without `.`, `/` or `<` is a name from `[textures]` (later also `[texts]`);
+/// - anything else is a file, in the film or `<library/path>`, and its file name says
+///   which kind: a run of `#` is an image sequence (`fog_####.png`), a video extension
+///   is a video, and the rest are images.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ChannelSource<'a> {
+    Empty,
+    Output(&'a str),
+    Name(&'a str),
+    Image(&'a str),
+    Sequence(&'a str),
+    Video(&'a str),
+}
+
+/// Extensions read as video (any case).
+const VIDEO_EXTENSIONS: &[&str] = &["mp4", "m4v", "mov", "mkv", "webm", "avi"];
+
+impl<'a> ChannelSource<'a> {
+    pub fn of(s: &'a str) -> ChannelSource<'a> {
+        if s.is_empty() {
+            return ChannelSource::Empty;
+        }
+        if let Some(out) = s.strip_prefix('@') {
+            return ChannelSource::Output(out);
+        }
+        if is_texture_name(s) {
+            return ChannelSource::Name(s);
+        }
+        let path = s
+            .strip_prefix('<')
+            .map_or(s, |p| p.strip_suffix('>').unwrap_or(p));
+        let file = path.rsplit('/').next().unwrap_or(path);
+        let ext = file.rsplit_once('.').map_or("", |(_, e)| e);
+        if file.contains('#') {
+            ChannelSource::Sequence(s)
+        } else if VIDEO_EXTENSIONS.iter().any(|v| ext.eq_ignore_ascii_case(v)) {
+            ChannelSource::Video(s)
+        } else {
+            ChannelSource::Image(s)
+        }
+    }
+}
+
+/// The message for a channel kind this shotglass knows the spelling of but can't bind
+/// yet, naming the version that brings it.
+fn not_yet(what: &str, s: &str, kind: &str) -> anyhow::Error {
+    let (is, arrives) = match kind {
+        "output" => (
+            "another pass's picture",
+            "@ sources arrive with layers (shotglass 0.1.4)",
+        ),
+        "sequence" => (
+            "an image sequence",
+            "image sequences arrive in shotglass 0.1.5",
+        ),
+        "video" => (
+            "a video",
+            "video files arrive after image sequences (shotglass 0.1.5)",
+        ),
+        "text" => (
+            "a text block",
+            "text arrives with [fonts] and [texts] in shotglass 0.1.3",
+        ),
+        _ => (
+            "a re-timed [textures] entry",
+            "re-timing arrives with image sequences (shotglass 0.1.5)",
+        ),
+    };
+    anyhow!("{what}: \"{s}\" is {is}; {arrives}")
+}
+
 /// An image bound to an iChannel.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Channel {
@@ -207,8 +287,8 @@ pub struct Shot {
     pub uniforms: Vec<(String, Anim)>,
     pub transition_in: Option<Transition>,
     pub sound: Option<ShotSound>,
-    /// What iChannel0..3 carry (None: black, `iChannelResolution` 0).
-    pub channels: [Option<Channel>; 4],
+    /// What iChannel0..N_CHANNELS-1 carry (None: black, `iChannelResolution` 0).
+    pub channels: [Option<Channel>; N_CHANNELS],
 }
 
 impl Shot {
@@ -580,25 +660,27 @@ impl Movie {
             };
         }
         let mut used: std::collections::HashSet<String> = Default::default();
-        let mut channel_list = |what: &str, list: &[toml::Value]| -> Result<[Option<Channel>; 4]> {
-            if list.len() > 4 {
-                bail!(
-                    "{what}channels has {} entries; there are 4 (iChannel0..3)",
-                    list.len()
-                );
-            }
-            let mut out: [Option<Channel>; 4] = Default::default();
-            for (n, v) in list.iter().enumerate() {
-                let ctx = format!("{what}channels[{n}]");
-                if let toml::Value::String(s) = v
-                    && is_texture_name(s)
-                {
-                    used.insert(s.clone());
+        let mut channel_list =
+            |what: &str, list: &[toml::Value]| -> Result<[Option<Channel>; N_CHANNELS]> {
+                if list.len() > N_CHANNELS {
+                    bail!(
+                        "{what}channels has {} entries; there are {N_CHANNELS} (iChannel0..{})",
+                        list.len(),
+                        N_CHANNELS - 1
+                    );
                 }
-                out[n] = texture_spec(&ctx, v, Some(&textures), &library_specs, root)?;
-            }
-            Ok(out)
-        };
+                let mut out: [Option<Channel>; N_CHANNELS] = Default::default();
+                for (n, v) in list.iter().enumerate() {
+                    let ctx = format!("{what}channels[{n}]");
+                    if let toml::Value::String(s) = v
+                        && let ChannelSource::Name(name) = ChannelSource::of(s)
+                    {
+                        used.insert(name.to_string());
+                    }
+                    out[n] = texture_spec(&ctx, v, Some(&textures), &library_specs, root)?;
+                }
+                Ok(out)
+            };
         let default_channels = match &f.channels {
             Some(list) => channel_list("", list)?,
             None => Default::default(),
@@ -1042,7 +1124,11 @@ fn loop_frames(duration: f32, num: u32, den: u32) -> Result<u64> {
 
 /// A `channels` entry or `[textures]` value names a `[textures]` entry (not a path)?
 fn is_texture_name(s: &str) -> bool {
-    !s.is_empty() && !s.contains('.') && !s.contains('/') && !s.starts_with('<')
+    !s.is_empty()
+        && !s.contains('.')
+        && !s.contains('/')
+        && !s.starts_with('<')
+        && !s.starts_with('@')
 }
 
 /// Resolve one `channels` entry (with `names`) or `[textures]` value (without):
@@ -1103,51 +1189,131 @@ fn texture_spec(
             srgb: false,
         })
     };
+    // A file entry by its kind: images bind now, the rest name the version that brings them.
+    let file_source = |s: &str| -> Result<Channel> {
+        match ChannelSource::of(s) {
+            ChannelSource::Sequence(_) => {
+                let path = s.trim_start_matches('<').trim_end_matches('>');
+                let (dir, file) = path.rsplit_once('/').unwrap_or(("", path));
+                if dir.contains('#') {
+                    bail!(
+                        "{what}: \"{s}\": # marks frame numbers and may only appear in the file name"
+                    );
+                }
+                if file.split(|c| c != '#').filter(|r| !r.is_empty()).count() > 1 {
+                    bail!("{what}: \"{s}\": an image sequence has one run of # (the frame number)");
+                }
+                Err(not_yet(what, s, "sequence"))
+            }
+            ChannelSource::Video(_) => Err(not_yet(what, s, "video")),
+            _ => {
+                if let Some(i) = s.find('%')
+                    && s[i + 1..]
+                        .trim_start_matches(|c: char| c.is_ascii_digit())
+                        .starts_with('d')
+                {
+                    let digits: usize = s[i + 1..]
+                        .chars()
+                        .take_while(char::is_ascii_digit)
+                        .collect::<String>()
+                        .parse()
+                        .unwrap_or(1);
+                    let end = i + 1 + s[i + 1..].find('d').unwrap_or(0) + 1;
+                    bail!(
+                        "{what}: \"{s}\": write the frame number as # (\"{}{}{}\")",
+                        &s[..i],
+                        "#".repeat(digits.max(1)),
+                        &s[end..]
+                    );
+                }
+                file_channel(s)
+            }
+        }
+    };
     match v {
-        toml::Value::String(s) if s.is_empty() => {
-            if names.is_none() {
-                bail!("{what}: \"\" names no file");
+        toml::Value::String(s) => match ChannelSource::of(s) {
+            ChannelSource::Empty => {
+                if names.is_none() {
+                    bail!("{what}: \"\" names no file");
+                }
+                Ok(None)
             }
-            Ok(None)
-        }
-        toml::Value::String(s) if is_texture_name(s) => {
-            let Some(names) = names else {
-                bail!(
-                    "{what}: \"{s}\" isn't a file; give a path like \"textures/{s}.png\" or \
-                     \"<kit/textures/{s}.png>\""
-                );
-            };
-            match names.get(s) {
-                Some(c) => Ok(Some(c.clone())),
-                None => bail!(
-                    "{what}: no texture called \"{s}\" in [textures] ({})",
-                    if names.is_empty() {
-                        "there are none".to_string()
-                    } else {
-                        format!(
-                            "there are {}",
-                            names
-                                .keys()
-                                .map(|k| format!("\"{k}\""))
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        )
-                    }
-                ),
+            ChannelSource::Output(out) => {
+                if names.is_none() {
+                    bail!("{what}: \"{s}\" isn't a file; @ sources go in a shot's channels");
+                }
+                if !is_ident(out) {
+                    bail!(
+                        "{what}: \"{s}\": after @ comes input, picture, or the id of a layer or comp"
+                    );
+                }
+                Err(not_yet(what, s, "output"))
             }
-        }
-        toml::Value::String(s) => file_channel(s).map(Some),
+            ChannelSource::Name(s) => {
+                let Some(names) = names else {
+                    bail!(
+                        "{what}: \"{s}\" isn't a file; give a path like \"textures/{s}.png\" or \
+                         \"<kit/textures/{s}.png>\""
+                    );
+                };
+                match names.get(s) {
+                    Some(c) => Ok(Some(c.clone())),
+                    None => bail!(
+                        "{what}: no texture called \"{s}\" in [textures] ({})",
+                        if names.is_empty() {
+                            "there are none".to_string()
+                        } else {
+                            format!(
+                                "there are {}",
+                                names
+                                    .keys()
+                                    .map(|k| format!("\"{k}\""))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            )
+                        }
+                    ),
+                }
+            }
+            _ => file_source(s).map(Some),
+        },
         toml::Value::Table(t) => {
+            // Exactly one key says what the table binds.
+            let sources: Vec<&str> = ["file", "frames", "video", "texture", "text"]
+                .into_iter()
+                .filter(|k| t.contains_key(*k))
+                .collect();
+            if sources.len() > 1 {
+                bail!(
+                    "{what}: a channel table takes one of file, frames, video, texture or text \
+                     (this one has {})",
+                    sources.join(" and ")
+                );
+            }
+            let shown = |k: &str| match t.get(k) {
+                Some(toml::Value::String(s)) => s.clone(),
+                _ => "…".to_string(),
+            };
+            match sources.first() {
+                Some(&"frames") => return Err(not_yet(what, &shown("frames"), "sequence")),
+                Some(&"video") => return Err(not_yet(what, &shown("video"), "video")),
+                Some(&"texture") => return Err(not_yet(what, &shown("texture"), "retime")),
+                Some(&"text") => return Err(not_yet(what, &shown("text"), "text")),
+                _ => {}
+            }
             let mut c = match t.get("file") {
                 Some(toml::Value::String(s)) if !s.is_empty() && !is_texture_name(s) => {
-                    file_channel(s)?
+                    file_source(s)?
                 }
                 Some(toml::Value::String(s)) => bail!(
                     "{what}: file = \"{s}\" must be a path to a .png or .jpg (names from \
                      [textures] can't have options)"
                 ),
                 Some(_) => bail!("{what}: file must be a string"),
-                None => bail!("{what}: a texture table needs file = \"…\""),
+                None => bail!(
+                    "{what}: a channel table needs file = \"…\" (an image; frames, video, \
+                     texture and text come later)"
+                ),
             };
             for (k, val) in t {
                 let word = |names: &[&str]| -> Result<String> {
@@ -1524,6 +1690,22 @@ mod tests {
                 }
                 s
             })
+        }
+
+        proptest! {
+            /// Every spelling of a channel entry either binds or fails with a message that
+            /// names the entry; the classifier and its error paths never panic.
+            #[test]
+            fn channel_spellings_never_panic(entry in "[a-zA-Z0-9_#@<>/.%-]{0,24}") {
+                let toml = format!(
+                    "[[shot]]\nid = \"s\"\nscene = \"a.glsl\"\nduration = 1\nchannels = [\"{entry}\"]\n"
+                );
+                let _ = ChannelSource::of(&entry);
+                if let Err(e) = Movie::parse(&toml, Path::new("/film")) {
+                    let e = format!("{e:#}");
+                    prop_assert!(e.contains("channels[0]"), "{}: {}", entry, e);
+                }
+            }
         }
 
         proptest! {
@@ -2007,6 +2189,110 @@ glsl = 450
         assert!(e.contains("expected a texture name"), "{e}");
         // Shot-level unknown fields are still refused.
         assert!(channels_film("", "", &["channel = [\"a.png\"]"]).is_err());
+    }
+
+    #[test]
+    fn channel_sources_by_spelling() {
+        use ChannelSource::*;
+        for (s, kind) in [
+            ("", Empty),
+            ("@input", Output("input")),
+            ("@title", Output("title")),
+            ("brick", Name("brick")),
+            ("my_tex2", Name("my_tex2")),
+            ("textures/brick.png", Image("textures/brick.png")),
+            ("brick.JPG", Image("brick.JPG")),
+            (
+                "<kit/textures/noise.png>",
+                Image("<kit/textures/noise.png>"),
+            ),
+            ("textures/sky.webp", Image("textures/sky.webp")), // refused later, as an image
+            ("renders/fog_####.png", Sequence("renders/fog_####.png")),
+            ("<kit/grain_##.png>", Sequence("<kit/grain_##.png>")),
+            ("footage/surf.mp4", Video("footage/surf.mp4")),
+            ("plate.MOV", Video("plate.MOV")),
+            (
+                "<kit/loops/caustics.webm>",
+                Video("<kit/loops/caustics.webm>"),
+            ),
+            ("clips.mp4/still.png", Image("clips.mp4/still.png")), // the file name decides
+        ] {
+            assert_eq!(ChannelSource::of(s), kind, "{s}");
+        }
+    }
+
+    #[test]
+    fn channel_kinds_that_arrive_later() {
+        let shot = |entry: &str| err(channels_film("", "", &[&format!("channels = [{entry}]")]));
+        for (entry, says) in [
+            (
+                r#""@input""#,
+                r#"channels[0]: "@input" is another pass's picture; @ sources arrive with layers (shotglass 0.1.4)"#,
+            ),
+            (
+                r#""renders/fog_####.png""#,
+                r#"channels[0]: "renders/fog_####.png" is an image sequence; image sequences arrive in shotglass 0.1.5"#,
+            ),
+            (
+                r#""footage/surf.mp4""#,
+                r#"channels[0]: "footage/surf.mp4" is a video; video files arrive after image sequences"#,
+            ),
+            (
+                r#"{ frames = "r/f_##.png", fps = 24 }"#,
+                "is an image sequence; image sequences arrive in shotglass 0.1.5",
+            ),
+            (
+                r#"{ video = "a.mov", in = 2.0 }"#,
+                "is a video; video files arrive",
+            ),
+            (
+                r#"{ texture = "plate", speed = 0.5 }"#,
+                "is a re-timed [textures] entry; re-timing arrives",
+            ),
+            (
+                r#"{ text = "credits", part = "glyphs" }"#,
+                r#""credits" is a text block; text arrives with [fonts] and [texts] in shotglass 0.1.3"#,
+            ),
+            (r#"{ file = "a.mp4" }"#, "is a video; video files arrive"),
+        ] {
+            let e = shot(entry);
+            assert!(e.contains(says), "{entry}: {e}");
+        }
+        // Malformed spellings get their own messages, not "arrives later".
+        for (entry, says) in [
+            (
+                r#""@""#,
+                "after @ comes input, picture, or the id of a layer or comp",
+            ),
+            (r#""@my layer""#, "after @ comes"),
+            (
+                r#""r_##/f_##.png""#,
+                "# marks frame numbers and may only appear in the file name",
+            ),
+            (r#""r/f_##_##.png""#, "an image sequence has one run of #"),
+            (
+                r#""renders/fog_%04d.png""#,
+                r#"write the frame number as # ("renders/fog_####.png")"#,
+            ),
+            (
+                r#"{ file = "a.png", video = "b.mp4" }"#,
+                "a channel table takes one of file, frames, video, texture or text (this one has file and video)",
+            ),
+        ] {
+            let e = shot(entry);
+            assert!(e.contains(says), "{entry}: {e}");
+        }
+        // [textures] values are files: @ sources only go in a shot's channels.
+        let e = err(channels_film("", "below = \"@input\"\n", &[]));
+        assert!(
+            e.contains("[textures] below: \"@input\" isn't a file"),
+            "{e}"
+        );
+        let e = err(channels_film("", "fog = \"r/fog_####.png\"\n", &[]));
+        assert!(
+            e.contains("[textures] fog: \"r/fog_####.png\" is an image sequence"),
+            "{e}"
+        );
     }
 
     #[test]
