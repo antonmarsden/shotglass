@@ -1015,57 +1015,20 @@ impl Player {
         }
     }
 
-    /// Mute (M) and solo (S) per layer, under the timeline.
-    fn layer_controls(&mut self, ui: &mut egui::Ui) {
-        let Some(m) = self.movie.clone() else { return };
-        if m.layers.is_empty() {
-            return;
-        }
-        let before = self.hidden_layers();
-        ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new("layers").small().weak());
-            for l in &m.layers {
-                ui.label(RichText::new(&l.id).small());
-                let muted = self.layer_mute.contains(&l.id);
-                if ui
-                    .selectable_label(muted, "M")
-                    .on_hover_text("mute this layer in the preview")
-                    .clicked()
-                {
-                    if muted {
-                        self.layer_mute.remove(&l.id);
-                    } else {
-                        self.layer_mute.insert(l.id.clone());
-                    }
-                }
-                let solo = self.layer_solo.as_deref() == Some(l.id.as_str());
-                if ui
-                    .selectable_label(solo, "S")
-                    .on_hover_text("show only this layer in the preview")
-                    .clicked()
-                {
-                    self.layer_solo = if solo { None } else { Some(l.id.clone()) };
-                }
-                ui.add_space(6.0);
-            }
-        });
-        let after = self.hidden_layers();
-        if after != before {
-            self.renderer.set_hidden_layers(after);
-        }
-    }
-
     fn timeline(&mut self, ui: &mut egui::Ui) {
         let Some(m) = self.movie.clone() else { return };
         let rows = m.layers.len() as f32;
         let (rect, resp) = ui.allocate_exact_size(
-            Vec2::new(ui.available_width(), 86.0 + 12.0 * rows),
+            Vec2::new(ui.available_width(), 86.0 + 16.0 * rows),
             Sense::click_and_drag(),
         );
         let p = ui.painter_at(rect);
         let d = m.duration.max(1e-3);
-        let x_of = |t: f32| rect.left() + 8.0 + (rect.width() - 16.0) * (t / d);
-        let t_of = |x: f32| ((x - rect.left() - 8.0) / (rect.width() - 16.0) * d).clamp(0.0, d);
+        // With layers, a left column holds each layer's mute/solo buttons, on its row.
+        let gutter = if m.layers.is_empty() { 8.0 } else { 46.0 };
+        let span = rect.width() - gutter - 8.0;
+        let x_of = |t: f32| rect.left() + gutter + span * (t / d);
+        let t_of = |x: f32| ((x - rect.left() - gutter) / span * d).clamp(0.0, d);
         p.rect_filled(rect, 4.0, Color32::from_gray(22));
 
         // ruler
@@ -1185,9 +1148,11 @@ impl Player {
         // fades are the lighter ends. Hidden layers (muted, or not the soloed one) grey.
         let hidden = self.hidden_layers();
         for (i, l) in m.layers.iter().enumerate() {
-            let y = rect.top() + 82.0 + 12.0 * i as f32;
-            let r =
-                Rect::from_min_max(Pos2::new(x_of(l.start), y), Pos2::new(x_of(l.end), y + 9.0));
+            let y = rect.top() + 82.0 + 16.0 * i as f32;
+            let r = Rect::from_min_max(
+                Pos2::new(x_of(l.start), y + 1.0),
+                Pos2::new(x_of(l.end), y + 13.0),
+            );
             let on = !hidden.contains(&l.id);
             let c = if on {
                 Color32::from_rgb(170, 120, 210)
@@ -1197,13 +1162,16 @@ impl Player {
             p.rect_filled(r, 2.0, c);
             for (a, b) in [(l.start, l.start + l.fade.0), (l.end - l.fade.1, l.end)] {
                 if b > a {
-                    let f = Rect::from_min_max(Pos2::new(x_of(a), y), Pos2::new(x_of(b), y + 9.0));
+                    let f = Rect::from_min_max(
+                        Pos2::new(x_of(a), y + 1.0),
+                        Pos2::new(x_of(b), y + 13.0),
+                    );
                     p.rect_filled(f, 2.0, Color32::from_white_alpha(50));
                 }
             }
             if r.width() > 7.0 * l.id.len() as f32 + 6.0 {
                 p.text(
-                    Pos2::new(r.left() + 3.0, y + 4.5),
+                    Pos2::new(r.left() + 3.0, y + 7.0),
                     egui::Align2::LEFT_CENTER,
                     &l.id,
                     egui::FontId::proportional(9.5),
@@ -1282,6 +1250,51 @@ impl Player {
         if let Some(pos) = resp.hover_pos() {
             let t = t_of(pos.x);
             resp.on_hover_text(format!("{}  |  {}", clock_text(t), describe(&m, t)));
+        }
+        // Each layer's mute (M) and solo (S), on its row (added after the timeline, so
+        // they take the clicks over it). Preview only: still and export draw every layer.
+        let before = self.hidden_layers();
+        for (i, l) in m.layers.iter().enumerate() {
+            let y = rect.top() + 82.0 + 16.0 * i as f32;
+            let toggle = |ui: &mut egui::Ui, x: f32, on: bool, text: &str, tip: String| {
+                let r = Rect::from_min_size(Pos2::new(rect.left() + x, y), Vec2::new(18.0, 14.0));
+                ui.put(
+                    r,
+                    egui::Button::new(RichText::new(text).size(9.5))
+                        .selected(on)
+                        .small(),
+                )
+                .on_hover_text(tip)
+                .clicked()
+            };
+            let muted = self.layer_mute.contains(&l.id);
+            if toggle(
+                ui,
+                4.0,
+                muted,
+                "M",
+                format!("mute layer \"{}\" in the preview", l.id),
+            ) {
+                if muted {
+                    self.layer_mute.remove(&l.id);
+                } else {
+                    self.layer_mute.insert(l.id.clone());
+                }
+            }
+            let solo = self.layer_solo.as_deref() == Some(l.id.as_str());
+            if toggle(
+                ui,
+                24.0,
+                solo,
+                "S",
+                format!("show only layer \"{}\" in the preview", l.id),
+            ) {
+                self.layer_solo = if solo { None } else { Some(l.id.clone()) };
+            }
+        }
+        let after = self.hidden_layers();
+        if after != before {
+            self.renderer.set_hidden_layers(after);
         }
     }
 
@@ -1525,7 +1538,6 @@ impl eframe::App for Player {
             ui.add_space(4.0);
             self.transport(ui);
             self.timeline(ui);
-            self.layer_controls(ui);
             ui.add_space(4.0);
         });
         if self.show_panel {
