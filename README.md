@@ -255,11 +255,13 @@ Text is a texture: name fonts in `[fonts]` and text blocks in `[texts]`, and bin
 to a channel like an image (needs `shotglass = "0.1.3"`):
 
 ```toml
+# Google Fonts families, added with `shotglass fonts add` (see "Getting fonts")
 [fonts]
-body = { file = "fonts/Inter-Regular.ttf", licence = "OFL-1.1" }
-bold = { file = "fonts/Inter-Variable.ttf", variations = { wght = 700 }, licence = "OFL-1.1" }
-display = { file = "<kit/fonts/Bungee-Regular.ttf>", fallback = ["body"] }   # from a library
-arabic = "fonts/NotoNaskhArabic-Regular.ttf"
+body = "<inter/Inter[opsz,wght].ttf>"
+bold = { file = "<inter/Inter[opsz,wght].ttf>", variations = { wght = 700 } }
+display = { file = "<bungee/Bungee-Regular.ttf>", fallback = ["body"] }
+arabic = "<notonaskharabic/NotoNaskhArabic[wght].ttf>"
+hand = { file = "fonts/MyHand.otf", licence = "OFL-1.1" }   # a font file in the film folder
 
 [texts]
 title = { text = "Big Shadow", font = "display", size = 160 }
