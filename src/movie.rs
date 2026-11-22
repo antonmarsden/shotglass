@@ -80,6 +80,9 @@ struct MovieFile {
     shots: Vec<ShotFile>,
     #[serde(rename = "marker", default)]
     markers: Vec<MarkerFile>,
+    /// Layers above the picture track, bottom to top (#69).
+    #[serde(rename = "layer", default)]
+    layers: Vec<LayerFile>,
     /// Film-wide channels for every shot that doesn't set its own `channels`.
     channels: Option<Vec<toml::Value>>,
     /// Named textures: `brick = "textures/brick.png"` or `{ file = "…", filter = … }`.
@@ -138,6 +141,40 @@ struct ShotFile {
     sound_gain: Option<f32>,
     /// Channel sources for iChannel0..: names from [textures], paths, `<lib/path>`, tables, "".
     channels: Option<Vec<toml::Value>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LayerFile {
+    id: String,
+    /// A film file whose `mainImage` writes straight alpha.
+    scene: Option<String>,
+    /// A library pass (`"fx/grain"`) or a film `.glsl` file, resolved like a transition.
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    /// From / to: movie seconds, or `"<shot or layer>[.start|.settled|.end] ± s"`.
+    from: Option<toml::Value>,
+    to: Option<toml::Value>,
+    /// 0..1, or keyframes in layer-local seconds.
+    opacity: Option<toml::Value>,
+    /// Fade in / out, seconds (smooth), multiplied into `opacity`.
+    fade: Option<[f32; 2]>,
+    /// `"auto"` (the player's render scale) or a fixed fraction of the output size.
+    scale: Option<toml::Value>,
+    #[serde(default)]
+    uniforms: BTreeMap<String, toml::Value>,
+    /// `#define`s for library passes, as transition params.
+    #[serde(default)]
+    params: BTreeMap<String, toml::Value>,
+    channels: Option<Vec<toml::Value>>,
+    time_offset: Option<f32>,
+    time_scale: Option<f32>,
+    // Later phases: recognised so the message names when they arrive.
+    blend: Option<String>,
+    comp: Option<toml::Value>,
+    matte: Option<toml::Value>,
+    transition_in: Option<toml::Value>,
+    transition_out: Option<toml::Value>,
 }
 
 #[derive(Deserialize)]
@@ -242,7 +279,7 @@ fn not_yet(what: &str, s: &str, kind: &str) -> anyhow::Error {
     let (is, arrives) = match kind {
         "output" => (
             "another pass's picture",
-            "@ sources arrive with layers (shotglass 0.1.4)",
+            "@picture and @<layer> arrive with layers phase 2 (only @input binds now)",
         ),
         "sequence" => (
             "an image sequence",
@@ -369,6 +406,8 @@ impl TextSource {
 pub enum Source {
     Image(FileRef),
     Text(Box<TextSource>),
+    /// `@input` on a layer: the picture below it (everything under it, composited).
+    Input,
 }
 
 /// What an iChannel is bound to, and how it's sampled.
@@ -387,6 +426,7 @@ impl Channel {
     /// Every file the channel reads: the image, or a text's file and fonts.
     pub fn files(&self) -> Vec<&FileRef> {
         match &self.source {
+            Source::Input => vec![],
             Source::Image(f) => vec![f],
             Source::Text(t) => {
                 let mut v: Vec<&FileRef> = vec![];
@@ -401,6 +441,7 @@ impl Channel {
 
     pub fn files_mut(&mut self) -> Vec<&mut FileRef> {
         match &mut self.source {
+            Source::Input => vec![],
             Source::Image(f) => vec![f],
             Source::Text(t) => {
                 let t = &mut **t;
@@ -419,6 +460,7 @@ impl Channel {
         match &self.source {
             Source::Image(f) => f.label.clone(),
             Source::Text(t) => format!("text \"{}\"", t.name),
+            Source::Input => "@input".to_string(),
         }
     }
 
@@ -426,14 +468,14 @@ impl Channel {
     pub fn image(&self) -> Option<&FileRef> {
         match &self.source {
             Source::Image(f) => Some(f),
-            Source::Text(_) => None,
+            _ => None,
         }
     }
 
     pub fn text(&self) -> Option<&TextSource> {
         match &self.source {
             Source::Text(t) => Some(t),
-            Source::Image(_) => None,
+            _ => None,
         }
     }
 }
@@ -465,6 +507,58 @@ impl Shot {
     /// iTime for the scene shader at shot-local time `local`.
     pub fn scene_time(&self, local: f32) -> f32 {
         self.time_offset + local * self.time_scale
+    }
+}
+
+/// What a layer draws.
+#[derive(Clone, Debug, PartialEq)]
+pub enum LayerScene {
+    /// `scene = "layers/title.glsl"`.
+    File(PathBuf),
+    /// `type = "fx/grain"` or `type = "fx/my.glsl"`: resolved like a transition type.
+    Pass(String),
+}
+
+/// A `[[layer]]`: a scene drawn over everything below it within its span (#69).
+#[derive(Clone, Debug)]
+pub struct Layer {
+    pub id: String,
+    /// The span, movie seconds: active in [start, end).
+    pub start: f32,
+    pub end: f32,
+    pub scene: LayerScene,
+    pub uniforms: Vec<(String, Anim)>,
+    pub params: Vec<(String, Vec<f32>)>,
+    pub channels: [Option<Channel>; N_CHANNELS],
+    pub opacity: Anim,
+    /// Fade in / out in seconds.
+    pub fade: (f32, f32),
+    /// None: the frame's (auto) render scale; Some(s): a fixed fraction of the output.
+    pub scale: Option<f32>,
+    pub time_offset: f32,
+    pub time_scale: f32,
+}
+
+impl Layer {
+    pub fn duration(&self) -> f32 {
+        self.end - self.start
+    }
+    /// iTime for the layer's shader at layer-local time `local`.
+    pub fn scene_time(&self, local: f32) -> f32 {
+        self.time_offset + local * self.time_scale
+    }
+    /// Opacity at layer-local time `local`: `opacity` (keyframes or constant) times the
+    /// fades (smooth), in 0..1.
+    pub fn opacity_at(&self, local: f32) -> f32 {
+        let fade = |x: f32, len: f32| {
+            if len <= 0.0 {
+                1.0
+            } else {
+                Ease::Smooth.apply((x / len).clamp(0.0, 1.0))
+            }
+        };
+        let o = self.opacity.eval(local)[0].clamp(0.0, 1.0);
+        o * fade(local, self.fade.0) * fade(self.duration() - local, self.fade.1)
     }
 }
 
@@ -501,6 +595,8 @@ pub struct Movie {
     pub mix_lookback: f32,
     pub volume: f32,
     pub shots: Vec<Shot>,
+    /// Layers above the picture track, bottom to top.
+    pub layers: Vec<Layer>,
     pub markers: Vec<Marker>,
     pub duration: f32,
     /// `shotglass = "…"` in the project: the engine contract range the film was made for.
@@ -562,10 +658,19 @@ impl Movie {
             .any(|s| s.channels.iter().any(Option::is_some))
     }
 
-    /// Every distinct texture (by file and how its texels are made), in shot order.
+    /// Every bound channel of every shot, then of every layer.
+    pub fn channels(&self) -> impl Iterator<Item = &Channel> {
+        self.shots
+            .iter()
+            .flat_map(|s| s.channels.iter().flatten())
+            .chain(self.layers.iter().flat_map(|l| l.channels.iter().flatten()))
+    }
+
+    /// Every distinct texture (by file and how its texels are made), in shot order,
+    /// then layer order. `@input` isn't a texture.
     pub fn textures(&self) -> Vec<&Channel> {
         let mut v: Vec<&Channel> = vec![];
-        for c in self.shots.iter().flat_map(|s| s.channels.iter().flatten()) {
+        for c in self.channels().filter(|c| c.source != Source::Input) {
             if !v
                 .iter()
                 .any(|o| o.source == c.source && o.vflip == c.vflip && o.srgb == c.srgb)
@@ -577,7 +682,8 @@ impl Movie {
     }
 
     /// `check`'s warning for a film that uses a feature newer than the engine contract
-    /// it says it needs (textures: 0.1.1, `loop`: 0.1.2, text and iChannel4..7: 0.1.3):
+    /// it says it needs (textures: 0.1.1, `loop`: 0.1.2, text and iChannel4..7: 0.1.3,
+    /// layers: 0.1.4):
     /// older engines would then fail
     /// on an "unknown field" instead of asking for a newer shotglass.
     pub fn contract_warning(&self) -> Option<String> {
@@ -604,6 +710,10 @@ impl Movie {
             features.push("iChannel4..7, which need shotglass 0.1.3");
             need = semver::Version::new(0, 1, 3);
         }
+        if !self.layers.is_empty() {
+            features.push("layers, which need shotglass 0.1.4");
+            need = semver::Version::new(0, 1, 4);
+        }
         if features.is_empty() {
             return None;
         }
@@ -612,6 +722,7 @@ impl Movie {
             semver::Version::new(0, 1, 0),
             semver::Version::new(0, 1, 1),
             semver::Version::new(0, 1, 2),
+            semver::Version::new(0, 1, 3),
         ];
         let allows_old = match &self.shotglass {
             None => true,
@@ -634,8 +745,17 @@ impl Movie {
     /// Every texture file exists (a missing one refuses the version, like a missing
     /// `#include`), and no shot needs more texture memory than the budget.
     fn check_textures(&self) -> Result<()> {
-        for s in &self.shots {
-            for (n, c) in s.channels.iter().enumerate() {
+        let items = self
+            .shots
+            .iter()
+            .map(|s| (format!("shot \"{}\"", s.id), &s.channels))
+            .chain(
+                self.layers
+                    .iter()
+                    .map(|l| (format!("layer \"{}\"", l.id), &l.channels)),
+            );
+        for (who, channels) in items {
+            for (n, c) in channels.iter().enumerate() {
                 let Some(c) = c else { continue };
                 for f in c.files() {
                     if f.file.is_file() {
@@ -656,14 +776,9 @@ impl Movie {
                             None => format!(" (did you mean \"{m}\"?)"),
                         });
                     match c.text() {
-                        None => bail!(
-                            "shot \"{}\": channels[{n}]: \"{}\" not found{hint}",
-                            s.id,
-                            f.label
-                        ),
+                        None => bail!("{who}: channels[{n}]: \"{}\" not found{hint}", f.label),
                         Some(t) => bail!(
-                            "shot \"{}\": channels[{n}]: text \"{}\": \"{}\" not found{hint}",
-                            s.id,
+                            "{who}: channels[{n}]: text \"{}\": \"{}\" not found{hint}",
                             t.name,
                             f.label
                         ),
@@ -672,16 +787,15 @@ impl Movie {
             }
             // Texts lay out now (the fonts exist): missing glyphs, max_lines and block
             // size are edit mistakes that refuse the version, like a missing file.
-            for c in s.channels.iter().flatten() {
+            for c in channels.iter().flatten() {
                 if let Some(t) = c.text() {
-                    t.layout().with_context(|| format!("shot \"{}\"", s.id))?;
+                    t.layout().with_context(|| who.clone())?;
                 }
             }
-            let (total, parts) = crate::texture::shot_memory(&s.channels);
+            let (total, parts) = crate::texture::shot_memory(channels);
             if total > crate::texture::BUDGET {
                 bail!(
-                    "shot \"{}\": its textures need {}, more than the {} budget: {}",
-                    s.id,
+                    "{who}: its textures need {}, more than the {} budget: {}",
                     crate::texture::describe_bytes(total),
                     crate::texture::describe_bytes(crate::texture::BUDGET),
                     parts.join(", ")
@@ -734,10 +848,15 @@ impl Movie {
         self.libraries =
             library::resolve(&self.project, &self.library_specs, o, lock.as_ref(), cache)?;
         let libs = self.libraries.clone();
+        let layer_channels = self
+            .layers
+            .iter_mut()
+            .flat_map(|l| l.channels.iter_mut().flatten());
         for f in self
             .shots
             .iter_mut()
             .flat_map(|s| s.channels.iter_mut().flatten())
+            .chain(layer_channels)
             .flat_map(Channel::files_mut)
         {
             if let Some(lib) = &f.library
@@ -777,6 +896,21 @@ impl Movie {
                 v.push(self.root.join(p));
             }
             for f in s.channels.iter().flatten().flat_map(Channel::files) {
+                if f.library.is_none() {
+                    v.push(f.file.clone());
+                }
+            }
+        }
+        for l in &self.layers {
+            match &l.scene {
+                LayerScene::File(p) => v.push(p.clone()),
+                LayerScene::Pass(k) => {
+                    if let TransitionKind::File(p) = transition_kind(k) {
+                        v.push(self.root.join(p));
+                    }
+                }
+            }
+            for f in l.channels.iter().flatten().flat_map(Channel::files) {
                 if f.library.is_none() {
                     v.push(f.file.clone());
                 }
@@ -853,7 +987,7 @@ impl Movie {
                     "{what}: a texture name may only use letters, digits and _ (and not start with a digit)"
                 );
             }
-            match texture_spec(&what, v, None, &library_specs, root)? {
+            match texture_spec(&what, v, None, &library_specs, root, false)? {
                 Some(c) => textures.insert(name.clone(), c),
                 None => bail!("{what}: \"\" names no file"),
             };
@@ -903,29 +1037,31 @@ impl Movie {
         }
         let textures = names;
         let mut used: std::collections::HashSet<String> = Default::default();
-        let mut channel_list =
-            |what: &str, list: &[toml::Value]| -> Result<[Option<Channel>; N_CHANNELS]> {
-                if list.len() > N_CHANNELS {
-                    bail!(
-                        "{what}channels has {} entries; there are {N_CHANNELS} (iChannel0..{})",
-                        list.len(),
-                        N_CHANNELS - 1
-                    );
+        let mut channel_list = |what: &str,
+                                list: &[toml::Value],
+                                on_layer: bool|
+         -> Result<[Option<Channel>; N_CHANNELS]> {
+            if list.len() > N_CHANNELS {
+                bail!(
+                    "{what}channels has {} entries; there are {N_CHANNELS} (iChannel0..{})",
+                    list.len(),
+                    N_CHANNELS - 1
+                );
+            }
+            let mut out: [Option<Channel>; N_CHANNELS] = Default::default();
+            for (n, v) in list.iter().enumerate() {
+                let ctx = format!("{what}channels[{n}]");
+                if let toml::Value::String(s) = v
+                    && let ChannelSource::Name(name) = ChannelSource::of(s)
+                {
+                    used.insert(name.to_string());
                 }
-                let mut out: [Option<Channel>; N_CHANNELS] = Default::default();
-                for (n, v) in list.iter().enumerate() {
-                    let ctx = format!("{what}channels[{n}]");
-                    if let toml::Value::String(s) = v
-                        && let ChannelSource::Name(name) = ChannelSource::of(s)
-                    {
-                        used.insert(name.to_string());
-                    }
-                    out[n] = texture_spec(&ctx, v, Some(&textures), &library_specs, root)?;
-                }
-                Ok(out)
-            };
+                out[n] = texture_spec(&ctx, v, Some(&textures), &library_specs, root, on_layer)?;
+            }
+            Ok(out)
+        };
         let default_channels = match &f.channels {
-            Some(list) => channel_list("", list)?,
+            Some(list) => channel_list("", list, false)?,
             None => Default::default(),
         };
         let mut shots: Vec<Shot> = Vec::new();
@@ -933,7 +1069,7 @@ impl Movie {
         for (index, s) in f.shots.into_iter().enumerate() {
             let ctx = || format!("shot \"{}\"", s.id);
             let channels = match &s.channels {
-                Some(list) => channel_list(&format!("{}: ", ctx()), list)?,
+                Some(list) => channel_list(&format!("{}: ", ctx()), list, false)?,
                 None => default_channels.clone(),
             };
             if !ids.insert(s.id.clone()) {
@@ -1125,6 +1261,172 @@ impl Movie {
                 );
             }
         }
+        // Layers, bottom to top. Ids share the shot namespace (fallback keys, cue names).
+        let mut layers: Vec<Layer> = vec![];
+        for l in f.layers {
+            let what = format!("layer \"{}\"", l.id);
+            if l.id.is_empty()
+                || !l
+                    .id
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            {
+                bail!(
+                    "layer id \"{}\" may only use letters, digits, _ and -",
+                    l.id
+                );
+            }
+            if shots.iter().any(|s| s.id == l.id) || layers.iter().any(|o| o.id == l.id) {
+                bail!(
+                    "{what}: the id is taken; shots and layers share ids (they name cues and \
+                     fallbacks)"
+                );
+            }
+            if l.comp.is_some() {
+                bail!("{what}: comp arrives with layers phase 3 (comps and mattes)");
+            }
+            if l.matte.is_some() {
+                bail!("{what}: matte arrives with layers phase 3 (comps and mattes)");
+            }
+            if l.transition_in.is_some() || l.transition_out.is_some() {
+                bail!("{what}: layer transitions arrive in a later phase; use fade = [in, out]");
+            }
+            if let Some(b) = &l.blend
+                && b != "over"
+            {
+                bail!(
+                    "{what}: blend = \"{b}\": blend modes arrive with layers phase 2 (only \
+                     \"over\" now)"
+                );
+            }
+            let scene = match (&l.scene, &l.kind) {
+                (Some(_), Some(_)) => bail!("{what}: give scene or type, not both"),
+                (None, None) => bail!(
+                    "{what}: a layer needs scene = \"…\" (a film file) or type = \"…\" (a \
+                     library pass like \"fx/grain\")"
+                ),
+                (Some(p), None) => {
+                    path_rule(format!("{what}: scene"), p)?;
+                    LayerScene::File(root.join(p))
+                }
+                (None, Some(k)) => {
+                    match transition_kind(k) {
+                        TransitionKind::File(p) => path_rule(format!("{what}: type"), p)?,
+                        TransitionKind::Library(lib, file) => {
+                            if !library_specs.iter().any(|s| s.name == lib) {
+                                bail!(
+                                    "{what}: type \"{k}\" names library \"{lib}\", but \
+                                     [libraries] has {}",
+                                    quoted_list(library_specs.iter().map(|s| &s.name))
+                                );
+                            }
+                            path_rule(format!("{what}: type"), &file)?;
+                        }
+                        TransitionKind::Name(n) => bail!(
+                            "{what}: type \"{n}\" needs a library (\"fx/{n}\") or a film file \
+                             (\"fx/{n}.glsl\")"
+                        ),
+                    }
+                    LayerScene::Pass(k.clone())
+                }
+            };
+            let start = match &l.from {
+                None => 0.0,
+                Some(v) => span_point(&format!("{what}: from"), v, true, &shots, &layers)?,
+            };
+            let end = match &l.to {
+                None => duration,
+                Some(v) => span_point(&format!("{what}: to"), v, false, &shots, &layers)?,
+            };
+            if !(0.0..duration).contains(&start) || !(start < end && end <= duration + 1e-4) {
+                bail!(
+                    "{what}: the span {}–{} s must lie within the film (0–{} s), from before to{}",
+                    glsl_float(start),
+                    glsl_float(end),
+                    glsl_float(duration),
+                    if loop_frames.is_some() {
+                        "; a loop film's layers stay inside one period"
+                    } else {
+                        ""
+                    }
+                );
+            }
+            let end = end.min(duration);
+            let (fade_in, fade_out) = match l.fade {
+                None => (0.0, 0.0),
+                Some([a, b]) => {
+                    if !(a >= 0.0 && b >= 0.0) || a + b > end - start + 1e-4 {
+                        bail!(
+                            "{what}: fade = [{a}, {b}] must be ≥ 0 and fit the span ({} s)",
+                            glsl_float(end - start)
+                        );
+                    }
+                    (a, b)
+                }
+            };
+            let opacity = match &l.opacity {
+                None => Anim::from_toml(&toml::Value::Float(1.0))?,
+                Some(v) => {
+                    let a = Anim::from_toml(v).with_context(|| format!("{what}: opacity"))?;
+                    if a.dim() != 1 {
+                        bail!("{what}: opacity is one number (or keyframes of one number)");
+                    }
+                    a
+                }
+            };
+            let scale = match &l.scale {
+                None => None,
+                Some(toml::Value::String(s)) if s == "auto" => None,
+                Some(v) => {
+                    let x = v
+                        .as_float()
+                        .or_else(|| v.as_integer().map(|i| i as f64))
+                        .unwrap_or(-1.0) as f32;
+                    if !(x > 0.0 && x <= 1.0) {
+                        bail!(
+                            "{what}: scale must be \"auto\" or a fraction of the output size in (0, 1]"
+                        );
+                    }
+                    Some(x)
+                }
+            };
+            let mut uniforms = Vec::new();
+            for (name, v) in &l.uniforms {
+                if !is_ident(name) {
+                    bail!("{what}: \"{name}\" is not a valid GLSL name");
+                }
+                let a = Anim::from_toml(v).with_context(|| format!("{what}: uniform {name}"))?;
+                uniforms.push((name.clone(), a));
+            }
+            let mut params = Vec::new();
+            for (name, v) in &l.params {
+                if !is_ident(name) {
+                    bail!("{what}: param \"{name}\" is not a valid GLSL name");
+                }
+                params.push((
+                    name.clone(),
+                    vector(v).with_context(|| format!("{what}: param {name}"))?,
+                ));
+            }
+            let channels = match &l.channels {
+                Some(list) => channel_list(&format!("{what}: "), list, true)?,
+                None => Default::default(),
+            };
+            layers.push(Layer {
+                id: l.id,
+                start,
+                end,
+                scene,
+                uniforms,
+                params,
+                channels,
+                opacity,
+                fade: (fade_in, fade_out),
+                scale,
+                time_offset: l.time_offset.unwrap_or(0.0),
+                time_scale: l.time_scale.unwrap_or(1.0),
+            });
+        }
         Ok(Movie {
             root: root.to_path_buf(),
             title: f.title.unwrap_or_else(|| "Untitled".into()),
@@ -1147,6 +1449,7 @@ impl Movie {
                 .map(|p| root.join(p)),
             mix_lookback: f.sound.as_ref().and_then(|s| s.mix_lookback).unwrap_or(1.0),
             shots,
+            layers,
             markers: f
                 .markers
                 .into_iter()
@@ -1162,7 +1465,7 @@ impl Movie {
                 .filter(|n| !used.contains(*n))
                 .map(|n| match textures[n].source {
                     Source::Text(_) => format!("[texts] {n} isn't used by any shot's channels"),
-                    Source::Image(_) => {
+                    Source::Image(_) | Source::Input => {
                         format!("[textures] {n} isn't used by any shot's channels")
                     }
                 })
@@ -1319,7 +1622,23 @@ impl Movie {
             s += &format!("#define CUE_{id}_SETTLED {}\n", glsl_float(shot.settled()));
             s += &format!("#define CUE_{id}_END {}\n", glsl_float(shot.end()));
         }
+        for layer in &self.layers {
+            let id = layer.id.to_ascii_uppercase().replace('-', "_");
+            s += &format!("#define CUE_{id}_START {}\n", glsl_float(layer.start));
+            s += &format!("#define CUE_{id}_END {}\n", glsl_float(layer.end));
+        }
         s
+    }
+
+    /// The layers active at `t` (half-open spans `[start, end)`), bottom to top, with
+    /// their layer-local times.
+    pub fn layers_at(&self, t: f32) -> Vec<(usize, f32)> {
+        self.layers
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| t >= l.start && t < l.end)
+            .map(|(j, l)| (j, t - l.start))
+            .collect()
     }
 
     /// Regions worth looping: each shot, and each transition with a little padding.
@@ -1368,6 +1687,80 @@ fn loop_frames(duration: f32, num: u32, den: u32) -> Result<u64> {
         secs(lo),
         secs(hi)
     )
+}
+
+/// One end of a layer's span: movie seconds, or `"<id>[.start|.settled|.end]"` with an
+/// optional `+ s` / `- s`. A bare shot id means its start for `from` and its end for
+/// `to`; layers (earlier ones only) have `.start` and `.end`.
+fn span_point(
+    what: &str,
+    v: &toml::Value,
+    is_from: bool,
+    shots: &[Shot],
+    layers: &[Layer],
+) -> Result<f32> {
+    if let Some(x) = v.as_float().or_else(|| v.as_integer().map(|i| i as f64)) {
+        return Ok(x as f32);
+    }
+    let Some(s) = v.as_str() else {
+        bail!("{what}: a number of seconds or \"<shot>[.start|.settled|.end] ± s\"");
+    };
+    let (base, offset) = match s
+        .find(['+', '-'])
+        .filter(|&i| i > 0 && s[..i].ends_with(' '))
+    {
+        Some(i) => {
+            let n: f32 = s[i + 1..].trim().parse().map_err(|_| {
+                anyhow!(
+                    "{what}: \"{s}\": the offset after {} must be seconds",
+                    &s[i..=i]
+                )
+            })?;
+            (s[..i].trim(), if &s[i..=i] == "-" { -n } else { n })
+        }
+        None => (s.trim(), 0.0),
+    };
+    let (id, part) = base.split_once('.').unwrap_or((base, ""));
+    let t = if let Some(shot) = shots.iter().find(|x| x.id == id) {
+        match part {
+            "" if is_from => shot.start,
+            "" => shot.end(),
+            "start" => shot.start,
+            "settled" => shot.settled(),
+            "end" => shot.end(),
+            p => bail!("{what}: \"{s}\": a shot has .start, .settled and .end, not .{p}"),
+        }
+    } else if let Some(layer) = layers.iter().find(|x| x.id == id) {
+        match part {
+            "" if is_from => layer.start,
+            "" => layer.end,
+            "start" => layer.start,
+            "end" => layer.end,
+            p => bail!("{what}: \"{s}\": a layer has .start and .end, not .{p}"),
+        }
+    } else {
+        bail!(
+            "{what}: \"{s}\": no shot or earlier layer called \"{id}\" (shots: {}{})",
+            shots
+                .iter()
+                .map(|x| x.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+            if layers.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "; layers: {}",
+                    layers
+                        .iter()
+                        .map(|x| x.id.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            }
+        );
+    };
+    Ok(t + offset)
 }
 
 fn quoted_list<'a>(names: impl Iterator<Item = &'a String>) -> String {
@@ -1741,6 +2134,7 @@ fn texture_spec(
     names: Option<&BTreeMap<String, Channel>>,
     specs: &[LibrarySpec],
     root: &Path,
+    on_layer: bool,
 ) -> Result<Option<Channel>> {
     let file_channel = |s: &str| -> Result<Channel> {
         let f = file_ref(what, s, specs, root)?;
@@ -1816,7 +2210,20 @@ fn texture_spec(
                         "{what}: \"{s}\": after @ comes input, picture, or the id of a layer or comp"
                     );
                 }
-                Err(not_yet(what, s, "output"))
+                match (out, on_layer) {
+                    ("input", true) => Ok(Some(Channel {
+                        source: Source::Input,
+                        filter: Filter::Linear,
+                        wrap: Wrap::Clamp,
+                        vflip: false,
+                        srgb: false,
+                    })),
+                    ("input", false) => bail!(
+                        "{what}: \"@input\" is the picture below a layer; a shot has nothing \
+                         below it (use it in a [[layer]]'s channels)"
+                    ),
+                    _ => Err(not_yet(what, s, "output")),
+                }
             }
             ChannelSource::Name(s) => {
                 let Some(names) = names else {
@@ -2823,8 +3230,8 @@ glsl = 450
         let shot = |entry: &str| err(channels_film("", "", &[&format!("channels = [{entry}]")]));
         for (entry, says) in [
             (
-                r#""@input""#,
-                r#"channels[0]: "@input" is another pass's picture; @ sources arrive with layers (shotglass 0.1.4)"#,
+                r#""@picture""#,
+                r#"channels[0]: "@picture" is another pass's picture; @picture and @<layer> arrive with layers phase 2"#,
             ),
             (
                 r#""renders/fog_####.png""#,
@@ -2888,6 +3295,175 @@ glsl = 450
         let e = err(channels_film("", "fog = \"r/fog_####.png\"\n", &[]));
         assert!(
             e.contains("[textures] fog: \"r/fog_####.png\" is an image sequence"),
+            "{e}"
+        );
+    }
+
+    fn layers_film(layers: &str) -> Result<Movie> {
+        fixture(
+            &format!(
+                "[libraries]\nfx = {{ path = \"lib/fx\" }}\n\
+                 [[shot]]\nid = \"moon\"\nscene = \"a.glsl\"\nduration = 3\n\
+                 [[shot]]\nid = \"closeup\"\nscene = \"b.glsl\"\nduration = 3\n\
+                 transition = {{ type = \"fx/mix.glsl\", duration = 1 }}\n{layers}"
+            ),
+            Path::new("/film"),
+        )
+    }
+
+    #[test]
+    fn layers_parse_and_resolve_spans() {
+        // moon: 0–3, closeup: 2–5 (settled at 3).
+        let m = layers_film(
+            "[[layer]]\nid = \"title\"\nscene = \"layers/title.glsl\"\nfrom = \"moon + 0.5\"\nto = \"closeup.settled\"\nfade = [0.4, 0.6]\nscale = 1\nuniforms.uSize = 0.08\nchannels = [\"\", \"@input\"]\n\
+             [[layer]]\nid = \"grain\"\ntype = \"fx/grain\"\nscale = 0.5\nopacity = 0.6\nparams = { amount = 0.3 }\n\
+             [[layer]]\nid = \"bars\"\ntype = \"fx/bars.glsl\"\nfrom = \"title.end - 0.5\"\nto = 4.5\nopacity = { keys = [[0, 0.0], [1, 1.0]] }\n",
+        )
+        .unwrap();
+        let [title, grain, bars] = &m.layers[..] else {
+            panic!("three layers")
+        };
+        assert_eq!((title.start, title.end), (0.5, 3.0));
+        assert_eq!(title.fade, (0.4, 0.6));
+        assert_eq!(title.scale, Some(1.0));
+        assert_eq!(
+            title.scene,
+            LayerScene::File(PathBuf::from("/film/layers/title.glsl"))
+        );
+        assert_eq!(title.channels[1].as_ref().unwrap().source, Source::Input);
+        // No span: the whole film.
+        assert_eq!((grain.start, grain.end), (0.0, 5.0));
+        assert_eq!(grain.scene, LayerScene::Pass("fx/grain".into()));
+        assert_eq!(grain.params, vec![("amount".to_string(), vec![0.3])]);
+        assert_eq!(bars.start, 2.5);
+        // Opacity: fades (smooth) times the keyframes / constant.
+        let near = |a: f32, b: f32| (a - b).abs() < 1e-5;
+        assert!(near(title.opacity_at(0.0), 0.0));
+        assert!(near(title.opacity_at(0.2), 0.5));
+        assert!(near(title.opacity_at(1.0), 1.0));
+        assert!(near(title.opacity_at(2.5 - 0.3), 0.5));
+        assert!(near(grain.opacity_at(3.0), 0.6));
+        assert!(near(bars.opacity_at(0.5), 0.5));
+        // Active layers: half-open spans, bottom to top, with layer-local times.
+        assert_eq!(m.layers_at(0.25), vec![(1, 0.25)]);
+        assert_eq!(m.layers_at(2.75), vec![(0, 2.25), (1, 2.75), (2, 0.25)]);
+        assert_eq!(m.layers_at(3.0), vec![(1, 3.0), (2, 0.5)]);
+        // Cues for layers; the contract asks for 0.1.4.
+        let cues = m.cue_defines();
+        assert!(cues.contains("#define CUE_TITLE_START 0.5\n"), "{cues}");
+        assert!(cues.contains("#define CUE_TITLE_END 3.0\n"), "{cues}");
+        let w = m.contract_warning().unwrap();
+        assert!(w.contains("layers, which need shotglass 0.1.4"), "{w}");
+        // A film without layers has exactly the cues it had.
+        let plain = layers_film("").unwrap();
+        assert!(plain.layers.is_empty() && !plain.cue_defines().contains("TITLE"));
+    }
+
+    #[test]
+    fn layers_are_validated() {
+        for (layer, says) in [
+            (
+                "id = \"moon\"\nscene = \"l.glsl\"",
+                "the id is taken; shots and layers share ids",
+            ),
+            ("id = \"a b\"\nscene = \"l.glsl\"", "may only use letters"),
+            ("id = \"x\"", "a layer needs scene = \"…\""),
+            (
+                "id = \"x\"\nscene = \"l.glsl\"\ntype = \"fx/grain\"",
+                "scene or type, not both",
+            ),
+            (
+                "id = \"x\"\ntype = \"grain\"",
+                "needs a library (\"fx/grain\")",
+            ),
+            (
+                "id = \"x\"\ntype = \"kit/grain\"",
+                "names library \"kit\", but [libraries] has \"fx\"",
+            ),
+            (
+                "id = \"x\"\nscene = \"l.glsl\"\nfrom = \"mooon\"",
+                "no shot or earlier layer called \"mooon\" (shots: moon, closeup)",
+            ),
+            (
+                "id = \"x\"\nscene = \"l.glsl\"\nfrom = \"moon.middle\"",
+                "a shot has .start, .settled and .end",
+            ),
+            (
+                "id = \"x\"\nscene = \"l.glsl\"\nfrom = \"moon + soon\"",
+                "the offset after + must be seconds",
+            ),
+            (
+                "id = \"x\"\nscene = \"l.glsl\"\nfrom = 3\nto = 2",
+                "must lie within the film (0–5.0 s), from before to",
+            ),
+            (
+                "id = \"x\"\nscene = \"l.glsl\"\nto = 9",
+                "must lie within the film",
+            ),
+            (
+                "id = \"x\"\nscene = \"l.glsl\"\nfrom = 1\nto = 2\nfade = [0.8, 0.8]",
+                "must be ≥ 0 and fit the span",
+            ),
+            (
+                "id = \"x\"\nscene = \"l.glsl\"\nscale = 2",
+                "scale must be \"auto\" or a fraction",
+            ),
+            (
+                "id = \"x\"\nscene = \"l.glsl\"\nscale = \"half\"",
+                "scale must be \"auto\" or a fraction",
+            ),
+            (
+                "id = \"x\"\nscene = \"l.glsl\"\nopacity = [1, 2]",
+                "opacity is one number",
+            ),
+            (
+                "id = \"x\"\nscene = \"l.glsl\"\nblend = \"screen\"",
+                "blend modes arrive with layers phase 2",
+            ),
+            (
+                "id = \"x\"\nscene = \"l.glsl\"\ncomp = \"intro\"",
+                "comp arrives with layers phase 3",
+            ),
+            (
+                "id = \"x\"\nscene = \"l.glsl\"\nmatte = { source = \"@t\" }",
+                "matte arrives with layers phase 3",
+            ),
+            (
+                "id = \"x\"\nscene = \"l.glsl\"\ntransition_in = { type = \"fx/iris\" }",
+                "layer transitions arrive in a later phase",
+            ),
+            (
+                "id = \"x\"\nscene = \"l.glsl\"\nchannels = [\"@picture\"]",
+                "@picture and @<layer> arrive with layers phase 2",
+            ),
+            (
+                "id = \"x\"\nscene = \"l.glsl\"\nopactiy = 1",
+                "unknown field `opactiy`",
+            ),
+        ] {
+            let e = err(layers_film(&format!("[[layer]]\n{layer}\n")));
+            assert!(e.contains(says), "{layer}: {e}");
+        }
+        // Layers can't be spanned by a later layer's id; a shot can't read @input.
+        let e = err(layers_film(
+            "[[layer]]\nid = \"a\"\nscene = \"l.glsl\"\nto = \"b.end\"\n[[layer]]\nid = \"b\"\nscene = \"l.glsl\"\n",
+        ));
+        assert!(e.contains("no shot or earlier layer called \"b\""), "{e}");
+        let e = err(fixture(
+            "[[shot]]\nid = \"s\"\nscene = \"a.glsl\"\nduration = 1\nchannels = [\"@input\"]\n",
+            Path::new("/film"),
+        ));
+        assert!(
+            e.contains("\"@input\" is the picture below a layer; a shot has nothing below it"),
+            "{e}"
+        );
+        // A loop film's layers stay inside one period.
+        let e = err(fixture(
+            "loop = true\n[[shot]]\nid = \"s\"\nscene = \"a.glsl\"\nduration = 2\n[[layer]]\nid = \"x\"\nscene = \"l.glsl\"\nfrom = 1\nto = 3\n",
+            Path::new("/film"),
+        ));
+        assert!(
+            e.contains("a loop film's layers stay inside one period"),
             "{e}"
         );
     }

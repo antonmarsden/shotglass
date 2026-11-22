@@ -50,7 +50,7 @@ cargo fmt && cargo clippy --all-targets -- -D warnings
 | `main.rs` | CLI (clap): play, still, strip, check, wav, export, new, fetch, update, licenses, bundle, freeze, unfreeze, test, selftest |
 | `golden.rs` | `strip`/`wav --compare/--bless`: golden-image comparison (per-pixel tolerance, pixel budget, mean limit, diff image); soundtrack comparison (RMS/peak of the difference per 50 ms window, first differing time), WAV reader |
 | `export.rs` | offline export: frame n at `frame_time(n)`, raw RGBA piped to ffmpeg (or PNGs), WAV muxed in |
-| `movie.rs` | `movie.toml` (+ its project) → `Movie`; timeline (`at(t)`), rational fps (`frame_time`/`frame_at`), cue defines, sound gains/windows, `channels`/`[textures]`/`[fonts]`/`[texts]` → `Shot::channels` (`Channel { source: Image(FileRef) \| Text(TextSource) }`, `files()` = every file it reads), `loop` (`loop_frames`, `loop_period`, `wrap`, `sound_samples`) |
+| `movie.rs` | `movie.toml` (+ its project) → `Movie`; timeline (`at(t)`), rational fps (`frame_time`/`frame_at`), cue defines, sound gains/windows, `[[layer]]` → `Movie::layers` (spans, `opacity_at`, `layers_at`), `channels`/`[textures]`/`[fonts]`/`[texts]` → `Shot::channels` (`Channel { source: Image(FileRef) \| Text(TextSource) }`, `files()` = every file it reads), `loop` (`loop_frames`, `loop_period`, `wrap`, `sound_samples`) |
 | `texture.rs` | iChannel textures, CPU side: PNG/JPEG → RGBA8 (flipped for `vflip`), `load_text` (layout + raster → RGBA8 + `meta`), size limits, GPU memory, error messages (HTML page, Git LFS pointer, half-saved file) |
 | `text.rs` | text (#68): fonts (ttf-parser; no system fonts, no hinting), shaping (rustybuzz), bidi per paragraph, greedy UAX #14 breaking, layout → `Layout` (glyphs, size, `meta` = iChannelMeta); raster: 4×4 coverage (R, A) + exact EDT signed distance on a 2×2 grid (G); fixture fonts in `tests/films/text/fonts` |
 | `anim.rs` | constants/keyframes, eases; `glsl_fn` turns keyframes into GLSL for sound shaders |
@@ -60,14 +60,14 @@ cargo fmt && cargo clippy --all-targets -- -D warnings
 | `bundle.rs` | `licenses` (libraries a film includes, SPDX licences, non-commercial flag), `freeze`/`unfreeze` and `bundle` (one writer: exactly the included library files in `shotglass-libs/`, a `shotglass.toml` marked frozen, lock `path` entries; `bundle` adds the film folder and `LIBRARY-LICENSES.md`) |
 | `glsl_test.rs` | `shotglass test` (#63): `*.test.glsl` discovery, `test_*` scan (`Param`, `Grid`, `// samples:`), `number_assertions` (id inserted into each `expect*(` call), the test prelude (engine contract), dispatcher (pixel → test sample, RGBA32UI MRT results), banded draws, decode → first failure per test |
 | `validate.rs` | strict, driver-independent check (glslang) of every assembled shader; `validate_movie(m, dialect)` is the API `check`/`check --web` and the web player use |
-| `gfx.rs` | `Renderer`: lazy prioritised compiles, program cache (disk + LRU), textures (decode thread → banded uploads in `pump` → `glGenerateMipmap`; sampler objects; LRU under a 256 MB budget), off-screen targets, transitions/freeze, strips, GPU timer, audio blocks (submit → PBO + fence → poll/wait) |
+| `gfx.rs` | `Renderer`: lazy prioritised compiles, program cache (disk + LRU), textures (decode thread → banded uploads in `pump` → `glGenerateMipmap`; sampler objects; LRU under a 256 MB budget), off-screen targets, transitions/freeze, layers (picture → `work[0]`; each active layer drawn into `layer` at its scale, then the over pass into the other `work`; final copy; `@input` = `INPUT_TEX`; layers follow shots in `wanted`), strips, GPU timer, audio blocks (submit → PBO + fence → poll/wait) |
 | `sound.rs` | `Soundtrack`: music / per-shot / mix tracks synthesised in cached chunks; `chunk` blocks, `stream` never does |
 | `audio.rs` | cpal output, lock-free `fill` callback, chunk store (wraps for loop films, `wrap_span`), master `Clock` (f64, `set_loop`), WAV writer |
 | `app.rs` | egui player: transport, timeline, panels, live reload, auto scale, sound streaming |
 | `headless.rs` | hidden-window GL context for CLI commands |
 | `selftest.rs` | GPU/sound checks on fixture films written to a temp dir |
-| `tests/golden.rs`, `tests/golden/` | golden tests: 8-frame 320x180 strips and 8 kHz soundtracks of the demo and the template, a strip of `tests/films/channels` (textures), a strip of `tests/films/text` (text blocks, distance field, RTL, iChannel6/7), and a two-period strip and the soundtrack of `tests/films/loop` (`loop = true`), vs reference PNGs / WAVs |
-| `glsl/copy.glsl` | the engine's internal copy pass (not a transition films can name; theirs come from libraries or files) |
+| `tests/golden.rs`, `tests/golden/` | golden tests: 8-frame 320x180 strips and 8 kHz soundtracks of the demo and the template, a strip of `tests/films/channels` (textures), a strip of `tests/films/text` (text blocks, distance field, RTL, iChannel6/7), a strip of `tests/films/layers` (spans, fades, fixed scale, `@input`), and a two-period strip and the soundtrack of `tests/films/loop` (`loop = true`), vs reference PNGs / WAVs |
+| `glsl/copy.glsl`, `glsl/over.glsl` | the engine's internal copy pass and layer composite (premultiplied over); not transitions films can name |
 | `movies/big-shadow/` | demo film; `templates/new/` is what `shotglass new` writes |
 
 ## Invariants (each was a real bug; most have a test)
@@ -150,6 +150,11 @@ cargo fmt && cargo clippy --all-targets -- -D warnings
   (8: `iChannel0..7`, `iChannelResolution`/`iChannelTime`/`iChannelMeta[8]` in the scene
   header). Engine-internal units in the scene pass go above the channels (layers: 8–9).
   Never bake the count into a file format or data layout.
+- **Layers: a frame shows only when every active layer is ready** (`usable` for each, plus the
+  over program), never the picture without a layer `still` would draw (selftest "layers:
+  playback waits…"). Films without layers take exactly the old path (no extra passes, same
+  cues, same goldens). `@input` binds the full-size working picture (exact size); layer
+  footers premultiply × opacity (engine GLSL by ruling, #67).
 - **Text blocks are deterministic and laid out off the render thread.** Bytes depend only on
   the font files, the `[texts]` entry and the engine (no system fonts, no hinting, plain
   IEEE maths, exact EDT; `text::tests::raster_is_pinned` pins a sha256: bump it on purpose,

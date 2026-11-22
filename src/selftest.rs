@@ -114,6 +114,18 @@ const CHECKS: &[Check] = &[
         run: text_textures,
     },
     Check {
+        name: "layers: source-over with opacity, @input, spans and fades",
+        run: layers_compose,
+    },
+    Check {
+        name: "layers: playback waits for every active layer; a broken layer edit keeps the last version",
+        run: layers_ready_and_fallback,
+    },
+    Check {
+        name: "layers: fixed scale ignores the render scale, auto follows it",
+        run: layers_scale,
+    },
+    Check {
         name: "chunked sound matches a single-pass render",
         run: sound_chunk_equivalence,
     },
@@ -2192,6 +2204,157 @@ fn text_textures(gl: &Gl, dir: &Path) -> Result<String> {
     let after = shot(&mut r, &m2, at_shot(0, 0.5), 1.0)?;
     expect_same("after a refused text edit", &after, &changed, 0, 0.0)?;
     Ok(format!("ready after {frames} frame(s)"))
+}
+
+fn layers_compose(gl: &Gl, dir: &Path) -> Result<String> {
+    // A solid picture (0.2, 0.4, 0.6); "half" (red, alpha 0.5, opacity 0.5) over
+    // [0.5, 1.5); "invert" reads the picture below (@input on iChannel3) from 1.0 on.
+    write(
+        dir,
+        &[
+            ("s.glsl", &scene("fragColor = vec4(0.2, 0.4, 0.6, 1.0);")),
+            ("half.glsl", &scene("fragColor = vec4(1.0, 0.0, 0.0, 0.5);")),
+            (
+                "invert.glsl",
+                &scene(
+                    "fragColor = vec4(1.0 - texture(iChannel3, fragCoord / iChannelResolution[3].xy).rgb, 1.0);",
+                ),
+            ),
+            ("fade.glsl", &scene("fragColor = vec4(1.0, 1.0, 1.0, 1.0);")),
+        ],
+    )?;
+    let m = movie(
+        dir,
+        "shotglass = \"0.1.4\"\n[[shot]]\nid=\"a\"\nscene=\"s.glsl\"\nduration=4\n\
+         [[layer]]\nid=\"half\"\nscene=\"half.glsl\"\nfrom=0.5\nto=1.5\nopacity=0.5\n\
+         [[layer]]\nid=\"invert\"\nscene=\"invert.glsl\"\nfrom=1.0\nto=2.0\nchannels=[\"\", \"\", \"\", \"@input\"]\n\
+         [[layer]]\nid=\"fade\"\nscene=\"fade.glsl\"\nfrom=2.0\nto=4.0\nfade=[1.0, 1.0]\n",
+    )?;
+    let mut r = renderer(gl, &m)?;
+    let at = |r: &mut Renderer, t: f32| shot(r, &m, at_shot(0, t), 1.0);
+    // Before any layer: the picture as it is.
+    expect_px("no layer", &at(&mut r, 0.25)?, 80, 45, [51, 102, 153], 1)?;
+    // Premultiplied over at opacity 0.5: a = 0.25 → 0.25·red + 0.75·below.
+    expect_px("half over", &at(&mut r, 0.75)?, 80, 45, [102, 77, 115], 1)?;
+    // @input sees everything below (half included) and inverts it.
+    expect_px(
+        "invert of half over",
+        &at(&mut r, 1.25)?,
+        80,
+        45,
+        [153, 178, 140],
+        1,
+    )?;
+    // Half's span is half-open: at 1.5 only invert is left.
+    expect_px("span ends", &at(&mut r, 1.75)?, 80, 45, [204, 153, 102], 1)?;
+    // A 1 s smooth fade: halfway in, half the white; fully in at the middle of the span.
+    expect_px("mid fade", &at(&mut r, 2.5)?, 80, 45, [153, 178, 204], 2)?;
+    expect_px("faded in", &at(&mut r, 3.0)?, 80, 45, [255, 255, 255], 1)?;
+    Ok(String::new())
+}
+
+fn layers_ready_and_fallback(gl: &Gl, dir: &Path) -> Result<String> {
+    write(
+        dir,
+        &[
+            ("s.glsl", &scene("fragColor = vec4(0.0, 0.0, 1.0, 1.0);")),
+            (
+                "l.glsl",
+                &scene("fragColor = vec4(1.0, 0.0, 0.0, uv.x < 0.5 ? 1.0 : 0.0);"),
+            ),
+        ],
+    )?;
+    let toml = "shotglass = \"0.1.4\"\n[[shot]]\nid=\"a\"\nscene=\"s.glsl\"\nduration=2\n\
+                [[layer]]\nid=\"left\"\nscene=\"l.glsl\"\n";
+    let m = movie(dir, toml)?;
+    let want = {
+        let mut r = renderer(gl, &m)?;
+        shot(&mut r, &m, at_shot(0, 1.0), 1.0)?
+    };
+    expect_px("layer drawn (left)", &want, 20, 45, [255, 0, 0], 1)?;
+    expect_px("layer transparent (right)", &want, 140, 45, [0, 0, 255], 1)?;
+    // The shot alone first, so its program is ready; then the layer arrives (a new id:
+    // no fallback). Until the layer compiles, playback holds the frame: never the
+    // picture without its layer. Then exactly the blocking frame.
+    let mut r = Renderer::new(gl.clone())?;
+    r.set_cache_dir(None);
+    let alone = movie(dir, "[[shot]]\nid=\"a\"\nscene=\"s.glsl\"\nduration=2\n")?;
+    r.set_movie(&alone).map_err(|e| anyhow!("{e:?}"))?;
+    shot(&mut r, &alone, at_shot(0, 1.0), 1.0)?;
+    let m = movie(dir, toml)?;
+    r.set_movie(&m).map_err(|e| anyhow!("{e:?}"))?;
+    if r.render(&m, W, H, &info(1.0, 1.0), false).is_some() {
+        bail!("playback drew the shot before its new layer was compiled");
+    }
+    let mut frames = 0;
+    let got = loop {
+        if r.render(&m, W, H, &info(1.0, 1.0), false).is_some() {
+            break r.read_output().unwrap();
+        }
+        frames += 1;
+        if frames > 5000 {
+            bail!("the layered shot never became ready without blocking");
+        }
+        r.pump(&m, 1.0, false);
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    };
+    expect_same("non-blocking render with a layer", &got, &want, 0, 0.0)?;
+    // A compile error in the layer: the last working layer stays on screen.
+    write(dir, &[("l.glsl", &scene("fragColor = vec4(oops);"))])?;
+    let m2 = movie(dir, toml)?;
+    r.set_movie(&m2)
+        .map_err(|_| anyhow!("set_movie refused a layer compile error (should defer it)"))?;
+    let still = shot(&mut r, &m2, at_shot(0, 1.0), 1.0)?;
+    expect_same("after a broken layer edit", &still, &want, 0, 0.0)?;
+    if !r.errors().iter().any(|e| e.what.contains("layer \"left\"")) {
+        bail!("the broken layer wasn't reported: {:?}", r.errors());
+    }
+    Ok(format!("ready after {frames} frame(s)"))
+}
+
+fn layers_scale(gl: &Gl, dir: &Path) -> Result<String> {
+    // Each layer writes its own iResolution.x / 255 into red: what it was drawn at.
+    write(
+        dir,
+        &[
+            ("s.glsl", &scene("fragColor = vec4(0.0, 0.0, 0.0, 1.0);")),
+            (
+                "res.glsl",
+                &scene(
+                    "fragColor = vec4(iResolution.x / 255.0, 0.0, 0.0, uv.y > 0.5 ? 1.0 : 0.0);",
+                ),
+            ),
+            (
+                "res2.glsl",
+                &scene(
+                    "fragColor = vec4(0.0, iResolution.x / 255.0, 0.0, uv.y <= 0.5 ? 1.0 : 0.0);",
+                ),
+            ),
+        ],
+    )?;
+    let m = movie(
+        dir,
+        "shotglass = \"0.1.4\"\n[[shot]]\nid=\"a\"\nscene=\"s.glsl\"\nduration=1\n\
+         [[layer]]\nid=\"fixed\"\nscene=\"res.glsl\"\nscale=0.5\n\
+         [[layer]]\nid=\"auto\"\nscene=\"res2.glsl\"\n",
+    )?;
+    let mut r = renderer(gl, &m)?;
+    // At render scale 1 (W = 160): fixed draws at 80, auto at 160.
+    let full = shot(&mut r, &m, at_shot(0, 0.5), 1.0)?;
+    expect_px("scale 0.5 at render scale 1", &full, 80, 20, [80, 0, 0], 1)?;
+    expect_px("auto at render scale 1", &full, 80, 70, [0, 160, 0], 1)?;
+    // At render scale 0.5: fixed still 80, auto follows to 80.
+    let half = shot(&mut r, &m, at_shot(0, 0.5), 0.5)?;
+    expect_px(
+        "scale 0.5 at render scale 0.5",
+        &half,
+        80,
+        20,
+        [80, 0, 0],
+        1,
+    )?;
+    expect_px("auto at render scale 0.5", &half, 80, 70, [0, 80, 0], 1)?;
+    Ok(String::new())
 }
 
 fn texture_edits(gl: &Gl, dir: &Path) -> Result<String> {

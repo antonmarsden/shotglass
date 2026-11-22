@@ -819,6 +819,7 @@ fn check_textures(m: &Movie, web: bool) -> Result<()> {
     };
     for c in m.textures() {
         let size = match &c.source {
+            movie::Source::Input => continue,
             movie::Source::Image(f) => match texture::load(&f.file, &f.label, c.vflip) {
                 Ok(img) => {
                     let (w, h) = (img.width, img.height);

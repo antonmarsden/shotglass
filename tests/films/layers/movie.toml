@@ -1,0 +1,45 @@
+# Golden-image film for layers (tests/golden.rs, #69): three shots with a cut and a
+# dissolve; a title layer spanning the dissolve (fades, full resolution); a film-wide
+# vignette that reads the picture below it (@input on iChannel2) with keyframed
+# opacity; and a half-resolution pattern over the first shot only. Shaders are
+# film-local, so the golden only moves when the engine does.
+title = "layers"
+fps = 30
+
+[[shot]]
+id = "a"
+scene = "scenes/gradient.glsl"
+duration = 2.0
+
+[[shot]]
+id = "b"
+scene = "scenes/rings.glsl"
+duration = 2.0
+
+[[shot]]
+id = "c"
+scene = "scenes/stripes.glsl"
+duration = 2.0
+transition = { type = "fx/mix.glsl", duration = 1.0 }
+
+[[layer]]
+id = "dots"
+scene = "layers/dots.glsl"
+to = "a"
+scale = 0.5
+opacity = 0.6
+
+[[layer]]
+id = "title"
+scene = "layers/title.glsl"
+from = "b + 0.5"
+to = "c.settled + 0.5"
+fade = [0.4, 0.4]
+scale = 1
+uniforms.uTint = [1.0, 0.85, 0.3]
+
+[[layer]]
+id = "vignette"
+scene = "layers/vignette.glsl"
+channels = ["", "", "@input"]
+opacity = { keys = [[0.0, 0.3], [6.0, 1.0]] }
