@@ -599,14 +599,20 @@ mod tests {
         })
     }
 
-    fn sample_for(clock: &Clock, dur: Duration) -> Vec<f32> {
-        let end = Instant::now() + dur;
+    /// Reads the clock every ~1 ms for `dur`. Also returns the wall time (s) from the
+    /// start to the last reading: on a busy CI runner a 1 ms sleep can overrun by
+    /// tens of ms, so tests compare the last reading with that, not with `dur`.
+    fn sample_for(clock: &Clock, dur: Duration) -> (Vec<f32>, f32) {
+        let start = Instant::now();
+        let end = start + dur;
         let mut v = vec![];
+        let mut at = 0.0;
         while Instant::now() < end {
             v.push(clock.time());
+            at = start.elapsed().as_secs_f32();
             sleep(Duration::from_millis(1));
         }
-        v
+        (v, at)
     }
 
     fn monotonic(v: &[f32]) -> bool {
@@ -652,15 +658,18 @@ mod tests {
         let h = run_device(dev, 1.0, stop.clone());
         c.seek(10.0);
         c.play();
-        let v = sample_for(&c, Duration::from_millis(300));
+        let (v, at) = sample_for(&c, Duration::from_millis(300));
         let locked = c.audio_locked();
         stop.store(true, Ordering::Relaxed);
         h.join().unwrap();
         assert!(monotonic(&v), "time went backwards");
         assert!(locked, "never locked to the device");
         let last = *v.last().unwrap();
-        // ≈ 0.3 s of playback, minus the 20 ms the sound card hasn't played yet
-        assert!((10.2..10.36).contains(&last), "{last}");
+        // ≈ `at` s of playback, minus the 20 ms the sound card hasn't played yet
+        assert!(
+            (10.0 + at - 0.1..10.0 + at + 0.06).contains(&last),
+            "{last} at {at}"
+        );
         assert!(v[0] >= 10.0);
     }
 
@@ -670,10 +679,10 @@ mod tests {
         let mut c = Clock::new(Some(out));
         c.play();
         dev.callback(480, LATENCY); // one callback, then silence
-        let v = sample_for(&c, Duration::from_millis(400));
+        let (v, at) = sample_for(&c, Duration::from_millis(400));
         assert!(monotonic(&v));
         let last = *v.last().unwrap();
-        assert!((0.33..0.5).contains(&last), "{last}");
+        assert!((at - 0.07..at + 0.1).contains(&last), "{last} at {at}");
         assert!(!c.audio_locked());
     }
 
@@ -685,12 +694,13 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let h = run_device(dev, 100.0, stop.clone());
         c.play();
-        let v = sample_for(&c, Duration::from_millis(200));
+        let (v, at) = sample_for(&c, Duration::from_millis(200));
         stop.store(true, Ordering::Relaxed);
         h.join().unwrap();
         assert!(monotonic(&v));
         let last = *v.last().unwrap();
-        assert!((0.15..0.3).contains(&last), "{last}");
+        // follows the timer, not the device (which would be ~100× ahead)
+        assert!((at - 0.05..at + 0.1).contains(&last), "{last} at {at}");
     }
 
     #[test]
@@ -705,7 +715,7 @@ mod tests {
             c.seek(target);
             let t = c.time();
             assert!((target..target + 0.02).contains(&t), "seek {target}: {t}");
-            let v = sample_for(&c, Duration::from_millis(80));
+            let (v, _) = sample_for(&c, Duration::from_millis(80));
             assert!(monotonic(&v));
             assert!(
                 v.iter().all(|x| *x >= target && *x < target + 0.2),
