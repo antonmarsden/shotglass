@@ -51,3 +51,7 @@ sound = "sfx/chime.glsl"
 # [textures]
 # brick = "textures/brick.png"
 # noise = { file = "<kit/textures/noise.png>", filter = "linear" }   # from a library
+# Image sequences, one file per frame (shotglass = "0.1.6"; see README, "Footage"):
+# fog = "renders/fog_####.png"
+# plate = { frames = "renders/plate_####.jpg", fps = 24, first = 1001, end = "loop" }
+# and in a shot, re-timed: channels = [{ texture = "plate", in = 2.0, speed = 0.5, clock = "shot" }]

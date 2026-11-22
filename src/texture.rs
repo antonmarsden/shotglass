@@ -91,6 +91,16 @@ pub fn gpu_bytes(w: usize, h: usize) -> usize {
     }
 }
 
+/// GPU memory of one footage frame: RGBA8, with a mipmap chain only for
+/// `filter = "mipmap"` (footage defaults to `linear`: no mipmaps to make per frame).
+pub fn frame_bytes(w: usize, h: usize, mipmap: bool) -> usize {
+    if mipmap {
+        gpu_bytes(w, h)
+    } else {
+        w.max(1) * h.max(1) * 4
+    }
+}
+
 /// "85 MB", "5.3 MB", "21 KB".
 pub fn describe_bytes(b: usize) -> String {
     let mb = b as f64 / (1 << 20) as f64;
@@ -215,7 +225,7 @@ pub fn dimensions(path: &Path) -> Option<(usize, usize)> {
 }
 
 /// Texture memory a shot's channels need at once (each texture once: image sizes from
-/// their headers, text blocks from their layout), and a description per texture for
+/// their headers, text blocks from their layout, sequences' minimum frame window), and a description per texture for
 /// messages. Unreadable files count 0: their error is reported where they're used.
 pub fn shot_memory(
     channels: &[Option<crate::movie::Channel>; crate::movie::N_CHANNELS],
@@ -228,6 +238,20 @@ pub fn shot_memory(
             continue;
         }
         seen.push(&c.source);
+        if let crate::movie::Source::Frames(seq) = &c.source {
+            // Footage needs a few frames resident at once (`footage::MIN_FRAMES`).
+            if let Some((w, h)) = seq.scan.as_ref().and_then(|s| s.size) {
+                let n = crate::footage::MIN_FRAMES;
+                let b = n * frame_bytes(w, h, c.filter == Filter::Mipmap);
+                total += b;
+                parts.push(format!(
+                    "{} {} ({n} frames of {w}×{h})",
+                    c.label(),
+                    describe_bytes(b)
+                ));
+            }
+            continue;
+        }
         let size = match &c.source {
             crate::movie::Source::Image(f) => dimensions(&f.file),
             crate::movie::Source::Text(t) => t.layout().ok().map(|(l, _)| (l.width, l.height)),

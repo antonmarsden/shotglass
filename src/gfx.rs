@@ -41,6 +41,17 @@ fn is_pass_key(k: u64) -> bool {
     k > LAYER_TEX - 65536
 }
 
+/// `ChanKey::tex` of a footage channel (#70). In the keys a version stores, the frame
+/// isn't known yet (`FOOTAGE_UNRESOLVED`: readiness is decided per frame); `resolve`
+/// replaces it with that frame's texture, or `FOOTAGE_BLACK` (`end = "black"` past the
+/// last frame: always ready, reads black with the clip's resolution).
+const FOOTAGE_BLACK: u64 = LAYER_TEX - 65536;
+const FOOTAGE_UNRESOLVED: u64 = LAYER_TEX - 65537;
+
+fn is_footage_marker(k: u64) -> bool {
+    k == FOOTAGE_BLACK || k == FOOTAGE_UNRESOLVED
+}
+
 /// A layer's blend pass (#72) sees the picture below as `getBase`, the layer
 /// (premultiplied, its opacity applied: alpha = coverage × opacity) as `getLayer`, and
 /// the opacity as `opacity`; it writes `vec4 blend(vec2 uv)` (alpha ignored). The
@@ -187,6 +198,28 @@ struct ChanKey {
     tex: u64,
     filter: Filter,
     wrap: Wrap,
+    /// A footage channel's `FootageEntry` (#70); `tex` is then per frame (`resolve`).
+    footage: Option<u64>,
+    /// `iChannelTime`: the source time of the footage frame shown (0 otherwise).
+    time: f32,
+}
+
+/// One footage channel of one shot or layer in one movie version (#70): where its
+/// frames are and which one shows on each film frame. Frames are ordinary textures in
+/// the store, keyed by their file's path, size and mtime (and how texels are made), so
+/// versions and channels showing the same file share one upload.
+struct FootageEntry {
+    scan: std::sync::Arc<crate::footage::Scan>,
+    map: crate::movie::FrameMap,
+    /// "renders/" (the pattern's folder as written), for frame labels.
+    folder: String,
+    vflip: bool,
+    srgb: bool,
+    mipmap: bool,
+    /// Source frame → texture key, filled as frames are first needed (one `stat` each).
+    frames: HashMap<u64, u64>,
+    /// The movie version (`Renderer::generation`) this entry belongs to.
+    generation: u64,
 }
 
 /// A texture's load state. Textures load lazily, nearest the playhead first, like
@@ -223,6 +256,8 @@ enum TexSource {
     File(PathBuf),
     /// A text block, laid out and rasterised (#68).
     Text(Box<crate::movie::TextSource>),
+    /// A sequence frame (#70): a file that must have the sequence's size.
+    Frame(PathBuf, Option<(usize, usize)>),
 }
 
 impl TexSource {
@@ -230,6 +265,16 @@ impl TexSource {
         match self {
             TexSource::File(path) => crate::texture::load(path, label, vflip),
             TexSource::Text(t) => crate::texture::load_text(t, vflip),
+            TexSource::Frame(path, size) => {
+                let img = crate::texture::load(path, label, vflip)?;
+                match size {
+                    Some((w, h)) if (img.width, img.height) != (*w, *h) => Err(format!(
+                        "{label}: {}×{}, but the sequence is {w}×{h} (its first frame)",
+                        img.width, img.height
+                    )),
+                    _ => Ok(img),
+                }
+            }
         }
     }
 }
@@ -239,33 +284,66 @@ struct TexEntry {
     label: String,
     vflip: bool,
     srgb: bool,
+    /// Make a mipmap chain after the last band (images always; footage only with
+    /// `filter = "mipmap"`).
+    mipmap: bool,
+    /// A footage frame (#70): its own upload budget and in-flight cap, dropped from the
+    /// store when evicted, and counted in `blocking_footage_loads`.
+    footage: bool,
+    /// Footage: the newest movie version that needed this frame (`errors` reports the
+    /// current version's failed frames without walking every footage entry).
+    generation: u64,
     state: TexState,
     last_used: u64,
 }
 
-/// The decode worker: jobs (key, source, label, vflip) in, decoded images (or
-/// rasterised text) out.
+type DecodeJob = (u64, TexSource, String, bool);
+type DecodeResult = (u64, std::result::Result<DecodedImage, String>);
+
+/// The decode workers (#70: a small pool shared by images, text and footage): jobs
+/// (key, source, label, vflip) in, decoded images (or rasterised text) out. Jobs are
+/// sent nearest the playhead first and few are in flight, so the queue's order is
+/// the priority order.
 struct Decoder {
-    jobs: std::sync::mpsc::Sender<(u64, TexSource, String, bool)>,
-    results: std::sync::mpsc::Receiver<(u64, std::result::Result<DecodedImage, String>)>,
+    jobs: std::sync::mpsc::Sender<DecodeJob>,
+    results: std::sync::mpsc::Receiver<DecodeResult>,
+    workers: usize,
 }
 
 impl Decoder {
     fn new() -> Decoder {
-        let (jobs, rx) = std::sync::mpsc::channel::<(u64, TexSource, String, bool)>();
+        let (jobs, rx) = std::sync::mpsc::channel::<DecodeJob>();
+        let rx = Arc::new(std::sync::Mutex::new(rx));
         let (tx, results) = std::sync::mpsc::channel();
-        std::thread::Builder::new()
-            .name("shotglass-texture-decode".into())
-            .spawn(move || {
-                // Ends when the renderer (the sender) is dropped.
-                while let Ok((k, source, label, vflip)) = rx.recv() {
-                    if tx.send((k, source.load(&label, vflip))).is_err() {
-                        break;
+        // min(4, cores − 2), at least 1: footage at 30 fps needs a few PNG decodes at once.
+        let cores = std::thread::available_parallelism().map_or(2, |n| n.get());
+        let workers = cores.saturating_sub(2).clamp(1, 4);
+        for i in 0..workers {
+            let (rx, tx) = (rx.clone(), tx.clone());
+            std::thread::Builder::new()
+                .name(format!("shotglass-texture-decode-{i}"))
+                .spawn(move || {
+                    loop {
+                        // Ends when the renderer (the sender) is dropped.
+                        let job = rx
+                            .lock()
+                            .map_err(|_| ())
+                            .and_then(|r| r.recv().map_err(|_| ()));
+                        let Ok((k, source, label, vflip)) = job else {
+                            break;
+                        };
+                        if tx.send((k, source.load(&label, vflip))).is_err() {
+                            break;
+                        }
                     }
-                }
-            })
-            .expect("spawn the texture decode thread");
-        Decoder { jobs, results }
+                })
+                .expect("spawn a texture decode thread");
+        }
+        Decoder {
+            jobs,
+            results,
+            workers,
+        }
     }
 }
 
@@ -273,6 +351,19 @@ impl Decoder {
 pub const UPLOAD_BUDGET: usize = 8 << 20;
 /// Decoded images waiting for (or in) upload at once: bounds CPU memory.
 const TEXTURES_IN_FLIGHT: usize = 2;
+/// Decoded footage frames waiting for (or in) upload at once, per decode worker, and
+/// their CPU memory cap (at least `FOOTAGE_MIN_IN_FLIGHT` frames whatever their size).
+const FOOTAGE_IN_FLIGHT_PER_WORKER: usize = 3;
+const FOOTAGE_MIN_IN_FLIGHT: usize = 2;
+const FOOTAGE_CPU_BYTES: usize = 64 << 20;
+/// Footage prefetch: the window ahead of the playhead (seconds, at least
+/// `footage::MIN_FRAMES` frames), frames kept behind it (for stepping back), and how
+/// soon a shot or layer must start for its first frames (its head) to load.
+const FOOTAGE_WINDOW: f64 = 0.5;
+const FOOTAGE_BEHIND: u64 = 2;
+const FOOTAGE_HEADS: f32 = 2.0;
+/// Spare GL textures kept for reuse by later frames of the same size.
+const SPARE_TEXTURES: usize = 8;
 
 /// How far ahead of the playhead programs are compiled.
 pub const LOOKAHEAD: f32 = 10.0;
@@ -371,8 +462,25 @@ pub struct Renderer {
     /// Resident texture memory before `pump` evicts unused textures.
     texture_budget: usize,
     upload_budget: usize,
+    /// `set_upload_budget` was called (tests): footage uses that budget too.
+    upload_pinned: bool,
     /// Time the last `pump` spent on textures (collecting decodes, uploading).
     pub texture_ms: f32,
+    /// Footage channels of the current and fallback versions (#70), by key.
+    footage: HashMap<u64, FootageEntry>,
+    /// Footage bytes `pump` may upload this time: two frames per footage channel on
+    /// screen (one per film frame, plus catch-up), at least `upload_budget`.
+    footage_budget: usize,
+    /// Footage frames loaded on the spot (`usable` with `blocking`): playback must do none.
+    pub blocking_footage_loads: usize,
+    /// Non-blocking renders that waited for a footage frame (the Performance panel).
+    pub footage_misses: usize,
+    /// GL textures created for channels (tests: footage reuses evicted ones).
+    pub texture_creates: usize,
+    /// Why the last rendered frame drew a footage channel black: its frame failed.
+    footage_failure: Option<String>,
+    /// Evicted textures kept for reuse: ((w, h, srgb, mipmap), texture).
+    spare: Vec<((usize, usize, bool, bool), glow::Texture)>,
 }
 
 /// A sound block submitted with `Renderer::submit_audio`, not yet collected.
@@ -571,6 +679,14 @@ impl Renderer {
                 texture_bands: 0,
                 texture_budget: crate::texture::BUDGET,
                 upload_budget: UPLOAD_BUDGET,
+                upload_pinned: false,
+                footage: HashMap::new(),
+                footage_budget: UPLOAD_BUDGET,
+                blocking_footage_loads: 0,
+                footage_misses: 0,
+                texture_creates: 0,
+                footage_failure: None,
+                spare: vec![],
                 texture_ms: 0.0,
             })
         }
@@ -615,6 +731,36 @@ impl Renderer {
     /// Texel bytes uploaded per `pump` (tests use a small one).
     pub fn set_upload_budget(&mut self, bytes: usize) {
         self.upload_budget = bytes.max(1);
+        self.upload_pinned = true;
+    }
+
+    /// The error of a footage frame the last render needed and couldn't decode (it
+    /// read black). Headless commands fail on it, as `load_all` does for textures.
+    pub fn footage_failure(&self) -> Option<&str> {
+        self.footage_failure.as_deref()
+    }
+
+    /// Footage on the GPU (#70): (frames resident, their bytes).
+    pub fn footage_resident(&self) -> (usize, usize) {
+        self.textures
+            .values()
+            .filter(|e| e.footage)
+            .filter_map(|e| match e.state {
+                TexState::Ready { bytes, .. } => Some(bytes),
+                _ => None,
+            })
+            .fold((0, 0), |(n, b), x| (n + 1, b + x))
+    }
+
+    /// Resident texture bytes (images, text and footage), for tests.
+    pub fn texture_bytes(&self) -> usize {
+        self.textures
+            .values()
+            .filter_map(|e| match e.state {
+                TexState::Ready { bytes, .. } => Some(bytes),
+                _ => None,
+            })
+            .sum()
     }
 
     /// Textures fully uploaded and held on the GPU.
@@ -656,9 +802,14 @@ impl Renderer {
     fn channel_keys(
         &mut self,
         what: &str,
-        channels: &[Option<crate::movie::Channel>; N_CHANNELS],
+        item: crate::movie::ItemRef,
+        movie: &Movie,
         tex_errors: &mut Vec<ShaderError>,
     ) -> [Option<ChanKey>; N_CHANNELS] {
+        let channels = match item {
+            crate::movie::ItemRef::Shot(i) => &movie.shots[i].channels,
+            crate::movie::ItemRef::Layer(j) => &movie.layers[j].channels,
+        };
         let mut keys = [None; N_CHANNELS];
         for (n, c) in channels.iter().enumerate() {
             let Some(c) = c else { continue };
@@ -673,6 +824,53 @@ impl Renderer {
                     tex,
                     filter: c.filter,
                     wrap: c.wrap,
+                    footage: None,
+                    time: 0.0,
+                });
+                continue;
+            }
+            if let crate::movie::Source::Frames(seq) = &c.source {
+                // A footage entry per version (`generation` in the key): its frame keys
+                // are stat'ed afresh, so a frame re-rendered in place reloads, while the
+                // previous version's entry keeps its frames for the fallback.
+                let (Some(scan), Some(map)) = (&seq.scan, movie.frame_map(item, n)) else {
+                    tex_errors.push(ShaderError {
+                        what: "movie.toml".into(),
+                        messages: vec![format!(
+                            "{what}: channels[{n}]: {}: the sequence wasn't scanned",
+                            c.label()
+                        )],
+                    });
+                    continue;
+                };
+                let mipmap = c.filter == Filter::Mipmap;
+                let fk = hash(&format!(
+                    "footage\0{}\0{scan:?}\0{map:?}\0{}\0{}\0{mipmap}\0{}",
+                    seq.pattern.file.display(),
+                    c.vflip,
+                    c.srgb,
+                    self.generation + 1
+                ));
+                self.footage.entry(fk).or_insert(FootageEntry {
+                    scan: scan.clone(),
+                    map,
+                    folder: seq
+                        .pattern
+                        .label
+                        .rsplit_once('/')
+                        .map_or(String::new(), |(d, _)| format!("{d}/")),
+                    vflip: c.vflip,
+                    srgb: c.srgb,
+                    mipmap,
+                    frames: HashMap::new(),
+                    generation: self.generation + 1,
+                });
+                keys[n] = Some(ChanKey {
+                    tex: FOOTAGE_UNRESOLVED,
+                    filter: c.filter,
+                    wrap: c.wrap,
+                    footage: Some(fk),
+                    time: 0.0,
                 });
                 continue;
             }
@@ -706,7 +904,7 @@ impl Renderer {
             let source = match &c.source {
                 crate::movie::Source::Image(f) => TexSource::File(f.file.clone()),
                 crate::movie::Source::Text(t) => TexSource::Text(t.clone()),
-                _ => unreachable!("pass outputs are handled above"),
+                _ => unreachable!("pass outputs and footage are handled above"),
             };
             let made = match &c.source {
                 crate::movie::Source::Text(t) => format!("{t:?}"),
@@ -718,6 +916,9 @@ impl Renderer {
                 label: c.label(),
                 vflip: c.vflip,
                 srgb: c.srgb,
+                mipmap: true,
+                footage: false,
+                generation: 0,
                 state: TexState::Idle,
                 last_used: 0,
             });
@@ -725,6 +926,8 @@ impl Renderer {
                 tex,
                 filter: c.filter,
                 wrap: c.wrap,
+                footage: None,
+                time: 0.0,
             });
         }
         keys
@@ -766,7 +969,7 @@ impl Renderer {
         let copy = add(self, "copy pass".into(), src);
         let mut wanted = vec![];
         let mut tex_errors = vec![];
-        for shot in &movie.shots {
+        for (i, shot) in movie.shots.iter().enumerate() {
             let src = scene_source(dialect, shot, &cues, movie);
             let scene = add(
                 self,
@@ -787,7 +990,8 @@ impl Renderer {
             };
             let channels = self.channel_keys(
                 &format!("shot \"{}\"", shot.id),
-                &shot.channels,
+                crate::movie::ItemRef::Shot(i),
+                movie,
                 &mut tex_errors,
             );
             if let (Some(scene), Some(trans)) = (scene, trans) {
@@ -799,7 +1003,7 @@ impl Renderer {
             }
         }
         // Layers (#69): their programs and channels follow the shots in `wanted`.
-        for layer in &movie.layers {
+        for (j, layer) in movie.layers.iter().enumerate() {
             let src = layer_source(dialect, layer, &cues, movie);
             let what = match &layer.scene {
                 LayerScene::File(p) => format!("layer \"{}\" ({})", layer.id, rel(p, &movie.root)),
@@ -817,7 +1021,8 @@ impl Renderer {
             };
             let channels = self.channel_keys(
                 &format!("layer \"{}\"", layer.id),
-                &layer.channels,
+                crate::movie::ItemRef::Layer(j),
+                movie,
                 &mut tex_errors,
             );
             if let (Some(scene), Some(blend)) = (scene, blend) {
@@ -932,10 +1137,24 @@ impl Renderer {
                 });
             }
         }
+        // Still textures, then the footage frames this version needed that failed.
+        let mut frames: Vec<(&str, u64)> = self
+            .textures
+            .iter()
+            .filter(|(_, e)| {
+                e.footage
+                    && e.generation == self.generation
+                    && matches!(e.state, TexState::Failed(_))
+            })
+            .map(|(k, e)| (e.label.as_str(), *k))
+            .collect();
+        frames.sort_unstable();
+        let frames = frames.into_iter().map(|(_, k)| k);
         for k in self
             .wanted
             .iter()
             .flat_map(|k| k.channels.iter().flatten().map(|c| c.tex))
+            .chain(frames)
         {
             if let Some(TexEntry {
                 state: TexState::Failed(m),
@@ -958,7 +1177,9 @@ impl Renderer {
             .wanted
             .iter()
             .flat_map(|k| k.channels.iter().flatten().map(|c| c.tex))
-            .filter(|k| !is_pass_key(*k)) // another pass's picture, not a texture to load
+            // Another pass's picture or a footage channel (loaded per frame): not a
+            // texture to load.
+            .filter(|k| !is_pass_key(*k) && !is_footage_marker(*k))
             .collect();
         let done = keys
             .iter()
@@ -1047,26 +1268,250 @@ impl Renderer {
                 }
             }
         }
-        let tex_order = self.texture_order(movie, t);
         let t_tex = std::time::Instant::now();
+        let mut tex_order = self.texture_order(movie, t);
+        let footage = !self.footage.is_empty();
+        if footage {
+            tex_order.extend(self.footage_order(movie, t));
+            tex_order.sort_by(|a, b| a.1.total_cmp(&b.1));
+            let mut seen = std::collections::HashSet::new();
+            tex_order.retain(|(k, _)| seen.insert(*k));
+        }
         self.pump_textures(&tex_order, background);
+        // Footage turns over every film frame: keep it within the budget every pump.
+        if footage {
+            self.evict_textures(&tex_order);
+        }
         self.texture_ms = ms_since(t_tex);
-        // Drop fallbacks once their replacement works.
-        let ready_ids: Vec<String> = self
-            .wanted_ids
-            .iter()
-            .zip(&self.wanted)
-            .filter(|(_, k)| self.keys_ready(**k))
-            .map(|(id, _)| id.clone())
-            .collect();
-        for id in ready_ids {
-            self.fallback.remove(&id);
+        // Drop fallbacks once their replacement works (footage on screen: at the
+        // playhead's frame; elsewhere its frames aren't needed yet).
+        if !self.fallback.is_empty() {
+            let n = film_frame(movie, t);
+            let n_shots = movie.shots.len();
+            let mut ready = vec![];
+            for i in 0..self.wanted.len().min(self.wanted_ids.len()) {
+                if !self.fallback.contains_key(&self.wanted_ids[i]) {
+                    continue;
+                }
+                let on_screen = match movie.shots.get(i) {
+                    Some(shot) => distance(movie, shot, t) == 0.0,
+                    None => movie
+                        .layers
+                        .get(i - n_shots)
+                        .is_some_and(|l| layer_distance(movie, l, t) == 0.0),
+                };
+                let k = self.wanted[i];
+                let k = if on_screen { self.resolve(k, n) } else { k };
+                if self.keys_ready(k) {
+                    ready.push(self.wanted_ids[i].clone());
+                }
+            }
+            for id in ready {
+                self.fallback.remove(&id);
+            }
         }
         if self.frame_no.is_multiple_of(30) {
             self.collect_garbage();
             self.evict(&order);
-            self.evict_textures(&tex_order);
+            if !footage {
+                self.evict_textures(&tex_order);
+            }
         }
+    }
+
+    /// Footage frames to load, by how soon they're needed (seconds), and this pump's
+    /// footage upload budget (#70). For each shot and layer on screen, the frames of
+    /// film frames `n − FOOTAGE_BEHIND .. n + W` (W: half a second, at least
+    /// `footage::MIN_FRAMES`, fewer when frames are large); for each one starting within
+    /// `FOOTAGE_HEADS` seconds (a loop film's first shots near the end of the period
+    /// too), its first frames: cuts and loop seams then don't stall. Frames are mapped
+    /// through `source_frame`, so repeats, speed and `end` count exactly.
+    fn footage_order(&mut self, movie: &Movie, t: f32) -> Vec<(u64, f32)> {
+        let n_now = film_frame(movie, t);
+        let dt = movie.fps_den as f64 / movie.fps_num as f64;
+        let n_shots = movie.shots.len();
+        // (item index in `wanted`, distance, the film frame its frames start from,
+        // how many frames: None = a window or head as below)
+        let mut items: Vec<(usize, f32, u64, Option<u64>)> = vec![];
+        for (i, shot) in movie.shots.iter().enumerate() {
+            let d = distance(movie, shot, t);
+            if d <= FOOTAGE_HEADS {
+                let from = if d == 0.0 {
+                    n_now
+                } else {
+                    movie.frame_at(shot.start).max(0) as u64
+                };
+                items.push((i, d, from, None));
+            }
+            // A frozen transition out of this shot shows its frame at the transition's
+            // first frame for the whole transition: keep that one frame too.
+            if let Some(next) = movie.shots.get(i + 1)
+                && next.transition_in.as_ref().is_some_and(|tr| tr.freeze)
+            {
+                let d = distance(movie, next, t);
+                if d <= FOOTAGE_HEADS {
+                    items.push((i, d, movie.frame_at(next.start).max(0) as u64, Some(1)));
+                }
+            }
+        }
+        for (j, layer) in movie.layers.iter().enumerate() {
+            let d = layer_distance(movie, layer, t);
+            if d <= FOOTAGE_HEADS {
+                let from = if d == 0.0 {
+                    n_now
+                } else {
+                    movie.frame_at(layer.start).max(0) as u64
+                };
+                items.push((n_shots + j, d, from, None));
+            }
+        }
+        let uses: Vec<(u64, f32, u64, Option<u64>)> = items
+            .iter()
+            .filter_map(|&(i, d, from, len)| Some((self.wanted.get(i)?, d, from, len)))
+            .flat_map(|(k, d, from, len)| {
+                k.channels
+                    .iter()
+                    .flatten()
+                    .filter_map(move |c| c.footage.map(|f| (f, d, from, len)))
+            })
+            .collect();
+        if uses.is_empty() {
+            self.footage_budget = self.upload_budget;
+            return vec![];
+        }
+        let half = ((FOOTAGE_WINDOW / dt).ceil() as u64).max(crate::footage::MIN_FRAMES as u64);
+        let share = self.texture_budget / 2 / uses.len();
+        let mut on_screen = 0;
+        let mut out = vec![];
+        for (fk, d, from, len) in uses {
+            let Some(e) = self.footage.get(&fk) else {
+                continue;
+            };
+            let bytes = e
+                .scan
+                .size
+                .map_or(1, |(w, h)| crate::texture::frame_bytes(w, h, e.mipmap));
+            let w = ((share / bytes) as u64).clamp(crate::footage::MIN_FRAMES as u64, half);
+            let map = e.map;
+            let range: Vec<u64> = if let Some(len) = len {
+                (from..from + len).collect()
+            } else if d == 0.0 {
+                on_screen += bytes;
+                (from.saturating_sub(FOOTAGE_BEHIND)..from + w).collect()
+            } else {
+                (from..from + w.div_ceil(2).max(crate::footage::MIN_FRAMES as u64)).collect()
+            };
+            for m in range {
+                let Some(k) = map.source_frame(m) else {
+                    continue;
+                };
+                let ahead = if m >= from {
+                    (m - from) as f64 * dt
+                } else {
+                    (from - m) as f64 * dt * 2.0
+                };
+                let tex = self.frame_tex(fk, k);
+                out.push((tex, d + ahead as f32));
+            }
+        }
+        self.footage_budget = if self.upload_pinned {
+            self.upload_budget
+        } else {
+            self.upload_budget.max(2 * on_screen)
+        };
+        out
+    }
+
+    /// The texture key of source frame `k` of footage `fk`, adding the frame to the
+    /// store (`Idle`) if it isn't there: keyed by its file's path, size and mtime (one
+    /// `stat` per version and frame) and how its texels are made. A missing file is a
+    /// `Failed` frame.
+    fn frame_tex(&mut self, fk: u64, k: u64) -> u64 {
+        let Some(e) = self.footage.get_mut(&fk) else {
+            return FOOTAGE_BLACK;
+        };
+        let generation = e.generation;
+        // Fast path (every render and pump): known, and still in the store.
+        if let Some(&t) = e.frames.get(&k)
+            && let Some(entry) = self.textures.get_mut(&t)
+        {
+            entry.generation = entry.generation.max(generation);
+            return t;
+        }
+        let path = e.scan.path(k);
+        let tex = match e.frames.get(&k) {
+            Some(&t) => t,
+            None => {
+                let stamp = match std::fs::metadata(&path) {
+                    Ok(md) => {
+                        let mtime = md
+                            .modified()
+                            .ok()
+                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                            .map_or(0, |d| d.as_nanos());
+                        format!("{}\0{mtime}", md.len())
+                    }
+                    Err(_) => "missing".to_string(),
+                };
+                let t = hash(&format!(
+                    "frame\0{}\0{stamp}\0{:?}\0{}\0{}\0{}",
+                    path.display(),
+                    e.scan.size,
+                    e.vflip,
+                    e.srgb,
+                    e.mipmap
+                ));
+                e.frames.insert(k, t);
+                t
+            }
+        };
+        // Another channel (or version) may have this very frame already: share it.
+        let entry = self.textures.entry(tex).or_insert_with(|| {
+            let label = format!("{}{}", e.folder, e.scan.pattern.name(e.scan.first + k));
+            let state = if path.is_file() {
+                TexState::Idle
+            } else {
+                TexState::Failed(format!(
+                    "{label}: not found (it was there when the film loaded)"
+                ))
+            };
+            TexEntry {
+                source: TexSource::Frame(path, e.scan.size),
+                label,
+                vflip: e.vflip,
+                srgb: e.srgb,
+                mipmap: e.mipmap,
+                footage: true,
+                generation,
+                state,
+                last_used: 0,
+            }
+        });
+        entry.generation = entry.generation.max(generation);
+        tex
+    }
+
+    /// `k` with each footage channel's frame for film frame `n` filled in (`tex` = that
+    /// frame's texture, or `FOOTAGE_BLACK`; `time` = its source time).
+    fn resolve(&mut self, mut k: ShotKeys, n: u64) -> ShotKeys {
+        for c in k.channels.iter_mut().flatten() {
+            let Some(fk) = c.footage else { continue };
+            let Some(map) = self.footage.get(&fk).map(|e| e.map) else {
+                c.tex = FOOTAGE_BLACK;
+                continue;
+            };
+            match map.source_frame(n) {
+                Some(frame) => {
+                    c.tex = self.frame_tex(fk, frame);
+                    c.time = map.source_time(frame);
+                }
+                None => {
+                    c.tex = FOOTAGE_BLACK;
+                    c.time = 0.0;
+                }
+            }
+        }
+        k
     }
 
     /// Textures sorted by how soon the playhead needs them (seconds).
@@ -1077,7 +1522,13 @@ impl Renderer {
                 continue;
             };
             let d = distance(movie, shot, t);
-            v.extend(k.channels.iter().flatten().map(|c| (c.tex, d)));
+            v.extend(
+                k.channels
+                    .iter()
+                    .flatten()
+                    .filter(|c| c.footage.is_none())
+                    .map(|c| (c.tex, d)),
+            );
         }
         let n = movie.shots.len();
         for (j, layer) in movie.layers.iter().enumerate() {
@@ -1089,7 +1540,7 @@ impl Renderer {
                 k.channels
                     .iter()
                     .flatten()
-                    .filter(|c| !is_pass_key(c.tex))
+                    .filter(|c| !is_pass_key(c.tex) && c.footage.is_none())
                     .map(|c| (c.tex, d)),
             );
         }
@@ -1119,13 +1570,26 @@ impl Renderer {
             }
         }
         let wanted = |d: f32| background || d <= LOOKAHEAD;
+        // Images and text share one budget, footage has its own (#70), so a big still
+        // texture never starves the frames under the playhead, nor they it.
         let mut budget = self.upload_budget;
+        let mut footage_budget = self.footage_budget;
         for (k, d) in order {
-            if budget == 0 || !wanted(*d) {
+            if (budget == 0 && footage_budget == 0) || !wanted(*d) {
                 break;
             }
-            budget = self.upload_some(*k, budget);
+            let Some(footage) = self.textures.get(k).map(|e| e.footage) else {
+                continue;
+            };
+            if footage {
+                if footage_budget > 0 {
+                    footage_budget = self.upload_some(*k, footage_budget);
+                }
+            } else if budget > 0 {
+                budget = self.upload_some(*k, budget);
+            }
         }
+        // Decodes in flight, (images and text, footage frames and their CPU bytes).
         let in_flight = |r: &Renderer| {
             r.textures
                 .values()
@@ -1135,16 +1599,50 @@ impl Renderer {
                         TexState::Decoding | TexState::Decoded(_) | TexState::Uploading { .. }
                     )
                 })
-                .count()
+                .fold((0, 0, 0), |(n, f, b), e| {
+                    if e.footage {
+                        let bytes = match &e.source {
+                            TexSource::Frame(_, Some((w, h))) => w * h * 4,
+                            _ => 0,
+                        };
+                        (n, f + 1, b + bytes)
+                    } else {
+                        (n + 1, f, b)
+                    }
+                })
         };
+        let workers = self.decoder.as_ref().map_or(1, |d| d.workers);
+        let footage_cap = (workers * FOOTAGE_IN_FLIGHT_PER_WORKER).max(FOOTAGE_MIN_IN_FLIGHT);
+        let (mut stills, mut frames, mut frame_bytes) = in_flight(self);
         for (k, d) in order {
-            if !wanted(*d) || in_flight(self) >= TEXTURES_IN_FLIGHT {
+            if !wanted(*d) || (stills >= TEXTURES_IN_FLIGHT && frames >= footage_cap) {
                 break;
             }
             let Some(e) = self.textures.get_mut(k) else {
                 continue;
             };
-            if matches!(e.state, TexState::Idle) {
+            if !matches!(e.state, TexState::Idle) {
+                continue;
+            }
+            if e.footage {
+                let bytes = match &e.source {
+                    TexSource::Frame(_, Some((w, h))) => w * h * 4,
+                    _ => 0,
+                };
+                let over_cpu =
+                    frames >= FOOTAGE_MIN_IN_FLIGHT && frame_bytes + bytes > FOOTAGE_CPU_BYTES;
+                if frames >= footage_cap || over_cpu {
+                    continue;
+                }
+                frames += 1;
+                frame_bytes += bytes;
+            } else {
+                if stills >= TEXTURES_IN_FLIGHT {
+                    continue;
+                }
+                stills += 1;
+            }
+            {
                 let job = (*k, e.source.clone(), e.label.clone(), e.vflip);
                 e.state = TexState::Decoding;
                 let d = self.decoder.get_or_insert_with(Decoder::new);
@@ -1165,9 +1663,9 @@ impl Renderer {
         if !matches!(e.state, TexState::Decoded(_) | TexState::Uploading { .. }) {
             return budget;
         }
-        let (srgb, label) = (e.srgb, e.label.clone());
+        let (srgb, mipmap, label) = (e.srgb, e.mipmap, e.label.clone());
         let (tex, img, row) = match std::mem::replace(&mut e.state, TexState::Idle) {
-            TexState::Decoded(img) => match self.begin_upload(&img, srgb, &label) {
+            TexState::Decoded(img) => match self.begin_upload(&img, srgb, mipmap, &label) {
                 Ok(tex) => (tex, img, 0),
                 Err(m) => {
                     self.textures.get_mut(&k).unwrap().state = TexState::Failed(m);
@@ -1182,14 +1680,14 @@ impl Renderer {
         };
         let row_bytes = img.width * 4;
         let rows = (budget / row_bytes).clamp(1, img.height - row);
-        self.upload_rows(tex, &img, row, rows);
+        self.upload_rows(tex, &img, row, rows, mipmap);
         let row = row + rows;
         let state = if row == img.height {
             TexState::Ready {
                 tex,
                 w: img.width,
                 h: img.height,
-                bytes: crate::texture::gpu_bytes(img.width, img.height),
+                bytes: crate::texture::frame_bytes(img.width, img.height, mipmap),
                 meta: img.meta,
             }
         } else {
@@ -1216,15 +1714,23 @@ impl Renderer {
             }
             _ => {}
         }
-        self.blocking_texture_loads += 1;
+        if e.footage {
+            self.blocking_footage_loads += 1;
+        } else {
+            self.blocking_texture_loads += 1;
+        }
         self.upload_some(k, usize::MAX);
     }
 
-    /// Allocate level 0 (`RGBA8`, or `SRGB8_ALPHA8` with `srgb`) for `img`.
+    /// Allocate level 0 (`RGBA8`, or `SRGB8_ALPHA8` with `srgb`) for `img`, or reuse a
+    /// spare texture of that size and format (footage frames turn over constantly:
+    /// `tex_sub_image_2d` into a reused texture, no reallocation; GL orders the new
+    /// upload after earlier draws that sampled the old contents, so no fence).
     fn begin_upload(
-        &self,
+        &mut self,
         img: &DecodedImage,
         srgb: bool,
+        mipmap: bool,
         label: &str,
     ) -> std::result::Result<glow::Texture, String> {
         let max = self.max_texture_size;
@@ -1234,6 +1740,11 @@ impl Renderer {
                 img.width, img.height
             ));
         }
+        let slot = (img.width, img.height, srgb, mipmap);
+        if let Some(i) = self.spare.iter().position(|(k, _)| *k == slot) {
+            return Ok(self.spare.swap_remove(i).1);
+        }
+        self.texture_creates += 1;
         let gl = &self.gl;
         unsafe {
             let tex = gl.create_texture()?;
@@ -1260,7 +1771,11 @@ impl Renderer {
             gl.tex_parameter_i32(
                 glow::TEXTURE_2D,
                 glow::TEXTURE_MIN_FILTER,
-                glow::LINEAR_MIPMAP_LINEAR as i32,
+                if mipmap {
+                    glow::LINEAR_MIPMAP_LINEAR
+                } else {
+                    glow::LINEAR
+                } as i32,
             );
             gl.tex_parameter_i32(
                 glow::TEXTURE_2D,
@@ -1276,7 +1791,14 @@ impl Renderer {
     /// them before returning: nothing to wait for), and the mipmaps after the last band.
     /// The unpack state is set for the band and put back to GL's defaults, and no
     /// unpack buffer is bound (with one bound, the slice would be read as an offset).
-    fn upload_rows(&mut self, tex: glow::Texture, img: &DecodedImage, row: usize, rows: usize) {
+    fn upload_rows(
+        &mut self,
+        tex: glow::Texture,
+        img: &DecodedImage,
+        row: usize,
+        rows: usize,
+        mipmap: bool,
+    ) {
         let gl = &self.gl;
         let stride = img.width * 4;
         unsafe {
@@ -1299,7 +1821,7 @@ impl Renderer {
                 glow::PixelUnpackData::Slice(Some(&img.rgba[row * stride..(row + rows) * stride])),
             );
             gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 4);
-            if row + rows == img.height {
+            if mipmap && row + rows == img.height {
                 gl.generate_mipmap(glow::TEXTURE_2D);
             }
             gl.bind_texture(glow::TEXTURE_2D, None);
@@ -1309,6 +1831,7 @@ impl Renderer {
 
     fn texture_ready(&self, k: u64) -> bool {
         is_pass_key(k)
+            || is_footage_marker(k)
             || matches!(
                 self.textures.get(&k).map(|e| &e.state),
                 Some(TexState::Ready { .. })
@@ -1319,6 +1842,33 @@ impl Renderer {
     /// textures that the playhead won't need soon and no fallback holds. They come
     /// back through the same decode and upload, identically.
     fn evict_textures(&mut self, order: &[(u64, f32)]) {
+        // Footage frames the playhead no longer wants (it moved on, or jumped) that
+        // aren't uploaded yet leave the store, so they hold neither CPU memory nor an
+        // in-flight slot; a decode still running for one is dropped when it returns.
+        if self.textures.values().any(|e| e.footage) {
+            let wanted: std::collections::HashSet<u64> = order.iter().map(|(k, _)| *k).collect();
+            let stale: Vec<u64> = self
+                .textures
+                .iter()
+                .filter(|(k, e)| {
+                    e.footage
+                        && !wanted.contains(k)
+                        && matches!(
+                            e.state,
+                            TexState::Idle
+                                | TexState::Decoding
+                                | TexState::Decoded(_)
+                                | TexState::Uploading { .. }
+                        )
+                })
+                .map(|(k, _)| *k)
+                .collect();
+            for k in stale {
+                if let Some(e) = self.textures.remove(&k) {
+                    self.delete_texture_state(e.state);
+                }
+            }
+        }
         let mut total: usize = self
             .textures
             .values()
@@ -1340,12 +1890,14 @@ impl Renderer {
             .values()
             .flat_map(|f| f.channels.iter().flatten().map(|c| c.tex))
             .collect();
-        let mut candidates: Vec<(u64, u64, usize)> = self
+        // Footage frames the playhead has passed go first (they turn over anyway),
+        // then the least recently used.
+        let mut candidates: Vec<(u64, (bool, u64), usize)> = self
             .textures
             .iter()
             .filter_map(|(k, e)| match e.state {
                 TexState::Ready { bytes, .. } if !near.contains(k) && !held.contains(k) => {
-                    Some((*k, e.last_used, bytes))
+                    Some((*k, (!e.footage, e.last_used), bytes))
                 }
                 _ => None,
             })
@@ -1356,7 +1908,22 @@ impl Renderer {
                 break;
             }
             let e = self.textures.get_mut(&k).unwrap();
+            let footage = e.footage;
+            let slot = (e.srgb, e.mipmap);
             let old = std::mem::replace(&mut e.state, TexState::Idle);
+            if footage {
+                // Footage frames leave the store (their footage entry remembers the key
+                // and re-adds them if needed again); their texture waits for the next
+                // frame of the same size.
+                self.textures.remove(&k);
+                if let TexState::Ready { tex, w, h, .. } = old
+                    && self.spare.len() < SPARE_TEXTURES
+                {
+                    self.spare.push(((w, h, slot.0, slot.1), tex));
+                    total -= bytes;
+                    continue;
+                }
+            }
             self.delete_texture_state(old);
             total -= bytes;
         }
@@ -1434,8 +2001,14 @@ impl Renderer {
     /// The programs to draw shot `i` with: the current version if it compiled,
     /// otherwise the last working one. With `blocking`, the current version is
     /// compiled first, so the decision is made knowing whether it works.
-    fn usable(&mut self, i: usize, blocking: bool) -> Option<ShotKeys> {
+    ///
+    /// Footage (#70): the keys are resolved for film frame `n`, and a frame is usable
+    /// only when *that* source frame is ready on every footage channel (or the fallback
+    /// version has it): never a neighbouring frame, so playback shows only what `still`
+    /// would.
+    fn usable(&mut self, i: usize, blocking: bool, n: u64) -> Option<ShotKeys> {
         let k = *self.wanted.get(i)?;
+        let k = self.resolve(k, n);
         if blocking {
             self.compile_now(k.scene);
             if let Some(t) = k.trans {
@@ -1453,8 +2026,19 @@ impl Renderer {
             .get(i)
             .and_then(|id| self.fallback.get(id))
             .copied();
-        if let Some(f) = fb.filter(|f| self.keys_ready(*f)) {
+        if let Some(f) = fb
+            .map(|f| self.resolve(f, n))
+            .filter(|f| self.keys_ready(*f))
+        {
             return Some(f);
+        }
+        if !blocking
+            && k.channels
+                .iter()
+                .flatten()
+                .any(|c| c.footage.is_some() && !self.texture_ready(c.tex))
+        {
+            self.footage_misses += 1;
         }
         // Nothing working to show: with `blocking`, draw what we have (a failed
         // scene shows black, a failed texture reads black); otherwise wait.
@@ -1523,11 +2107,24 @@ impl Renderer {
                 self.delete_state(e.state);
             }
         }
+        // Footage entries of the current version and the fallbacks, and their frames.
+        let live: std::collections::HashSet<u64> = self
+            .wanted
+            .iter()
+            .chain(self.fallback.values())
+            .flat_map(|k| k.channels.iter().flatten().filter_map(|c| c.footage))
+            .collect();
+        self.footage.retain(|k, _| live.contains(k));
         let keep: std::collections::HashSet<u64> = self
             .wanted
             .iter()
             .chain(self.fallback.values())
             .flat_map(|k| k.channels.iter().flatten().map(|c| c.tex))
+            .chain(
+                self.footage
+                    .values()
+                    .flat_map(|f| f.frames.values().copied()),
+            )
             .collect();
         let drop: Vec<u64> = self
             .textures
@@ -1807,13 +2404,27 @@ impl Renderer {
         if invalid_at(movie, at) {
             return None;
         }
-        let needed: Vec<usize> = match at {
-            At::Shot { shot, .. } => vec![shot],
-            At::Transition { from, to, .. } => vec![from, to],
+        // The film frame on screen picks each footage channel's source frame (#70); a
+        // frozen transition's outgoing shot shows the frame where the transition starts.
+        let n = film_frame(movie, info.t);
+        let needed: Vec<(usize, u64)> = match at {
+            At::Shot { shot, .. } => vec![(shot, n)],
+            At::Transition { from, to, .. } => {
+                let freeze = movie.shots[to]
+                    .transition_in
+                    .as_ref()
+                    .is_some_and(|t| t.freeze);
+                let from_n = if freeze {
+                    movie.frame_at(movie.shots[to].start).max(0) as u64
+                } else {
+                    n
+                };
+                vec![(from, from_n), (to, n)]
+            }
         };
         let mut keys = vec![];
-        for &i in &needed {
-            keys.push(self.usable(i, blocking)?);
+        for &(i, n) in &needed {
+            keys.push(self.usable(i, blocking, n)?);
         }
         // Layers (#69): a frame is usable only when every active layer is, so playback
         // never shows a frame without a layer that `still` and `export` would draw.
@@ -1825,7 +2436,7 @@ impl Renderer {
             .collect();
         let mut layer_keys = vec![];
         for &(j, _) in &active {
-            layer_keys.push(self.usable(n_shots + j, blocking)?);
+            layer_keys.push(self.usable(n_shots + j, blocking, n)?);
         }
         let over = if active.is_empty() {
             None
@@ -1837,6 +2448,17 @@ impl Renderer {
             self.prog(o)?;
             Some(o)
         };
+        // A footage frame that failed to decode reads black (a broken still texture
+        // too); headless commands refuse such a frame (`footage_failure`).
+        self.footage_failure = keys
+            .iter()
+            .chain(&layer_keys)
+            .flat_map(|k| k.channels.iter().flatten())
+            .filter(|c| c.footage.is_some())
+            .find_map(|c| match &self.textures.get(&c.tex)?.state {
+                TexState::Failed(m) => Some(m.clone()),
+                _ => None,
+            });
         let frame_no = self.frame_no;
         for k in keys.iter().chain(&layer_keys) {
             for x in [Some(k.scene), k.trans].into_iter().flatten() {
@@ -2162,8 +2784,21 @@ impl Renderer {
             // were set to n at link time), or black with resolution 0.
             let mut res = [0f32; 3 * N_CHANNELS];
             let mut meta = [0f32; 4 * N_CHANNELS];
+            let mut times = [0f32; N_CHANNELS];
             let mut sampled = false;
             for (n, c) in keys.channels.iter().enumerate() {
+                // Footage: the shown frame's source time; past the end with
+                // `end = "black"`, black with the clip's resolution.
+                if let Some(c) = c
+                    && let Some(fk) = c.footage
+                {
+                    times[n] = c.time;
+                    if c.tex == FOOTAGE_BLACK
+                        && let Some((w, h)) = self.footage.get(&fk).and_then(|f| f.scan.size)
+                    {
+                        res[n * 3..n * 3 + 3].copy_from_slice(&[w as f32, h as f32, 1.0]);
+                    }
+                }
                 let ready = c.and_then(|c| {
                     if is_pass_key(c.tex) {
                         // Another pass's picture, exactly its size; black (resolution 0)
@@ -2201,6 +2836,9 @@ impl Renderer {
             }
             if let Some(l) = p.loc("iChannelMeta") {
                 gl.uniform_4_f32_slice(Some(l), &meta);
+            }
+            if let Some(l) = p.loc("iChannelTime") {
+                gl.uniform_1_f32_slice(Some(l), &times);
             }
             for (name, a) in item.uniforms {
                 if let Some(l) = p.loc(name) {
@@ -3184,6 +3822,9 @@ impl Drop for Renderer {
             for (_, e) in std::mem::take(&mut self.textures) {
                 self.delete_texture_state(e.state);
             }
+            for (_, t) in std::mem::take(&mut self.spare) {
+                self.gl.delete_texture(t);
+            }
             for (_, s) in std::mem::take(&mut self.samplers) {
                 self.gl.delete_sampler(s);
             }
@@ -3370,6 +4011,12 @@ fn distance_once(shot: &Shot, t: f32) -> f32 {
     } else {
         0.0
     }
+}
+
+/// The film frame on screen at `t` (a loop film's within one period): `frame_at`, as
+/// `FrameInfo::at` derives `iFrame`, so playback, `still` and `export` agree.
+fn film_frame(movie: &Movie, t: f32) -> u64 {
+    movie.frame_at(movie.wrap(t)).max(0) as u64
 }
 
 fn invalid_at(movie: &Movie, at: At) -> bool {

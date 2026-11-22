@@ -281,21 +281,15 @@ fn not_yet(what: &str, s: &str, kind: &str) -> anyhow::Error {
             "not a layer below this one",
             "@ names input, picture, an earlier layer, or (with comps, in layers phase 3) a comp",
         ),
-        "sequence" => (
-            "an image sequence",
-            "image sequences arrive in shotglass 0.1.5",
-        ),
         "video" => (
             "a video",
-            "video files arrive after image sequences (shotglass 0.1.5)",
-        ),
-        "text" => (
-            "a text block",
-            "text arrives with [fonts] and [texts] in shotglass 0.1.3",
+            "video files arrive with footage phase 2, after shotglass 0.1.6; meanwhile \
+             convert it to an image sequence (ffmpeg -i clip.mp4 frames/clip_%05d.png, then \
+             \"frames/clip_#####.png\")",
         ),
         _ => (
-            "a re-timed [textures] entry",
-            "re-timing arrives with image sequences (shotglass 0.1.5)",
+            "a text block",
+            "text arrives with [fonts] and [texts] in shotglass 0.1.3",
         ),
     };
     anyhow!("{what}: \"{s}\" is {is}; {arrives}")
@@ -401,11 +395,179 @@ impl TextSource {
     }
 }
 
+/// An image sequence (#70): `renders/fog_####.png`, one image per frame.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Sequence {
+    /// The pattern as a path (label as written: "renders/fog_####.png"); its file name
+    /// has one run of `#`. Library patterns resolve like any library file.
+    pub pattern: FileRef,
+    /// Source frames per second (`fps`); None = the film's.
+    pub fps: Option<(u32, u32)>,
+    /// The file number that is source frame 0 (`first`); None = the lowest found.
+    pub first: Option<u64>,
+    /// What `Movie::load` found on disk (None after a bare `parse`).
+    pub scan: Option<std::sync::Arc<crate::footage::Scan>>,
+}
+
+/// Where footage starts: `in` (source seconds) or `in_frame` (a source frame).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum In {
+    Seconds(f64),
+    Frame(u64),
+}
+
+/// Footage's clock (`clock`): 0 at the item's start (a shot's or a layer's), or at
+/// the film's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FootageClock {
+    Shot,
+    Movie,
+}
+
+/// Past the last source frame (`end`): keep it, wrap to frame 0, or read black.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum End {
+    Hold,
+    Loop,
+    Black,
+}
+
+impl FootageClock {
+    pub const NAMES: &[&str] = &["shot", "movie"];
+}
+impl End {
+    pub const NAMES: &[&str] = &["hold", "loop", "black"];
+}
+
+/// Which source frame a footage channel shows when (`in`/`in_frame`, `speed`,
+/// `clock`, `end`). Independent of the item's `time_offset`/`time_scale`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Timing {
+    pub start: In,
+    /// Source seconds per clock second; 0 is a freeze frame.
+    pub speed: f64,
+    pub clock: FootageClock,
+    pub end: End,
+}
+
+impl Default for Timing {
+    fn default() -> Timing {
+        Timing {
+            start: In::Seconds(0.0),
+            speed: 1.0,
+            clock: FootageClock::Shot,
+            end: End::Hold,
+        }
+    }
+}
+
+/// Everything `source_frame` needs for one footage channel of one shot or layer:
+/// a pure function of the film frame number, shared by the renderer, `check` and
+/// the tests.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FrameMap {
+    /// The film's exact frame rate.
+    pub film: (u32, u32),
+    pub loop_frames: Option<u64>,
+    /// Movie seconds where the item starts (its clock's 0 with `clock = "shot"`).
+    pub origin: f32,
+    pub timing: Timing,
+    /// The source's exact frame rate.
+    pub src: (u32, u32),
+    /// Source frames (≥ 1).
+    pub count: u64,
+}
+
+/// `frame_at`'s rounding rule: round when within 1e-4·k of a whole number (an exact
+/// ratio computed in floating point lands a hair either side), otherwise floor.
+pub fn floor_snap(f: f64) -> i64 {
+    let n = f.round();
+    if (f - n).abs() < 1e-4 * n.max(1.0) {
+        n as i64
+    } else {
+        f.floor() as i64
+    }
+}
+
+/// The source frame containing source position `f` (in frames): floor, except that a
+/// value within floating-point error of a whole number is that number. The tolerance
+/// (1e-9 absolute, 1e-11 relative) is far above f64 error (~1e-16 relative) and far
+/// below any real fraction (24-in-30 steps by 0.2, 25 in 30000/1001 by 1/1200), so
+/// exact ratios never lose a frame and long clips never gain one. (`floor_snap`'s
+/// 1e-4 relative suits f32 film times, not frame counts in the millions.)
+pub fn source_snap(f: f64) -> i64 {
+    let n = f.round();
+    if (f - n).abs() <= 1e-9 + 1e-11 * n.abs() {
+        n as i64
+    } else {
+        f.floor() as i64
+    }
+}
+
+impl FrameMap {
+    /// The source frame shown on film frame `n`, or None for black (`end = "black"`
+    /// past the last frame). Exact rationals in f64, never an f32 `t * fps`: film
+    /// time `n·den/num`, the item's clock, `in + speed·clock` source seconds, then the
+    /// source frame whose interval contains that instant (`source_snap`). A loop
+    /// film's `n` is taken within one period first.
+    pub fn source_frame(&self, n: u64) -> Option<u64> {
+        let n = match self.loop_frames {
+            Some(p) => n % p,
+            None => n,
+        };
+        let (num, den) = (self.film.0 as f64, self.film.1 as f64);
+        let t = n as f64 * den / num;
+        let clock = match self.timing.clock {
+            FootageClock::Shot => {
+                // An item starts at an f32 time; on (or within 0.01 frame of) a frame
+                // boundary it is that boundary exactly, so its clock is exact too.
+                let o = self.origin as f64 * num / den;
+                let r = o.round();
+                let origin = if (o - r).abs() < 0.01 {
+                    r * den / num
+                } else {
+                    self.origin as f64
+                };
+                t - origin
+            }
+            FootageClock::Movie => t,
+        };
+        let rate = self.src.0 as f64 / self.src.1 as f64;
+        let start = match self.timing.start {
+            In::Seconds(s) => s * rate,
+            In::Frame(k) => k as f64,
+        };
+        let k = source_snap(start + self.timing.speed * clock * rate).max(0) as u64;
+        if k < self.count {
+            return Some(k);
+        }
+        match self.timing.end {
+            End::Hold => Some(self.count - 1),
+            End::Loop => Some(k % self.count),
+            End::Black => None,
+        }
+    }
+
+    /// Source time of frame `k` (`iChannelTime`): `k·den/num` seconds.
+    pub fn source_time(&self, k: u64) -> f32 {
+        (k as f64 * self.src.1 as f64 / self.src.0 as f64) as f32
+    }
+}
+
+/// A shot or a layer, for `Movie::source_frame`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ItemRef {
+    Shot(usize),
+    Layer(usize),
+}
+
 /// What a channel shows.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Source {
     Image(FileRef),
     Text(Box<TextSource>),
+    /// An image sequence (#70): which frame depends on the film frame (`FrameMap`).
+    Frames(Box<Sequence>),
     /// `@input` on a layer: the picture below it (everything under it, composited).
     Input,
     /// `@picture` on a layer: the picture track before any layer.
@@ -435,13 +597,16 @@ pub struct Channel {
     pub vflip: bool,
     /// Uploaded as SRGB8_ALPHA8: `texture()` returns linear values.
     pub srgb: bool,
+    /// Footage only: which source frame shows when.
+    pub timing: Timing,
 }
 
 impl Channel {
-    /// Every file the channel reads: the image, or a text's file and fonts.
+    /// Every single file the channel reads: the image, or a text's file and fonts.
+    /// A sequence's frames are in its scan (`Sequence::scan`), not here.
     pub fn files(&self) -> Vec<&FileRef> {
         match &self.source {
-            Source::Input | Source::Picture | Source::Layer { .. } => vec![],
+            Source::Input | Source::Picture | Source::Layer { .. } | Source::Frames(_) => vec![],
             Source::Image(f) => vec![f],
             Source::Text(t) => {
                 let mut v: Vec<&FileRef> = vec![];
@@ -454,9 +619,19 @@ impl Channel {
         }
     }
 
+    /// Every path as `movie.toml` writes it: `files()`, and a sequence's pattern.
+    pub fn written(&self) -> Vec<&FileRef> {
+        match &self.source {
+            Source::Frames(s) => vec![&s.pattern],
+            _ => self.files(),
+        }
+    }
+
+    /// The written paths, to resolve against libraries (`written`).
     pub fn files_mut(&mut self) -> Vec<&mut FileRef> {
         match &mut self.source {
             Source::Input | Source::Picture | Source::Layer { .. } => vec![],
+            Source::Frames(s) => vec![&mut s.pattern],
             Source::Image(f) => vec![f],
             Source::Text(t) => {
                 let t = &mut **t;
@@ -474,6 +649,7 @@ impl Channel {
     pub fn label(&self) -> String {
         match &self.source {
             Source::Image(f) => f.label.clone(),
+            Source::Frames(s) => s.pattern.label.clone(),
             Source::Text(t) => format!("text \"{}\"", t.name),
             Source::Input => "@input".to_string(),
             Source::Picture => "@picture".to_string(),
@@ -494,6 +670,39 @@ impl Channel {
             Source::Text(t) => Some(t),
             _ => None,
         }
+    }
+
+    pub fn sequence(&self) -> Option<&Sequence> {
+        match &self.source {
+            Source::Frames(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// A library sequence's frames as library files (for `bundle`/`freeze`), once scanned.
+    pub fn sequence_files(&self) -> Vec<FileRef> {
+        let Some(seq) = self.sequence() else {
+            return vec![];
+        };
+        let Some(scan) = &seq.scan else {
+            return vec![];
+        };
+        let dir = seq.pattern.rel.rsplit_once('/').map(|(d, _)| d);
+        (0..scan.count)
+            .map(|k| {
+                let name = scan.pattern.name(scan.first + k);
+                let rel = dir.map_or(name.clone(), |d| format!("{d}/{name}"));
+                FileRef {
+                    file: scan.path(k),
+                    label: match &seq.pattern.library {
+                        Some(l) => format!("{l}/{rel}"),
+                        None => rel.clone(),
+                    },
+                    library: seq.pattern.library.clone(),
+                    rel,
+                }
+            })
+            .collect()
     }
 }
 
@@ -655,6 +864,8 @@ impl Movie {
         let mut m = Movie::read(path)?;
         m.resolve_libraries(&|k| std::env::var(k).ok(), &library::cache_dir())
             .with_context(|| format!("in {}", m.root.join("movie.toml").display()))?;
+        m.scan_footage()
+            .with_context(|| format!("in {}", m.root.join("movie.toml").display()))?;
         m.check_case();
         m.check_textures()
             .with_context(|| format!("in {}", m.root.join("movie.toml").display()))?;
@@ -667,6 +878,8 @@ impl Movie {
     pub fn load_locked(path: &Path, cache: &Path) -> Result<Movie> {
         let mut m = Movie::read(path)?;
         m.resolve_libraries_with(&BTreeMap::new(), cache)
+            .with_context(|| format!("in {}", m.root.join("movie.toml").display()))?;
+        m.scan_footage()
             .with_context(|| format!("in {}", m.root.join("movie.toml").display()))?;
         m.check_case();
         m.check_textures()
@@ -706,7 +919,7 @@ impl Movie {
 
     /// `check`'s warning for a film that uses a feature newer than the engine contract
     /// it says it needs (textures: 0.1.1, `loop`: 0.1.2, text and iChannel4..7: 0.1.3,
-    /// layers: 0.1.4):
+    /// layers: 0.1.4, blends: 0.1.5, image sequences: 0.1.6):
     /// older engines would then fail
     /// on an "unknown field" instead of asking for a newer shotglass.
     pub fn contract_warning(&self) -> Option<String> {
@@ -748,6 +961,10 @@ impl Movie {
             features.push("blend modes, @picture or @<layer>, which need shotglass 0.1.5");
             need = semver::Version::new(0, 1, 5);
         }
+        if self.channels().any(|c| c.sequence().is_some()) {
+            features.push("image sequences, which need shotglass 0.1.6");
+            need = semver::Version::new(0, 1, 6);
+        }
         if features.is_empty() {
             return None;
         }
@@ -758,6 +975,7 @@ impl Movie {
             semver::Version::new(0, 1, 2),
             semver::Version::new(0, 1, 3),
             semver::Version::new(0, 1, 4),
+            semver::Version::new(0, 1, 5),
         ];
         let allows_old = match &self.shotglass {
             None => true,
@@ -775,6 +993,69 @@ impl Movie {
                     .map_or(String::new(), |v| format!(" (it says \"{v}\")"))
             )
         })
+    }
+
+    /// Find every sequence's frames (once per pattern): a missing sequence or a gap
+    /// refuses the version, like a missing `#include`; so does an `in` past the end.
+    pub fn scan_footage(&mut self) -> Result<()> {
+        let film = (self.fps_num, self.fps_den);
+        // Each pattern (and `first`) is scanned once, whichever channels use it.
+        type Found = ((PathBuf, Option<u64>), std::sync::Arc<crate::footage::Scan>);
+        let mut found: Vec<Found> = vec![];
+        let items = self
+            .shots
+            .iter_mut()
+            .map(|s| (format!("shot \"{}\"", s.id), &mut s.channels))
+            .chain(
+                self.layers
+                    .iter_mut()
+                    .map(|l| (format!("layer \"{}\"", l.id), &mut l.channels)),
+            );
+        for (who, channels) in items {
+            for (n, c) in channels.iter_mut().enumerate() {
+                let Some(c) = c else { continue };
+                let timing = c.timing;
+                let Source::Frames(seq) = &mut c.source else {
+                    continue;
+                };
+                let key = (seq.pattern.file.clone(), seq.first);
+                let scan = match found.iter().find(|(k, _)| *k == key) {
+                    Some((_, s)) => s.clone(),
+                    None => {
+                        let file = &seq.pattern.file;
+                        let name = file.file_name().map(|n| n.to_string_lossy().into_owned());
+                        let dir = file.parent().unwrap_or(Path::new("."));
+                        let s = crate::footage::Pattern::parse(name.as_deref().unwrap_or(""))
+                            .and_then(|p| {
+                                crate::footage::scan(dir, &seq.pattern.label, &p, seq.first)
+                            })
+                            .map_err(|e| anyhow!("{who}: channels[{n}]: {e}"))?;
+                        let s = std::sync::Arc::new(s);
+                        found.push((key, s.clone()));
+                        s
+                    }
+                };
+                let rate = seq.fps.unwrap_or(film);
+                let start = match timing.start {
+                    In::Seconds(s) => source_snap(s * rate.0 as f64 / rate.1 as f64).max(0) as u64,
+                    In::Frame(k) => k,
+                };
+                if start >= scan.count && timing.end != End::Loop {
+                    let what = match timing.start {
+                        In::Seconds(s) => format!("in = {s}"),
+                        In::Frame(k) => format!("in_frame = {k}"),
+                    };
+                    bail!(
+                        "{who}: channels[{n}]: {what} is past the end of {} ({:.2} s, {} frames)",
+                        seq.pattern.label,
+                        scan.count as f64 * rate.1 as f64 / rate.0 as f64,
+                        scan.count
+                    );
+                }
+                seq.scan = Some(scan);
+            }
+        }
+        Ok(())
     }
 
     /// Every texture file exists (a missing one refuses the version, like a missing
@@ -1072,7 +1353,7 @@ impl Movie {
         }
         let library_refs: std::collections::BTreeSet<String> = names
             .values()
-            .flat_map(Channel::files)
+            .flat_map(Channel::written)
             .chain(fonts.values().map(|(f, _)| &f.file))
             .filter_map(|f| f.library.clone())
             .collect();
@@ -1095,6 +1376,9 @@ impl Movie {
                 if let toml::Value::String(s) = v
                     && let ChannelSource::Name(name) = ChannelSource::of(s)
                 {
+                    used.insert(name.to_string());
+                }
+                if let Some(name) = v.get("texture").and_then(toml::Value::as_str) {
                     used.insert(name.to_string());
                 }
                 out[n] = texture_spec(&ctx, v, Some(&textures), &library_specs, root, on_layer)?;
@@ -1538,12 +1822,32 @@ impl Movie {
     pub fn frame_at(&self, t: f32) -> i64 {
         let f = t.max(0.0) as f64 * self.fps_num as f64 / self.fps_den as f64;
         // frame_time rounds to f32, which can land just below n/fps; don't drop a frame for that.
-        let n = f.round();
-        if (f - n).abs() < 1e-4 * n.max(1.0) {
-            n as i64
-        } else {
-            f.floor() as i64
-        }
+        floor_snap(f)
+    }
+
+    /// The footage mapping of channel `c` of a shot or layer (None if it isn't a
+    /// scanned sequence).
+    pub fn frame_map(&self, item: ItemRef, c: usize) -> Option<FrameMap> {
+        let (origin, ch) = match item {
+            ItemRef::Shot(i) => (self.shots[i].start, &self.shots[i].channels[c]),
+            ItemRef::Layer(j) => (self.layers[j].start, &self.layers[j].channels[c]),
+        };
+        let ch = ch.as_ref()?;
+        let seq = ch.sequence()?;
+        Some(FrameMap {
+            film: (self.fps_num, self.fps_den),
+            loop_frames: self.loop_frames,
+            origin,
+            timing: ch.timing,
+            src: seq.fps.unwrap_or((self.fps_num, self.fps_den)),
+            count: seq.scan.as_ref()?.count,
+        })
+    }
+
+    /// The source frame channel `c` of a shot or layer shows on film frame `n` (None:
+    /// black, or not footage). See `FrameMap::source_frame`.
+    pub fn source_frame(&self, item: ItemRef, c: usize, n: u64) -> Option<u64> {
+        self.frame_map(item, c)?.source_frame(n)
     }
 
     /// Frames in the film: every n with `frame_time(n) < duration` (one period of a
@@ -1998,6 +2302,7 @@ fn text_spec(
         wrap: Wrap::Clamp,
         vflip: true,
         srgb: false,
+        timing: Timing::default(),
     };
     let number = |k: &str, val: &toml::Value| -> Result<f32> {
         val.as_float()
@@ -2203,24 +2508,45 @@ fn texture_spec(
             wrap: Wrap::Repeat,
             vflip: true,
             srgb: false,
+            timing: Timing::default(),
+        })
+    };
+    // An image sequence: one run of # in the file name. Footage samples linearly by
+    // default (no mipmaps to make for every frame).
+    let sequence_channel = |s: &str| -> Result<Channel> {
+        let path = s.trim_start_matches('<').trim_end_matches('>');
+        let (dir, file) = path.rsplit_once('/').unwrap_or(("", path));
+        if dir.contains('#') {
+            bail!("{what}: \"{s}\": # marks frame numbers and may only appear in the file name");
+        }
+        if file.split(|c| c != '#').filter(|r| !r.is_empty()).count() > 1 {
+            bail!("{what}: \"{s}\": an image sequence has one run of # (the frame number)");
+        }
+        let f = file_ref(what, s, specs, root)?;
+        if !crate::texture::has_image_extension(&f.rel) {
+            bail!(
+                "{what}: {}: an image sequence's frames are PNG or JPEG images (.png, .jpg, .jpeg)",
+                f.label
+            );
+        }
+        Ok(Channel {
+            source: Source::Frames(Box::new(Sequence {
+                pattern: f,
+                fps: None,
+                first: None,
+                scan: None,
+            })),
+            filter: Filter::Linear,
+            wrap: Wrap::Repeat,
+            vflip: true,
+            srgb: false,
+            timing: Timing::default(),
         })
     };
     // A file entry by its kind: images bind now, the rest name the version that brings them.
     let file_source = |s: &str| -> Result<Channel> {
         match ChannelSource::of(s) {
-            ChannelSource::Sequence(_) => {
-                let path = s.trim_start_matches('<').trim_end_matches('>');
-                let (dir, file) = path.rsplit_once('/').unwrap_or(("", path));
-                if dir.contains('#') {
-                    bail!(
-                        "{what}: \"{s}\": # marks frame numbers and may only appear in the file name"
-                    );
-                }
-                if file.split(|c| c != '#').filter(|r| !r.is_empty()).count() > 1 {
-                    bail!("{what}: \"{s}\": an image sequence has one run of # (the frame number)");
-                }
-                Err(not_yet(what, s, "sequence"))
-            }
+            ChannelSource::Sequence(_) => sequence_channel(s),
             ChannelSource::Video(_) => Err(not_yet(what, s, "video")),
             _ => {
                 if let Some(i) = s.find('%')
@@ -2293,6 +2619,7 @@ fn texture_spec(
                     wrap: Wrap::Clamp,
                     vflip: false,
                     srgb: false,
+                    timing: Timing::default(),
                 }))
             }
             ChannelSource::Name(s) => {
@@ -2340,11 +2667,8 @@ fn texture_spec(
                 Some(toml::Value::String(s)) => s.clone(),
                 _ => "…".to_string(),
             };
-            match sources.first() {
-                Some(&"frames") => return Err(not_yet(what, &shown("frames"), "sequence")),
-                Some(&"video") => return Err(not_yet(what, &shown("video"), "video")),
-                Some(&"texture") => return Err(not_yet(what, &shown("texture"), "retime")),
-                _ => {}
+            if sources.first() == Some(&"video") {
+                return Err(not_yet(what, &shown("video"), "video"));
             }
             if t.contains_key("part") {
                 bail!(
@@ -2353,6 +2677,8 @@ fn texture_spec(
                     t["part"]
                 );
             }
+            // `texture = "name"`: a [textures] footage entry, re-timed.
+            let retimed = sources.first() == Some(&"texture");
             let mut c = if let Some(v) = t.get("text") {
                 let Some(name) = v.as_str() else {
                     bail!("{what}: text must be the name of a [texts] entry");
@@ -2364,22 +2690,66 @@ fn texture_spec(
                     }
                     _ => bail!("{what}: text = \"{name}\": no [texts] entry called \"{name}\""),
                 }
+            } else if retimed {
+                let Some(name) = t["texture"].as_str() else {
+                    bail!("{what}: texture must be the name of a [textures] entry");
+                };
+                let Some(names) = names else {
+                    bail!(
+                        "{what}: texture = \"{name}\" re-times a [textures] entry; it goes in a \
+                         shot's or layer's channels"
+                    );
+                };
+                match names.get(name) {
+                    Some(c) if c.sequence().is_some() => c.clone(),
+                    Some(c) => bail!(
+                        "{what}: texture = \"{name}\" re-times footage, and {} isn't footage \
+                         (bind it as \"{name}\")",
+                        c.label()
+                    ),
+                    None => bail!(
+                        "{what}: texture = \"{name}\": no [textures] entry called \"{name}\" ({})",
+                        if names.is_empty() {
+                            "there are none".to_string()
+                        } else {
+                            format!("there are {}", quoted_list(names.keys()))
+                        }
+                    ),
+                }
             } else {
-                match t.get("file") {
+                let (key, image) = if t.contains_key("frames") {
+                    ("frames", false)
+                } else {
+                    ("file", true)
+                };
+                match t.get(key) {
                     Some(toml::Value::String(s)) if !s.is_empty() && !is_texture_name(s) => {
-                        file_source(s)?
+                        let c = file_source(s)?;
+                        if !image && c.sequence().is_none() {
+                            bail!(
+                                "{what}: frames = \"{s}\" needs one run of # in its file name, \
+                                 the frame number (\"renders/fog_####.png\")"
+                            );
+                        }
+                        c
                     }
                     Some(toml::Value::String(s)) => bail!(
-                        "{what}: file = \"{s}\" must be a path to a .png or .jpg (names from \
-                     [textures] can't have options)"
+                        "{what}: {key} = \"{s}\" must be a path to a .png or .jpg{} (names from \
+                         [textures] can't have options)",
+                        if image { "" } else { " sequence" }
                     ),
-                    Some(_) => bail!("{what}: file must be a string"),
+                    Some(_) => bail!("{what}: {key} must be a string"),
                     None => bail!(
-                        "{what}: a channel table needs file = \"…\" (an image) or text = \"…\" \
-                     (a [texts] entry); frames, video and texture come later"
+                        "{what}: a channel table needs file = \"…\" (an image), frames = \"…\" \
+                         (an image sequence), texture = \"…\" (re-timed footage) or text = \"…\" \
+                         (a [texts] entry)"
                     ),
                 }
             };
+            if t.contains_key("in") && t.contains_key("in_frame") {
+                bail!("{what}: give in (seconds) or in_frame (a source frame), not both");
+            }
+            let footage = c.sequence().is_some();
             for (k, val) in t {
                 let word = |names: &[&str]| -> Result<String> {
                     match val {
@@ -2408,8 +2778,38 @@ fn texture_spec(
                             .join(", ")
                     )
                 };
+                let number = || -> Result<f64> {
+                    val.as_float()
+                        .or_else(|| val.as_integer().map(|i| i as f64))
+                        .filter(|x| x.is_finite() && *x >= 0.0)
+                        .ok_or_else(|| anyhow!("{what}: {k} must be a number ≥ 0"))
+                };
+                let whole = || -> Result<u64> {
+                    val.as_integer()
+                        .and_then(|i| u64::try_from(i).ok())
+                        .ok_or_else(|| anyhow!("{what}: {k} must be a whole number ≥ 0"))
+                };
+                const TIMING: &[&str] = &["in", "in_frame", "speed", "clock", "end"];
+                if TIMING.contains(&k.as_str()) && !footage {
+                    bail!(
+                        "{what}: \"{k}\" is for footage (image sequences); {} isn't footage",
+                        c.label()
+                    );
+                }
+                if retimed && !TIMING.contains(&k.as_str()) && k != "texture" {
+                    bail!(
+                        "{what}: only timing options (in, in_frame, speed, clock, end) may follow \
+                         texture = \"…\"; `{k}` goes on the [textures] entry"
+                    );
+                }
+                if matches!(k.as_str(), "fps" | "first") && !footage {
+                    bail!(
+                        "{what}: {k} is for image sequences (frames = \"…\"); {} isn't one",
+                        c.label()
+                    );
+                }
                 match k.as_str() {
-                    "file" | "text" => {}
+                    "file" | "text" | "frames" | "texture" => {}
                     "filter" => {
                         let s = word(Filter::NAMES)?;
                         c.filter =
@@ -2424,6 +2824,48 @@ fn texture_spec(
                         bail!("{what}: srgb is for images; a text's channels are data")
                     }
                     "srgb" => c.srgb = flag()?,
+                    "fps" => {
+                        let f = match val {
+                            toml::Value::Integer(i) => FpsFile::Int(*i),
+                            toml::Value::Float(x) => FpsFile::Float(*x),
+                            toml::Value::String(s) => FpsFile::Ratio(s.clone()),
+                            _ => bail!("{what}: fps must look like 24 or \"30000/1001\""),
+                        };
+                        let fps = parse_fps(f).map_err(|e| anyhow!("{what}: {e}"))?;
+                        if let Source::Frames(s) = &mut c.source {
+                            s.fps = Some(fps);
+                        }
+                    }
+                    "first" => {
+                        let n = whole()?;
+                        if let Source::Frames(s) = &mut c.source {
+                            s.first = Some(n);
+                        }
+                    }
+                    "in" => c.timing.start = In::Seconds(number()?),
+                    "in_frame" => c.timing.start = In::Frame(whole()?),
+                    "speed" => c.timing.speed = number()?,
+                    "clock" => {
+                        let s = word(FootageClock::NAMES)?;
+                        c.timing.clock = match s.as_str() {
+                            "shot" => FootageClock::Shot,
+                            "movie" => FootageClock::Movie,
+                            _ => return Err(not_one_of(&s, FootageClock::NAMES)),
+                        };
+                    }
+                    "end" => {
+                        let s = word(End::NAMES)?;
+                        c.timing.end = match s.as_str() {
+                            "hold" => End::Hold,
+                            "loop" => End::Loop,
+                            "black" => End::Black,
+                            _ => return Err(not_one_of(&s, End::NAMES)),
+                        };
+                    }
+                    other if footage => bail!(
+                        "{what}: unknown option `{other}` (an image sequence has frames, fps, \
+                         first, in, in_frame, speed, clock, end, filter, wrap, vflip and srgb)"
+                    ),
                     other => bail!(
                         "{what}: unknown option `{other}` (a texture has file, filter, wrap, vflip and srgb)"
                     ),
@@ -2780,6 +3222,49 @@ mod tests {
                 if let Err(e) = Movie::parse(&toml, Path::new("/film")) {
                     let e = format!("{e:#}");
                     prop_assert!(e.contains("channels[0]"), "{}: {}", entry, e);
+                }
+            }
+        }
+
+        proptest! {
+            /// For speed ≥ 0, a footage channel's source frame never goes back within a
+            /// shot (before `loop` wraps), whatever the rates, in and origin, and it never
+            /// panics; `black` only ever turns black, and stays so.
+            #[test]
+            fn source_frame_never_goes_back(
+                film in prop::sample::select(vec![(24u32, 1u32), (25, 1), (30, 1), (30000, 1001), (60, 1), (24000, 1001)]),
+                src in prop::sample::select(vec![(12u32, 1u32), (24, 1), (25, 1), (30000, 1001), (60, 1), (7, 3)]),
+                start in prop::option::of(0.0f64..20.0),
+                start_frame in 0u64..500,
+                speed in prop::sample::select(vec![0.0f64, 0.25, 0.5, 1.0, 1.5, 2.0, 3.7]),
+                origin in 0.0f32..100.0,
+                count in 1u64..400,
+                black in any::<bool>(),
+                movie_clock in any::<bool>(),
+                from in 0u64..5000,
+            ) {
+                let m = FrameMap {
+                    film,
+                    loop_frames: None,
+                    origin,
+                    timing: Timing {
+                        start: start.map_or(In::Frame(start_frame), In::Seconds),
+                        speed,
+                        clock: if movie_clock { FootageClock::Movie } else { FootageClock::Shot },
+                        end: if black { End::Black } else { End::Hold },
+                    },
+                    src,
+                    count,
+                };
+                let mut prev: Option<u64> = Some(0);
+                for n in from..from + 300 {
+                    let k = m.source_frame(n);
+                    match (prev, k) {
+                        (Some(p), Some(k)) => prop_assert!(k >= p && k < count, "{} then {} at {}", p, k, n),
+                        (None, Some(k)) => prop_assert!(false, "black, then frame {} at {}", k, n),
+                        (_, None) => prop_assert!(black),
+                    }
+                    prev = k;
                 }
             }
         }
@@ -3312,24 +3797,12 @@ glsl = 450
                 r#"channels[0]: "@picture" is another pass's picture; only a [[layer]]'s channels can read one"#,
             ),
             (
-                r#""renders/fog_####.png""#,
-                r#"channels[0]: "renders/fog_####.png" is an image sequence; image sequences arrive in shotglass 0.1.5"#,
-            ),
-            (
                 r#""footage/surf.mp4""#,
-                r#"channels[0]: "footage/surf.mp4" is a video; video files arrive after image sequences"#,
-            ),
-            (
-                r#"{ frames = "r/f_##.png", fps = 24 }"#,
-                "is an image sequence; image sequences arrive in shotglass 0.1.5",
+                r#"channels[0]: "footage/surf.mp4" is a video; video files arrive with footage phase 2"#,
             ),
             (
                 r#"{ video = "a.mov", in = 2.0 }"#,
                 "is a video; video files arrive",
-            ),
-            (
-                r#"{ texture = "plate", speed = 0.5 }"#,
-                "is a re-timed [textures] entry; re-timing arrives",
             ),
             (
                 r#"{ text = "credits", part = "glyphs" }"#,
@@ -3370,11 +3843,508 @@ glsl = 450
             e.contains("[textures] below: \"@input\" isn't a file"),
             "{e}"
         );
-        let e = err(channels_film("", "fog = \"r/fog_####.png\"\n", &[]));
+        // A video names its replacement for now: an image sequence.
+        let e = shot(r#""a.mp4""#);
+        assert!(e.contains("\"frames/clip_#####.png\""), "{e}");
+    }
+
+    #[test]
+    fn sequence_channels_parse() {
+        let m = channels_film(
+            "",
+            "fog = \"renders/fog_####.png\"\n\
+             matte = { frames = \"<kit/m/matte_####.png>\", fps = \"24000/1001\", first = 1001, \
+             clock = \"movie\", end = \"loop\", filter = \"nearest\", srgb = true }\n",
+            &["channels = [\"fog\", \"matte\", { texture = \"fog\", in = 2.5, speed = 0.5 }, \
+               { texture = \"matte\", in_frame = 7, end = \"black\" }, { frames = \"a/b_##.jpg\", in = 1 }, \
+               { file = \"x/y_#.png\", fps = 12 }]"],
+        )
+        .unwrap();
+        let c = |n: usize| m.shots[0].channels[n].as_ref().unwrap();
+        let fog = c(0).sequence().unwrap();
+        assert_eq!(
+            fog.pattern.file,
+            PathBuf::from("/film/renders/fog_####.png")
+        );
+        assert_eq!(
+            (fog.fps, fog.first, fog.scan.is_some()),
+            (None, None, false)
+        );
+        assert_eq!(
+            (c(0).filter, c(0).wrap, c(0).vflip, c(0).srgb, c(0).timing),
+            (Filter::Linear, Wrap::Repeat, true, false, Timing::default()),
+            "footage samples linearly by default (no mipmaps per frame)"
+        );
+        let matte = c(1).sequence().unwrap();
+        assert_eq!(matte.pattern.library.as_deref(), Some("kit"));
+        assert_eq!(c(1).label(), "kit/m/matte_####.png");
+        assert_eq!((matte.fps, matte.first), (Some((24000, 1001)), Some(1001)));
+        assert_eq!((c(1).filter, c(1).srgb), (Filter::Nearest, true));
+        assert_eq!(
+            (c(1).timing.clock, c(1).timing.end),
+            (FootageClock::Movie, End::Loop)
+        );
+        // Re-timed: the entry's source and options, the channel's own timing on top.
+        assert_eq!(c(2).source, c(0).source);
+        assert_eq!(
+            c(2).timing,
+            Timing {
+                start: In::Seconds(2.5),
+                speed: 0.5,
+                ..Timing::default()
+            }
+        );
+        assert_eq!(c(3).source, c(1).source);
+        assert_eq!(
+            c(3).timing,
+            Timing {
+                start: In::Frame(7),
+                end: End::Black,
+                ..c(1).timing
+            }
+        );
+        assert_eq!(c(4).timing.start, In::Seconds(1.0));
+        assert_eq!(c(4).label(), "a/b_##.jpg");
+        // The spelling decides, in a table too.
+        assert_eq!(c(5).sequence().unwrap().fps, Some((12, 1)));
+        // Used through texture = "…" counts as used; the library is referenced.
+        assert!(m.warnings.is_empty(), "{:?}", m.warnings);
+        assert!(m.library_refs.contains("kit"));
+        // A sequence's frames aren't files to check by name (the scan finds them).
+        assert!(c(0).files().is_empty() && c(0).written().len() == 1);
         assert!(
-            e.contains("[textures] fog: \"r/fog_####.png\" is an image sequence"),
+            !m.referenced_files()
+                .iter()
+                .any(|f| f.to_string_lossy().contains('#'))
+        );
+        let w = m.contract_warning().unwrap();
+        assert!(
+            w.contains("image sequences, which need shotglass 0.1.6"),
+            "{w}"
+        );
+        let m = channels_film("", "fog = \"r/f_##.png\"\n", &["channels = [\"fog\"]"]).unwrap();
+        assert!(m.textures().len() == 1 && m.uses_channels());
+    }
+
+    #[test]
+    fn sequence_channels_are_validated() {
+        let shot = |entry: &str| {
+            err(channels_film(
+                "",
+                "fog = \"r/fog_####.png\"\nimg = \"t/i.png\"\n",
+                &[&format!("channels = [\"fog\", \"img\", {entry}]")],
+            ))
+        };
+        for (entry, says) in [
+            (
+                r#"{ file = "a.png", in = 1 }"#,
+                r#"channels[2]: "in" is for footage (image sequences); a.png isn't footage"#,
+            ),
+            (
+                r#"{ file = "a.png", fps = 24 }"#,
+                "fps is for image sequences",
+            ),
+            (
+                r#"{ frames = "a/b_##.png", in = 1, in_frame = 2 }"#,
+                "give in (seconds) or in_frame (a source frame), not both",
+            ),
+            (
+                r#"{ frames = "a/b_##.png", speed = -1 }"#,
+                "speed must be a number ≥ 0",
+            ),
+            (
+                r#"{ frames = "a/b_##.png", in = "x" }"#,
+                "in must be a number ≥ 0",
+            ),
+            (
+                r#"{ frames = "a/b_##.png", in_frame = 1.5 }"#,
+                "in_frame must be a whole number ≥ 0",
+            ),
+            (
+                r#"{ frames = "a/b_##.png", clock = "wall" }"#,
+                r#"clock "wall" isn't one of "shot", "movie""#,
+            ),
+            (
+                r#"{ frames = "a/b_##.png", end = "bounce" }"#,
+                r#"end "bounce" isn't one of "hold", "loop", "black""#,
+            ),
+            (r#"{ frames = "a/b_##.png", fps = 0 }"#, "fps must be"),
+            (
+                r#"{ frames = "a/b_##.png", fps = "24/x" }"#,
+                "fps must look like",
+            ),
+            (
+                r#"{ frames = "a/b_##.png", first = -1 }"#,
+                "first must be a whole number ≥ 0",
+            ),
+            (
+                r#"{ frames = "a/b.png" }"#,
+                "needs one run of # in its file name",
+            ),
+            (
+                r#"{ frames = "a/b_%03d.png" }"#,
+                r#"write the frame number as # ("a/b_###.png")"#,
+            ),
+            (
+                r#"{ frames = "a/b_##.gif" }"#,
+                "an image sequence's frames are PNG or JPEG images",
+            ),
+            (
+                r#"{ frames = "a/b_##.png", bogus = 1 }"#,
+                "unknown option `bogus` (an image sequence has frames, fps, first, in",
+            ),
+            (
+                r#"{ frames = "fog" }"#,
+                "frames = \"fog\" must be a path to a .png or .jpg sequence",
+            ),
+            (
+                r#"{ texture = "img" }"#,
+                "texture = \"img\" re-times footage, and t/i.png isn't footage (bind it as \"img\")",
+            ),
+            (
+                r#"{ texture = "nope" }"#,
+                r#"texture = "nope": no [textures] entry called "nope" (there are "fog", "img")"#,
+            ),
+            (
+                r#"{ texture = "fog", filter = "nearest" }"#,
+                "only timing options (in, in_frame, speed, clock, end) may follow texture",
+            ),
+            (
+                r#"{ texture = "fog", fps = 24 }"#,
+                "`fps` goes on the [textures] entry",
+            ),
+            (
+                r#"{ texture = 3 }"#,
+                "texture must be the name of a [textures] entry",
+            ),
+        ] {
+            let e = shot(entry);
+            assert!(e.contains(says), "{entry}: {e}");
+        }
+        let e = err(channels_film(
+            "",
+            "fog = \"r/f_##.png\"\nx = { texture = \"fog\" }\n",
+            &[],
+        ));
+        assert!(
+            e.contains("[textures] x: texture = \"fog\" re-times a [textures] entry"),
             "{e}"
         );
+    }
+
+    fn rate_map(film: (u32, u32), src: (u32, u32)) -> FrameMap {
+        FrameMap {
+            film,
+            loop_frames: None,
+            origin: 0.0,
+            timing: Timing {
+                clock: FootageClock::Movie,
+                ..Timing::default()
+            },
+            src,
+            count: u64::MAX,
+        }
+    }
+
+    #[test]
+    fn source_frame_is_exact_for_rate_pairs() {
+        // Equal rates are the identity for a million frames, NTSC included.
+        for r in [(30, 1), (30000, 1001), (24000, 1001), (25, 1)] {
+            let m = rate_map(r, r);
+            for n in 0..1_000_000u64 {
+                assert_eq!(m.source_frame(n), Some(n), "{r:?} frame {n}");
+            }
+        }
+        // Different rates: "the source frame whose interval contains this instant",
+        // which is exact integer arithmetic: floor(n · src · film_den / (film · src_den)).
+        for (film, src) in [
+            ((30, 1), (24, 1)),
+            ((24, 1), (25, 1)),
+            ((24, 1), (60, 1)),
+            ((30000, 1001), (24000, 1001)),
+            ((60, 1), (24000, 1001)),
+            ((25, 1), (30000, 1001)),
+        ] {
+            let m = rate_map(film, src);
+            for n in 0..200_000u64 {
+                let want =
+                    (n as u128 * src.0 as u128 * film.1 as u128) / (film.0 as u128 * src.1 as u128);
+                assert_eq!(
+                    m.source_frame(n),
+                    Some(want as u64),
+                    "{src:?} in {film:?}, frame {n}"
+                );
+            }
+        }
+        // clock = "shot" with an item starting late in a film (an f32 start, rounded):
+        // still the identity from its first frame.
+        for r in [(30, 1), (30000, 1001)] {
+            for n0 in [1u64, 33, 1799, 107_892, 1_000_003] {
+                let start = (n0 as f64 * r.1 as f64 / r.0 as f64) as f32;
+                let m = FrameMap {
+                    origin: start,
+                    timing: Timing::default(),
+                    ..rate_map(r, r)
+                };
+                for j in 0..2000 {
+                    assert_eq!(m.source_frame(n0 + j), Some(j), "{r:?} from {n0}, +{j}");
+                }
+            }
+        }
+        let m = rate_map((30, 1), (24, 1));
+        let v: Vec<u64> = (0..12).map(|n| m.source_frame(n).unwrap()).collect();
+        assert_eq!(
+            v,
+            [0, 0, 1, 2, 3, 4, 4, 5, 6, 7, 8, 8],
+            "one repeat every five"
+        );
+    }
+
+    #[test]
+    fn source_frame_timing_options() {
+        let base = FrameMap {
+            film: (30, 1),
+            loop_frames: None,
+            origin: 0.0,
+            timing: Timing::default(),
+            src: (24, 1),
+            count: 48,
+        };
+        let with = |t: Timing| FrameMap { timing: t, ..base };
+        let at = |m: FrameMap, n: u64| m.source_frame(n);
+        // in (seconds) and in_frame agree: 0.5 s at 24 fps is frame 12.
+        let a = with(Timing {
+            start: In::Seconds(0.5),
+            ..Timing::default()
+        });
+        let b = with(Timing {
+            start: In::Frame(12),
+            ..Timing::default()
+        });
+        for n in 0..40 {
+            assert_eq!(at(a, n), at(b, n));
+        }
+        assert_eq!(at(a, 0), Some(12));
+        // speed: half (each source frame on ~2.5 film frames), double, 0 = freeze at in.
+        let half = with(Timing {
+            speed: 0.5,
+            ..Timing::default()
+        });
+        assert_eq!(
+            (0..10).map(|n| at(half, n).unwrap()).collect::<Vec<_>>(),
+            [0, 0, 0, 1, 1, 2, 2, 2, 3, 3]
+        );
+        let double = with(Timing {
+            speed: 2.0,
+            ..Timing::default()
+        });
+        assert_eq!(at(double, 5), Some(8));
+        let freeze = with(Timing {
+            start: In::Frame(7),
+            speed: 0.0,
+            ..Timing::default()
+        });
+        assert!((0..100).all(|n| at(freeze, n) == Some(7)));
+        // end: frame 47 is the last (film frame 59 is source 47.2); past it…
+        assert_eq!(at(base, 59), Some(47));
+        assert_eq!(at(base, 60), Some(47), "hold");
+        assert_eq!(at(base, 1000), Some(47), "hold");
+        let looped = with(Timing {
+            end: End::Loop,
+            ..Timing::default()
+        });
+        assert_eq!(at(looped, 60), Some(0));
+        assert_eq!(at(looped, 61), Some(0));
+        assert_eq!(at(looped, 62), Some(1));
+        let black = with(Timing {
+            end: End::Black,
+            ..Timing::default()
+        });
+        assert_eq!((at(black, 59), at(black, 60)), (Some(47), None));
+        // clock = "shot": 0 at the item's start, even an f32 start that isn't exact
+        // (1.1 s is film frame 33); clock = "movie" ignores it. Before the start (and
+        // rounding below 0) clamps to frame 0.
+        let shot = FrameMap {
+            origin: 1.1,
+            ..base
+        };
+        assert_eq!(
+            (at(shot, 33), at(shot, 34), at(shot, 35)),
+            (Some(0), Some(0), Some(1))
+        );
+        assert_eq!(at(shot, 0), Some(0));
+        let movie = FrameMap {
+            origin: 1.1,
+            timing: Timing {
+                clock: FootageClock::Movie,
+                ..Timing::default()
+            },
+            ..base
+        };
+        assert_eq!(at(movie, 33), Some(26));
+        // The outgoing shot of a transition keeps moving past its own end.
+        let long = FrameMap {
+            count: 1000,
+            ..base
+        };
+        assert_eq!(at(long, 100), Some(80));
+        // Loop films: frame n of loop k is frame n of loop 0.
+        let lp = FrameMap {
+            loop_frames: Some(45),
+            timing: Timing {
+                end: End::Loop,
+                ..Timing::default()
+            },
+            ..base
+        };
+        for n in 0..45 {
+            for k in 1..4 {
+                assert_eq!(at(lp, n + 45 * k), at(lp, n));
+            }
+        }
+        assert_eq!(
+            (
+                base.source_time(12),
+                FrameMap {
+                    src: (30000, 1001),
+                    ..base
+                }
+                .source_time(30)
+            ),
+            (0.5, 1.001)
+        );
+    }
+
+    #[test]
+    fn load_scans_sequences_and_maps_frames() {
+        let dir = std::env::temp_dir().join(format!("shotglass-movie-seq-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("r")).unwrap();
+        std::fs::write(dir.join("a.glsl"), "").unwrap();
+        for k in 1..=6 {
+            image::RgbaImage::new(4, 2)
+                .save(dir.join(format!("r/f_{k:02}.png")))
+                .unwrap();
+        }
+        let film = |channels: &str| {
+            crate::project::write_fixture(
+                &dir,
+                &format!(
+                    "fps = 30\n[[shot]]\nid = \"lead\"\nscene = \"a.glsl\"\nduration = 0.5\n\
+                     [[shot]]\nid = \"s\"\nscene = \"a.glsl\"\nduration = 1\nchannels = {channels}\n"
+                ),
+            )
+            .unwrap();
+            Movie::load(&dir)
+        };
+        let m = film("[\"r/f_##.png\", { frames = \"r/f_##.png\", first = 3, fps = 15 }]").unwrap();
+        let seq = m.shots[1].channels[0].as_ref().unwrap().sequence().unwrap();
+        let scan = seq.scan.as_ref().unwrap();
+        assert_eq!((scan.first, scan.count, scan.size), (1, 6, Some((4, 2))));
+        assert_eq!(scan.path(0), dir.join("r/f_01.png"));
+        let s2 = m.shots[1].channels[1].as_ref().unwrap().sequence().unwrap();
+        assert_eq!(s2.scan.as_ref().unwrap().count, 4);
+        // The second shot starts at film frame 15: its clock ("shot") starts there.
+        let item = ItemRef::Shot(1);
+        assert_eq!(m.source_frame(item, 0, 15), Some(0));
+        assert_eq!(m.source_frame(item, 0, 20), Some(5));
+        assert_eq!(m.source_frame(item, 0, 25), Some(5), "hold");
+        assert_eq!(
+            m.source_frame(item, 1, 17),
+            Some(1),
+            "15 fps: one frame per two"
+        );
+        assert_eq!(m.source_frame(item, 2, 17), None, "unbound");
+        assert_eq!(m.source_frame(ItemRef::Shot(0), 0, 0), None, "no channels");
+        // Edit mistakes refuse the version.
+        let e = format!(
+            "{:#}",
+            film("[{ frames = \"r/f_##.png\", in = 5 }]").unwrap_err()
+        );
+        assert!(
+            e.contains(
+                "shot \"s\": channels[0]: in = 5 is past the end of r/f_##.png (0.20 s, 6 frames)"
+            ),
+            "{e}"
+        );
+        assert!(film("[{ frames = \"r/f_##.png\", in = 5, end = \"loop\" }]").is_ok());
+        let e = format!("{:#}", film("[\"r/g_##.png\"]").unwrap_err());
+        assert!(
+            e.contains("channels[0]: r/g_##.png: matches no files"),
+            "{e}"
+        );
+        std::fs::remove_file(dir.join("r/f_03.png")).unwrap();
+        let e = format!("{:#}", film("[\"r/f_##.png\"]").unwrap_err());
+        assert!(
+            e.contains("r/f_##.png: frame 3 is missing (between 1 and 6)"),
+            "{e}"
+        );
+        // With first after the gap, the frames from there on are a sequence.
+        assert!(film("[{ frames = \"r/f_##.png\", first = 4 }]").is_ok());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A PNG that is only a signature and a header: enough for `texture::dimensions`.
+    fn png_header(w: u32, h: u32) -> Vec<u8> {
+        fn crc(data: &[u8]) -> u32 {
+            let mut c = 0xFFFF_FFFFu32;
+            for &b in data {
+                c ^= b as u32;
+                for _ in 0..8 {
+                    c = if c & 1 != 0 {
+                        0xEDB8_8320 ^ (c >> 1)
+                    } else {
+                        c >> 1
+                    };
+                }
+            }
+            !c
+        }
+        let mut chunk = b"IHDR".to_vec();
+        chunk.extend(w.to_be_bytes());
+        chunk.extend(h.to_be_bytes());
+        chunk.extend([8, 6, 0, 0, 0]);
+        let mut v = b"\x89PNG\r\n\x1a\n".to_vec();
+        v.extend(13u32.to_be_bytes());
+        v.extend(&chunk);
+        v.extend(crc(&chunk).to_be_bytes());
+        // An empty IDAT: the decoder reads the header up to the first one.
+        v.extend(0u32.to_be_bytes());
+        v.extend(b"IDAT");
+        v.extend(crc(b"IDAT").to_be_bytes());
+        v
+    }
+
+    #[test]
+    fn a_shot_whose_footage_cant_fit_is_refused() {
+        let dir =
+            std::env::temp_dir().join(format!("shotglass-movie-seqmem-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("r")).unwrap();
+        std::fs::write(dir.join("a.glsl"), "").unwrap();
+        // Two 4096² sequences: three frames each (the minimum window) are 384 MB.
+        for name in ["a_1.png", "b_1.png"] {
+            std::fs::write(dir.join("r").join(name), png_header(4096, 4096)).unwrap();
+        }
+        let film = |channels: &str| {
+            crate::project::write_fixture(
+                &dir,
+                &format!("[[shot]]\nid = \"s\"\nscene = \"a.glsl\"\nduration = 1\nchannels = {channels}\n"),
+            )
+            .unwrap();
+            Movie::load(&dir)
+        };
+        assert!(film("[\"r/a_#.png\"]").is_ok(), "one fits (192 MB)");
+        let e = format!("{:#}", film("[\"r/a_#.png\", \"r/b_#.png\"]").unwrap_err());
+        assert!(
+            e.contains("shot \"s\": its textures need 384 MB, more than the 256 MB budget"),
+            "{e}"
+        );
+        assert!(
+            e.contains("r/a_#.png 192 MB (3 frames of 4096×4096)"),
+            "{e}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     fn layers_film(layers: &str) -> Result<Movie> {

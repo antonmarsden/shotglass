@@ -160,7 +160,8 @@ These uniforms are available:
 | `iResolution`, `iTime`, `iTimeDelta`, `iFrame`, `iFrameRate`, `iDate`, `iMouse` | as on Shadertoy. `iTime` is the shot's own clock (plus `time_offset`) |
 | `iShotTime`, `iShotDuration`, `iShotProgress` | shot-local seconds, the shot's length, and 0→1 over the shot |
 | `iMovieTime` | seconds since the start of the movie |
-| `iChannel0..7`, `iChannelResolution[8]` | images and text from the shot's `channels` (see [Textures](#textures)); an unbound channel reads black and its resolution is 0. Shadertoy code uses 0–3; 4–7 are shotglass's. `iChannelTime` is 0 |
+| `iChannel0..7`, `iChannelResolution[8]` | images, text and image sequences from the shot's `channels` (see [Textures](#textures)); an unbound channel reads black and its resolution is 0. Shadertoy code uses 0–3; 4–7 are shotglass's |
+| `iChannelTime[8]` | an image sequence's source time of the frame shown, in seconds (see [Footage](#footage)); 0 for other channels |
 | `iChannelMeta[8]` | a text channel's metrics in texels: (em, first baseline from the top, line pitch, padding); 0 for images (see [Text](#text)) |
 | your `uniforms.*` | declared automatically from `movie.toml` |
 | `CUE_<ID>_START`, `CUE_<ID>_SETTLED`, `CUE_<ID>_END`, `MOVIE_DURATION` | `#define`s from the edit (`SETTLED` = the incoming transition has finished) |
@@ -212,16 +213,17 @@ shotglass tells what an entry is from how it's written, the same way everywhere:
 | `""` | nothing: the channel reads black |
 | `"brick"` (no `.`, `/` or `<`) | a name from `[textures]` |
 | `"textures/brick.png"`, `"<kit/textures/noise.png>"` | an image (`.png`, `.jpg`, `.jpeg`) |
-| `"renders/fog_####.png"` (one run of `#` in the file name) | an image sequence, `#` = frame number |
-| `"footage/surf.mp4"` (`.mp4`, `.m4v`, `.mov`, `.mkv`, `.webm`, `.avi`) | a video |
-| `"@input"` | on a [layer](#layers): the picture below it (`"@title"`, another layer's picture, comes later) |
+| `"renders/fog_####.png"` (one run of `#` in the file name) | an image sequence, `#` = frame number (see [Footage](#footage)) |
+| `"footage/surf.mp4"` (`.mp4`, `.m4v`, `.mov`, `.mkv`, `.webm`, `.avi`) | a video (not yet: footage phase 2) |
+| `"@input"`, `"@picture"`, `"@title"` | on a [layer](#layers): another pass's picture |
 | `{ file = "…", … }` | an image with options |
+| `{ frames = "…", … }` | an image sequence with options |
+| `{ texture = "plate", in = 2.0, … }` | a `[textures]` image sequence, re-timed |
 | `{ text = "title", … }` | a `[texts]` entry with sampling options (`filter`, `wrap`, `vflip`) |
 
-Names come from `[textures]` and `[texts]`, which share one namespace. Images, text and
-`@input` bind today. The other kinds are recognised so a film that uses one gets a clear
-message saying when it arrives (image sequences in 0.1.5, then video; `@picture` and
-`@<layer>` with layers phase 2), instead of an unrelated error.
+Names come from `[textures]` and `[texts]`, which share one namespace. Videos are
+recognised so a film that uses one gets a clear message (they arrive with footage
+phase 2; convert a clip to an image sequence meanwhile), instead of an unrelated error.
 
 | option | values | default |
 |---|---|---|
@@ -248,6 +250,75 @@ out looks too dark.
   a missing file refuses the edit, like a missing `#include`.
 - `check` decodes every texture (also with `--no-gpu`), prints sizes and memory, and warns
   when a scene reads an `iChannel` its shot binds nothing to.
+
+### Footage
+
+An image sequence is a channel whose picture changes with time: one PNG or JPEG per
+frame, from Blender or another renderer, a matte, or a shotglass `export --format png`
+(needs `shotglass = "0.1.6"`). Write the frame number as one run of `#` in the file name:
+
+```toml
+[textures]
+fog   = "renders/fog_####.png"                          # fog_0001.png, fog_0002.png, …
+matte = { frames = "renders/matte_####.png", fps = 24, first = 1001 }
+grain = { frames = "<kit/grain/grain_##.png>", clock = "movie", end = "loop" }
+
+[[shot]]
+id = "beach"
+scene = "scenes/beach.glsl"
+duration = 6.0
+channels = ["fog", "matte", "grain"]
+
+[[shot]]
+id = "beach-again"                                       # the same frames, later and slower
+scene = "scenes/beach.glsl"
+duration = 4.0
+channels = [{ texture = "fog", in = 4.0, speed = 0.5 }, "matte"]
+```
+
+| option | values | default | meaning |
+|---|---|---|---|
+| `fps` | a number or `"num/den"`, like the film's `fps` | the film's | source frames per second |
+| `first` | a whole number | the lowest found | the file number that is the sequence's frame 0 (`1001` for a Blender range) |
+| `in` | seconds ≥ 0 | `0` | the source time shown when the channel's clock is 0 |
+| `in_frame` | a whole number ≥ 0 | | the same, as a source frame (instead of `in`) |
+| `speed` | ≥ 0 | `1` | source seconds per second; `0` holds the `in` frame |
+| `clock` | `"shot"`, `"movie"` | `"shot"` | 0 at the shot's (or layer's) start, or at the film's: then one sequence runs on across cuts, like the music |
+| `end` | `"hold"`, `"loop"`, `"black"` | `"hold"` | past the last frame: keep it, start again, or read black |
+
+`filter`, `wrap`, `vflip` and `srgb` work as for images, but footage defaults to
+`filter = "linear"`: no mipmaps to make for every frame (`"mipmap"` works, at a cost).
+
+- `{ texture = "fog", … }` re-times a `[textures]` sequence; only the timing options
+  (`in`, `in_frame`, `speed`, `clock`, `end`) may follow it.
+- Film frame n shows the source frame whose interval contains that moment, computed
+  exactly: 24 fps frames in a 30 fps film repeat one frame in five, equal rates (29.97
+  too) are frame for frame. Footage timing doesn't follow `time_offset`/`time_scale`.
+  `iChannelTime[n]` is the source time of the frame shown, and `iChannelResolution[n]`
+  the sequence's size (also while it reads black).
+- The frames must be contiguous from `first` (a gap is an error naming the missing
+  frames) and all the same size. Frames that aren't there yet (a render in progress)
+  just make the sequence shorter. `fog_####.png` matches exactly four digits, or more
+  when the number needs them (`fog_10000.png`), as Blender writes. Names are
+  case-sensitive everywhere.
+- Frames load on background threads ahead of the playhead, within the 256 MB texture
+  budget (a shot needs room for at least three frames of each sequence). While playing, a
+  frame shows only when every sequence's exact frame is uploaded, otherwise the previous
+  frame stays up: playback never shows a frame that `still` or `export` wouldn't. The next
+  shot's first frames load early, so cuts and a loop film's seam don't stall.
+- For speed, use JPEG (quality 90–95) for plates: it decodes several times faster than
+  PNG. Use PNG for mattes and anything with alpha (straight, as stored). A 1080p frame is
+  8 MB on the GPU. The Performance panel shows the frames on the GPU and how often
+  playback waited for one.
+- Re-render frames while the player is open and they reload (after 300 ms without
+  changes). A half-written frame keeps that frame's last working version on screen; a
+  frame missing in the middle refuses the edit, like a missing `#include`.
+- `check` lists each sequence (frames, size, rate, length, memory per frame) and decodes
+  its first frame; `check --deep` decodes every frame. It warns when a shot runs past
+  the end of its sequence with `end = "hold"`, and when an `end = "loop"` sequence on the
+  movie clock doesn't fit a loop film's period a whole number of times.
+- Video files come with footage phase 2. Meanwhile convert a clip to a sequence:
+  `ffmpeg -i clip.mp4 frames/clip_%05d.png`, then `"frames/clip_#####.png"`.
 
 ### Text
 
@@ -727,6 +798,11 @@ To scrub, click or drag on the timeline. Hatched blocks are transitions;
   stall's time went, down to the GL call. Ticks under its frame graph mark the
   frames that rendered a film frame, queued or collected sound, or compiled;
   hover a frame for its numbers.
+- **Image sequences stream ahead of the playhead.** Frames decode on a few worker
+  threads and upload in bands, half a second ahead (and the next shot's first frames),
+  with their own upload budget, so a still texture never waits behind them nor they
+  behind it. A frame whose image isn't uploaded yet is a stall, not a drop: it doesn't
+  lower the render scale.
 - **Frozen transitions** render only one scene.
 - `shotglass check` times every shot and transition, so you can see which ones
   are over budget.
@@ -1063,8 +1139,9 @@ shotglass still  <movie> --at 3.5,moon,closeup+2 [--size 1280x720] [--out stills
 shotglass strip  <movie> [--count 12 | --at ...] [--size 384x216] [--cols 4] [--out strip.png]
                  [--compare ref.png [--bless] [--tolerance 8] [--budget 0.1%] [--max-mean 0.25]]
                  # --compare: fail if the strip differs from ref.png (writes strip.diff.png)
-shotglass check  <movie> [--web] [--no-gpu] [--size 1280x720] [--frames 8]
+shotglass check  <movie> [--web] [--no-gpu] [--deep] [--size 1280x720] [--frames 8]
                  # validate movie.toml and the GLSL (strictly), compile, synth, time
+                 # --deep: also decode every frame of every image sequence
 shotglass wav    <movie> [--out sound.wav] [--rate 48000]
                  [--compare ref.wav [--bless] [--max-rms 0.0015] [--max-peak 0.01]]
                  # --compare: fail if the sound differs from ref.wav (writes sound.diff.wav)

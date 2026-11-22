@@ -149,8 +149,8 @@ contract).
 CI catches "compiles but looks wrong" (or sounds wrong): tests/golden.rs renders a
 contact sheet (`shotglass strip`, 8 frames at 320x180) and the soundtrack
 (`shotglass wav`, at 8 kHz) of the demo film and of the `shotglass new` template (and
-of the test films in `tests/films/`: a strip of `channels`, a two-period strip and the
-soundtrack of `loop`), and compares them with reference PNGs and WAVs in `tests/golden/`.
+of the test films in `tests/films/`: strips of `channels`, `text`, `layers`, `blends` and
+`footage`, a two-period strip and the soundtrack of `loop`), and compares them with reference PNGs and WAVs in `tests/golden/`.
 
 - A strip matches when few pixels differ by more than a small per-pixel tolerance
   and the average difference stays small (`strip --compare`'s defaults). Software

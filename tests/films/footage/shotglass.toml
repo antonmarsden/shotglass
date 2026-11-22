@@ -1,0 +1,2 @@
+# Engine contract: image sequences need shotglass 0.1.6.
+shotglass = "0.1.6"

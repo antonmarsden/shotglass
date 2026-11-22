@@ -429,6 +429,10 @@ pub fn export(
             failed = Some(anyhow!("frame {n} ({t:.3}s) didn't render"));
             break;
         }
+        if let Some(e) = r.footage_failure() {
+            failed = Some(anyhow!("frame {n} ({t:.3}s): {e}"));
+            break;
+        }
         // Export reads every frame back anyway, so a once-a-second check costs nothing.
         if r.context_lost(true, false) {
             failed = Some(anyhow!(
