@@ -47,7 +47,7 @@ cargo fmt && cargo clippy --all-targets -- -D warnings
 
 | file | what |
 |---|---|
-| `main.rs` | CLI (clap): play, still, strip, check, wav, export, new, fetch, update, licenses, bundle, selftest |
+| `main.rs` | CLI (clap): play, still, strip, check, wav, export, new, fetch, update, licenses, bundle, freeze, unfreeze, test, selftest |
 | `golden.rs` | `strip`/`wav --compare/--bless`: golden-image comparison (per-pixel tolerance, pixel budget, mean limit, diff image); soundtrack comparison (RMS/peak of the difference per 50 ms window, first differing time), WAV reader |
 | `export.rs` | offline export: frame n at `frame_time(n)`, raw RGBA piped to ffmpeg (or PNGs), WAV muxed in |
 | `movie.rs` | `movie.toml` (+ its project) → `Movie`; timeline (`at(t)`), rational fps (`frame_time`/`frame_at`), cue defines, sound gains/windows, `channels`/`[textures]` → `Shot::channels`, `loop` (`loop_frames`, `loop_period`, `wrap`, `sound_samples`) |
@@ -57,6 +57,7 @@ cargo fmt && cargo clippy --all-targets -- -D warnings
 | `project.rs` | projects (#59): `shotglass.toml` (engine contract + `[libraries]`), nearest one at or above a film, a project's films, film-or-project command targets, `split_fixture`/`write_fixture` for test films written as one text |
 | `library.rs` | `[libraries]` specs, `library.toml`, overrides (`shotglass.local.toml`, `SHOTGLASS_LIB_*`, relative to the project), path rules, `shotglass.lock` (frozen `path` entries win over overrides), sha256, `Fetcher` (git), peer/contract checks |
 | `bundle.rs` | `licenses` (libraries a film includes, SPDX licences, non-commercial flag), `freeze`/`unfreeze` and `bundle` (one writer: exactly the included library files in `shotglass-libs/`, a `shotglass.toml` marked frozen, lock `path` entries; `bundle` adds the film folder and `LIBRARY-LICENSES.md`) |
+| `glsl_test.rs` | `shotglass test` (#63): `*.test.glsl` discovery, `test_*` scan (`Param`, `Grid`, `// samples:`), `number_assertions` (id inserted into each `expect*(` call), the test prelude (engine contract), dispatcher (pixel → test sample, RGBA32UI MRT results), banded draws, decode → first failure per test |
 | `validate.rs` | strict, driver-independent check (glslang) of every assembled shader; `validate_movie(m, dialect)` is the API `check`/`check --web` and the web player use |
 | `gfx.rs` | `Renderer`: lazy prioritised compiles, program cache (disk + LRU), textures (decode thread → banded uploads in `pump` → `glGenerateMipmap`; sampler objects; LRU under a 256 MB budget), off-screen targets, transitions/freeze, strips, GPU timer, audio blocks (submit → PBO + fence → poll/wait) |
 | `sound.rs` | `Soundtrack`: music / per-shot / mix tracks synthesised in cached chunks; `chunk` blocks, `stream` never does |
@@ -137,7 +138,9 @@ cargo fmt && cargo clippy --all-targets -- -D warnings
 - **The engine provides a contract, not looks.** Uniforms, entry points, the transition interface
   and cue defines are the engine's API (semver). Reusable GLSL belongs in versioned libraries
   (the shotglass-kit repo, #3–#5), not embedded in the binary. The built-in transitions
-  were removed (the kit has them). Don't add built-in GLSL.
+  were removed (the kit has them). Don't add built-in GLSL. The one exception is the
+  `shotglass test` prelude (`glsl_test::prelude`: the `expect*` assertions), which is
+  contract, not looks, and only test shaders get it.
 
 ## Adding things
 
@@ -153,6 +156,8 @@ cargo fmt && cargo clippy --all-targets -- -D warnings
   `templates/new/movie.toml`.
 - **A new demo/template look, or a film-level feature worth guarding visually:** add a
   case to `tests/golden.rs` and bless its reference.
+- **`shotglass test` behaviour:** the selftest "shotglass test" check pins the whole report
+  of a fixture file; extend the fixture and its expected text.
 - **Renderer behaviour:** add a selftest check. Mutation-check it: break the code and make sure
   the check fails.
 - Working in parallel with other sessions: see "Working with AI agents" in CONTRIBUTING.md

@@ -724,6 +724,91 @@ letters, backslashes or `..` that climbs out. URLs only go in `source`. File nam
 case-sensitive: `check` (and every command) warns when a name only matches a file by
 ignoring case, which works on Windows and macOS but not on Linux or the web.
 
+## Testing GLSL
+
+Golden strips show *that* a film changed. To pin down what a function promises (its
+endpoints, range, identities, continuity) write tests in GLSL and run them on the GPU:
+
+```glsl
+// tests/unit/animate.test.glsl
+#include <kit/animate.glsl>
+#include <kit/color.glsl>
+
+void test_back_out_endpoints() {                 // no parameter: runs once
+    expect_near(kit_ease_back_out(0.0), 0.0, 1e-6);
+    expect_near(kit_ease_back_out(1.0), 1.0, 1e-6);
+}
+
+void test_bounce_in_range(float t) {             // property: t sweeps [0, 1]
+    float y = kit_ease_bounce_out(t);
+    expect(y >= 0.0 && y <= 1.0 + 1e-6, y);
+}
+
+// samples: 262144
+void test_srgb_round_trip(vec3 c) {              // property: c sweeps the unit cube
+    expect_near(kit_srgb_decode(kit_srgb_encode(c)), c, 1e-5);
+}
+```
+
+```
+$ shotglass test tests/unit
+tests/unit/animate.test.glsl
+  ok    test_back_out_endpoints
+  FAIL  test_bounce_in_range (4096 samples)
+        tests/unit/animate.test.glsl:11: expect(y >= 0.0 && y <= 1.0 + 1e-6, y)
+        at t = 0.3637: got 1.0213
+        12 of 4096 samples failed
+  ok    test_srgb_round_trip (262144 samples)
+
+error: 2 passed, 1 failed (266241 samples) on llvmpipe (LLVM 20.1.2, 256 bits)
+```
+
+- `shotglass test [file|folder] [filter]` runs every `*.test.glsl` file at or under the
+  folder (default `.`; hidden folders, `target/` and `shotglass-libs/` are skipped), or
+  one file. The filter keeps only tests whose name contains it. It exits non-zero if
+  anything fails.
+- A test file is assembled like a scene, with the libraries of its
+  [project](#projects): the nearest `shotglass.toml` at or above the file. Libraries
+  come from the lock, overrides and the cache as for films (missing ones are fetched).
+  Keep test files **outside** library folders (e.g. `tests/unit/` next to them): a file
+  inside a library ships with it and changes its sha256.
+- **Tests** are top-level `void test_<name>()` functions, or property tests taking one
+  `float`, `vec2` or `vec3`. A property test's parameter sweeps a regular grid over
+  `[0, 1]` per component, both ends included; map it to the range you need
+  (`mix(-2.0, 2.0, t)`). Samples: 4096 for a `float`, 256² for a `vec2`, 64³ for a
+  `vec3`, or `// samples: N` on the line just above the function (up to 4 194 304; a
+  grid rounds up to a whole number of points per axis). Test names must be unique.
+- **Each test reports its first failure**: the call as written, with `file:line`, the
+  input of the lowest failing sample, the values, and how many samples failed. A test
+  where no assertion ran on any sample fails ("ran no assertions"), so an early `return`
+  can't hide one. Some samples skipping their assertions is fine.
+- **Strict first:** each file must pass the strict GLSL check (as GLSL 330 and as GLSL ES
+  3.00, or at the version a library needs) before it runs on the driver. A file that
+  doesn't assemble, validate or compile is reported with `file:line`, and the other
+  files still run.
+- Tests run on the real driver, so they catch driver differences too: run them on your
+  GPU as well as in CI (software OpenGL).
+
+### Assertions
+
+The engine provides these to test files only (never to films); they are part of the
+engine contract (semver). `T` is `float`, `vec2`, `vec3` or `vec4`, and comparisons are
+per component.
+
+| assertion | passes when |
+|---|---|
+| `expect(bool cond)` | `cond` |
+| `expect(bool cond, T value)` | `cond`; shows `value` on failure |
+| `expect_eq(T a, T b)` | `a == b` exactly; also `int`, `ivec2`–`ivec4` and `bool` |
+| `expect_near(T a, T b, float tol)` | `abs(a - b) <= tol`, and both are finite |
+| `expect_rel(T a, T b, float rel)` | `abs(a - b) <= rel * max(abs(a), abs(b))`, and both are finite |
+| `expect_finite(T x)` | no NaN or infinity |
+
+NaN never passes `expect_near`, `expect_rel` or `expect_finite`. Call assertions in the
+test file itself (in a test or in a helper function there): the engine numbers each call
+before compiling, which is how a failure names the exact call, even with several on one
+line. Names starting with `sgtest_` are reserved in test files.
+
 ## Command line
 
 ```sh
@@ -746,6 +831,7 @@ shotglass licenses <movie>                                 # libraries the film 
 shotglass bundle <movie> --out <dir>                       # self-contained copy with the library files it includes
 shotglass freeze <movie>                                   # copy the library files it includes into the film
 shotglass unfreeze <movie>                                 # follow the project's libraries again
+shotglass test   [file|folder] [filter]                    # GLSL unit and property tests (*.test.glsl) on the GPU
 shotglass selftest [filter]                                # GPU + sound checks on this machine
 ```
 
@@ -859,6 +945,9 @@ shotglass selftest strips   # only checks whose name contains "strips"
     a million loops in, and by time), and one looped period of sound is the steady
     state of a long unlooped render: no click at the seam, the echo carries over, the
     same whatever the chunk size, streamed or not.
+  - `shotglass test` reports exactly the expected failures (first failure per test,
+    inputs, NaN, grid endpoints, banded draws, "ran no assertions") on a fixture
+    project, and a broken test file doesn't stop the others.
 - **Golden images** (`tests/golden.rs`): contact sheets of the demo film, the
   `shotglass new` template, `tests/films/channels` (iChannel textures: mipmaps,
   wrap and filter modes, `vflip`) and `tests/films/loop` (a `loop = true` film over

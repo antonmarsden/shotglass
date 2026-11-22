@@ -204,6 +204,15 @@ impl Builder {
         Ok(self)
     }
 
+    /// A file of the film whose text the caller already has (e.g. rewritten): includes
+    /// resolve from its folder, and messages name it like [`Builder::file`] would.
+    pub fn file_text(mut self, path: &Path, src: &str) -> Result<Builder> {
+        self.included.insert(absolute(path));
+        let idx = self.new_string(self.display(path, Scope::Film));
+        self.push_text(src, idx, Some(path), Scope::Film, 0)?;
+        Ok(self)
+    }
+
     pub fn builtin(self, name: &str, src: &str) -> Result<Builder> {
         self.generated(&format!("<builtin {name}>"), src)
     }
@@ -486,7 +495,7 @@ impl Builder {
 /// (`name(param types)` or `struct Name`, line). Comments are skipped, and so is code
 /// inside `#if`/`#ifdef` blocks (other than include guards), which may never be compiled.
 /// A heuristic for error messages, not a parser: anything odd is simply not reported.
-fn top_level_definitions(src: &str) -> Vec<(String, usize)> {
+pub(crate) fn top_level_definitions(src: &str) -> Vec<(String, usize)> {
     // Blank comments and preprocessor lines, keeping every newline (line numbers) and
     // byte offset.
     let mut code: Vec<u8> = src.as_bytes().to_vec();

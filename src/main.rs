@@ -6,6 +6,7 @@ mod audio;
 mod bundle;
 mod export;
 mod gfx;
+mod glsl_test;
 mod golden;
 mod headless;
 mod library;
@@ -184,6 +185,15 @@ enum Cmd {
     Freeze { movie: PathBuf },
     /// Undo freeze: the film follows its project's libraries again.
     Unfreeze { movie: PathBuf },
+    /// Run GLSL unit and property tests (*.test.glsl) on the GPU, with the libraries of
+    /// each file's project. Takes a file or a folder (searched recursively).
+    Test {
+        /// A test file, or a folder to search for *.test.glsl files.
+        #[arg(default_value = ".")]
+        target: PathBuf,
+        /// Only run tests whose name contains this text.
+        filter: Option<String>,
+    },
     /// Check the renderer and soundtrack on this GPU and driver with built-in test films.
     Selftest {
         /// Only run checks whose name contains this text.
@@ -328,6 +338,7 @@ fn real_main() -> Result<()> {
         Cmd::Bundle { movie, out } => bundle::run_bundle(&project::film(&movie)?, &out),
         Cmd::Freeze { movie } => bundle::run_freeze(&project::film(&movie)?),
         Cmd::Unfreeze { movie } => bundle::run_unfreeze(&project::film(&movie)?),
+        Cmd::Test { target, filter } => test_glsl(&target, filter),
         Cmd::Selftest { filter } => selftest::run(filter),
     }
 }
@@ -365,6 +376,103 @@ fn for_each_film(path: &Path, f: impl Fn(&Path) -> Result<()>) -> Result<()> {
     }
     println!("all {} films ok", films.len());
     Ok(())
+}
+
+/// `shotglass test`: find the test files, resolve each project's libraries (fetching
+/// missing ones, as for films), then run them all in one GL context.
+fn test_glsl(target: &Path, filter: Option<String>) -> Result<()> {
+    let paths = glsl_test::find_files(target)?;
+    if paths.is_empty() {
+        bail!(
+            "no test files (*.test.glsl) at or under {}",
+            target.display()
+        );
+    }
+    let mut projects: std::collections::BTreeMap<PathBuf, Vec<library::Library>> =
+        Default::default();
+    let mut files = vec![];
+    for path in paths {
+        let dir = path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let root = project::find_root(&dir).unwrap_or(dir);
+        if !projects.contains_key(&root) {
+            let libs = project_libraries(&root)
+                .with_context(|| format!("libraries for {}", path.display()))?;
+            projects.insert(root.clone(), libs);
+        }
+        files.push(glsl_test::TestFile {
+            display: rel_display(&path, &root),
+            libs: projects[&root].clone(),
+            path,
+            root,
+        });
+    }
+    let filter_text = filter.clone();
+    let sum = headless::with_gl(move |gl| {
+        use eframe::glow::HasContext;
+        let renderer = unsafe { gl.get_parameter_string(eframe::glow::RENDERER) };
+        let sum = glsl_test::run(&gl, &files, filter.as_deref(), &mut |l| println!("{l}"))?;
+        Ok((sum, renderer))
+    })?;
+    let (sum, renderer) = sum;
+    println!();
+    let summary = format!(
+        "{} passed, {} failed{} ({} samples) on {renderer}",
+        sum.passed,
+        sum.failed,
+        if sum.broken > 0 {
+            format!(", {} file(s) with errors", sum.broken)
+        } else {
+            String::new()
+        },
+        sum.samples
+    );
+    if sum.failed > 0 || sum.broken > 0 {
+        bail!("{summary}");
+    }
+    if sum.passed == 0 {
+        bail!(
+            "no tests ran (no test_ functions{})",
+            match &filter_text {
+                Some(f) => format!(" whose name contains \"{f}\""),
+                None => String::new(),
+            }
+        );
+    }
+    println!("{summary}");
+    Ok(())
+}
+
+/// `path` relative to `root` (both made absolute first), with forward slashes.
+fn rel_display(path: &Path, root: &Path) -> String {
+    let abs = |p: &Path| std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
+    let (p, r) = (abs(path), abs(root));
+    p.strip_prefix(&r)
+        .unwrap_or(&p)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+/// The libraries of the project rooted at `root` (with a `shotglass.toml`, or none),
+/// fetching missing ones first.
+fn project_libraries(root: &Path) -> Result<Vec<library::Library>> {
+    if !root.join(project::PROJECT_FILE).is_file() {
+        return Ok(vec![]);
+    }
+    let p = project::Project::read(root)?;
+    if p.specs.is_empty() {
+        return Ok(vec![]);
+    }
+    let env = |k: &str| std::env::var(k).ok();
+    let o = library::overrides(&p.root, &p.specs, &env)?;
+    if p.specs.iter().any(|s| s.source.is_some()) {
+        let skip = o.keys().cloned().collect();
+        fetch_libraries(&p.root, library::FetchMode::Missing { skip }, false)?;
+    }
+    let lock = library::Lock::load(&p.root)?;
+    library::resolve(&p.root, &p.specs, &o, lock.as_ref(), &library::cache_dir())
 }
 
 /// Load a film for a command, first fetching libraries that aren't locked or downloaded
