@@ -5,3 +5,11 @@
 *.JPG binary
 *.jpeg binary
 *.JPEG binary
+
+# Fonts (for [fonts]) are binary too.
+*.ttf binary
+*.TTF binary
+*.otf binary
+*.OTF binary
+*.ttc binary
+*.TTC binary
