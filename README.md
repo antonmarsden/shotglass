@@ -466,8 +466,10 @@ uniforms.uExposure = { keys = [[0, -2.0], [3, 0.0]] }
 - A frame shows only when every active layer is ready (like a shot's programs and
   textures), and a broken layer edit keeps its last working version on screen.
 - In the player, each layer has a row under the shots in the timeline, with **M** (mute)
-  and **S** (solo) buttons at its left end, to preview without some layers. While any layer is
-  hidden the transport says "layers muted": `still` and `export` always draw them all.
+  and **S** (solo) buttons at its left end, to preview without some layers. Solo wins:
+  while a layer is soloed only it is drawn, and the mutes (dimmed) come back when you
+  turn solo off. While any layer is hidden the transport says "layers muted": `still`
+  and `export` always draw them all.
 
 #### Blend modes and reading other layers
 

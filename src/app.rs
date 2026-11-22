@@ -1254,14 +1254,21 @@ impl Player {
         // Each layer's mute (M) and solo (S), on its row (added after the timeline, so
         // they take the clicks over it). Preview only: still and export draw every layer.
         let before = self.hidden_layers();
+        let soloing =
+            (self.layer_solo.as_ref()).is_some_and(|s| m.layers.iter().any(|l| &l.id == s));
         for (i, l) in m.layers.iter().enumerate() {
             let y = rect.top() + 82.0 + 16.0 * i as f32;
             let toggle = |ui: &mut egui::Ui, x: f32, on: bool, text: &str, tip: String| {
                 let r = Rect::from_min_size(Pos2::new(rect.left() + x, y), Vec2::new(18.0, 14.0));
+                // While a layer is soloed the mutes are kept but have no effect: dim them.
+                let mut label = RichText::new(text).size(9.5);
+                if text == "M" && soloing {
+                    label = label.weak();
+                }
                 ui.put(
                     r,
-                    egui::Button::new(RichText::new(text).size(9.5))
-                        .selected(on)
+                    egui::Button::new(label)
+                        .selected(on && !(text == "M" && soloing))
                         .small(),
                 )
                 .on_hover_text(tip)
@@ -1273,7 +1280,14 @@ impl Player {
                 4.0,
                 muted,
                 "M",
-                format!("mute layer \"{}\" in the preview", l.id),
+                if soloing {
+                    format!(
+                        "mute layer \"{}\" in the preview (no effect while a layer is soloed)",
+                        l.id
+                    )
+                } else {
+                    format!("mute layer \"{}\" in the preview", l.id)
+                },
             ) {
                 if muted {
                     self.layer_mute.remove(&l.id);
