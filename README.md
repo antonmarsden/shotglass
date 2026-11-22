@@ -465,8 +465,8 @@ uniforms.uExposure = { keys = [[0, -2.0], [3, 0.0]] }
   (`#ifndef SG_HAS_uExposure` … `const float uExposure = 0.0;`).
 - A frame shows only when every active layer is ready (like a shot's programs and
   textures), and a broken layer edit keeps its last working version on screen.
-- In the player, each layer has a row under the shots in the timeline, and **M** (mute)
-  and **S** (solo) buttons below it, to preview without some layers. While any layer is
+- In the player, each layer has a row under the shots in the timeline, with **M** (mute)
+  and **S** (solo) buttons at its left end, to preview without some layers. While any layer is
   hidden the transport says "layers muted": `still` and `export` always draw them all.
 
 #### Blend modes and reading other layers
