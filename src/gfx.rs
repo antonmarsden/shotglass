@@ -23,13 +23,30 @@ const COPY: &str = include_str!("glsl/copy.glsl");
 const OVER: &str = include_str!("glsl/over.glsl");
 
 /// A layer's footer (#69): `mainImage` writes straight alpha (alpha 1 unless it writes
-/// one); the stored layer is premultiplied and multiplied by the layer's opacity.
-/// Engine GLSL by the owner's ruling (#67): it defines what a layer at opacity o is.
-const LAYER_FOOTER: &str = "void main(){\n  vec4 c = vec4(0.0, 0.0, 0.0, 1.0);\n  mainImage(c, gl_FragCoord.xy);\n  float a = clamp(c.a, 0.0, 1.0) * sg_opacity;\n  shotglass_out = vec4(c.rgb * a, a);\n}";
+/// one); the stored layer is premultiplied. Its opacity is applied when it's
+/// composited (the over pass, or `getLayer` in a blend), so a later layer reading it
+/// with `@<id>` sees the layer itself, whatever its opacity (#72). Engine GLSL by the
+/// owner's ruling (#67): with the over pass, it defines what a layer at opacity o is.
+const LAYER_FOOTER: &str = "void main(){\n  vec4 c = vec4(0.0, 0.0, 0.0, 1.0);\n  mainImage(c, gl_FragCoord.xy);\n  float a = clamp(c.a, 0.0, 1.0);\n  shotglass_out = vec4(c.rgb * a, a);\n}";
 
-/// The `ChanKey::tex` of an `@input` channel: the working picture below the layer,
-/// bound by the frame, not a texture in the store.
+/// `ChanKey::tex` values for another pass's picture, bound by the frame rather than
+/// taken from the texture store: `@input` (the working picture below the layer),
+/// `@picture` (the picture track) and `@<layer>` (`LAYER_TEX - index`).
 const INPUT_TEX: u64 = u64::MAX;
+const PICTURE_TEX: u64 = u64::MAX - 1;
+const LAYER_TEX: u64 = u64::MAX - 2;
+
+/// A pass key rather than a texture in the store?
+fn is_pass_key(k: u64) -> bool {
+    k > LAYER_TEX - 65536
+}
+
+/// A layer's blend pass (#72) sees the picture below as `getBase`, the layer
+/// (premultiplied, its opacity applied: alpha = coverage × opacity) as `getLayer`, and
+/// the opacity as `opacity`; it writes `vec4 blend(vec2 uv)` (alpha ignored). The
+/// composite passes the opacity in `progress`.
+const BLEND_HEADER: &str = "#define getBase getFromColor\n#define getLayer(uv) (getToColor(uv) * progress)\n#define opacity progress\n";
+const BLEND_FOOTER: &str = "vec4 transition(vec2 uv) { return blend(uv); }\n";
 
 const VERTEX: &str = "out vec2 sg_uv;\nvoid main(){\n  vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));\n  sg_uv = p;\n  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);\n}\n";
 
@@ -326,6 +343,12 @@ pub struct Renderer {
     /// and the scratch target a layer draws into at its scale.
     work: [Option<Target>; 2],
     layer: Option<Target>,
+    /// The picture track while layers are active (for `@picture` and the first layer).
+    picture: Option<Target>,
+    /// Outputs of layers that later layers read, per layer index.
+    held: Vec<Option<Target>>,
+    /// Layers left out of the picture (the player's mute/solo); export never sets it.
+    hidden: std::collections::HashSet<String>,
     /// Draw the output upside down for readback (`set_readback`), and whether the
     /// current output was drawn that way.
     flip_output: bool,
@@ -533,6 +556,9 @@ impl Renderer {
                 out: None,
                 work: [None, None],
                 layer: None,
+                picture: None,
+                held: vec![],
+                hidden: Default::default(),
                 flip_output: false,
                 out_flipped: false,
                 freeze_key: None,
@@ -636,9 +662,15 @@ impl Renderer {
         let mut keys = [None; N_CHANNELS];
         for (n, c) in channels.iter().enumerate() {
             let Some(c) = c else { continue };
-            if c.source == crate::movie::Source::Input {
+            let pass = match &c.source {
+                crate::movie::Source::Input => Some(INPUT_TEX),
+                crate::movie::Source::Picture => Some(PICTURE_TEX),
+                crate::movie::Source::Layer { index, .. } => Some(LAYER_TEX - *index as u64),
+                _ => None,
+            };
+            if let Some(tex) = pass {
                 keys[n] = Some(ChanKey {
-                    tex: INPUT_TEX,
+                    tex,
                     filter: c.filter,
                     wrap: c.wrap,
                 });
@@ -674,11 +706,11 @@ impl Renderer {
             let source = match &c.source {
                 crate::movie::Source::Image(f) => TexSource::File(f.file.clone()),
                 crate::movie::Source::Text(t) => TexSource::Text(t.clone()),
-                crate::movie::Source::Input => unreachable!("handled above"),
+                _ => unreachable!("pass outputs are handled above"),
             };
             let made = match &c.source {
-                crate::movie::Source::Image(_) | crate::movie::Source::Input => String::new(),
                 crate::movie::Source::Text(t) => format!("{t:?}"),
+                _ => String::new(),
             };
             let tex = hash(&format!("{stamp}{made}\0{}\0{}", c.vflip, c.srgb));
             self.textures.entry(tex).or_insert(TexEntry {
@@ -774,15 +806,25 @@ impl Renderer {
                 LayerScene::Pass(k) => format!("layer \"{}\" ({k})", layer.id),
             };
             let scene = add(self, what, src);
+            let blend = match &layer.blend {
+                Some(b) => add(
+                    self,
+                    format!("blend of layer \"{}\" ({b})", layer.id),
+                    blend_source(dialect, layer, b, &cues, movie),
+                )
+                .map(Some),
+                None => Some(None),
+            };
             let channels = self.channel_keys(
                 &format!("layer \"{}\"", layer.id),
                 &layer.channels,
                 &mut tex_errors,
             );
-            if let Some(scene) = scene {
+            if let (Some(scene), Some(blend)) = (scene, blend) {
+                // A layer's blend program rides in `trans`: keys_ready needs it too.
                 wanted.push(ShotKeys {
                     scene,
-                    trans: None,
+                    trans: blend,
                     channels,
                 });
             }
@@ -916,6 +958,7 @@ impl Renderer {
             .wanted
             .iter()
             .flat_map(|k| k.channels.iter().flatten().map(|c| c.tex))
+            .filter(|k| !is_pass_key(*k)) // another pass's picture, not a texture to load
             .collect();
         let done = keys
             .iter()
@@ -1046,7 +1089,7 @@ impl Renderer {
                 k.channels
                     .iter()
                     .flatten()
-                    .filter(|c| c.tex != INPUT_TEX)
+                    .filter(|c| !is_pass_key(c.tex))
                     .map(|c| (c.tex, d)),
             );
         }
@@ -1265,7 +1308,7 @@ impl Renderer {
     }
 
     fn texture_ready(&self, k: u64) -> bool {
-        k == INPUT_TEX
+        is_pass_key(k)
             || matches!(
                 self.textures.get(&k).map(|e| &e.state),
                 Some(TexState::Ready { .. })
@@ -1341,7 +1384,11 @@ impl Renderer {
         let n = movie.shots.len();
         for (j, layer) in movie.layers.iter().enumerate() {
             if let Some(k) = self.wanted.get(n + j) {
-                v.push((k.scene, layer_distance(movie, layer, t)));
+                let d = layer_distance(movie, layer, t);
+                v.push((k.scene, d));
+                if let Some(b) = k.trans {
+                    v.push((b, d));
+                }
             }
         }
         // The layer composite is needed as soon as any layer is near.
@@ -1771,7 +1818,11 @@ impl Renderer {
         // Layers (#69): a frame is usable only when every active layer is, so playback
         // never shows a frame without a layer that `still` and `export` would draw.
         let n_shots = movie.shots.len();
-        let active = movie.layers_at(info.t);
+        let active: Vec<(usize, f32)> = movie
+            .layers_at(info.t)
+            .into_iter()
+            .filter(|(j, _)| !self.hidden.contains(&movie.layers[*j].id))
+            .collect();
         let mut layer_keys = vec![];
         for &(j, _) in &active {
             layer_keys.push(self.usable(n_shots + j, blocking)?);
@@ -1806,11 +1857,13 @@ impl Renderer {
         ensure_target(&self.gl, &mut self.b, w, h);
         ensure_target(&self.gl, &mut self.out, w, h);
         // With layers, the picture track goes into a working picture first.
-        let pic_dest = over.map(|_| Which::Work(0));
+        let pic_dest = over.map(|_| Which::Picture);
         if over.is_some() {
+            ensure_target(&self.gl, &mut self.picture, w, h);
             ensure_target(&self.gl, &mut self.work[0], w, h);
             ensure_target(&self.gl, &mut self.work[1], w, h);
             ensure_target(&self.gl, &mut self.layer, w, h);
+            self.held.resize_with(movie.layers.len(), || None);
         }
         match at {
             At::Shot { shot, local } => {
@@ -1890,9 +1943,24 @@ impl Renderer {
         }
         if let Some(over) = over {
             // Each layer bottom to top: draw it at its scale (premultiplied, opacity
-            // applied), then composite it over the picture so far into the other
-            // working picture. The last one is copied to the output.
-            let mut cur = 0;
+            // applied), then composite it over the picture so far (the engine's
+            // source-over, or its blend pass) into a working picture; the picture
+            // track stays in its own target for `@picture`. A layer that later layers
+            // read draws into a target of exactly its size and stays there for them.
+            // The last working picture is copied to the output.
+            let read: std::collections::HashSet<usize> = movie
+                .layers
+                .iter()
+                .flat_map(|l| l.channels.iter().flatten())
+                .filter_map(|c| match c.source {
+                    crate::movie::Source::Layer { index, .. } => Some(index),
+                    _ => None,
+                })
+                .collect();
+            let full = (w as usize, h as usize);
+            let picture = self.picture.as_ref().unwrap().tex;
+            let mut held: Vec<(u64, (glow::Texture, usize, usize))> = vec![];
+            let mut cur = Which::Picture;
             for (&(j, local), k) in active.iter().zip(&layer_keys) {
                 let layer = &movie.layers[j];
                 let (lw, lh) = match layer.scale {
@@ -1902,29 +1970,40 @@ impl Renderer {
                         ((h as f32 * s).round() as i32).clamp(1, h),
                     ),
                 };
-                let below = self.work[cur].as_ref().unwrap().tex;
+                let below = self.target(cur).tex;
+                let mut passes = vec![
+                    (INPUT_TEX, (below, full.0, full.1)),
+                    (PICTURE_TEX, (picture, full.0, full.1)),
+                ];
+                passes.extend(held.iter().copied());
                 let item = Item {
                     start: layer.start,
                     duration: layer.duration(),
                     itime: layer.scene_time(local),
                     uniforms: &layer.uniforms,
                     opacity: Some(layer.opacity_at(local)),
-                    input: Some((below, w as usize, h as usize)),
+                    passes,
                 };
-                self.draw_scene(*k, &item, local, Which::Layer, lw, lh, info, movie);
-                let next = 1 - cur;
-                self.composite_into(
-                    over,
-                    Which::Work(cur),
-                    Which::Layer,
-                    0.0,
-                    w,
-                    h,
-                    Some(Which::Work(next)),
-                );
+                let into = if read.contains(&j) {
+                    ensure_target(&self.gl, &mut self.held[j], lw, lh);
+                    Which::Held(j)
+                } else {
+                    Which::Layer
+                };
+                self.draw_scene(*k, &item, local, into, lw, lh, info, movie);
+                if let Which::Held(j) = into {
+                    let t = self.target(into);
+                    held.push((LAYER_TEX - j as u64, (t.tex, lw as usize, lh as usize)));
+                }
+                let next = match cur {
+                    Which::Work(0) => Which::Work(1),
+                    _ => Which::Work(0),
+                };
+                let prog = k.trans.filter(|b| self.prog(*b).is_some()).unwrap_or(over);
+                self.composite_into(prog, cur, into, layer.opacity_at(local), w, h, Some(next));
                 cur = next;
             }
-            self.composite(copy, Which::Work(cur), Which::Work(cur), 0.0, w, h);
+            self.composite(copy, cur, cur, 0.0, w, h);
         }
         if let Some(timer) = &mut self.timer {
             timer.end(&self.gl);
@@ -1935,6 +2014,12 @@ impl Renderer {
             self.gl.bind_vertex_array(None);
         }
         self.out.as_ref().map(|t| t.tex)
+    }
+
+    /// Leave these layers out of the picture (the player's mute/solo). Their `@<id>`
+    /// readers see black. Export and the CLI never call it.
+    pub fn set_hidden_layers(&mut self, ids: std::collections::HashSet<String>) {
+        self.hidden = ids;
     }
 
     pub fn has_gpu_timer(&self) -> bool {
@@ -1994,6 +2079,8 @@ impl Renderer {
             Which::Freeze => self.freeze.as_ref().unwrap(),
             Which::Work(i) => self.work[i].as_ref().unwrap(),
             Which::Layer => self.layer.as_ref().unwrap(),
+            Which::Picture => self.picture.as_ref().unwrap(),
+            Which::Held(j) => self.held[j].as_ref().unwrap(),
         }
     }
 
@@ -2004,6 +2091,8 @@ impl Renderer {
             Which::Freeze => self.freeze.as_mut().unwrap(),
             Which::Work(i) => self.work[i].as_mut().unwrap(),
             Which::Layer => self.layer.as_mut().unwrap(),
+            Which::Picture => self.picture.as_mut().unwrap(),
+            Which::Held(j) => self.held[j].as_mut().unwrap(),
         }
     }
 
@@ -2059,9 +2148,7 @@ impl Renderer {
             f1("iShotTime", local);
             f1("iShotDuration", item.duration);
             f1("iShotProgress", (local / item.duration).clamp(0.0, 1.0));
-            if let Some(o) = item.opacity {
-                f1("sg_opacity", o);
-            }
+
             if let Some(l) = p.loc("iFrame") {
                 gl.uniform_1_i32(Some(l), info.frame);
             }
@@ -2078,9 +2165,10 @@ impl Renderer {
             let mut sampled = false;
             for (n, c) in keys.channels.iter().enumerate() {
                 let ready = c.and_then(|c| {
-                    if c.tex == INPUT_TEX {
-                        // The picture below the layer, exactly its size.
-                        let (tex, w, h) = item.input?;
+                    if is_pass_key(c.tex) {
+                        // Another pass's picture, exactly its size; black (resolution 0)
+                        // when it isn't drawn this frame (an inactive or hidden layer).
+                        let &(_, (tex, w, h)) = item.passes.iter().find(|(k, _)| *k == c.tex)?;
                         return Some((tex, w, h, [0.0; 4], self.sampler(c)));
                     }
                     match self.textures.get(&c.tex)?.state {
@@ -2793,7 +2881,6 @@ pub fn layer_source(
 ) -> Result<Assembled> {
     let root = &movie.root;
     let mut header = SCENE_HEADER.to_string();
-    header += "uniform float sg_opacity;\n";
     for (name, a) in &layer.uniforms {
         header += &format!("uniform {} {name};\n#define SG_HAS_{name}\n", a.glsl_type());
     }
@@ -2827,6 +2914,50 @@ pub fn layer_source(
         },
     };
     Ok(b.footer(LAYER_FOOTER).build())
+}
+
+/// The fragment shader for a layer's blend pass (#72): the transition header, with
+/// `getBase`/`getLayer`/`opacity` naming the picture below, the layer and its opacity,
+/// the layer's params as `#define`s, the cues, the pass (a library's or a film file),
+/// then the footer that writes `blend(uv)`.
+pub fn blend_source(
+    dialect: Dialect,
+    layer: &Layer,
+    kind: &str,
+    cues: &str,
+    movie: &Movie,
+) -> Result<Assembled> {
+    let root = &movie.root;
+    let mut header = TRANSITION_HEADER.to_string();
+    header += BLEND_HEADER;
+    for (name, v) in &layer.params {
+        let val = match v.len() {
+            1 => glsl_float(v[0]),
+            n => format!(
+                "vec{n}({})",
+                v.iter()
+                    .map(|x| glsl_float(*x))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        };
+        header += &format!("#define {name} {val}\n");
+    }
+    header += cues;
+    let b = Builder::new(dialect, &header, root).libraries(&movie.libraries);
+    let b = match crate::movie::transition_kind(kind) {
+        TransitionKind::File(p) => b.file(&root.join(p))?,
+        TransitionKind::Library(lib, file) => b.generated(
+            &format!("blend \"{kind}\""),
+            &format!("#include <{lib}/{file}>\n"),
+        )?,
+        TransitionKind::Name(_) => anyhow::bail!(
+            "layer \"{}\": blend \"{kind}\" needs a library or a .glsl file",
+            layer.id
+        ),
+    };
+    Ok(b.footer(&format!("{BLEND_FOOTER}{TRANSITION_FOOTER}"))
+        .build())
 }
 
 /// Which of `iChannel0..7` an assembled scene mentions, outside the header that
@@ -3071,6 +3202,10 @@ enum Which {
     Work(usize),
     /// Where a layer draws, at its scale.
     Layer,
+    /// The picture track, kept for `@picture` (#72).
+    Picture,
+    /// A layer that later layers read (`@<id>`), at exactly its own size.
+    Held(usize),
 }
 
 /// What `draw_scene` needs from a shot or a layer: its clock, uniforms and, for a
@@ -3082,9 +3217,12 @@ struct Item<'a> {
     /// iTime at this frame.
     itime: f32,
     uniforms: &'a [(String, Anim)],
-    /// Some for a layer: the footer multiplies by it.
+    /// Some for a layer (its opacity; the composite applies it). A layer whose program
+    /// failed with no working version draws nothing rather than black.
     opacity: Option<f32>,
-    input: Option<(glow::Texture, usize, usize)>,
+    /// Other passes' pictures a layer's channels can read (`@input`, `@picture`,
+    /// `@<layer>`): (pass key, (texture, width, height)).
+    passes: Vec<(u64, (glow::Texture, usize, usize))>,
 }
 
 impl<'a> Item<'a> {
@@ -3095,7 +3233,7 @@ impl<'a> Item<'a> {
             itime: shot.scene_time(local),
             uniforms: &shot.uniforms,
             opacity: None,
-            input: None,
+            passes: vec![],
         }
     }
 }

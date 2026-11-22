@@ -1,9 +1,8 @@
 //! Golden regression tests: renders a contact sheet and the soundtrack of the demo film
 //! and of the `shotglass new` template (and contact sheets of tests/films/channels, the
-//! iChannel textures film, tests/films/text, the text film, and tests/films/layers, the
-//! layers film, and both of tests/films/loop, a `loop = true` film) and compares them
-//! with reference PNGs and WAVs
-//! in tests/golden/, so "compiles but looks (or sounds) wrong" fails `cargo test` (and
+//! iChannel textures film, tests/films/text, the text film, tests/films/layers and
+//! tests/films/blends, the layer films, and both of tests/films/loop, a `loop = true`
+//! film) and compares them with reference PNGs and WAVs in tests/golden/, so "compiles but looks (or sounds) wrong" fails `cargo test` (and
 //! CI, on software OpenGL).
 //!
 //! - On a mismatch the actual strip and a diff image (differences in magenta), or the
@@ -242,6 +241,22 @@ fn layers_film() {
     golden_frames(
         "layers",
         &root().join("tests").join("films").join("layers"),
+        &["--count", COUNT],
+        &[],
+    );
+}
+
+/// Layers phase 2 (#72): tests/films/blends, a bloom from a bright pass read back with
+/// `@glow` and screen-blended, a multiply-blended texture with fades, and a
+/// picture-in-picture of the picture track (`@picture`).
+#[test]
+fn blends_film() {
+    if skip() {
+        return;
+    }
+    golden_frames(
+        "blends",
+        &root().join("tests").join("films").join("blends"),
         &["--count", COUNT],
         &[],
     );

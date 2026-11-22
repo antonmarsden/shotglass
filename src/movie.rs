@@ -278,8 +278,8 @@ impl<'a> ChannelSource<'a> {
 fn not_yet(what: &str, s: &str, kind: &str) -> anyhow::Error {
     let (is, arrives) = match kind {
         "output" => (
-            "another pass's picture",
-            "@picture and @<layer> arrive with layers phase 2 (only @input binds now)",
+            "not a layer below this one",
+            "@ names input, picture, an earlier layer, or (with comps, in layers phase 3) a comp",
         ),
         "sequence" => (
             "an image sequence",
@@ -408,6 +408,21 @@ pub enum Source {
     Text(Box<TextSource>),
     /// `@input` on a layer: the picture below it (everything under it, composited).
     Input,
+    /// `@picture` on a layer: the picture track before any layer.
+    Picture,
+    /// `@<id>` on a layer: an earlier layer's own output (premultiplied, before it is
+    /// composited); black while that layer isn't active.
+    Layer {
+        index: usize,
+        id: String,
+    },
+}
+
+impl Source {
+    /// Another pass's picture (`@…`), not a texture.
+    pub fn is_pass(&self) -> bool {
+        matches!(self, Source::Input | Source::Picture | Source::Layer { .. })
+    }
 }
 
 /// What an iChannel is bound to, and how it's sampled.
@@ -426,7 +441,7 @@ impl Channel {
     /// Every file the channel reads: the image, or a text's file and fonts.
     pub fn files(&self) -> Vec<&FileRef> {
         match &self.source {
-            Source::Input => vec![],
+            Source::Input | Source::Picture | Source::Layer { .. } => vec![],
             Source::Image(f) => vec![f],
             Source::Text(t) => {
                 let mut v: Vec<&FileRef> = vec![];
@@ -441,7 +456,7 @@ impl Channel {
 
     pub fn files_mut(&mut self) -> Vec<&mut FileRef> {
         match &mut self.source {
-            Source::Input => vec![],
+            Source::Input | Source::Picture | Source::Layer { .. } => vec![],
             Source::Image(f) => vec![f],
             Source::Text(t) => {
                 let t = &mut **t;
@@ -461,6 +476,8 @@ impl Channel {
             Source::Image(f) => f.label.clone(),
             Source::Text(t) => format!("text \"{}\"", t.name),
             Source::Input => "@input".to_string(),
+            Source::Picture => "@picture".to_string(),
+            Source::Layer { id, .. } => format!("@{id}"),
         }
     }
 
@@ -537,6 +554,9 @@ pub struct Layer {
     pub scale: Option<f32>,
     pub time_offset: f32,
     pub time_scale: f32,
+    /// How the layer is composited: None = "over" (the engine's source-over), or a
+    /// blend pass (`"blend/screen"`, a film `.glsl`) resolved like a transition type.
+    pub blend: Option<String>,
 }
 
 impl Layer {
@@ -673,7 +693,7 @@ impl Movie {
     /// then layer order. `@input` isn't a texture.
     pub fn textures(&self) -> Vec<&Channel> {
         let mut v: Vec<&Channel> = vec![];
-        for c in self.channels().filter(|c| c.source != Source::Input) {
+        for c in self.channels().filter(|c| !c.source.is_pass()) {
             if !v
                 .iter()
                 .any(|o| o.source == c.source && o.vflip == c.vflip && o.srgb == c.srgb)
@@ -717,6 +737,17 @@ impl Movie {
             features.push("layers, which need shotglass 0.1.4");
             need = semver::Version::new(0, 1, 4);
         }
+        let phase2 = self.layers.iter().any(|l| {
+            l.blend.is_some()
+                || l.channels
+                    .iter()
+                    .flatten()
+                    .any(|c| matches!(c.source, Source::Picture | Source::Layer { .. }))
+        });
+        if phase2 {
+            features.push("blend modes, @picture or @<layer>, which need shotglass 0.1.5");
+            need = semver::Version::new(0, 1, 5);
+        }
         if features.is_empty() {
             return None;
         }
@@ -726,6 +757,7 @@ impl Movie {
             semver::Version::new(0, 1, 1),
             semver::Version::new(0, 1, 2),
             semver::Version::new(0, 1, 3),
+            semver::Version::new(0, 1, 4),
         ];
         let allows_old = match &self.shotglass {
             None => true,
@@ -990,7 +1022,7 @@ impl Movie {
                     "{what}: a texture name may only use letters, digits and _ (and not start with a digit)"
                 );
             }
-            match texture_spec(&what, v, None, &library_specs, root, false)? {
+            match texture_spec(&what, v, None, &library_specs, root, None)? {
                 Some(c) => textures.insert(name.clone(), c),
                 None => bail!("{what}: \"\" names no file"),
             };
@@ -1048,7 +1080,7 @@ impl Movie {
         let mut used: std::collections::HashSet<String> = Default::default();
         let mut channel_list = |what: &str,
                                 list: &[toml::Value],
-                                on_layer: bool|
+                                on_layer: Option<LayerRefs>|
          -> Result<[Option<Channel>; N_CHANNELS]> {
             if list.len() > N_CHANNELS {
                 bail!(
@@ -1070,7 +1102,7 @@ impl Movie {
             Ok(out)
         };
         let default_channels = match &f.channels {
-            Some(list) => channel_list("", list, false)?,
+            Some(list) => channel_list("", list, None)?,
             None => Default::default(),
         };
         let mut shots: Vec<Shot> = Vec::new();
@@ -1078,7 +1110,7 @@ impl Movie {
         for (index, s) in f.shots.into_iter().enumerate() {
             let ctx = || format!("shot \"{}\"", s.id);
             let channels = match &s.channels {
-                Some(list) => channel_list(&format!("{}: ", ctx()), list, false)?,
+                Some(list) => channel_list(&format!("{}: ", ctx()), list, None)?,
                 None => default_channels.clone(),
             };
             if !ids.insert(s.id.clone()) {
@@ -1272,7 +1304,27 @@ impl Movie {
         }
         // Layers, bottom to top. Ids share the shot namespace (fallback keys, cue names).
         let mut layers: Vec<Layer> = vec![];
-        for l in f.layers {
+        let layer_ids: Vec<String> = f.layers.iter().map(|l| l.id.clone()).collect();
+        // `type` and `blend` name a pass the way a transition's `type` does.
+        let pass_kind = |what: &str, key: &str, k: &str, example: &str| -> Result<()> {
+            match transition_kind(k) {
+                TransitionKind::File(p) => path_rule(format!("{what}: {key}"), p),
+                TransitionKind::Library(lib, file) => {
+                    if !library_specs.iter().any(|s| s.name == lib) {
+                        bail!(
+                            "{what}: {key} \"{k}\" names library \"{lib}\", but [libraries] has {}",
+                            quoted_list(library_specs.iter().map(|s| &s.name))
+                        );
+                    }
+                    path_rule(format!("{what}: {key}"), &file)
+                }
+                TransitionKind::Name(n) => bail!(
+                    "{what}: {key} \"{n}\" needs a library (\"{example}/{n}\") or a film file \
+                     (\"fx/{n}.glsl\")"
+                ),
+            }
+        };
+        for (index, l) in f.layers.into_iter().enumerate() {
             let what = format!("layer \"{}\"", l.id);
             if l.id.is_empty()
                 || !l
@@ -1300,14 +1352,13 @@ impl Movie {
             if l.transition_in.is_some() || l.transition_out.is_some() {
                 bail!("{what}: layer transitions arrive in a later phase; use fade = [in, out]");
             }
-            if let Some(b) = &l.blend
-                && b != "over"
-            {
-                bail!(
-                    "{what}: blend = \"{b}\": blend modes arrive with layers phase 2 (only \
-                     \"over\" now)"
-                );
-            }
+            let blend = match l.blend.as_deref() {
+                None | Some("over") => None,
+                Some(b) => {
+                    pass_kind(&what, "blend", b, "blend")?;
+                    Some(b.to_string())
+                }
+            };
             let scene = match (&l.scene, &l.kind) {
                 (Some(_), Some(_)) => bail!("{what}: give scene or type, not both"),
                 (None, None) => bail!(
@@ -1319,23 +1370,7 @@ impl Movie {
                     LayerScene::File(root.join(p))
                 }
                 (None, Some(k)) => {
-                    match transition_kind(k) {
-                        TransitionKind::File(p) => path_rule(format!("{what}: type"), p)?,
-                        TransitionKind::Library(lib, file) => {
-                            if !library_specs.iter().any(|s| s.name == lib) {
-                                bail!(
-                                    "{what}: type \"{k}\" names library \"{lib}\", but \
-                                     [libraries] has {}",
-                                    quoted_list(library_specs.iter().map(|s| &s.name))
-                                );
-                            }
-                            path_rule(format!("{what}: type"), &file)?;
-                        }
-                        TransitionKind::Name(n) => bail!(
-                            "{what}: type \"{n}\" needs a library (\"fx/{n}\") or a film file \
-                             (\"fx/{n}.glsl\")"
-                        ),
-                    }
+                    pass_kind(&what, "type", k, "fx")?;
                     LayerScene::Pass(k.clone())
                 }
             };
@@ -1418,7 +1453,14 @@ impl Movie {
                 ));
             }
             let channels = match &l.channels {
-                Some(list) => channel_list(&format!("{what}: "), list, true)?,
+                Some(list) => channel_list(
+                    &format!("{what}: "),
+                    list,
+                    Some(LayerRefs {
+                        earlier: &layer_ids[..index],
+                        later: &layer_ids[index..],
+                    }),
+                )?,
                 None => Default::default(),
             };
             layers.push(Layer {
@@ -1434,6 +1476,7 @@ impl Movie {
                 scale,
                 time_offset: l.time_offset.unwrap_or(0.0),
                 time_scale: l.time_scale.unwrap_or(1.0),
+                blend,
             });
         }
         Ok(Movie {
@@ -1474,7 +1517,7 @@ impl Movie {
                 .filter(|n| !used.contains(*n))
                 .map(|n| match textures[n].source {
                     Source::Text(_) => format!("[texts] {n} isn't used by any shot's channels"),
-                    Source::Image(_) | Source::Input => {
+                    _ => {
                         format!("[textures] {n} isn't used by any shot's channels")
                     }
                 })
@@ -2144,7 +2187,7 @@ fn texture_spec(
     names: Option<&BTreeMap<String, Channel>>,
     specs: &[LibrarySpec],
     root: &Path,
-    on_layer: bool,
+    on_layer: Option<LayerRefs>,
 ) -> Result<Option<Channel>> {
     let file_channel = |s: &str| -> Result<Channel> {
         let f = file_ref(what, s, specs, root)?;
@@ -2220,20 +2263,37 @@ fn texture_spec(
                         "{what}: \"{s}\": after @ comes input, picture, or the id of a layer or comp"
                     );
                 }
-                match (out, on_layer) {
-                    ("input", true) => Ok(Some(Channel {
-                        source: Source::Input,
-                        filter: Filter::Linear,
-                        wrap: Wrap::Clamp,
-                        vflip: false,
-                        srgb: false,
-                    })),
-                    ("input", false) => bail!(
-                        "{what}: \"@input\" is the picture below a layer; a shot has nothing \
-                         below it (use it in a [[layer]]'s channels)"
-                    ),
-                    _ => Err(not_yet(what, s, "output")),
-                }
+                let Some(refs) = on_layer else {
+                    bail!(
+                        "{what}: \"{s}\" is another pass's picture; only a [[layer]]'s channels \
+                         can read one (a shot has nothing below it)"
+                    );
+                };
+                let source = match out {
+                    "input" => Source::Input,
+                    "picture" => Source::Picture,
+                    id => match refs.earlier.iter().position(|e| e == id) {
+                        Some(index) => Source::Layer {
+                            index,
+                            id: id.to_string(),
+                        },
+                        None if refs.later.first().is_some_and(|x| x == id) => {
+                            bail!("{what}: \"{s}\" is this layer; a layer can't read itself")
+                        }
+                        None if refs.later.iter().any(|x| x == id) => bail!(
+                            "{what}: \"{s}\" is a later layer; a layer reads only layers below \
+                             it (earlier in movie.toml)"
+                        ),
+                        None => return Err(not_yet(what, s, "output")),
+                    },
+                };
+                Ok(Some(Channel {
+                    source,
+                    filter: Filter::Linear,
+                    wrap: Wrap::Clamp,
+                    vflip: false,
+                    srgb: false,
+                }))
             }
             ChannelSource::Name(s) => {
                 let Some(names) = names else {
@@ -2375,6 +2435,14 @@ fn texture_spec(
             "{what}: expected a texture name, a path, \"<library/path>\", a table {{ file = \"…\" }} or \"\""
         ),
     }
+}
+
+/// The layer ids a layer's `@<id>` channels may name (`earlier`), and the rest
+/// (`later`, this layer first) for messages.
+#[derive(Clone, Copy)]
+struct LayerRefs<'a> {
+    earlier: &'a [String],
+    later: &'a [String],
 }
 
 /// What a transition's `type` names.
@@ -3241,7 +3309,7 @@ glsl = 450
         for (entry, says) in [
             (
                 r#""@picture""#,
-                r#"channels[0]: "@picture" is another pass's picture; @picture and @<layer> arrive with layers phase 2"#,
+                r#"channels[0]: "@picture" is another pass's picture; only a [[layer]]'s channels can read one"#,
             ),
             (
                 r#""renders/fog_####.png""#,
@@ -3370,6 +3438,53 @@ glsl = 450
     }
 
     #[test]
+    fn blends_and_layer_references() {
+        let m = layers_film(
+            "[[layer]]\nid = \"glow\"\nscene = \"l.glsl\"\nopacity = 0\n\
+             [[layer]]\nid = \"screen\"\nscene = \"l.glsl\"\nblend = \"fx/screen\"\nchannels = [\"@glow\", \"@picture\", \"@input\"]\n\
+             [[layer]]\nid = \"local\"\nscene = \"l.glsl\"\nblend = \"fx/my-blend.glsl\"\n\
+             [[layer]]\nid = \"plain\"\nscene = \"l.glsl\"\nblend = \"over\"\n",
+        )
+        .unwrap();
+        let screen = &m.layers[1];
+        assert_eq!(screen.blend.as_deref(), Some("fx/screen"));
+        let src: Vec<&Source> = screen
+            .channels
+            .iter()
+            .flatten()
+            .map(|c| &c.source)
+            .collect();
+        assert_eq!(
+            src,
+            [
+                &Source::Layer {
+                    index: 0,
+                    id: "glow".into()
+                },
+                &Source::Picture,
+                &Source::Input
+            ]
+        );
+        assert_eq!(screen.channels[0].as_ref().unwrap().label(), "@glow");
+        assert_eq!(m.layers[2].blend.as_deref(), Some("fx/my-blend.glsl"));
+        // "over" is the engine's source-over: no blend pass.
+        assert_eq!(m.layers[3].blend, None);
+        // Pass outputs aren't textures.
+        assert!(m.textures().is_empty());
+        let w = m.contract_warning().unwrap();
+        assert!(
+            w.contains("blend modes, @picture or @<layer>, which need shotglass 0.1.5"),
+            "{w}"
+        );
+        // A later layer can't be read (the stack stays a DAG).
+        let e = err(layers_film(
+            "[[layer]]\nid = \"a\"\nscene = \"l.glsl\"\nchannels = [\"@b\"]\n\
+             [[layer]]\nid = \"b\"\nscene = \"l.glsl\"\n",
+        ));
+        assert!(e.contains("\"@b\" is a later layer"), "{e}");
+    }
+
+    #[test]
     fn layers_are_validated() {
         for (layer, says) in [
             (
@@ -3428,7 +3543,7 @@ glsl = 450
             ),
             (
                 "id = \"x\"\nscene = \"l.glsl\"\nblend = \"screen\"",
-                "blend modes arrive with layers phase 2",
+                "blend \"screen\" needs a library (\"blend/screen\") or a film file",
             ),
             (
                 "id = \"x\"\nscene = \"l.glsl\"\ncomp = \"intro\"",
@@ -3443,8 +3558,16 @@ glsl = 450
                 "layer transitions arrive in a later phase",
             ),
             (
-                "id = \"x\"\nscene = \"l.glsl\"\nchannels = [\"@picture\"]",
-                "@picture and @<layer> arrive with layers phase 2",
+                "id = \"x\"\nscene = \"l.glsl\"\nchannels = [\"@nobody\"]",
+                "\"@nobody\" is not a layer below this one",
+            ),
+            (
+                "id = \"x\"\nscene = \"l.glsl\"\nchannels = [\"@x\"]",
+                "\"@x\" is this layer; a layer can't read itself",
+            ),
+            (
+                "id = \"x\"\nscene = \"l.glsl\"\nblend = \"kit/screen\"",
+                "blend \"kit/screen\" names library \"kit\", but [libraries] has \"fx\"",
             ),
             (
                 "id = \"x\"\nscene = \"l.glsl\"\nopactiy = 1",
@@ -3464,7 +3587,7 @@ glsl = 450
             Path::new("/film"),
         ));
         assert!(
-            e.contains("\"@input\" is the picture below a layer; a shot has nothing below it"),
+            e.contains("\"@input\" is another pass's picture; only a [[layer]]'s channels can read one (a shot has nothing below it)"),
             "{e}"
         );
         // A loop film's layers stay inside one period.

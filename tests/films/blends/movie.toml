@@ -1,0 +1,40 @@
+# Golden-image film for layers phase 2 (tests/golden.rs, #72): a bloom built from two
+# layers (a bright pass drawn at opacity 0 and half resolution, read back with @glow,
+# blurred and screen-blended), a multiply-blended paper texture over a span with fades,
+# and a picture-in-picture of the picture track (@picture) over the last second.
+# Blend passes are film-local (fx/), so the golden only moves when the engine does.
+title = "blends"
+fps = 30
+
+[[shot]]
+id = "lights"
+scene = "scenes/lights.glsl"
+duration = 4.0
+
+[[layer]]
+id = "glow"
+scene = "layers/bright.glsl"
+scale = 0.5
+opacity = 0.0
+channels = ["@input"]
+
+[[layer]]
+id = "bloom"
+scene = "layers/blur.glsl"
+blend = "fx/screen.glsl"
+opacity = 0.9
+channels = ["@glow"]
+
+[[layer]]
+id = "paper"
+scene = "layers/paper.glsl"
+blend = "fx/multiply.glsl"
+from = 1.0
+to = 3.0
+fade = [0.5, 0.5]
+
+[[layer]]
+id = "pip"
+scene = "layers/pip.glsl"
+from = 3.0
+channels = ["@picture"]

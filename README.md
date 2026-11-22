@@ -465,8 +465,64 @@ uniforms.uExposure = { keys = [[0, -2.0], [3, 0.0]] }
   (`#ifndef SG_HAS_uExposure` … `const float uExposure = 0.0;`).
 - A frame shows only when every active layer is ready (like a shot's programs and
   textures), and a broken layer edit keeps its last working version on screen.
-- Only `blend = "over"` for now; blend modes, `@picture`/`@<layer>`, comps and mattes
-  come in later phases (see `docs/design/layers-compositing.md`).
+- In the player, each layer has a row under the shots in the timeline, with **M** (mute)
+  and **S** (solo) buttons at its left end, to preview without some layers. Solo wins:
+  while a layer is soloed only it is drawn, and the mutes (dimmed) come back when you
+  turn solo off. While any layer is hidden the transport says "layers muted": `still`
+  and `export` always draw them all.
+
+#### Blend modes and reading other layers
+
+A layer is composited with source-over unless it names a **blend pass** (needs
+`shotglass = "0.1.5"`). Blend passes come from libraries or film files, like
+transitions:
+
+```toml
+[[layer]]
+id = "glow"
+scene = "layers/bright.glsl"    # a bright pass of the picture below
+scale = 0.5
+opacity = 0                     # adds nothing itself...
+channels = ["@input"]
+
+[[layer]]
+id = "bloom"
+scene = "layers/blur.glsl"      # ...but this layer reads it, blurs it
+channels = ["@glow"]
+blend = "blend/screen"          # and screens it over the picture
+```
+
+A blend pass is a small GLSL file that writes `vec4 blend(vec2 uv)`, the new picture
+(alpha is ignored), from:
+
+| name | what |
+|---|---|
+| `getBase(uv)` | the picture below the layer |
+| `getLayer(uv)` | the layer, premultiplied, its opacity applied (alpha = coverage × opacity) |
+| `opacity` | the layer's opacity (fades included) |
+| `ratio` | width / height |
+
+```glsl
+// fx/multiply.glsl
+vec4 blend(vec2 uv) {
+  vec4 b = getBase(uv);
+  vec4 l = getLayer(uv);
+  vec3 m = b.rgb * l.rgb / max(l.a, 1e-5);   // unpremultiply, multiply
+  return vec4(mix(b.rgb, m, l.a), 1.0);      // by coverage × opacity
+}
+```
+
+A layer's channels can read other passes' pictures:
+
+| channel | is |
+|---|---|
+| `"@input"` | the picture below this layer (everything under it, composited) |
+| `"@picture"` | the picture track, before any layer (for a picture-in-picture, a clean plate) |
+| `"@<id>"` | an earlier layer's own picture, at its own size, before it's composited and whatever its opacity: a layer at `opacity = 0` is a hidden helper pass. Black, with resolution 0, while that layer isn't active |
+
+A layer can read only layers below it (earlier in `movie.toml`), so passes never loop.
+Comps (sequences inside a layer) and mattes come next (see
+`docs/design/layers-compositing.md`).
 
 ### Sound
 
