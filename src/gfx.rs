@@ -6,7 +6,7 @@
 
 use crate::anim::Anim;
 use crate::movie::TransitionKind;
-use crate::movie::{At, Movie, Shot, glsl_float};
+use crate::movie::{At, Movie, N_CHANNELS, Shot, glsl_float};
 use crate::shader::{Assembled, Builder, Dialect, DriverGlsl, remap_log};
 use crate::texture::{DecodedImage, Filter, Wrap};
 use anyhow::{Result, anyhow};
@@ -35,8 +35,13 @@ uniform sampler2D iChannel0;
 uniform sampler2D iChannel1;
 uniform sampler2D iChannel2;
 uniform sampler2D iChannel3;
-uniform vec3 iChannelResolution[4];
-uniform float iChannelTime[4];
+uniform sampler2D iChannel4;
+uniform sampler2D iChannel5;
+uniform sampler2D iChannel6;
+uniform sampler2D iChannel7;
+uniform vec3 iChannelResolution[8];
+uniform float iChannelTime[8];
+uniform vec4 iChannelMeta[8];
 uniform float iMovieTime;
 uniform float iShotTime;
 uniform float iShotDuration;
@@ -44,7 +49,17 @@ uniform float iShotProgress;
 out vec4 shotglass_out;
 ";
 
-const CHANNEL_UNIFORMS: [&str; 4] = ["iChannel0", "iChannel1", "iChannel2", "iChannel3"];
+/// The scene header's samplers, one per channel (`movie::N_CHANNELS`).
+const CHANNEL_UNIFORMS: [&str; N_CHANNELS] = [
+    "iChannel0",
+    "iChannel1",
+    "iChannel2",
+    "iChannel3",
+    "iChannel4",
+    "iChannel5",
+    "iChannel6",
+    "iChannel7",
+];
 
 const SCENE_FOOTER: &str = "void main(){\n  vec4 c = vec4(0.0, 0.0, 0.0, 1.0);\n  mainImage(c, gl_FragCoord.xy);\n  shotglass_out = vec4(c.rgb, 1.0);\n}";
 
@@ -135,7 +150,7 @@ struct Entry {
 struct ShotKeys {
     scene: u64,
     trans: Option<u64>,
-    channels: [Option<ChanKey>; 4],
+    channels: [Option<ChanKey>; N_CHANNELS],
 }
 
 /// A texture on a channel: what's uploaded (`tex`, a `TexKey`) and how it's sampled.
@@ -167,12 +182,32 @@ enum TexState {
         w: usize,
         h: usize,
         bytes: usize,
+        /// `iChannelMeta` (a text block's metrics; zeros for images).
+        meta: [f32; 4],
     },
     Failed(String),
 }
 
+/// What a texture is made from.
+#[derive(Clone)]
+enum TexSource {
+    /// A PNG or JPEG file.
+    File(PathBuf),
+    /// A text block, laid out and rasterised (#68).
+    Text(Box<crate::movie::TextSource>),
+}
+
+impl TexSource {
+    fn load(&self, label: &str, vflip: bool) -> std::result::Result<DecodedImage, String> {
+        match self {
+            TexSource::File(path) => crate::texture::load(path, label, vflip),
+            TexSource::Text(t) => crate::texture::load_text(t, vflip),
+        }
+    }
+}
+
 struct TexEntry {
-    path: PathBuf,
+    source: TexSource,
     label: String,
     vflip: bool,
     srgb: bool,
@@ -180,25 +215,23 @@ struct TexEntry {
     last_used: u64,
 }
 
-/// The decode worker: jobs (key, file, label, vflip) in, decoded images out.
+/// The decode worker: jobs (key, source, label, vflip) in, decoded images (or
+/// rasterised text) out.
 struct Decoder {
-    jobs: std::sync::mpsc::Sender<(u64, PathBuf, String, bool)>,
+    jobs: std::sync::mpsc::Sender<(u64, TexSource, String, bool)>,
     results: std::sync::mpsc::Receiver<(u64, std::result::Result<DecodedImage, String>)>,
 }
 
 impl Decoder {
     fn new() -> Decoder {
-        let (jobs, rx) = std::sync::mpsc::channel::<(u64, PathBuf, String, bool)>();
+        let (jobs, rx) = std::sync::mpsc::channel::<(u64, TexSource, String, bool)>();
         let (tx, results) = std::sync::mpsc::channel();
         std::thread::Builder::new()
             .name("shotglass-texture-decode".into())
             .spawn(move || {
                 // Ends when the renderer (the sender) is dropped.
-                while let Ok((k, path, label, vflip)) = rx.recv() {
-                    if tx
-                        .send((k, crate::texture::load(&path, &label, vflip)))
-                        .is_err()
-                    {
+                while let Ok((k, source, label, vflip)) = rx.recv() {
+                    if tx.send((k, source.load(&label, vflip))).is_err() {
                         break;
                     }
                 }
@@ -628,45 +661,58 @@ impl Renderer {
                 }
                 None => Some(None),
             };
-            let mut channels = [None; 4];
+            let mut channels = [None; N_CHANNELS];
             for (n, c) in shot.channels.iter().enumerate() {
                 let Some(c) = c else { continue };
-                match std::fs::metadata(&c.file) {
-                    Ok(md) => {
-                        let mtime = md
-                            .modified()
-                            .ok()
-                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                            .map_or(0, |d| d.as_nanos());
-                        let tex = hash(&format!(
-                            "{}\0{}\0{mtime}\0{}\0{}",
-                            c.file.display(),
-                            md.len(),
-                            c.vflip,
-                            c.srgb
-                        ));
-                        self.textures.entry(tex).or_insert(TexEntry {
-                            path: c.file.clone(),
-                            label: c.label.clone(),
-                            vflip: c.vflip,
-                            srgb: c.srgb,
-                            state: TexState::Idle,
-                            last_used: 0,
-                        });
-                        channels[n] = Some(ChanKey {
-                            tex,
-                            filter: c.filter,
-                            wrap: c.wrap,
-                        });
+                // The key covers every file the texture reads (path, size, mtime) and
+                // how its texels are made, so an edit to any of them reloads it.
+                let mut stamp = String::new();
+                let mut missing = None;
+                for f in c.files() {
+                    match std::fs::metadata(&f.file) {
+                        Ok(md) => {
+                            let mtime = md
+                                .modified()
+                                .ok()
+                                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                                .map_or(0, |d| d.as_nanos());
+                            stamp += &format!("{}\0{}\0{mtime}\0", f.file.display(), md.len());
+                        }
+                        Err(e) => {
+                            missing = Some(format!("\"{}\": {e}", f.label));
+                            break;
+                        }
                     }
-                    Err(e) => tex_errors.push(ShaderError {
-                        what: "movie.toml".into(),
-                        messages: vec![format!(
-                            "shot \"{}\": channels[{n}]: \"{}\": {e}",
-                            shot.id, c.label
-                        )],
-                    }),
                 }
+                if let Some(m) = missing {
+                    tex_errors.push(ShaderError {
+                        what: "movie.toml".into(),
+                        messages: vec![format!("shot \"{}\": channels[{n}]: {m}", shot.id)],
+                    });
+                    continue;
+                }
+                let source = match &c.source {
+                    crate::movie::Source::Image(f) => TexSource::File(f.file.clone()),
+                    crate::movie::Source::Text(t) => TexSource::Text(t.clone()),
+                };
+                let made = match &c.source {
+                    crate::movie::Source::Image(_) => String::new(),
+                    crate::movie::Source::Text(t) => format!("{t:?}"),
+                };
+                let tex = hash(&format!("{stamp}{made}\0{}\0{}", c.vflip, c.srgb));
+                self.textures.entry(tex).or_insert(TexEntry {
+                    source,
+                    label: c.label(),
+                    vflip: c.vflip,
+                    srgb: c.srgb,
+                    state: TexState::Idle,
+                    last_used: 0,
+                });
+                channels[n] = Some(ChanKey {
+                    tex,
+                    filter: c.filter,
+                    wrap: c.wrap,
+                });
             }
             if let (Some(scene), Some(trans)) = (scene, trans) {
                 wanted.push(ShotKeys {
@@ -963,7 +1009,7 @@ impl Renderer {
                 continue;
             };
             if matches!(e.state, TexState::Idle) {
-                let job = (*k, e.path.clone(), e.label.clone(), e.vflip);
+                let job = (*k, e.source.clone(), e.label.clone(), e.vflip);
                 e.state = TexState::Decoding;
                 let d = self.decoder.get_or_insert_with(Decoder::new);
                 if d.jobs.send(job).is_err() {
@@ -1008,6 +1054,7 @@ impl Renderer {
                 w: img.width,
                 h: img.height,
                 bytes: crate::texture::gpu_bytes(img.width, img.height),
+                meta: img.meta,
             }
         } else {
             TexState::Uploading { tex, img, row }
@@ -1026,7 +1073,7 @@ impl Renderer {
             TexState::Ready { .. } | TexState::Failed(_) => return,
             TexState::Idle | TexState::Decoding => {
                 // A worker may be decoding it too; its result is ignored once this is done.
-                e.state = match crate::texture::load(&e.path, &e.label, e.vflip) {
+                e.state = match e.source.load(&e.label, e.vflip) {
                     Ok(img) => TexState::Decoded(img),
                     Err(m) => TexState::Failed(m),
                 };
@@ -1513,9 +1560,9 @@ impl Renderer {
                     }
                 }
             }
-            // The channel samplers read units 0..3, always: set once here (this also
-            // covers programs loaded from the binary cache, whose uniforms reset).
-            let units: Vec<(&glow::UniformLocation, i32)> = (0..4)
+            // The channel samplers read units 0..N_CHANNELS, always: set once here (this
+            // also covers programs loaded from the binary cache, whose uniforms reset).
+            let units: Vec<(&glow::UniformLocation, i32)> = (0..N_CHANNELS)
                 .filter_map(|n| locs.get(CHANNEL_UNIFORMS[n]).map(|l| (l, n as i32)))
                 .collect();
             if !units.is_empty() {
@@ -1838,11 +1885,14 @@ impl Renderer {
             }
             // Channels: the texture and its sampler on unit n (the iChannelN uniforms
             // were set to n at link time), or black with resolution 0.
-            let mut res = [0f32; 12];
+            let mut res = [0f32; 3 * N_CHANNELS];
+            let mut meta = [0f32; 4 * N_CHANNELS];
             let mut sampled = false;
             for (n, c) in keys.channels.iter().enumerate() {
                 let ready = c.and_then(|c| match self.textures.get(&c.tex)?.state {
-                    TexState::Ready { tex, w, h, .. } => Some((tex, w, h, self.sampler(c))),
+                    TexState::Ready {
+                        tex, w, h, meta, ..
+                    } => Some((tex, w, h, meta, self.sampler(c))),
                     _ => None,
                 });
                 if ready.is_none() && p.loc(CHANNEL_UNIFORMS[n]).is_none() {
@@ -1850,10 +1900,11 @@ impl Renderer {
                 }
                 gl.active_texture(glow::TEXTURE0 + n as u32);
                 match ready {
-                    Some((tex, w, h, sampler)) => {
+                    Some((tex, w, h, m, sampler)) => {
                         gl.bind_texture(glow::TEXTURE_2D, Some(tex));
                         gl.bind_sampler(n as u32, Some(sampler));
                         res[n * 3..n * 3 + 3].copy_from_slice(&[w as f32, h as f32, 1.0]);
+                        meta[n * 4..n * 4 + 4].copy_from_slice(&m);
                         sampled = true;
                     }
                     None => {
@@ -1864,6 +1915,9 @@ impl Renderer {
             }
             if let Some(l) = p.loc("iChannelResolution") {
                 gl.uniform_3_f32_slice(Some(l), &res);
+            }
+            if let Some(l) = p.loc("iChannelMeta") {
+                gl.uniform_4_f32_slice(Some(l), &meta);
             }
             for (name, a) in &shot.uniforms {
                 if let Some(l) = p.loc(name) {
@@ -1892,7 +1946,7 @@ impl Renderer {
             // Sampler objects override texture state on their unit: unbind them, or
             // the composite pass (and egui) would sample through them.
             if sampled {
-                for n in 0..4 {
+                for n in 0..N_CHANNELS as u32 {
                     gl.bind_sampler(n, None);
                 }
             }
@@ -2506,11 +2560,11 @@ pub fn scene_source(dialect: Dialect, shot: &Shot, cues: &str, movie: &Movie) ->
         .build())
 }
 
-/// Which of `iChannel0..3` an assembled scene mentions, outside the header that
+/// Which of `iChannel0..7` an assembled scene mentions, outside the header that
 /// declares them (`check` warns when a shot reads a channel it binds nothing to).
-pub fn channels_read(src: &Assembled) -> [bool; 4] {
+pub fn channels_read(src: &Assembled) -> [bool; N_CHANNELS] {
     let text = src.text.replacen(SCENE_HEADER, "", 1);
-    let mut out = [false; 4];
+    let mut out = [false; N_CHANNELS];
     for (n, name) in CHANNEL_UNIFORMS.iter().enumerate() {
         out[n] = text.match_indices(name).any(|(i, _)| {
             let before = text[..i].chars().next_back();

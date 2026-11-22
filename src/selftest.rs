@@ -106,6 +106,14 @@ const CHECKS: &[Check] = &[
         run: texture_unpack_state,
     },
     Check {
+        name: "iChannel4..7 bind like 0..3, with resolution and black when unbound",
+        run: channels_high,
+    },
+    Check {
+        name: "text textures: drawn without blocking, iChannelMeta reaches the shader, edits compile nothing",
+        run: text_textures,
+    },
+    Check {
         name: "chunked sound matches a single-pass render",
         run: sound_chunk_equivalence,
     },
@@ -2034,6 +2042,156 @@ fn texture_streaming(gl: &Gl, dir: &Path) -> Result<String> {
         "ready after {frames} frame(s), {} upload bands",
         r.texture_bands
     ))
+}
+
+fn channels_high(gl: &Gl, dir: &Path) -> Result<String> {
+    png(dir, "t/quad.png", 2, 2, quadrants)?;
+    png(dir, "t/magenta.png", 3, 5, |_, _| [200, 0, 200, 255])?;
+    // Quarters across: iChannel7 stretched (orientation), iChannel5 (unbound),
+    // iChannel4, and iChannelResolution[4] / [5] / [7] as colours.
+    write(
+        dir,
+        &[(
+            "s.glsl",
+            &scene(
+                "float q = floor(uv.x * 4.0);\n  \
+                 vec3 r = vec3(iChannelResolution[7].xy, iChannelResolution[5].x + iChannelResolution[4].x + iChannelResolution[4].y + iChannelResolution[4].z * 2.0) / 10.0;\n  \
+                 vec3 c = q < 1.0 ? texture(iChannel7, vec2(uv.x * 4.0, uv.y)).rgb\n    \
+                 : q < 2.0 ? texture(iChannel5, uv).rgb + 0.2 * iChannelResolution[5].z\n    \
+                 : q < 3.0 ? texture(iChannel4, uv).rgb : r;\n  \
+                 fragColor = vec4(c, 1.0);",
+            ),
+        )],
+    )?;
+    let m = movie(
+        dir,
+        "shotglass = \"0.1.3\"\n[[shot]]\nid=\"a\"\nscene=\"s.glsl\"\nduration=1\n\
+         channels = [\"\", \"\", \"\", \"\", { file = \"t/magenta.png\", filter = \"nearest\" }, \"\", \"\", \
+         { file = \"t/quad.png\", filter = \"nearest\" }]\n",
+    )?;
+    let mut r = renderer(gl, &m)?;
+    let f = shot(&mut r, &m, at_shot(0, 0.5), 1.0)?;
+    expect_px("iChannel7 top-left", &f, 10, 10, [255, 0, 0], 1)?;
+    expect_px("iChannel7 bottom-right", &f, 30, 80, [255, 255, 255], 1)?;
+    expect_px(
+        "unbound iChannel5 (black, resolution 0)",
+        &f,
+        60,
+        45,
+        [0, 0, 0],
+        1,
+    )?;
+    expect_px("iChannel4", &f, 100, 45, [200, 0, 200], 1)?;
+    // [7] = (2, 2, 1), [5] = 0, [4] = (3, 5, 1) → b = (3 + 5 + 2) / 10.
+    expect_px("iChannelResolution[4..7]", &f, 140, 45, [51, 51, 255], 1)?;
+    Ok(String::new())
+}
+
+/// The fixture font, embedded so the selftest runs from an installed binary too.
+const TEST_FONT: &[u8] = include_bytes!("../tests/films/text/fonts/NotoSans-subset.ttf");
+
+fn text_textures(gl: &Gl, dir: &Path) -> Result<String> {
+    std::fs::create_dir_all(dir.join("fonts"))?;
+    std::fs::write(dir.join("fonts/sans.ttf"), TEST_FONT)?;
+    png(dir, "t/grey.png", 2, 2, |_, _| [128, 128, 128, 255])?;
+    // Left half: the text block stretched over it (coverage in red, distance in green).
+    // Right half: iChannelMeta[0] (em, padding, pitch) / 255, plus iChannelMeta[1] (an
+    // image: must be 0) as blue.
+    write(
+        dir,
+        &[(
+            "s.glsl",
+            &scene(
+                "vec4 t = texture(iChannel0, vec2(uv.x * 2.0, uv.y));\n  \
+                 vec3 meta = vec3(iChannelMeta[0].x, iChannelMeta[0].w, iChannelMeta[0].z) / 255.0;\n  \
+                 meta.b += dot(iChannelMeta[1], vec4(1.0));\n  \
+                 fragColor = vec4(uv.x < 0.5 ? vec3(t.r, t.g, t.a) : meta, 1.0);",
+            ),
+        )],
+    )?;
+    let toml = |words: &str| {
+        format!(
+            "shotglass = \"0.1.3\"\n[fonts]\nsans = {{ file = \"fonts/sans.ttf\", licence = \"OFL-1.1\" }}\n\
+             [texts]\ntitle = {{ text = \"{words}\", font = \"sans\", size = 120, sdf_spread = 6 }}\n\
+             [[shot]]\nid=\"a\"\nscene=\"s.glsl\"\nduration=2\nchannels = [\"title\", \"t/grey.png\"]\n"
+        )
+    };
+    let m = movie(dir, &toml("HI"))?;
+    // Blocking render (as still/export): the reference.
+    let want = {
+        let mut r = renderer(gl, &m)?;
+        shot(&mut r, &m, at_shot(0, 0.5), 1.0)?
+    };
+    // iChannelMeta: em 120, padding 6, pitch 1.2 × 120 = 144; an image's meta is 0.
+    expect_px("iChannelMeta", &want, 120, 45, [120, 6, 144], 1)?;
+    // The block: padding is empty (coverage 0, distance far outside); the letters are ink.
+    expect_px("text padding", &want, 1, 1, [0, 0, 0], 2)?;
+    let inked = (0..80)
+        .flat_map(|c| (0..90).map(move |r| (c, r)))
+        .filter(|&(c, r)| px(&want, c, r)[0] == 255)
+        .count();
+    if inked < 300 {
+        bail!("the text block has {inked} fully covered pixels; expected the letters' ink");
+    }
+    for (c, r) in (0..80).flat_map(|c| (0..90).map(move |r| (c, r))) {
+        let p = px(&want, c, r);
+        if p[0] != p[2] {
+            bail!("text alpha differs from coverage at ({c}, {r}): {p:?}");
+        }
+    }
+    // Playing from cold: frames are held (never drawn half-made) until the block is
+    // rasterised and uploaded, nothing loads on the spot, and the frame matches still.
+    let mut r = Renderer::new(gl.clone())?;
+    r.set_cache_dir(None);
+    r.set_movie(&m).map_err(|e| anyhow!("{e:?}"))?;
+    let mut frames = 0;
+    let got = loop {
+        if r.render(&m, W, H, &info(0.5, 1.0), false).is_some() {
+            break r.read_output().unwrap();
+        }
+        frames += 1;
+        if frames > 5000 {
+            bail!("the text shot never became ready without blocking");
+        }
+        r.pump(&m, 0.5, false);
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    };
+    if frames == 0 {
+        bail!("a non-blocking render drew before the text was rasterised");
+    }
+    if r.blocking_texture_loads != 0 {
+        bail!(
+            "playback rasterised {} text(s) on the spot",
+            r.blocking_texture_loads
+        );
+    }
+    expect_same("non-blocking render of a text", &got, &want, 0, 0.0)?;
+    // New words: a new texture, no program compiled.
+    let compiles = r.compiles_started;
+    let m2 = movie(dir, &toml("Hi there"))?;
+    r.set_movie(&m2).map_err(|e| anyhow!("{e:?}"))?;
+    let changed = shot(&mut r, &m2, at_shot(0, 0.5), 1.0)?;
+    if diff(&changed, &want, 0).1 == 0.0 {
+        bail!("editing the text didn't change the picture");
+    }
+    if r.compiles_started != compiles {
+        bail!(
+            "a text edit compiled {} program(s)",
+            r.compiles_started - compiles
+        );
+    }
+    // A broken font refuses the edit; the last working version stays up.
+    std::fs::write(dir.join("fonts/sans.ttf"), b"<html>not a font</html>")?;
+    match movie(dir, &toml("Bye")) {
+        Ok(_) => bail!("a broken font was accepted on load"),
+        Err(e) if !format!("{e:#}").contains("not a font") => {
+            bail!("the broken font wasn't explained: {e:#}")
+        }
+        Err(_) => {}
+    }
+    let after = shot(&mut r, &m2, at_shot(0, 0.5), 1.0)?;
+    expect_same("after a refused text edit", &after, &changed, 0, 0.0)?;
+    Ok(format!("ready after {frames} frame(s)"))
 }
 
 fn texture_edits(gl: &Gl, dir: &Path) -> Result<String> {

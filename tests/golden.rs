@@ -1,7 +1,7 @@
 //! Golden regression tests: renders a contact sheet and the soundtrack of the demo film
-//! and of the `shotglass new` template (and a contact sheet of tests/films/channels, the
-//! iChannel textures film, and both of tests/films/loop, a `loop = true` film) and
-//! compares them with reference PNGs and WAVs
+//! and of the `shotglass new` template (and contact sheets of tests/films/channels, the
+//! iChannel textures film, and tests/films/text, the text film, and both of
+//! tests/films/loop, a `loop = true` film) and compares them with reference PNGs and WAVs
 //! in tests/golden/, so "compiles but looks (or sounds) wrong" fails `cargo test` (and
 //! CI, on software OpenGL).
 //!
@@ -211,6 +211,22 @@ fn channels_film() {
         &root().join("tests").join("films").join("channels"),
         &["--count", COUNT],
         &["--max-mean", "0.4"],
+    );
+}
+
+/// Text (#68): tests/films/text, a title's coverage and its distance field magnified
+/// 4× with an outline, a wrapped centred paragraph and a right-to-left line on
+/// iChannel6/7. The blocks are rasterised on the CPU, so the GPU only filters them.
+#[test]
+fn text_film() {
+    if skip() {
+        return;
+    }
+    golden_frames(
+        "text",
+        &root().join("tests").join("films").join("text"),
+        &["--count", COUNT],
+        &[],
     );
 }
 

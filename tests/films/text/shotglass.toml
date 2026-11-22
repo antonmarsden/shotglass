@@ -1,0 +1,2 @@
+# Engine contract: text ([fonts], [texts]) and iChannel4..7 need shotglass 0.1.3.
+shotglass = "0.1.3"

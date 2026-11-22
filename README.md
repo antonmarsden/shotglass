@@ -160,7 +160,8 @@ These uniforms are available:
 | `iResolution`, `iTime`, `iTimeDelta`, `iFrame`, `iFrameRate`, `iDate`, `iMouse` | as on Shadertoy. `iTime` is the shot's own clock (plus `time_offset`) |
 | `iShotTime`, `iShotDuration`, `iShotProgress` | shot-local seconds, the shot's length, and 0→1 over the shot |
 | `iMovieTime` | seconds since the start of the movie |
-| `iChannel0..3`, `iChannelResolution[4]` | images from the shot's `channels` (see [Textures](#textures)); an unbound channel reads black and its resolution is 0. `iChannelTime` is 0 |
+| `iChannel0..7`, `iChannelResolution[8]` | images and text from the shot's `channels` (see [Textures](#textures)); an unbound channel reads black and its resolution is 0. Shadertoy code uses 0–3; 4–7 are shotglass's. `iChannelTime` is 0 |
+| `iChannelMeta[8]` | a text channel's metrics in texels: (em, first baseline from the top, line pitch, padding); 0 for images (see [Text](#text)) |
 | your `uniforms.*` | declared automatically from `movie.toml` |
 | `CUE_<ID>_START`, `CUE_<ID>_SETTLED`, `CUE_<ID>_END`, `MOVIE_DURATION` | `#define`s from the edit (`SETTLED` = the incoming transition has finished) |
 
@@ -171,8 +172,9 @@ shared helpers can include each other freely.
 
 ### Textures
 
-A shot can bind up to four PNG or JPEG images to `iChannel0..3`, as on Shadertoy
-(needs `shotglass = "0.1.1"` in `shotglass.toml`):
+A shot can bind up to eight PNG or JPEG images (or [text blocks](#text)) to
+`iChannel0..7`; Shadertoy has four, so pasted code uses 0–3 (needs
+`shotglass = "0.1.1"` in `shotglass.toml`, and `"0.1.3"` for channels 4–7):
 
 ```toml
 channels = ["noise"]            # film-wide default for shots without their own (before any table)
@@ -213,11 +215,13 @@ shotglass tells what an entry is from how it's written, the same way everywhere:
 | `"renders/fog_####.png"` (one run of `#` in the file name) | an image sequence, `#` = frame number |
 | `"footage/surf.mp4"` (`.mp4`, `.m4v`, `.mov`, `.mkv`, `.webm`, `.avi`) | a video |
 | `"@input"`, `"@title"` | another pass's picture (layers) |
-| `{ file = "…", … }` | an image with options; later also `{ frames = … }`, `{ video = … }`, `{ text = … }` |
+| `{ file = "…", … }` | an image with options |
+| `{ text = "title", … }` | a `[texts]` entry with sampling options (`filter`, `wrap`, `vflip`) |
 
-Only images bind today. The other kinds are recognised so a film that uses one gets a
-clear message naming the shotglass version that brings it (text in 0.1.3, layers and `@`
-sources in 0.1.4, image sequences in 0.1.5, then video), instead of an unrelated error.
+Names come from `[textures]` and `[texts]`, which share one namespace. Images and text
+bind today. The other kinds are recognised so a film that uses one gets a clear message
+naming the shotglass version that brings it (layers and `@` sources in 0.1.4, image
+sequences in 0.1.5, then video), instead of an unrelated error.
 
 | option | values | default |
 |---|---|---|
@@ -244,6 +248,85 @@ out looks too dark.
   a missing file refuses the edit, like a missing `#include`.
 - `check` decodes every texture (also with `--no-gpu`), prints sizes and memory, and warns
   when a scene reads an `iChannel` its shot binds nothing to.
+
+### Text
+
+Text is a texture: name fonts in `[fonts]` and text blocks in `[texts]`, and bind a block
+to a channel like an image (needs `shotglass = "0.1.3"`):
+
+```toml
+[fonts]
+body = { file = "fonts/Inter-Regular.ttf", licence = "OFL-1.1" }
+bold = { file = "fonts/Inter-Variable.ttf", variations = { wght = 700 }, licence = "OFL-1.1" }
+display = { file = "<kit/fonts/Bungee-Regular.ttf>", fallback = ["body"] }   # from a library
+arabic = "fonts/NotoNaskhArabic-Regular.ttf"
+
+[texts]
+title = { text = "Big Shadow", font = "display", size = 160 }
+tagline = { text = "a tiny mouse, a tealight,\nand a lot of wall", font = "body", size = 72, width = 1400, align = "center" }
+hello = { text = "مرحبا بالعالم", font = "arabic", size = 96 }
+credits = { file = "credits.txt", font = "body", size = 48, align = "center" }
+
+[[shot]]
+id = "titlecard"
+scene = "scenes/title.glsl"
+duration = 4.0
+channels = ["title", "tagline"]          # iChannel0 = title, iChannel1 = tagline
+```
+
+shotglass lays the text out and rasterises it once, on the CPU, into a texture whose
+**red and alpha** are the antialiased coverage (so `texture(iChannel0, uv).a` is the
+text) and whose **green** is a signed distance field: 0.5 on the outline, rising inside.
+The distance field stays crisp when a shader scales the text up, and makes outlines,
+glows and shadows cheap:
+
+```glsl
+float d = texture(iChannel0, uv).g;               // 0.5 at the edge
+float w = fwidth(d) * 0.75;
+float ink = smoothstep(0.5 - w, 0.5 + w, d);      // crisp at any scale
+float outline = smoothstep(0.42 - w, 0.42 + w, d) - ink;
+```
+
+What text *looks like* (placement, colour, outlines, fades) is up to the shader, or to a
+library such as shotglass-kit's text helpers; the engine only supplies the pixels and the
+metrics. `iChannelMeta[n]` gives a text channel's em size, first baseline (from the top),
+line pitch and padding, in texels, so blocks can be sized and aligned consistently.
+Changing the words or the style makes a new texture and never recompiles a shader.
+
+| `[texts]` option | values | default |
+|---|---|---|
+| `text` / `file` | the words, or a UTF-8 file of them (one is required); `\n` starts a new line | – |
+| `font` | a name from `[fonts]` (required) | – |
+| `size` | the em in texture pixels, 4–1024: rasterise as large as it appears on screen | 64 |
+| `width` | wrap width in pixels; without it lines break only at `\n` | none |
+| `align` | `"left"`, `"center"`, `"right"`, `"start"`, `"end"` (start = left for left-to-right text, right for right-to-left) | `"start"` |
+| `line_height` | line pitch in ems | 1.2 |
+| `letter_spacing` | extra space after each letter, in ems | 0 |
+| `max_lines` | more lines than this is an error (a title that silently wraps is a bug) | none |
+| `direction` | `"auto"` (from the first strong letter of each paragraph), `"ltr"`, `"rtl"` | `"auto"` |
+| `features` | OpenType features: `["ss01", "-liga", "tnum"]` | none |
+| `sdf_spread` | distance-field reach in pixels, also the padding around the text | 8 |
+| `filter`, `wrap`, `vflip` | as for images | `"linear"`, `"clamp"`, `true` |
+
+| `[fonts]` option | values |
+|---|---|
+| `file` | a `.ttf`, `.otf` or `.ttc` in the film or `<library/path>` (pinned by `shotglass.lock`) |
+| `index` | the face in a `.ttc` collection (default 0) |
+| `variations` | fixed axis values of a variable font: `{ wght = 700, wdth = 90 }` |
+| `fallback` | fonts to try, in order, for letters this one doesn't have |
+| `licence` | the font's SPDX licence (`"OFL-1.1"`), for a font in the film folder |
+
+- Fonts come only from the film or its libraries, never from the system, and are not
+  hinted, so text looks the same on every machine and in `export`.
+- Shaping (kerning, ligatures, Arabic joining, marks) is HarfBuzz's, via rustybuzz;
+  mixed left-to-right and right-to-left text is ordered per line (Unicode bidi).
+- Each letter uses the first font in the fallback chain that has it. A letter no font
+  has is an error that names it (`check` and the player refuse the edit), as are a text
+  over `max_lines` and a block larger than 4096 pixels on a side.
+- Texts lay out on the texture thread like images decode, so playback never waits for
+  them; save the text file or a font and the block reloads.
+- `check` lists every block's size, lines and fonts, and warns about film fonts without
+  a `licence`.
 
 Shadertoy's built-in textures (its noise, "Organic", "Abstract" and so on) aren't licensed
 for redistribution, so shotglass doesn't ship them. Use your own images, CC0 ones (e.g.

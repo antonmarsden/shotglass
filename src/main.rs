@@ -15,6 +15,7 @@ mod project;
 mod selftest;
 mod shader;
 mod sound;
+mod text;
 mod texture;
 mod validate;
 
@@ -801,52 +802,98 @@ fn strict_check(m: &Movie, web: bool) -> Result<()> {
     Ok(())
 }
 
-/// The texture part of `check` (no GPU needed): decode every texture, check the limits
-/// and each shot's memory, and point out channels a scene reads but nothing is bound to.
+/// The texture part of `check` (no GPU needed): decode every texture and lay out every
+/// text, check the limits and each shot's memory, and point out channels a scene reads
+/// but nothing is bound to.
 fn check_textures(m: &Movie, web: bool) -> Result<()> {
     if let Some(w) = m.contract_warning() {
         println!("warning: {w}");
     }
-    let mut sizes: std::collections::HashMap<PathBuf, (usize, usize)> = Default::default();
+    let mut sizes: Vec<(&movie::Source, (usize, usize))> = vec![];
     let mut failed = 0;
+    let flags = |c: &movie::Channel| match (c.srgb, c.vflip) {
+        (true, true) => ", srgb",
+        (true, false) => ", srgb, vflip = false",
+        (false, false) => ", vflip = false",
+        (false, true) => "",
+    };
     for c in m.textures() {
-        match texture::load(&c.file, &c.label, c.vflip) {
-            Ok(img) => {
-                let (w, h) = (img.width, img.height);
-                println!(
-                    "texture {}: {w}×{h}, {} on the GPU{}",
-                    c.label,
-                    texture::describe_bytes(texture::gpu_bytes(w, h)),
-                    match (c.srgb, c.vflip) {
-                        (true, true) => ", srgb",
-                        (true, false) => ", srgb, vflip = false",
-                        (false, false) => ", vflip = false",
-                        (false, true) => "",
-                    }
-                );
-                for warning in &img.warnings {
-                    println!("warning: {warning}");
-                }
-                if w.max(h) > texture::WEB_MAX_SIZE {
-                    let max = texture::WEB_MAX_SIZE;
+        let size = match &c.source {
+            movie::Source::Image(f) => match texture::load(&f.file, &f.label, c.vflip) {
+                Ok(img) => {
+                    let (w, h) = (img.width, img.height);
                     println!(
-                        "warning: {}: {w}×{h} is over {max}×{max}, the most some phones' browsers \
-                         support{}",
-                        c.label,
-                        if web {
-                            ""
-                        } else {
-                            " (matters for the web player)"
-                        }
+                        "texture {}: {w}×{h}, {} on the GPU{}",
+                        f.label,
+                        texture::describe_bytes(texture::gpu_bytes(w, h)),
+                        flags(c)
                     );
+                    for warning in &img.warnings {
+                        println!("warning: {warning}");
+                    }
+                    Some((w, h))
                 }
-                sizes.insert(c.file.clone(), (w, h));
-            }
-            Err(e) => {
-                eprintln!("{e}");
-                failed += 1;
-            }
+                Err(e) => {
+                    eprintln!("{e}");
+                    None
+                }
+            },
+            movie::Source::Text(t) => match t.layout() {
+                Ok((l, _)) => {
+                    println!(
+                        "text \"{}\": {}×{}, {} line{}, font{} {}, {} on the GPU{}",
+                        t.name,
+                        l.width,
+                        l.height,
+                        l.lines,
+                        if l.lines == 1 { "" } else { "s" },
+                        if t.fonts.len() == 1 { "" } else { "s" },
+                        t.fonts
+                            .iter()
+                            .map(|f| f.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(" → "),
+                        texture::describe_bytes(texture::gpu_bytes(l.width, l.height)),
+                        flags(c)
+                    );
+                    for warning in &l.warnings {
+                        println!("warning: text \"{}\": {warning}", t.name);
+                    }
+                    for f in t.fonts.iter().filter(|f| f.file.library.is_none()) {
+                        if f.licence.is_none() {
+                            println!(
+                                "warning: font \"{}\" ({}) has no licence = \"…\"; say which \
+                                 (e.g. \"OFL-1.1\") so `shotglass licenses` can list it",
+                                f.name, f.file.label
+                            );
+                        }
+                    }
+                    Some((l.width, l.height))
+                }
+                Err(e) => {
+                    eprintln!("{e:#}");
+                    None
+                }
+            },
+        };
+        let Some((w, h)) = size else {
+            failed += 1;
+            continue;
+        };
+        if w.max(h) > texture::WEB_MAX_SIZE {
+            let max = texture::WEB_MAX_SIZE;
+            println!(
+                "warning: {}: {w}×{h} is over {max}×{max}, the most some phones' browsers \
+                 support{}",
+                c.label(),
+                if web {
+                    ""
+                } else {
+                    " (matters for the web player)"
+                }
+            );
         }
+        sizes.push((&c.source, (w, h)));
     }
     if failed > 0 {
         bail!("{failed} texture(s) can't be used");
@@ -854,14 +901,20 @@ fn check_textures(m: &Movie, web: bool) -> Result<()> {
     let mut largest: Option<(usize, &str)> = None;
     let cues = m.cue_defines();
     for s in &m.shots {
-        let mut files: Vec<&PathBuf> = s.channels.iter().flatten().map(|c| &c.file).collect();
-        files.sort();
-        files.dedup();
-        let total: usize = files
-            .iter()
-            .filter_map(|f| sizes.get(*f))
-            .map(|(w, h)| texture::gpu_bytes(*w, *h))
-            .sum();
+        let mut sources: Vec<&movie::Source> =
+            s.channels.iter().flatten().map(|c| &c.source).collect();
+        sources.dedup();
+        let mut counted: Vec<&movie::Source> = vec![];
+        let mut total = 0;
+        for src in sources {
+            if counted.contains(&src) {
+                continue;
+            }
+            counted.push(src);
+            if let Some((_, (w, h))) = sizes.iter().find(|(s, _)| *s == src) {
+                total += texture::gpu_bytes(*w, *h);
+            }
+        }
         if total > 0 && largest.is_none_or(|(b, _)| total > b) {
             largest = Some((total, &s.id));
         }
@@ -884,7 +937,7 @@ fn check_textures(m: &Movie, web: bool) -> Result<()> {
     }
     if let Some((b, id)) = largest {
         println!(
-            "textures: {} file(s); the most one shot needs is {} (shot \"{id}\"; budget {})",
+            "textures: {} in all; the most one shot needs is {} (shot \"{id}\"; budget {})",
             sizes.len(),
             texture::describe_bytes(b),
             texture::describe_bytes(texture::BUDGET)
