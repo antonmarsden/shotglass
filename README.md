@@ -201,6 +201,24 @@ Each entry of `channels` is a name from `[textures]`, a path in the film folder,
 `{ file = "…", … }` with options, or `""` (black). A shot's `channels` replaces the
 film-wide default entirely; `channels = []` binds nothing.
 
+#### Channel sources
+
+shotglass tells what an entry is from how it's written, the same way everywhere:
+
+| written | is |
+|---|---|
+| `""` | nothing: the channel reads black |
+| `"brick"` (no `.`, `/` or `<`) | a name from `[textures]` |
+| `"textures/brick.png"`, `"<kit/textures/noise.png>"` | an image (`.png`, `.jpg`, `.jpeg`) |
+| `"renders/fog_####.png"` (one run of `#` in the file name) | an image sequence, `#` = frame number |
+| `"footage/surf.mp4"` (`.mp4`, `.m4v`, `.mov`, `.mkv`, `.webm`, `.avi`) | a video |
+| `"@input"`, `"@title"` | another pass's picture (layers) |
+| `{ file = "…", … }` | an image with options; later also `{ frames = … }`, `{ video = … }`, `{ text = … }` |
+
+Only images bind today. The other kinds are recognised so a film that uses one gets a
+clear message naming the shotglass version that brings it (text in 0.1.3, layers and `@`
+sources in 0.1.4, image sequences in 0.1.5, then video), instead of an unrelated error.
+
 | option | values | default |
 |---|---|---|
 | `filter` | `"mipmap"` (trilinear), `"linear"`, `"nearest"` | `"mipmap"` |

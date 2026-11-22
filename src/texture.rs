@@ -184,7 +184,9 @@ pub fn dimensions(path: &Path) -> Option<(usize, usize)> {
 /// Texture memory a shot's channels need at once (each file once, read from the
 /// image headers), and a description per file for messages. Unreadable files count 0:
 /// their decode error is reported where they're used.
-pub fn shot_memory(channels: &[Option<crate::movie::Channel>; 4]) -> (usize, Vec<String>) {
+pub fn shot_memory(
+    channels: &[Option<crate::movie::Channel>; crate::movie::N_CHANNELS],
+) -> (usize, Vec<String>) {
     let mut seen: Vec<&Path> = vec![];
     let mut total = 0;
     let mut parts = vec![];
