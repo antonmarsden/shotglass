@@ -471,6 +471,11 @@ impl Renderer {
                 glow::UNSIGNED_BYTE,
                 glow::PixelUnpackData::Slice(Some(&[0, 0, 0, 255])),
             );
+            // One level, so no mipmap filter: the default NEAREST_MIPMAP_LINEAR would
+            // leave it incomplete (macOS reads it as zero, not opaque black).
+            for p in [glow::TEXTURE_MIN_FILTER, glow::TEXTURE_MAG_FILTER] {
+                gl.tex_parameter_i32(glow::TEXTURE_2D, p, glow::NEAREST as i32);
+            }
             gl.bind_texture(glow::TEXTURE_2D, None);
             let timer = if driver.es { None } else { GpuTimer::new(&gl) };
             let ext = gl.supported_extensions();
@@ -1760,7 +1765,17 @@ impl Renderer {
             if let Some(l) = p.loc("uOutRes") {
                 self.gl.uniform_2_f32(Some(l), 4.0, 4.0);
             }
+            // Samplers need something loadable on their units: with nothing bound,
+            // macOS logs "unit 0 GLD_TEXTURE_INDEX_2D is unloadable".
+            for n in 0..N_CHANNELS as u32 {
+                self.gl.active_texture(glow::TEXTURE0 + n);
+                self.gl.bind_texture(glow::TEXTURE_2D, Some(self.dummy));
+            }
             self.gl.draw_arrays(glow::TRIANGLES, 0, 3);
+            for n in (0..N_CHANNELS as u32).rev() {
+                self.gl.active_texture(glow::TEXTURE0 + n);
+                self.gl.bind_texture(glow::TEXTURE_2D, None);
+            }
             self.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
             self.gl.use_program(None);
             self.gl.bind_vertex_array(None);
