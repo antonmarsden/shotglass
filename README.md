@@ -308,6 +308,38 @@ Changing the words or the style makes a new texture and never recompiles a shade
 | `sdf_spread` | distance-field reach in pixels, also the padding around the text | 8 |
 | `filter`, `wrap`, `vflip` | as for images | `"linear"`, `"clamp"`, `true` |
 
+#### Getting fonts
+
+Fetch any family from [Google Fonts](https://fonts.google.com) by name:
+
+```sh
+shotglass fonts add "Lobster" "Atkinson Hyperlegible" --film movies/my-film
+```
+
+This copies the family's font files into the film's `fonts/<family>/` folder, with
+their licence file, `METADATA.pb` and a `SOURCE.txt` naming the google/fonts commit they
+came from, and adds an entry per file to `[fonts]` in `movie.toml` with its licence:
+
+```toml
+[fonts]
+lobster = { file = "fonts/lobster/Lobster-Regular.ttf", licence = "OFL-1.1" }
+atkinsonhyperlegible_bold = { file = "fonts/atkinsonhyperlegible/AtkinsonHyperlegible-Bold.ttf", licence = "OFL-1.1" }
+```
+
+- Names are as fonts.google.com shows them. Entries are named after the family, plus the
+  weight and `_italic` for the other styles; variable fonts get one entry per file
+  (`Inter[opsz,wght].ttf` is saved as `Inter-Variable.ttf`) and the command prints
+  their axes, for `variations`.
+- Licences come from where Google Fonts keeps the family: nearly all are SIL OFL 1.1, a
+  few Apache 2.0 or the Ubuntu Font Licence. All allow using the fonts in a film and
+  passing them on unmodified; `shotglass licenses` lists them.
+- Only this command uses the network (it needs git, like `fetch`; it downloads just
+  those families). Commit the `fonts/` folder with the film: playback, `export`,
+  `bundle` and `freeze` use the copies, so the film looks the same everywhere.
+  `--rev <commit>` takes the files from a given google/fonts commit.
+- Any other TTF/OTF works too: put it in the film and name it in `[fonts]`, with its
+  `licence`.
+
 | `[fonts]` option | values |
 |---|---|
 | `file` | a `.ttf`, `.otf` or `.ttc` in the film or `<library/path>` (pinned by `shotglass.lock`) |
@@ -978,7 +1010,8 @@ shotglass export <movie> --out film.webm [--size 1920x1080] [--format webm|av1|f
 shotglass new    <dir>
 shotglass fetch  <movie>                                   # download libraries, write shotglass.lock
 shotglass update <movie> [library..]                       # move library pins to the newest allowed
-shotglass licenses <movie>                                 # libraries the film includes and their licences
+shotglass licenses <movie>                                 # libraries the film includes, film fonts, and their licences
+shotglass fonts add "Family" [..] [--film <dir>] [--rev <commit>]  # fetch Google Fonts families into the film
 shotglass bundle <movie> --out <dir>                       # self-contained copy with the library files it includes
 shotglass freeze <movie>                                   # copy the library files it includes into the film
 shotglass unfreeze <movie>                                 # follow the project's libraries again

@@ -30,6 +30,8 @@ semver = "1.0.28"
 serde = { version = "1.0.229", features = ["derive"] }
 sha2 = "0.11.1"
 toml = "1.2.1"
+# `shotglass fonts add` edits movie.toml in place, keeping comments and order.
+toml_edit = "0.25.19"
 toodee = "0.8"
 ttf-parser = "0.25.1"
 unicode-bidi = "0.3.18"

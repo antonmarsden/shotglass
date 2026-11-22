@@ -211,7 +211,44 @@ pub fn print_licences(movie: &Path) -> Result<()> {
             none.join(", ")
         );
     }
+    let fonts = film_fonts(&m);
+    if !fonts.is_empty() {
+        println!("\nfonts in the film folder:");
+        for (name, label, licence) in &fonts {
+            println!(
+                "  {name}  {label}  {}",
+                licence.as_deref().unwrap_or("[no licence given]")
+            );
+        }
+        let missing: Vec<&str> = fonts
+            .iter()
+            .filter(|f| f.2.is_none())
+            .map(|f| f.0.as_str())
+            .collect();
+        if !missing.is_empty() {
+            println!(
+                "\nwarning: no licence = \"…\" for font{} {}; say which before you publish \
+                 (fonts from `shotglass fonts add` have it)",
+                if missing.len() == 1 { "" } else { "s" },
+                missing.join(", ")
+            );
+        }
+    }
     Ok(())
+}
+
+/// Fonts the film's texts use from its own folder (library fonts are covered by their
+/// library's licences): (name, file as written, licence), each once, in use order.
+pub fn film_fonts(m: &Movie) -> Vec<(String, String, Option<String>)> {
+    let mut out: Vec<(String, String, Option<String>)> = vec![];
+    for t in m.channels().filter_map(|c| c.text()) {
+        for f in t.fonts.iter().filter(|f| f.file.library.is_none()) {
+            if !out.iter().any(|o| o.0 == f.name) {
+                out.push((f.name.clone(), f.file.label.clone(), f.licence.clone()));
+            }
+        }
+    }
+    out
 }
 
 /// What `freeze` or `bundle` wrote.
@@ -840,6 +877,30 @@ mod tests {
         ] {
             assert!(!library::is_non_commercial(ok), "{ok}");
         }
+    }
+
+    #[test]
+    fn film_fonts_are_listed_with_their_licences() {
+        let text = "[libraries]\nkit = { path = \"lib/kit\" }\n[fonts]\n\
+             lobster = { file = \"fonts/lobster/Lobster-Regular.ttf\", licence = \"OFL-1.1\" }\n\
+             mine = \"fonts/Mine.otf\"\nkitfont = \"<kit/fonts/K.ttf>\"\nunused = \"fonts/U.ttf\"\n\
+             [texts]\na = { text = \"x\", font = \"lobster\" }\nb = { text = \"y\", font = \"mine\" }\n\
+             c = { text = \"z\", font = \"kitfont\" }\n\
+             [[shot]]\nid = \"s\"\nscene = \"a.glsl\"\nduration = 1\nchannels = [\"a\", \"b\", \"c\", \"a\"]\n";
+        let (p, mv) = crate::project::split_fixture(text);
+        let project = crate::project::Project::parse(&p, Path::new("/film")).unwrap();
+        let m = Movie::parse_in(&mv, Path::new("/film"), &project).unwrap();
+        assert_eq!(
+            film_fonts(&m),
+            vec![
+                (
+                    "lobster".to_string(),
+                    "fonts/lobster/Lobster-Regular.ttf".to_string(),
+                    Some("OFL-1.1".to_string())
+                ),
+                ("mine".to_string(), "fonts/Mine.otf".to_string(), None),
+            ]
+        );
     }
 
     #[test]

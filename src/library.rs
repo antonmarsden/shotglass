@@ -1192,7 +1192,7 @@ fn download(
 pub struct Git;
 
 impl Git {
-    fn run(args: &[&str]) -> Result<String> {
+    pub(crate) fn run(args: &[&str]) -> Result<String> {
         let out = std::process::Command::new("git")
             // Paths past 260 characters on Windows (deep caches); ignored elsewhere.
             .args(["-c", "core.longpaths=true"])

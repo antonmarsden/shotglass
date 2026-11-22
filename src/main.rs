@@ -5,6 +5,7 @@ mod app;
 mod audio;
 mod bundle;
 mod export;
+mod fonts;
 mod gfx;
 mod glsl_test;
 mod golden;
@@ -39,6 +40,25 @@ struct Cli {
     cmd: Option<Cmd>,
     /// Movie folder (or movie.toml) to play.
     movie: Option<PathBuf>,
+}
+
+#[derive(Subcommand)]
+enum FontsCmd {
+    /// Fetch font families from Google Fonts (github.com/google/fonts) into the film:
+    /// the files, their licence and where they came from go in fonts/<family>/, and
+    /// movie.toml gets a [fonts] entry per file with its licence. Needs git; only this
+    /// command uses the network, the film then plays from its own folder.
+    Add {
+        /// Family names as fonts.google.com shows them ("Lobster", "Atkinson Hyperlegible").
+        #[arg(required = true)]
+        families: Vec<String>,
+        /// The film (a folder with movie.toml).
+        #[arg(long, default_value = ".")]
+        film: PathBuf,
+        /// A google/fonts commit to take the files from (default: the newest).
+        #[arg(long)]
+        rev: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -171,8 +191,14 @@ enum Cmd {
         names: Vec<String>,
     },
     /// List the libraries the film includes, with their licences (flags non-commercial
-    /// ones). A project root lists every film.
+    /// ones), and the film's own fonts. A project root lists every film.
     Licenses { movie: PathBuf },
+    /// Fonts for [fonts]: `shotglass fonts add "Lobster"` fetches families from Google
+    /// Fonts into the film's fonts/ folder and adds their entries to movie.toml.
+    Fonts {
+        #[command(subcommand)]
+        cmd: FontsCmd,
+    },
     /// Write a self-contained copy of the film: its folder plus exactly the locked library
     /// files it includes, playable with no project, network, cache or overrides.
     Bundle {
@@ -336,6 +362,14 @@ fn real_main() -> Result<()> {
             fetch_libraries(&movie, library::FetchMode::Update(names), true)
         }
         Cmd::Licenses { movie } => for_each_film(&movie, bundle::print_licences),
+        Cmd::Fonts {
+            cmd:
+                FontsCmd::Add {
+                    families,
+                    film,
+                    rev,
+                },
+        } => fonts::run_add(&project::film(&film)?, &families, rev.as_deref()),
         Cmd::Bundle { movie, out } => bundle::run_bundle(&project::film(&movie)?, &out),
         Cmd::Freeze { movie } => bundle::run_freeze(&project::film(&movie)?),
         Cmd::Unfreeze { movie } => bundle::run_unfreeze(&project::film(&movie)?),
