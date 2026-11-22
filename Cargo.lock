@@ -2694,6 +2694,7 @@ dependencies = [
  "serde",
  "sha2",
  "toml",
+ "toml_edit",
  "toodee",
  "ttf-parser",
  "unicode-bidi",
@@ -2963,6 +2964,7 @@ dependencies = [
  "indexmap",
  "toml_datetime",
  "toml_parser",
+ "toml_writer",
  "winnow",
 ]
 

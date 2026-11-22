@@ -124,8 +124,16 @@ pub fn licence_report(m: &Movie) -> Result<LicenceReport> {
         };
         rows.push(LicenceRow {
             name: l.name.clone(),
-            canonical: l.canonical.clone(),
-            version: l.version.to_string(),
+            canonical: match &l.google {
+                Some(f) => format!("Google Fonts \"{f}\""),
+                None => l.canonical.clone(),
+            },
+            // A font family has no version; its pin is in `source`.
+            version: if l.google.is_some() {
+                String::new()
+            } else {
+                l.version.to_string()
+            },
             non_commercial: l.licences.iter().any(|x| library::is_non_commercial(x)),
             licences: l.licences.clone(),
             source,
@@ -161,10 +169,14 @@ pub fn print_licences(movie: &Path) -> Result<()> {
     }
     for row in &r.rows {
         println!(
-            "\n{}  ({} {})\n    licences: {}{}\n    source:   {}\n    files:    {} included",
+            "\n{}  ({}{})\n    licences: {}{}\n    source:   {}\n    files:    {} included",
             row.name,
             row.canonical,
-            row.version,
+            if row.version.is_empty() {
+                String::new()
+            } else {
+                format!(" {}", row.version)
+            },
             if row.licences.is_empty() {
                 "none declared".to_string()
             } else {
@@ -211,7 +223,44 @@ pub fn print_licences(movie: &Path) -> Result<()> {
             none.join(", ")
         );
     }
+    let fonts = film_fonts(&m);
+    if !fonts.is_empty() {
+        println!("\nfonts in the film folder:");
+        for (name, label, licence) in &fonts {
+            println!(
+                "  {name}  {label}  {}",
+                licence.as_deref().unwrap_or("[no licence given]")
+            );
+        }
+        let missing: Vec<&str> = fonts
+            .iter()
+            .filter(|f| f.2.is_none())
+            .map(|f| f.0.as_str())
+            .collect();
+        if !missing.is_empty() {
+            println!(
+                "\nwarning: no licence = \"…\" for font{} {}; say which before you publish \
+                 (fonts from `shotglass fonts add` have it)",
+                if missing.len() == 1 { "" } else { "s" },
+                missing.join(", ")
+            );
+        }
+    }
     Ok(())
+}
+
+/// Fonts the film's texts use from its own folder (library fonts are covered by their
+/// library's licences): (name, file as written, licence), each once, in use order.
+pub fn film_fonts(m: &Movie) -> Vec<(String, String, Option<String>)> {
+    let mut out: Vec<(String, String, Option<String>)> = vec![];
+    for t in m.channels().filter_map(|c| c.text()) {
+        for f in t.fonts.iter().filter(|f| f.file.library.is_none()) {
+            if !out.iter().any(|o| o.0 == f.name) {
+                out.push((f.name.clone(), f.file.label.clone(), f.licence.clone()));
+            }
+        }
+    }
+    out
 }
 
 /// What `freeze` or `bundle` wrote.
@@ -246,7 +295,14 @@ fn write_frozen(
     );
     // What the film includes, plus the peers those libraries require (transitively):
     // loading checks peer requirements, so a frozen film must still declare them.
-    let mut keep: BTreeSet<&str> = used.keys().map(String::as_str).collect();
+    // Libraries movie.toml names a file of stay declared even if nothing uses them (an
+    // unused [fonts] entry): parsing checks the name. They're frozen with no files but
+    // their identity and licence.
+    let mut keep: BTreeSet<&str> = used
+        .keys()
+        .map(String::as_str)
+        .chain(m.library_refs.iter().map(String::as_str))
+        .collect();
     loop {
         let before = keep.len();
         for l in &m.libraries {
@@ -278,10 +334,12 @@ fn write_frozen(
             l.licences.join(", ")
         };
         let mut section = format!(
-            "\n## {} ({} {})\n\n- Licences: {licences}{}\n",
+            "\n## {} ({})\n\n- Licences: {licences}{}\n",
             l.name,
-            l.canonical,
-            l.version,
+            match &l.google {
+                Some(f) => format!("Google Fonts \"{f}\""),
+                None => format!("{} {}", l.canonical, l.version),
+            },
             if nc { " (non-commercial)" } else { "" }
         );
         let mut decl = toml::Table::new();
@@ -311,6 +369,7 @@ fn write_frozen(
                 rev: None,
                 subdir: None,
                 path: None,
+                google: None,
                 sha256: String::new(),
             },
             _ => bail!(
@@ -319,8 +378,11 @@ fn write_frozen(
                 library::LOCK_FILE
             ),
         };
-        match &spec.source {
-            Some(src) => {
+        match (&spec.google, &spec.source) {
+            (Some(family), _) => {
+                decl.insert("google".into(), family.clone().into());
+            }
+            (None, Some(src)) => {
                 decl.insert("source".into(), src.clone().into());
                 if let Some(v) = &spec.version {
                     decl.insert("version".into(), v.to_string().into());
@@ -332,7 +394,7 @@ fn write_frozen(
                     decl.insert("subdir".into(), sd.clone().into());
                 }
             }
-            None => {
+            (None, None) => {
                 decl.insert("path".into(), rel_dir.clone().into());
             }
         }
@@ -343,10 +405,12 @@ fn write_frozen(
         };
         let to_dir = dest.join(&rel_dir);
         let mut files: BTreeMap<String, PathBuf> = BTreeMap::new();
-        files.insert(
-            library::LIBRARY_FILE.to_string(),
-            l.root.join(library::LIBRARY_FILE),
-        );
+        // A library's identity: library.toml, or a Google Fonts family's METADATA.pb.
+        for id in [library::LIBRARY_FILE, "METADATA.pb"] {
+            if l.root.join(id).is_file() {
+                files.insert(id.to_string(), l.root.join(id));
+            }
+        }
         for f in used.get(&l.name).into_iter().flatten() {
             files.insert(f.clone(), l.root.join(f));
         }
@@ -603,7 +667,7 @@ pub fn bundle(movie: &Path, out: &Path, cache: &Path) -> Result<Bundled> {
 /// `freeze`/`bundle` can copy the locked files.
 fn fetch_all(movie: &Path) -> Result<Movie> {
     let m = Movie::read(movie)?;
-    if m.library_specs.iter().any(|s| s.source.is_some()) {
+    if m.library_specs.iter().any(|s| s.fetched()) {
         crate::fetch_libraries(
             &m.project,
             library::FetchMode::Missing {
@@ -795,6 +859,7 @@ mod tests {
                 rev: None,
                 subdir: Some("core".into()),
                 path: None,
+                google: None,
                 sha256: library::hash_dir(&core).unwrap(),
             }],
         };
@@ -840,6 +905,30 @@ mod tests {
         ] {
             assert!(!library::is_non_commercial(ok), "{ok}");
         }
+    }
+
+    #[test]
+    fn film_fonts_are_listed_with_their_licences() {
+        let text = "[libraries]\nkit = { path = \"lib/kit\" }\n[fonts]\n\
+             lobster = { file = \"fonts/lobster/Lobster-Regular.ttf\", licence = \"OFL-1.1\" }\n\
+             mine = \"fonts/Mine.otf\"\nkitfont = \"<kit/fonts/K.ttf>\"\nunused = \"fonts/U.ttf\"\n\
+             [texts]\na = { text = \"x\", font = \"lobster\" }\nb = { text = \"y\", font = \"mine\" }\n\
+             c = { text = \"z\", font = \"kitfont\" }\n\
+             [[shot]]\nid = \"s\"\nscene = \"a.glsl\"\nduration = 1\nchannels = [\"a\", \"b\", \"c\", \"a\"]\n";
+        let (p, mv) = crate::project::split_fixture(text);
+        let project = crate::project::Project::parse(&p, Path::new("/film")).unwrap();
+        let m = Movie::parse_in(&mv, Path::new("/film"), &project).unwrap();
+        assert_eq!(
+            film_fonts(&m),
+            vec![
+                (
+                    "lobster".to_string(),
+                    "fonts/lobster/Lobster-Regular.ttf".to_string(),
+                    Some("OFL-1.1".to_string())
+                ),
+                ("mine".to_string(), "fonts/Mine.otf".to_string(), None),
+            ]
+        );
     }
 
     #[test]

@@ -194,6 +194,9 @@ pub struct LibraryDecl {
     pub subdir: Option<String>,
     /// A library inside the project folder (relative, may not climb out).
     pub path: Option<String>,
+    /// A Google Fonts family ("Lobster"): fetched from google/fonts like a library that
+    /// follows a branch, one family folder at a pinned commit (`shotglass fonts add`).
+    pub google: Option<String>,
 }
 
 /// A validated `[libraries]` entry.
@@ -208,9 +211,17 @@ pub struct LibrarySpec {
     pub branch: Option<String>,
     pub subdir: Option<String>,
     pub path: Option<String>,
+    /// A Google Fonts family (`google = "Lobster"`): no source, version or path; the
+    /// fetcher supplies google/fonts and the lock pins the commit and the family folder.
+    pub google: Option<String>,
 }
 
 impl LibrarySpec {
+    /// Downloaded (a git source or a Google Fonts family), as opposed to a project folder?
+    pub fn fetched(&self) -> bool {
+        self.source.is_some() || self.google.is_some()
+    }
+
     /// Follows a branch (no version range) rather than tagged releases?
     pub fn tracks_branch(&self) -> bool {
         self.source.is_some() && self.version.is_none()
@@ -232,6 +243,32 @@ impl LibrarySpec {
             bail!("library name \"{name}\" may only use letters, digits, _ and -");
         }
         let ctx = || format!("library \"{name}\"");
+        if let Some(family) = &d.google {
+            if d.source.is_some()
+                || d.path.is_some()
+                || d.version.is_some()
+                || d.branch.is_some()
+                || d.subdir.is_some()
+            {
+                bail!(
+                    "{}: google = \"{family}\" stands alone (no source, path, version, branch or \
+                     subdir; shotglass.lock pins the commit)",
+                    ctx()
+                );
+            }
+            if crate::fonts::slug(family).is_empty() {
+                bail!("{}: \"{family}\" isn't a font family name", ctx());
+            }
+            return Ok(LibrarySpec {
+                name: name.to_string(),
+                version: None,
+                source: None,
+                branch: None,
+                subdir: None,
+                path: None,
+                google: Some(family.clone()),
+            });
+        }
         let version = match &d.version {
             Some(v) => Some(parse_req(v).with_context(ctx)?),
             None => None,
@@ -239,7 +276,8 @@ impl LibrarySpec {
         match (&d.source, &d.path) {
             (Some(_), Some(_)) => bail!("{}: give either source or path, not both", ctx()),
             (None, None) => bail!(
-                "{}: needs a source (https git URL + version) or a path inside the project",
+                "{}: needs a source (https git URL + version), a path inside the project, or \
+                 google = \"<Google Fonts family>\"",
                 ctx()
             ),
             (Some(src), None) => {
@@ -292,6 +330,7 @@ impl LibrarySpec {
                 .map(|s| s.trim_matches('/').to_string())
                 .filter(|s| !s.is_empty()),
             path: d.path.clone(),
+            google: None,
         })
     }
 }
@@ -349,9 +388,37 @@ pub struct Library {
     pub requires_shotglass: Option<VersionReq>,
     pub glsl: Option<u32>,
     pub origin: Origin,
+    /// A Google Fonts family (its folder has `METADATA.pb`, no `library.toml`).
+    pub google: Option<String>,
 }
 
 impl Library {
+    /// A Google Fonts family folder as a library: `google-fonts/<slug>`, its licence from
+    /// `METADATA.pb` (`OFL` → OFL-1.1, `APACHE2` → Apache-2.0, `UFL` → Ubuntu-font-1.0).
+    pub fn google(name: &str, family: &str, root: &Path, origin: Origin) -> Result<Library> {
+        let file = root.join("METADATA.pb");
+        let text = std::fs::read_to_string(&file).with_context(|| {
+            format!(
+                "library \"{name}\" (Google Fonts \"{family}\"): can't read {}",
+                file.display()
+            )
+        })?;
+        let meta = crate::fonts::parse_metadata(&text)
+            .with_context(|| format!("library \"{name}\": in {}", file.display()))?;
+        Ok(Library {
+            name: name.to_string(),
+            canonical: format!("google-fonts/{}", crate::fonts::slug(family)),
+            version: Version::new(0, 0, 0),
+            root: root.to_path_buf(),
+            licences: crate::fonts::spdx(&meta.license).into_iter().collect(),
+            requires: vec![],
+            requires_shotglass: None,
+            glsl: None,
+            origin,
+            google: Some(family.to_string()),
+        })
+    }
+
     pub fn read(name: &str, root: &Path, origin: Origin) -> Result<Library> {
         let file = root.join(LIBRARY_FILE);
         let text = std::fs::read_to_string(&file).with_context(|| {
@@ -406,12 +473,16 @@ impl Library {
             },
             glsl: t.glsl,
             origin,
+            google: None,
         })
     }
 
-    /// "kit (shotglass-kit/core 0.4.2)".
+    /// "kit (shotglass-kit/core 0.4.2)", or "lobster (Google Fonts \"Lobster\")".
     pub fn describe(&self) -> String {
-        format!("{} ({} {})", self.name, self.canonical, self.version)
+        match &self.google {
+            Some(f) => format!("{} (Google Fonts \"{f}\")", self.name),
+            None => format!("{} ({} {})", self.name, self.canonical, self.version),
+        }
     }
 }
 
@@ -505,6 +576,9 @@ pub struct LockEntry {
     /// an override, and `sha256` is the hash of that folder.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    /// A Google Fonts family: `subdir` is its folder in google/fonts (`ofl/lobster`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub google: Option<String>,
     /// sha256 of the library root's files (see `hash_dir`).
     pub sha256: String,
 }
@@ -580,6 +654,11 @@ impl LockEntry {
     /// Still valid for this spec (same source and subdir, version in range)? A frozen
     /// copy of a `path` library fits a `path` spec.
     fn fits(&self, s: &LibrarySpec) -> bool {
+        if let Some(g) = &s.google {
+            // The pin is the commit and folder; the source may be a mirror.
+            return self.google.as_deref() == Some(g.as_str())
+                && (self.rev.is_some() || self.path.is_some());
+        }
         if s.path.is_some() {
             return self.source.is_empty() && self.path.is_some();
         }
@@ -592,15 +671,22 @@ impl LockEntry {
             }
     }
 
-    /// The cache folder name under the source: the version, or the commit.
-    fn cache_key(&self) -> &str {
-        self.rev.as_deref().unwrap_or(&self.version)
+    /// The cache folder name under the source: the version, or the commit (plus the
+    /// family for a Google Fonts family: each is a sparse checkout of its own folder).
+    pub fn cache_key(&self) -> String {
+        match (&self.google, &self.rev) {
+            (Some(f), Some(r)) => format!("{r}-{}", crate::fonts::slug(f)),
+            _ => self.rev.clone().unwrap_or_else(|| self.version.clone()),
+        }
     }
 
     /// For messages: `0.4.2`, or `main@1a2b3c4 (0.1.0)`.
     pub fn pin(&self) -> String {
         if self.source.is_empty() {
             return self.version.clone();
+        }
+        if let (Some(_), Some(r)) = (&self.google, &self.rev) {
+            return format!("google/fonts@{}", &r[..7]);
         }
         match &self.rev {
             Some(r) => format!(
@@ -752,7 +838,7 @@ pub fn resolve(
             let (root, origin) = match &e.path {
                 Some(p) => (project_root.join(p), Origin::Bundled(p.clone())),
                 None => {
-                    let dir = cache_path(cache, &e.source, e.cache_key());
+                    let dir = cache_path(cache, &e.source, &e.cache_key());
                     let root = match &e.subdir {
                         Some(sub) => dir.join(sub),
                         None => dir,
@@ -793,7 +879,10 @@ pub fn resolve(
             }
             (root, origin)
         };
-        let lib = Library::read(&s.name, &root, origin)?;
+        let lib = match &s.google {
+            Some(f) => Library::google(&s.name, f, &root, origin)?,
+            None => Library::read(&s.name, &root, origin)?,
+        };
         if let Some(r) = &s.version
             && !r.matches(&lib.version)
         {
@@ -870,9 +959,18 @@ pub fn is_non_commercial(licence: &str) -> bool {
 /// `NOTICE`, `UNLICENSE`, any case.
 pub fn is_notice_file(name: &str) -> bool {
     let n = name.to_ascii_uppercase();
-    ["LICENSE", "LICENCE", "COPYING", "NOTICE", "UNLICENSE"]
-        .iter()
-        .any(|p| n.starts_with(p))
+    // OFL.txt / UFL.txt: font licences as Google Fonts (and most font projects) ship them.
+    [
+        "LICENSE",
+        "LICENCE",
+        "COPYING",
+        "NOTICE",
+        "UNLICENSE",
+        "OFL",
+        "UFL",
+    ]
+    .iter()
+    .any(|p| n.starts_with(p))
 }
 
 /// Licence and notice files that apply to a library: those in its root, then those in each
@@ -923,6 +1021,16 @@ pub trait Fetcher {
     fn head(&self, source: &str, refname: &str) -> Result<String>;
     /// Put the files of commit `rev` into `dest`, which doesn't exist yet.
     fn download_rev(&self, source: &str, rev: &str, dest: &Path) -> Result<()>;
+    /// Like `download_rev`, but only the folders `dirs` (for huge repositories such as
+    /// google/fonts). Fetchers that can't do better download everything.
+    fn download_sparse(&self, source: &str, rev: &str, dirs: &[String], dest: &Path) -> Result<()> {
+        let _ = dirs;
+        self.download_rev(source, rev, dest)
+    }
+    /// The repository Google Fonts families come from.
+    fn google_source(&self) -> String {
+        crate::fonts::google_source()
+    }
 }
 
 /// `v1.2.3` or `1.2.3`.
@@ -966,6 +1074,26 @@ pub fn fetch(
     let mut lock = Lock::default();
     let mut log = vec![];
     for s in specs {
+        if s.google.is_some() {
+            let prev = old.and_then(|l| l.get(&s.name)).filter(|e| e.fits(s));
+            let refresh = match mode {
+                FetchMode::Missing { skip } => {
+                    if skip.contains(&s.name) {
+                        if let Some(e) = old.and_then(|l| l.get(&s.name)) {
+                            lock.libraries.push(e.clone());
+                        }
+                        log.push(format!("{}: overridden locally", s.name));
+                        continue;
+                    }
+                    false
+                }
+                FetchMode::Update(names) => names.is_empty() || names.contains(&s.name),
+            };
+            let (e, line) = fetch_google(s, prev, refresh, fetcher, cache)?;
+            log.push(line);
+            lock.libraries.push(e);
+            continue;
+        }
         let Some(source) = &s.source else {
             match old.and_then(|l| l.get(&s.name)).filter(|e| e.fits(s)) {
                 // A frozen copy of a path library: kept as it is.
@@ -1011,10 +1139,10 @@ pub fn fetch(
                 e.clone()
             }
             Some(e) if !refresh => {
-                let dir = cache_path(cache, &e.source, e.cache_key());
+                let dir = cache_path(cache, &e.source, &e.cache_key());
                 let fresh = !dir.exists();
                 if fresh {
-                    download(fetcher, source, &e.tag, e.rev.as_deref(), &dir)?;
+                    download(fetcher, source, &e.tag, e.rev.as_deref(), None, &dir)?;
                 }
                 let root = lib_root(&dir, &e.subdir, &s.name)?;
                 let got = hash_dir(&root)?;
@@ -1057,7 +1185,7 @@ pub fn fetch(
                 }
                 let dir = cache_path(cache, source, &rev);
                 if !dir.exists() {
-                    download(fetcher, source, &refname, Some(&rev), &dir)?;
+                    download(fetcher, source, &refname, Some(&rev), None, &dir)?;
                 }
                 let root = lib_root(&dir, &s.subdir, &s.name)?;
                 let lib = Library::read(&s.name, &root, Origin::Locked)?;
@@ -1069,6 +1197,7 @@ pub fn fetch(
                     rev: Some(rev),
                     subdir: s.subdir.clone(),
                     path: None,
+                    google: None,
                     sha256: hash_dir(&root)?,
                 };
                 log.push(pin_change(&s.name, prev, &e));
@@ -1100,7 +1229,7 @@ pub fn fetch(
                 })?;
                 let dir = cache_path(cache, source, &v.to_string());
                 if !dir.exists() {
-                    download(fetcher, source, &tag, None, &dir)?;
+                    download(fetcher, source, &tag, None, None, &dir)?;
                 }
                 let root = lib_root(&dir, &s.subdir, &s.name)?;
                 let e = LockEntry {
@@ -1111,6 +1240,7 @@ pub fn fetch(
                     rev: None,
                     subdir: s.subdir.clone(),
                     path: None,
+                    google: None,
                     sha256: hash_dir(&root)?,
                 };
                 log.push(pin_change(&s.name, prev, &e));
@@ -1120,6 +1250,128 @@ pub fn fetch(
         lock.libraries.push(entry);
     }
     Ok((lock, log))
+}
+
+/// `fetch` for a Google Fonts family: keep a frozen copy; check (and if needed
+/// re-download) a locked one; otherwise pin google/fonts' newest commit and find the
+/// family's folder (`ofl/`, `apache/` or `ufl/` + slug) with a sparse checkout.
+fn fetch_google(
+    s: &LibrarySpec,
+    prev: Option<&LockEntry>,
+    refresh: bool,
+    fetcher: &dyn Fetcher,
+    cache: &Path,
+) -> Result<(LockEntry, String)> {
+    let family = s.google.as_deref().expect("a Google Fonts spec");
+    let slug = crate::fonts::slug(family);
+    match prev {
+        Some(e) if !refresh && e.path.is_some() => Ok((
+            e.clone(),
+            format!(
+                "{}: {} frozen in {} (locked)",
+                s.name,
+                e.pin(),
+                e.path.as_deref().unwrap_or("")
+            ),
+        )),
+        Some(e) if !refresh => {
+            let dir = cache_path(cache, &e.source, &e.cache_key());
+            let sub = e.subdir.clone().unwrap_or_default();
+            let fresh = !dir.exists();
+            if fresh {
+                download(
+                    fetcher,
+                    &e.source,
+                    &e.tag,
+                    e.rev.as_deref(),
+                    Some(std::slice::from_ref(&sub)),
+                    &dir,
+                )?;
+            }
+            let root = dir.join(&sub);
+            let got = hash_dir(&root)?;
+            if got != e.sha256 {
+                bail!(
+                    "library \"{}\" (Google Fonts \"{family}\") {}: sha256 {got} doesn't match \
+                     {LOCK_FILE} ({}); {}",
+                    s.name,
+                    e.pin(),
+                    e.sha256,
+                    if fresh {
+                        "the files at that commit changed; `shotglass update` to accept them"
+                    } else {
+                        "the cached copy was changed; delete it and fetch again"
+                    }
+                );
+            }
+            Ok((
+                e.clone(),
+                format!(
+                    "{}: {} {} (locked)",
+                    s.name,
+                    e.pin(),
+                    if fresh { "downloaded" } else { "cached" }
+                ),
+            ))
+        }
+        _ => {
+            let source = fetcher.google_source();
+            let rev = fetcher.head(&source, "HEAD").with_context(|| {
+                format!(
+                    "library \"{}\": looking up the newest commit of {source}",
+                    s.name
+                )
+            })?;
+            if !is_commit_id(&rev) {
+                bail!(
+                    "library \"{}\": {source} HEAD gave \"{rev}\", not a commit id",
+                    s.name
+                );
+            }
+            let dir = cache_path(cache, &source, &format!("{rev}-{slug}"));
+            let candidates: Vec<String> = crate::fonts::LICENCE_DIRS
+                .iter()
+                .map(|(l, _)| format!("{l}/{slug}"))
+                .collect();
+            if !dir.exists() {
+                download(
+                    fetcher,
+                    &source,
+                    "HEAD",
+                    Some(&rev),
+                    Some(&candidates),
+                    &dir,
+                )?;
+            }
+            let Some(sub) = candidates
+                .iter()
+                .find(|c| dir.join(c).join("METADATA.pb").is_file())
+                .cloned()
+            else {
+                let _ = std::fs::remove_dir_all(&dir);
+                bail!(
+                    "library \"{}\": no family \"{family}\" in Google Fonts (looked for {} in \
+                     {source}); use the name as fonts.google.com shows it",
+                    s.name,
+                    candidates.join(", ")
+                );
+            };
+            let root = dir.join(&sub);
+            let e = LockEntry {
+                name: s.name.clone(),
+                version: "0.0.0".to_string(),
+                source,
+                tag: "HEAD".to_string(),
+                rev: Some(rev),
+                subdir: Some(sub),
+                path: None,
+                google: Some(family.to_string()),
+                sha256: hash_dir(&root)?,
+            };
+            let line = pin_change(&s.name, prev, &e);
+            Ok((e, line))
+        }
+    }
 }
 
 /// A log line for a (re-)resolved pin.
@@ -1157,6 +1409,7 @@ fn download(
     source: &str,
     tag: &str,
     rev: Option<&str>,
+    sparse: Option<&[String]>,
     dir: &Path,
 ) -> Result<()> {
     let parent = dir.parent().expect("cache path has a parent");
@@ -1172,9 +1425,11 @@ fn download(
     ));
     let _ = std::fs::remove_dir_all(&tmp);
     match rev {
-        Some(r) => fetcher
-            .download_rev(source, r, &tmp)
-            .with_context(|| format!("downloading {source} {tag} at {r}")),
+        Some(r) => match sparse {
+            Some(dirs) => fetcher.download_sparse(source, r, dirs, &tmp),
+            None => fetcher.download_rev(source, r, &tmp),
+        }
+        .with_context(|| format!("downloading {source} {tag} at {r}")),
         None => fetcher
             .download(source, tag, &tmp)
             .with_context(|| format!("downloading {source} {tag}")),
@@ -1192,7 +1447,7 @@ fn download(
 pub struct Git;
 
 impl Git {
-    fn run(args: &[&str]) -> Result<String> {
+    pub(crate) fn run(args: &[&str]) -> Result<String> {
         let out = std::process::Command::new("git")
             // Paths past 260 characters on Windows (deep caches); ignored elsewhere.
             .args(["-c", "core.longpaths=true"])
@@ -1212,6 +1467,42 @@ impl Git {
 }
 
 impl Fetcher for Git {
+    fn download_sparse(&self, source: &str, rev: &str, dirs: &[String], dest: &Path) -> Result<()> {
+        if !is_commit_id(rev) {
+            bail!("\"{rev}\" is not a full commit id");
+        }
+        // Shallow, blobless and sparse: only `dirs` of one commit, not the repository.
+        let d = dest.to_string_lossy();
+        Git::run(&["init", "--quiet", "--", &d])?;
+        let in_dest = |args: &[&str]| {
+            let mut a = vec!["-C", &*d, "-c", "core.autocrlf=false"];
+            a.extend_from_slice(args);
+            Git::run(&a)
+        };
+        let patterns: Vec<String> = dirs.iter().map(|x| format!("/{x}/")).collect();
+        let mut args = vec!["sparse-checkout", "set", "--no-cone"];
+        args.extend(patterns.iter().map(String::as_str));
+        in_dest(&args)?;
+        in_dest(&[
+            "fetch",
+            "--quiet",
+            "--depth",
+            "1",
+            "--filter=blob:none",
+            source,
+            rev,
+        ])?;
+        in_dest(&[
+            "-c",
+            "advice.detachedHead=false",
+            "checkout",
+            "--quiet",
+            rev,
+        ])?;
+        std::fs::remove_dir_all(dest.join(".git"))?;
+        Ok(())
+    }
+
     fn tags(&self, source: &str) -> Result<Vec<String>> {
         let out = Git::run(&["ls-remote", "--tags", "--refs", source])?;
         Ok(out
@@ -1288,6 +1579,51 @@ impl Fetcher for Git {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn decl(toml: &str) -> LibraryDecl {
+        toml::from_str(toml).unwrap()
+    }
+
+    #[test]
+    fn google_font_libraries_are_declared_alone() {
+        let s = LibrarySpec::parse("lobster", &decl("google = \"Lobster\"")).unwrap();
+        assert_eq!(s.google.as_deref(), Some("Lobster"));
+        assert!(s.fetched() && s.source.is_none() && s.version.is_none());
+        for (extra, _) in [
+            ("source = \"https://example.com/x\"", ()),
+            ("path = \"x\"", ()),
+            ("version = \"0.1\"", ()),
+            ("branch = \"main\"", ()),
+            ("subdir = \"ofl/x\"", ()),
+        ] {
+            let e = LibrarySpec::parse("f", &decl(&format!("google = \"Lobster\"\n{extra}")))
+                .unwrap_err();
+            assert!(e.to_string().contains("stands alone"), "{extra}: {e}");
+        }
+        let e = LibrarySpec::parse("f", &decl("google = \" - \"")).unwrap_err();
+        assert!(e.to_string().contains("isn't a font family name"), "{e}");
+        // A lock entry fits by family and pin, whatever mirror it came from.
+        let e = LockEntry {
+            name: "lobster".into(),
+            version: "0.0.0".into(),
+            source: "https://mirror.example/fonts".into(),
+            tag: "HEAD".into(),
+            rev: Some("06bfe0d62a98375cb09c942fa18e68bd32cff057".into()),
+            subdir: Some("ofl/lobster".into()),
+            path: None,
+            google: Some("Lobster".into()),
+            sha256: String::new(),
+        };
+        assert!(e.fits(&s));
+        assert_eq!(e.pin(), "google/fonts@06bfe0d");
+        assert_eq!(
+            e.cache_key(),
+            "06bfe0d62a98375cb09c942fa18e68bd32cff057-lobster"
+        );
+        let other = LibrarySpec::parse("lobster", &decl("google = \"Inter\"")).unwrap();
+        assert!(!e.fits(&other));
+        assert!(is_notice_file("OFL.txt") && is_notice_file("UFL.txt"));
+    }
     use std::cell::RefCell;
 
     fn tmp(name: &str) -> PathBuf {
@@ -1487,6 +1823,7 @@ mod tests {
             requires_shotglass: None,
             glsl: None,
             origin: Origin::Path,
+            google: None,
         }
     }
 
@@ -1560,6 +1897,7 @@ mod tests {
                     rev: Some("e".repeat(40)),
                     subdir: Some("core".into()),
                     path: None,
+                    google: None,
                     sha256: "ef".repeat(32),
                 },
                 LockEntry {
@@ -1570,6 +1908,7 @@ mod tests {
                     rev: None,
                     subdir: Some("sounds".into()),
                     path: Some("shotglass-libs/sfx".into()),
+                    google: None,
                     sha256: "ab".repeat(32),
                 },
                 LockEntry {
@@ -1580,6 +1919,7 @@ mod tests {
                     rev: None,
                     subdir: None,
                     path: None,
+                    google: None,
                     sha256: "cd".repeat(32),
                 },
             ],
@@ -2004,6 +2344,7 @@ mod tests {
             rev: None,
             subdir: (!source.is_empty()).then(|| "core".to_string()),
             path: Some(format!("shotglass-libs/{name}")),
+            google: None,
             sha256: hash_dir(&film.join("shotglass-libs").join(name)).unwrap(),
         };
         let lock = Lock {
@@ -2087,7 +2428,7 @@ mod tests {
         let rev = "a".repeat(40);
         std::thread::scope(|sc| {
             let runs: Vec<_> = (0..4)
-                .map(|_| sc.spawn(|| download(&Slow, KIT, "HEAD", Some(&rev), &dir)))
+                .map(|_| sc.spawn(|| download(&Slow, KIT, "HEAD", Some(&rev), None, &dir)))
                 .collect();
             for r in runs {
                 r.join().unwrap().unwrap();

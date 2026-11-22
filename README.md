@@ -308,6 +308,44 @@ Changing the words or the style makes a new texture and never recompiles a shade
 | `sdf_spread` | distance-field reach in pixels, also the padding around the text | 8 |
 | `filter`, `wrap`, `vflip` | as for images | `"linear"`, `"clamp"`, `true` |
 
+#### Getting fonts
+
+Any [Google Fonts](https://fonts.google.com) family is a library: declare it by name in
+the project and name its files in `[fonts]`, like any library file.
+
+```sh
+shotglass fonts add "Lobster" "Inter" --film movies/my-film
+```
+
+writes both for you, fetches the families and pins them:
+
+```toml
+# shotglass.toml
+[libraries]
+lobster = { google = "Lobster" }
+inter = { google = "Inter" }
+
+# movie.toml
+[fonts]
+lobster = "<lobster/Lobster-Regular.ttf>"
+inter = "<inter/Inter[opsz,wght].ttf>"
+inter_italic = "<inter/Inter-Italic[opsz,wght].ttf>"
+```
+
+- They behave exactly like libraries: any command fetches what's missing (git, only that
+  family's folder of google/fonts), `shotglass.lock` pins the commit and a hash of the
+  files so every machine gets the same glyphs, `shotglass update inter` moves the pin on
+  purpose, `SHOTGLASS_LIB_INTER` points at a local copy, and `freeze`/`bundle` copy in
+  exactly the font files a film uses, with their licence. Commit `shotglass.lock`;
+  there's no need to commit font files.
+- Entries are named after the family, plus the weight and `_italic` for other styles;
+  `fonts add` prints a variable font's axes, for `variations`. Rename entries as you like.
+- Licences come from where Google Fonts keeps the family: nearly all SIL OFL 1.1, a few
+  Apache 2.0 or the Ubuntu Font Licence; all allow using the fonts in a film and passing
+  them on unmodified. `shotglass licenses` lists each family with its licence.
+- Any other TTF/OTF works too: put it in the film (or a library) and name it in
+  `[fonts]`, with its `licence`.
+
 | `[fonts]` option | values |
 |---|---|
 | `file` | a `.ttf`, `.otf` or `.ttc` in the film or `<library/path>` (pinned by `shotglass.lock`) |
@@ -714,6 +752,7 @@ sfx  = { version = "0.3", source = "https://github.com/antonmarsden/shotglass-ki
 toon = { version = "1.2", source = "https://github.com/someone/toon-kit" }
 edge = { source = "https://github.com/someone/fx-kit" }   # no version: follow the default branch
 mine = { path = "lib/mykit" }            # a library inside the project folder
+lobster = { google = "Lobster" }         # a Google Fonts family (see "Getting fonts")
 ```
 
 ```glsl
@@ -978,7 +1017,8 @@ shotglass export <movie> --out film.webm [--size 1920x1080] [--format webm|av1|f
 shotglass new    <dir>
 shotglass fetch  <movie>                                   # download libraries, write shotglass.lock
 shotglass update <movie> [library..]                       # move library pins to the newest allowed
-shotglass licenses <movie>                                 # libraries the film includes and their licences
+shotglass licenses <movie>                                 # libraries the film includes, film fonts, and their licences
+shotglass fonts add "Family" [..] [--film <dir>]           # Google Fonts families as libraries, plus [fonts] entries
 shotglass bundle <movie> --out <dir>                       # self-contained copy with the library files it includes
 shotglass freeze <movie>                                   # copy the library files it includes into the film
 shotglass unfreeze <movie>                                 # follow the project's libraries again

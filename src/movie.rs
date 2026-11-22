@@ -607,6 +607,9 @@ pub struct Movie {
     pub libraries: Vec<Library>,
     /// Portability warnings (e.g. a file name that only matches when ignoring case).
     pub warnings: Vec<String>,
+    /// Libraries `movie.toml` names a file of (`<lib/…>` in `[textures]`, `[fonts]`,
+    /// `[texts]`), used or not: a frozen copy must still declare them.
+    pub library_refs: std::collections::BTreeSet<String>,
 }
 
 /// What is on screen at a moment.
@@ -1035,6 +1038,12 @@ impl Movie {
                 text_spec(&what, name, v, &fonts, &library_specs, root)?,
             );
         }
+        let library_refs: std::collections::BTreeSet<String> = names
+            .values()
+            .flat_map(Channel::files)
+            .chain(fonts.values().map(|(f, _)| &f.file))
+            .filter_map(|f| f.library.clone())
+            .collect();
         let textures = names;
         let mut used: std::collections::HashSet<String> = Default::default();
         let mut channel_list = |what: &str,
@@ -1473,6 +1482,7 @@ impl Movie {
             library_specs,
             libraries: vec![],
             project: project.root.clone(),
+            library_refs,
         })
     }
 
