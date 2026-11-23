@@ -141,6 +141,9 @@ enum Cmd {
         out: PathBuf,
         #[arg(long, default_value_t = 48000)]
         rate: u32,
+        /// Write a silent WAV when the film has no music or shot sounds.
+        #[arg(long)]
+        allow_silence: bool,
         /// Compare against this reference WAV and fail if any 50 ms window of the
         /// difference is beyond --max-rms or --max-peak; writes <out>.diff.wav.
         #[arg(long, value_name = "REF")]
@@ -319,6 +322,7 @@ fn real_main() -> Result<()> {
             movie,
             out,
             rate,
+            allow_silence,
             compare,
             bless,
             max_rms,
@@ -333,7 +337,7 @@ fn real_main() -> Result<()> {
                     ..Default::default()
                 },
             });
-            wav(&movie, &out, rate, golden)
+            wav(&movie, &out, rate, allow_silence, golden)
         }
         Cmd::Export {
             movie,
@@ -1326,22 +1330,35 @@ struct GoldenSound {
     tol: golden::SoundTolerance,
 }
 
-fn wav(movie: &Path, out: &Path, rate: u32, golden: Option<GoldenSound>) -> Result<()> {
+fn wav(
+    movie: &Path,
+    out: &Path,
+    rate: u32,
+    allow_silence: bool,
+    golden: Option<GoldenSound>,
+) -> Result<()> {
     let m = load_movie(movie)?;
-    if !m.has_sound() {
+    let frames = if m.has_sound() {
+        let path = out.to_path_buf();
+        headless::with_gl(move |gl| {
+            let mut r = Renderer::new(gl)?;
+            export::write_wav(&mut r, &m, rate, &path, 1)
+        })?
+    } else if allow_silence {
+        let frames = m.sound_samples(rate);
+        let mut writer = audio::WavWriter::create(out, frames, rate)
+            .with_context(|| format!("couldn't create {}", out.display()))?;
+        writer.write_silence(frames)?;
+        writer.finish()?;
+        frames
+    } else {
         bail!("this movie has no sound (no [sound] music and no shot sounds)");
-    }
-    let path = out.to_path_buf();
-    headless::with_gl(move |gl| {
-        let mut r = Renderer::new(gl)?;
-        let frames = export::write_wav(&mut r, &m, rate, &path, 1)?;
-        println!(
-            "wrote {} ({:.1}s at {rate} Hz)",
-            path.display(),
-            frames as f32 / rate as f32
-        );
-        Ok(())
-    })?;
+    };
+    println!(
+        "wrote {} ({:.1}s at {rate} Hz)",
+        out.display(),
+        frames as f32 / rate as f32
+    );
     match golden {
         Some(g) => compare_golden_sound(out, &g),
         None => Ok(()),
@@ -1569,6 +1586,44 @@ fn new_movie(dir: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn silent_wav_can_be_blessed_and_compared() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("shotglass-silent-wav-{}", std::process::id()));
+        project::write_fixture(
+            &dir,
+            r#"fps = 24
+[[shot]]
+id = "silent"
+scene = "scene.glsl"
+duration = 0.375
+"#,
+        )?;
+        std::fs::write(
+            dir.join("scene.glsl"),
+            "void mainImage(out vec4 c, in vec2 p) { c = vec4(0.0); }",
+        )?;
+        let out = dir.join("actual.wav");
+        let reference = dir.join("reference.wav");
+        let rate = 11025;
+        assert_eq!(
+            wav(&dir, &out, rate, false, None).unwrap_err().to_string(),
+            "this movie has no sound (no [sound] music and no shot sounds)"
+        );
+        let golden = |bless| GoldenSound {
+            reference: reference.clone(),
+            bless,
+            tol: golden::SoundTolerance::default(),
+        };
+        wav(&dir, &out, rate, true, Some(golden(true)))?;
+        let (actual_rate, samples) = golden::load_wav(&reference)?;
+        assert_eq!(actual_rate, rate);
+        assert_eq!(samples.len(), 4135 * 2); // ceil(0.375 * 11025) stereo frames
+        assert!(samples.iter().all(|&sample| sample == 0.0));
+        wav(&dir, &out, rate, true, Some(golden(false)))?;
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
 
     #[test]
     fn template_parses_and_names_this_engine() {

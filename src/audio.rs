@@ -612,7 +612,22 @@ impl WavWriter {
         sample_rate: u32,
     ) -> std::io::Result<WavWriter> {
         use std::io::Write;
-        let data_len = (frames * 4) as u32;
+        let data_len = u32::try_from(frames)
+            .ok()
+            .and_then(|frames| frames.checked_mul(4))
+            .filter(|&len| len <= u32::MAX - 36)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "WAV exceeds the RIFF size limit",
+                )
+            })?;
+        let byte_rate = sample_rate
+            .checked_mul(4)
+            .filter(|&rate| rate > 0)
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid WAV sample rate")
+            })?;
         let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
         f.write_all(b"RIFF")?;
         f.write_all(&(36 + data_len).to_le_bytes())?;
@@ -621,7 +636,7 @@ impl WavWriter {
         f.write_all(&1u16.to_le_bytes())?; // PCM
         f.write_all(&2u16.to_le_bytes())?; // stereo
         f.write_all(&sample_rate.to_le_bytes())?;
-        f.write_all(&(sample_rate * 4).to_le_bytes())?;
+        f.write_all(&byte_rate.to_le_bytes())?;
         f.write_all(&4u16.to_le_bytes())?;
         f.write_all(&16u16.to_le_bytes())?;
         f.write_all(b"data")?;
@@ -634,6 +649,18 @@ impl WavWriter {
         for s in samples {
             self.f
                 .write_all(&((s.clamp(-1.0, 1.0) * 32767.0) as i16).to_le_bytes())?;
+        }
+        Ok(())
+    }
+
+    pub fn write_silence(&mut self, frames: usize) -> std::io::Result<()> {
+        use std::io::Write;
+        let zeros = [0; 8192];
+        let mut remaining = frames;
+        while remaining > 0 {
+            let block = remaining.min(zeros.len() / 4);
+            self.f.write_all(&zeros[..block * 4])?;
+            remaining -= block;
         }
         Ok(())
     }
