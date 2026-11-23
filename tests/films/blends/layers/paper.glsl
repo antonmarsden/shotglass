@@ -1,5 +1,12 @@
 // A warm paper texture, multiply-blended (fx/multiply.glsl) over the middle of the film.
-float hash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+// Integer hash, exact on every driver (a sin-based one depends on the driver's sin).
+float hash(vec2 p) {
+  uvec2 q = uvec2(ivec2(p));
+  uint h = q.x * 1597334677u ^ q.y * 3812015801u;
+  h = (h ^ (h >> 16)) * 2246822519u;
+  h ^= h >> 13;
+  return float(h >> 8) / 16777216.0;
+}
 void mainImage(out vec4 fragColor, in vec2 fragCoord) {
   vec2 g = floor(fragCoord / 3.0);
   float n = 0.85 + 0.15 * hash(g);
