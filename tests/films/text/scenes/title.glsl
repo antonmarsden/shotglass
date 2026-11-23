@@ -10,6 +10,22 @@ vec2 blockUV(vec2 p, vec2 centre, float h) {
   return q;
 }
 
+// Bilinear in float from texelFetch: hardware filtering weights differ between
+// drivers (llvmpipe's are 8-bit), and the edges below magnify the difference.
+float fieldAt(vec2 uv, vec2 size) {
+  vec2 p = uv * size - 0.5;
+  vec2 i = floor(p);
+  vec2 f = p - i;
+  ivec2 hi = ivec2(size) - 1;
+  ivec2 a = clamp(ivec2(i), ivec2(0), hi);
+  ivec2 b = clamp(ivec2(i) + 1, ivec2(0), hi);
+  float d00 = texelFetch(iChannel0, a, 0).g;
+  float d10 = texelFetch(iChannel0, ivec2(b.x, a.y), 0).g;
+  float d01 = texelFetch(iChannel0, ivec2(a.x, b.y), 0).g;
+  float d11 = texelFetch(iChannel0, b, 0).g;
+  return mix(mix(d00, d10, f.x), mix(d01, d11, f.x), f.y);
+}
+
 void mainImage(out vec4 fragColor, in vec2 fragCoord) {
   vec2 res = iResolution.xy;
   vec3 col = mix(vec3(0.05, 0.06, 0.1), vec3(0.12, 0.1, 0.16), fragCoord.y / res.y);
@@ -30,8 +46,11 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
   vec2 zuv = blockUV(fragCoord, vec2(res.x * 0.5, res.y * 0.28), h * 4.0);
   zuv.x += 0.32;
   if (fragCoord.y < res.y * 0.5 && all(greaterThanEqual(zuv, vec2(0.0))) && all(lessThanEqual(zuv, vec2(1.0)))) {
-    float d = texture(iChannel0, zuv).g;           // 0.5 at the outline
-    float w = fwidth(d) * 0.75;
+    float d = fieldAt(zuv, size);                  // 0.5 at the outline
+    // Edge width from the known scale, not fwidth(d): derivatives of a texture
+    // fetch differ between drivers. d moves 0.5 per spread (meta.w) texels, and a
+    // pixel here covers size.y / (4h) texels.
+    float w = 0.75 * (0.5 / meta.w) * size.y / (h * 4.0);
     float fill = smoothstep(0.5 - w, 0.5 + w, d);
     float band = smoothstep(0.42 - w, 0.42 + w, d) - fill;   // outline outside the ink
     float glow = smoothstep(0.1, 0.42, d) * (1.0 - fill - band);

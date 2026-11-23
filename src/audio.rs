@@ -37,6 +37,7 @@ pub fn wrap_span(total: usize) -> u64 {
 
 struct Shared {
     store: ArcSwap<ChunkStore>,
+    failed: AtomicBool,
     /// Samples the callback had to play as silence because their chunk wasn't ready.
     underruns: AtomicU64,
     pos: AtomicU64,
@@ -51,15 +52,32 @@ pub struct AudioOut {
     shared: Arc<Shared>,
     pub sample_rate: u32,
     pub device_name: String,
-    _stream: Option<cpal::Stream>,
+    stream: Option<cpal::Stream>,
 }
 
 impl AudioOut {
     pub fn open() -> anyhow::Result<AudioOut> {
+        Self::open_default(false)
+    }
+
+    fn reopen() -> anyhow::Result<AudioOut> {
+        Self::open_default(cfg!(windows))
+    }
+
+    fn open_default(use_endpoint: bool) -> anyhow::Result<AudioOut> {
         let host = cpal::default_host();
         let device = host
             .default_output_device()
             .ok_or_else(|| anyhow::anyhow!("no audio output device"))?;
+        // CPAL's WASAPI default device uses ActivateAudioInterfaceAsync, which
+        // can fail with RPC_E_CHANGED_MODE on reopen. A concrete endpoint uses
+        // IMMDevice::Activate. Resolve the current default afresh each time.
+        let device = if use_endpoint {
+            host.device_by_id(&device.id()?)
+                .ok_or_else(|| anyhow::anyhow!("default audio endpoint disappeared"))?
+        } else {
+            device
+        };
         let device_name = device
             .description()
             .map(|d| d.name().to_string())
@@ -68,6 +86,7 @@ impl AudioOut {
         let sample_rate = config.sample_rate();
         let shared = Arc::new(Shared {
             store: ArcSwap::from_pointee(ChunkStore::default()),
+            failed: AtomicBool::new(false),
             underruns: AtomicU64::new(0),
             pos: AtomicU64::new(0),
             playing: AtomicBool::new(false),
@@ -90,7 +109,7 @@ impl AudioOut {
             shared,
             sample_rate,
             device_name,
-            _stream: Some(stream),
+            stream: Some(stream),
         })
     }
 
@@ -99,6 +118,7 @@ impl AudioOut {
     pub fn fake(sample_rate: u32) -> (AudioOut, FakeDevice) {
         let shared = Arc::new(Shared {
             store: ArcSwap::from_pointee(ChunkStore::default()),
+            failed: AtomicBool::new(false),
             underruns: AtomicU64::new(0),
             pos: AtomicU64::new(0),
             playing: AtomicBool::new(false),
@@ -114,7 +134,7 @@ impl AudioOut {
                 shared,
                 sample_rate,
                 device_name: "fake".into(),
-                _stream: None,
+                stream: None,
             },
             dev,
         )
@@ -144,13 +164,31 @@ fn build<T: SizedSample + FromSample<f32>>(
     sh: Arc<Shared>,
 ) -> anyhow::Result<cpal::Stream> {
     let channels = cfg.channels as usize;
+    let status = sh.clone();
     let stream = device.build_output_stream(
         cfg,
         move |data: &mut [T], info: &cpal::OutputCallbackInfo| {
             let ts = info.timestamp();
             fill(&sh, data, channels, ts.playback - ts.callback);
         },
-        |e| eprintln!("audio: {e}"),
+        move |e| {
+            let kind = e.kind();
+            if matches!(
+                kind,
+                cpal::ErrorKind::DeviceNotAvailable
+                    | cpal::ErrorKind::HostUnavailable
+                    | cpal::ErrorKind::StreamInvalidated
+            ) || (cfg!(windows) && kind == cpal::ErrorKind::BackendError)
+            {
+                // WASAPI can also report a fatal render error as a generic backend error.
+                status.failed.store(true, Ordering::Release);
+            }
+            // The next Play reports the result of reopening the output. A failed
+            // stream can emit follow-up errors while it is being torn down.
+            if !status.failed.load(Ordering::Acquire) {
+                eprintln!("audio: {e}");
+            }
+        },
         None,
     )?;
     Ok(stream)
@@ -290,7 +328,7 @@ impl Clock {
             }
             a.shared.store.store(Arc::new(st));
         }
-        if new.map(|p| p.0) == self.period.map(|p| p.0) {
+        if new == self.period {
             return;
         }
         let t = self.time() as f64;
@@ -329,6 +367,35 @@ impl Clock {
 
     pub fn sample_rate(&self) -> u32 {
         self.audio.as_ref().map_or(44100, |a| a.sample_rate)
+    }
+
+    /// Reopen a missing or invalidated output before starting playback.
+    pub fn reconnect_audio(&mut self) -> anyhow::Result<Option<&AudioOut>> {
+        self.reconnect_with(AudioOut::reopen)
+    }
+
+    fn reconnect_with(
+        &mut self,
+        open: impl FnOnce() -> anyhow::Result<AudioOut>,
+    ) -> anyhow::Result<Option<&AudioOut>> {
+        debug_assert!(!self.playing);
+        if self.has_audio() {
+            return Ok(None);
+        }
+        if let Some(a) = &mut self.audio {
+            drop(a.stream.take());
+        }
+        let output = open()?;
+        if let Some(a) = &self.audio
+            && a.sample_rate == output.sample_rate
+        {
+            output.shared.store.store(a.shared.store.load_full());
+        }
+        output
+            .shared
+            .rate
+            .store(self.rate.to_bits(), Ordering::Relaxed);
+        Ok(Some(self.audio.insert(output)))
     }
 
     /// Version of chunk `c` that the sound card can currently play, if any.
@@ -393,7 +460,9 @@ impl Clock {
     }
 
     pub fn has_audio(&self) -> bool {
-        self.audio.is_some()
+        self.audio
+            .as_ref()
+            .is_some_and(|a| !a.shared.failed.load(Ordering::Acquire))
     }
 
     pub fn playing(&self) -> bool {
@@ -407,12 +476,16 @@ impl Clock {
     /// The movie time being *heard* right now. Never decreases while playing, except
     /// that a loop film's time wraps to 0 at the end of each period.
     pub fn time(&self) -> f32 {
+        self.time_precise() as f32
+    }
+
+    pub fn time_precise(&self) -> f64 {
         if !self.playing {
-            return self.wrap(self.floor) as f32;
+            return self.wrap(self.floor);
         }
         let t = self.source_time().max(self.reported.get());
         self.reported.set(t);
-        self.wrap(t) as f32
+        self.wrap(t)
     }
 
     /// Unwrapped playback time (seconds since the last play/seek's origin).
@@ -420,6 +493,9 @@ impl Clock {
         let (bt, bat) = self.base.get();
         let wall = bt + bat.elapsed().as_secs_f64() * self.rate as f64;
         let Some(a) = &self.audio else { return wall };
+        if a.shared.failed.load(Ordering::Acquire) {
+            return wall;
+        }
         let last = *a.shared.last.lock().unwrap();
         match last {
             // Use the sound card's position when it has reported since the last seek
@@ -449,6 +525,7 @@ impl Clock {
     pub fn audio_locked(&self) -> bool {
         let Some(a) = &self.audio else { return false };
         self.playing
+            && !a.shared.failed.load(Ordering::Acquire)
             && a.shared.last.lock().unwrap().is_some_and(|(_, at, _)| {
                 at >= self.since && at.elapsed() < Duration::from_millis(250)
             })
@@ -477,16 +554,12 @@ impl Clock {
         self.floor = self.wrap(t);
     }
 
-    pub fn toggle(&mut self) {
-        if self.playing {
-            self.pause()
-        } else {
-            self.play()
-        }
+    pub fn seek(&mut self, t: f32) {
+        self.seek_precise(f64::from(t));
     }
 
-    pub fn seek(&mut self, t: f32) {
-        let t = self.wrap(t.max(0.0) as f64);
+    pub fn seek_precise(&mut self, t: f64) {
+        let t = self.wrap(t.max(0.0));
         if self.playing {
             self.start_at(t);
         } else {
@@ -599,14 +672,20 @@ mod tests {
         })
     }
 
-    fn sample_for(clock: &Clock, dur: Duration) -> Vec<f32> {
-        let end = Instant::now() + dur;
+    /// Reads the clock every ~1 ms for `dur`. Also returns the wall time (s) from the
+    /// start to the last reading: on a busy CI runner a 1 ms sleep can overrun by
+    /// tens of ms, so tests compare the last reading with that, not with `dur`.
+    fn sample_for(clock: &Clock, dur: Duration) -> (Vec<f32>, f32) {
+        let start = Instant::now();
+        let end = start + dur;
         let mut v = vec![];
+        let mut at = 0.0;
         while Instant::now() < end {
             v.push(clock.time());
+            at = start.elapsed().as_secs_f32();
             sleep(Duration::from_millis(1));
         }
-        v
+        (v, at)
     }
 
     fn monotonic(v: &[f32]) -> bool {
@@ -622,6 +701,36 @@ mod tests {
         assert_eq!(c.time(), 3.5);
         c.seek(-1.0);
         assert_eq!(c.time(), 0.0);
+    }
+
+    #[test]
+    fn resume_reopens_an_invalidated_device_and_keeps_the_playhead() {
+        let (output, old) = AudioOut::fake(SR);
+        let mut clock = Clock::new(Some(output));
+        clock.seek_precise(1.0);
+        clock.set_rate(0.5);
+        clock.put_chunk(SR as usize, 2 * SR as usize, 1, 7, Arc::new(vec![0.5; 4]));
+        old.shared.failed.store(true, Ordering::Release);
+
+        assert!(!clock.has_audio());
+        assert!(
+            clock
+                .reconnect_with(|| anyhow::bail!("device absent"))
+                .is_err()
+        );
+        assert_eq!(clock.sample_rate(), SR);
+        assert_eq!(clock.time_precise(), 1.0);
+
+        let (output, replacement) = AudioOut::fake(SR);
+        assert!(clock.reconnect_with(|| Ok(output)).unwrap().is_some());
+        assert!(clock.has_audio());
+        assert_eq!(clock.chunk_version(1), Some(7));
+        clock.play();
+        assert_eq!(replacement.callback(2, Duration::ZERO), vec![0.5; 4]);
+        assert_eq!(
+            replacement.shared.pos.load(Ordering::Acquire) >> 32,
+            u64::from(SR) + 1
+        );
     }
 
     #[test]
@@ -652,15 +761,18 @@ mod tests {
         let h = run_device(dev, 1.0, stop.clone());
         c.seek(10.0);
         c.play();
-        let v = sample_for(&c, Duration::from_millis(300));
+        let (v, at) = sample_for(&c, Duration::from_millis(300));
         let locked = c.audio_locked();
         stop.store(true, Ordering::Relaxed);
         h.join().unwrap();
         assert!(monotonic(&v), "time went backwards");
         assert!(locked, "never locked to the device");
         let last = *v.last().unwrap();
-        // ≈ 0.3 s of playback, minus the 20 ms the sound card hasn't played yet
-        assert!((10.2..10.36).contains(&last), "{last}");
+        // ≈ `at` s of playback, minus the 20 ms the sound card hasn't played yet
+        assert!(
+            (10.0 + at - 0.1..10.0 + at + 0.06).contains(&last),
+            "{last} at {at}"
+        );
         assert!(v[0] >= 10.0);
     }
 
@@ -670,10 +782,10 @@ mod tests {
         let mut c = Clock::new(Some(out));
         c.play();
         dev.callback(480, LATENCY); // one callback, then silence
-        let v = sample_for(&c, Duration::from_millis(400));
+        let (v, at) = sample_for(&c, Duration::from_millis(400));
         assert!(monotonic(&v));
         let last = *v.last().unwrap();
-        assert!((0.33..0.5).contains(&last), "{last}");
+        assert!((at - 0.07..at + 0.1).contains(&last), "{last} at {at}");
         assert!(!c.audio_locked());
     }
 
@@ -685,12 +797,13 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let h = run_device(dev, 100.0, stop.clone());
         c.play();
-        let v = sample_for(&c, Duration::from_millis(200));
+        let (v, at) = sample_for(&c, Duration::from_millis(200));
         stop.store(true, Ordering::Relaxed);
         h.join().unwrap();
         assert!(monotonic(&v));
         let last = *v.last().unwrap();
-        assert!((0.15..0.3).contains(&last), "{last}");
+        // follows the timer, not the device (which would be ~100× ahead)
+        assert!((at - 0.05..at + 0.1).contains(&last), "{last} at {at}");
     }
 
     #[test]
@@ -705,7 +818,7 @@ mod tests {
             c.seek(target);
             let t = c.time();
             assert!((target..target + 0.02).contains(&t), "seek {target}: {t}");
-            let v = sample_for(&c, Duration::from_millis(80));
+            let (v, _) = sample_for(&c, Duration::from_millis(80));
             assert!(monotonic(&v));
             assert!(
                 v.iter().all(|x| *x >= target && *x < target + 0.2),

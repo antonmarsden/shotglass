@@ -66,6 +66,7 @@ impl Stall {
 #[derive(Clone, Copy, Default)]
 struct Marks {
     rendered: bool,
+    film_ms: Option<f32>,
     gpu_ms: Option<f32>,
     /// Housekeeping in `pump`: compiles and texture uploads.
     compile_ms: f32,
@@ -83,8 +84,8 @@ struct Perf {
     /// Work since the last measured frame, pushed with its frame time.
     pending: Marks,
     gpu_ms: VecDeque<f32>,
-    dropped: u32,
-    /// Dropped frames caused by compiling or sound synthesis, not by rendering.
+    skipped: u64,
+    /// Render gaps with slow compile, upload or sound work.
     stalled: u32,
     /// ... of which sound took most of the housekeeping time.
     stalled_sound: u32,
@@ -92,7 +93,7 @@ struct Perf {
     worst_sound: Option<Stall>,
     /// This frame did slow housekeeping work.
     stall: Option<Stall>,
-    last_render: Option<Instant>,
+    last_render: Option<(u64, Instant)>,
     stall_since_render: Option<Stall>,
     /// GPU times since the last scale change (for the scaler).
     gpu_recent: VecDeque<f32>,
@@ -108,9 +109,9 @@ impl Perf {
         }
         q.push_back(v);
     }
-    fn since_render_ms(&self) -> f32 {
-        self.last_render
-            .map_or(0.0, |t| t.elapsed().as_secs_f32() * 1000.0)
+    fn reset_render_timing(&mut self) {
+        self.last_render = None;
+        self.stall_since_render = None;
     }
 
     /// Estimated display refresh interval: a low percentile of recent frame times.
@@ -153,7 +154,7 @@ struct Player {
     reloads: u32,
     status: Option<(String, Instant)>,
     tex: Option<(glow::Texture, egui::TextureId)>,
-    rendered_key: Option<(u32, i32, i32, u32, u64)>,
+    rendered_key: Option<(u32, i32, i32, i32, u32, u64)>,
     generation: u64,
     scale_mode: ScaleMode,
     auto_scale: f32,
@@ -283,7 +284,7 @@ impl Player {
                 marks: VecDeque::new(),
                 pending: Marks::default(),
                 gpu_ms: VecDeque::new(),
-                dropped: 0,
+                skipped: 0,
                 stalled: 0,
                 stalled_sound: 0,
                 worst_sound: None,
@@ -350,6 +351,7 @@ impl Player {
                 }
                 self.movie = Some(m);
                 self.generation += 1;
+                self.perf.reset_render_timing();
                 self.sync_loop();
                 if let Some((a, b)) = self.loop_region {
                     let d = self.duration();
@@ -542,15 +544,25 @@ impl Player {
     // ------------------------------------------------------------ transport
 
     fn seek(&mut self, t: f32) {
-        self.clock.seek(t.clamp(0.0, self.duration()));
+        self.seek_precise(f64::from(t));
+    }
+
+    fn seek_precise(&mut self, t: f64) {
+        self.clock
+            .seek_precise(t.clamp(0.0, f64::from(self.duration())));
+        self.perf.reset_render_timing();
         self.last_input = Instant::now();
     }
 
-    fn step(&mut self, frames: f32) {
+    fn step(&mut self, frames: i64) {
         self.clock.pause();
-        let fps = self.fps();
-        let t = ((self.clock.time() * fps).round() + frames) / fps;
-        self.seek(t);
+        if let Some(m) = &self.movie {
+            let index = m.frame_at_precise(self.clock.time_precise());
+            let next = index
+                .saturating_add_signed(frames)
+                .min(m.frame_count().saturating_sub(1));
+            self.seek_precise(m.frame_time_precise(next));
+        }
     }
 
     fn shot_starts(&self) -> Vec<f32> {
@@ -626,10 +638,10 @@ impl Player {
             self.seek(t);
         }
         if k(none, Key::ArrowLeft) {
-            self.step(-1.0);
+            self.step(-1);
         }
         if k(none, Key::ArrowRight) {
-            self.step(1.0);
+            self.step(1);
         }
         if k(none, Key::Home) {
             self.seek(0.0);
@@ -680,24 +692,56 @@ impl Player {
     }
 
     fn toggle_play(&mut self) {
-        if !self.clock.playing() && self.clock.time() >= self.duration() - 1e-3 {
-            self.clock.seek(self.loop_region.map_or(0.0, |r| r.0));
+        if self.clock.playing() {
+            self.clock.pause();
+        } else {
+            if self.clock.time() >= self.duration() - 1e-3 {
+                self.clock.seek(self.loop_region.map_or(0.0, |r| r.0));
+            }
+            self.resume_playback();
         }
-        self.clock.toggle();
         self.last_input = Instant::now();
+    }
+
+    fn resume_playback(&mut self) {
+        let previous_rate = self.clock.sample_rate();
+        match self.clock.reconnect_audio() {
+            Ok(Some(a)) => {
+                self.sound_info = format!("{} | {} Hz", a.device_name, a.sample_rate);
+                eprintln!("audio: reopened output ({})", self.sound_info);
+                self.clock
+                    .set_gain(if self.muted { 0.0 } else { self.volume });
+                self.clock.set_loop(self.desired_loop_samples());
+                if self.clock.sample_rate() != previous_rate
+                    && let Some(m) = self.movie.clone()
+                {
+                    self.update_sound(&m);
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                eprintln!("audio: could not reopen output: {e}");
+                self.sound_info = format!("no audio output ({e}); using the system clock");
+            }
+        }
+        self.clock.play();
     }
 
     // ------------------------------------------------------------ frame logic
 
     /// Loop the clock (seamless: the sound card plays across the wrap) when a loop
     /// film plays with "repeat movie" on and no shot loop.
-    fn sync_loop(&mut self) {
-        let want = match &self.movie {
+    fn desired_loop_samples(&self) -> Option<usize> {
+        match &self.movie {
             Some(m) if m.loop_frames.is_some() && self.loop_all && self.loop_region.is_none() => {
                 Some(m.sound_samples(self.clock.sample_rate()))
             }
             _ => None,
-        };
+        }
+    }
+
+    fn sync_loop(&mut self) {
+        let want = self.desired_loop_samples();
         if want != self.clock.loop_samples() {
             self.clock.set_loop(want);
         }
@@ -715,10 +759,12 @@ impl Player {
         if let Some((a, b)) = self.loop_region {
             if t >= b || t < a - 0.5 {
                 self.clock.seek(a);
+                self.perf.reset_render_timing();
             }
         } else if t >= self.duration() {
             if self.loop_all {
                 self.clock.seek(0.0);
+                self.perf.reset_render_timing();
             } else {
                 self.clock.pause();
                 self.clock.seek(self.duration());
@@ -740,7 +786,7 @@ impl Player {
         }
     }
 
-    fn measure(&mut self, rendered: bool) {
+    fn measure(&mut self, rendered: Option<u64>) {
         let now = Instant::now();
         let dt = self.perf.last.map(|l| (now - l).as_secs_f32() * 1000.0);
         self.perf.last = Some(now);
@@ -751,14 +797,27 @@ impl Player {
         if !self.clock.playing() {
             self.perf.last = None;
             self.perf.pending = Marks::default();
-            self.perf.last_render = None;
-            self.perf.stall_since_render = None;
+            self.perf.reset_render_timing();
             return;
+        }
+        let mut film_ms = None;
+        let mut skipped = 0;
+        let stall = self.perf.stall_since_render;
+        if let Some(index) = rendered
+            && self.perf.last_render.is_none_or(|(last, _)| last != index)
+        {
+            if let Some((last, at)) = self.perf.last_render {
+                film_ms = Some((now - at).as_secs_f32() * 1000.0);
+                skipped = index.saturating_sub(last).saturating_sub(1);
+            }
+            self.perf.last_render = Some((index, now));
+            self.perf.stall_since_render = None;
         }
         let Some(dt) = dt else { return };
         Perf::push(&mut self.perf.frame_ms, dt);
         let mut mk = std::mem::take(&mut self.perf.pending);
-        mk.rendered = rendered;
+        mk.rendered = rendered.is_some();
+        mk.film_ms = film_ms;
         mk.gpu_ms = gpu;
         if self.perf.marks.len() >= 240 {
             self.perf.marks.pop_front();
@@ -771,30 +830,23 @@ impl Player {
                 self.say(format!("a frame took {g:.0} ms on the GPU; drawing it in strips to keep the driver happy"));
             }
         }
-        let stall = self.perf.stall_since_render;
         let vsync = self.perf.vsync_ms();
-        // A film frame is late if it took longer than a film frame to arrive.
         let frame_ms = 1000.0 / self.fps();
-        let late = rendered && self.perf.since_render_ms() > (frame_ms.max(vsync) * 1.5);
-        if rendered {
-            self.perf.last_render = Some(now);
-            self.perf.stall_since_render = None;
-        }
-        if late {
-            if let Some(st) = stall {
-                self.perf.stalled += 1;
-                if st.sound_ms >= st.compile_ms {
-                    self.perf.stalled_sound += 1;
-                    if self
-                        .perf
-                        .worst_sound
-                        .is_none_or(|w| st.sound_ms > w.sound_ms)
-                    {
-                        self.perf.worst_sound = Some(st);
-                    }
+        let late = film_ms.is_some_and(|ms| ms > frame_ms.max(vsync) * 1.5);
+        self.perf.skipped += skipped;
+        if (late || skipped > 0)
+            && let Some(st) = stall
+        {
+            self.perf.stalled += 1;
+            if st.sound_ms >= st.compile_ms {
+                self.perf.stalled_sound += 1;
+                if self
+                    .perf
+                    .worst_sound
+                    .is_none_or(|w| st.sound_ms > w.sound_ms)
+                {
+                    self.perf.worst_sound = Some(st);
                 }
-            } else {
-                self.perf.dropped += 1;
             }
         }
         if self.scale_mode != ScaleMode::Auto {
@@ -821,7 +873,7 @@ impl Player {
                 self.perf.gpu_recent.clear(); // measure afresh at the new scale
                 self.perf.cooldown = 10;
             }
-        } else if rendered {
+        } else if film_ms.is_some() {
             // No GPU timer: go by late film frames, ignoring ones we stalled ourselves.
             if late && stall.is_none() {
                 self.perf.misses += 1;
@@ -860,38 +912,40 @@ impl Player {
         }
     }
 
-    fn render_view(&mut self, frame: &mut eframe::Frame, w: i32, h: i32) -> bool {
+    fn render_view(&mut self, frame: &mut eframe::Frame, w: i32, h: i32) -> Option<u64> {
         if self.gpu_lost {
-            return false;
+            return None;
         }
-        let Some(m) = &self.movie else { return false };
-        let fps = m.fps;
+        let m = self.movie.as_ref()?;
         let playing = self.clock.playing();
         // While playing, render each film frame once (fps from movie.toml) and keep it
         // up until the next: a 30 fps film needs half the GPU work of a 60 Hz redraw,
         // and playback shows exactly the frames `still` would.
-        let t = if playing {
-            (self.clock.time() * fps).floor() / fps
+        let t = self.clock.time_precise();
+        let index = m.frame_at_precise(t).min(m.frame_count().saturating_sub(1));
+        let mut info = if playing {
+            FrameInfo::frame(m, index)
         } else {
-            self.clock.time()
+            FrameInfo::at(m, t as f32)
         };
-        let scale = self.effective_scale();
-        let key = (t.to_bits(), w, h, scale.to_bits(), self.generation);
+        info.frame = index.min(i32::MAX as u64) as i32;
+        let index = self.clock.loops() * m.loop_frames.unwrap_or(0) + index;
+        info.scale = self.effective_scale();
+        let key = (
+            info.t.to_bits(),
+            info.frame,
+            w,
+            h,
+            info.scale.to_bits(),
+            self.generation,
+        );
         if self.rendered_key == Some(key) {
-            return false;
+            return None;
         }
-        let info = FrameInfo {
-            t,
-            dt: 1.0 / fps,
-            frame: (t * fps) as i32,
-            scale,
-        };
         // Paused or scrubbing: compile on the spot if needed. Playing: never stall,
         // keep the previous frame up until the shot's program is ready.
         let blocking = !self.clock.playing();
-        let Some(tex) = self.renderer.render(m, w, h, &info, blocking) else {
-            return false;
-        };
+        let tex = self.renderer.render(m, w, h, &info, blocking)?;
         let tex = Some(tex);
         self.rendered_key = Some(key);
         if let Some(tex) = tex
@@ -900,7 +954,7 @@ impl Player {
             let id = frame.register_native_glow_texture(tex);
             self.tex = Some((tex, id));
         }
-        true
+        Some(index)
     }
 
     // ------------------------------------------------------------ ui pieces
@@ -915,14 +969,14 @@ impl Player {
                 self.jump_shot(-1);
             }
             if b(ui, "<", "previous frame (Left)") {
-                self.step(-1.0);
+                self.step(-1);
             }
             let play = if self.clock.playing() { "Pause" } else { "Play" };
             if b(ui, play, "play / pause (Space)") {
                 self.toggle_play();
             }
             if b(ui, ">", "next frame (Right)") {
-                self.step(1.0);
+                self.step(1);
             }
             if b(ui, ">>", "next shot (])") {
                 self.jump_shot(1);
@@ -956,15 +1010,17 @@ impl Player {
                 self.clock.set_rate(rate);
             }
             ui.separator();
-            let t = self.clock.time();
-            let fps = self.fps();
+            let t = self.clock.time_precise();
+            let index = self.movie.as_ref().map_or(0, |m| {
+                m.frame_at_precise(t).min(m.frame_count().saturating_sub(1))
+            });
             let loops = if self.clock.looping() {
                 format!("   loop {}", self.clock.loops() + 1)
             } else {
                 String::new()
             };
             ui.label(
-                RichText::new(format!("{}  /  {}   frame {}{loops}", clock_text(t), clock_text(self.duration()), (t * fps).round() as i64))
+                RichText::new(format!("{}  /  {}   frame {index}{loops}", clock_text(t as f32), clock_text(self.duration())))
                     .monospace()
                     .size(14.0),
             );
@@ -1243,7 +1299,7 @@ impl Player {
         }
         if resp.drag_stopped() || (resp.clicked() && !resp.dragged()) {
             if let Some(true) = self.scrub_resume.take() {
-                self.clock.play();
+                self.resume_playback();
             }
             self.scrub_resume = None;
         }
@@ -1392,17 +1448,24 @@ impl Player {
                         }
                     };
                     let fms = avg(&self.perf.frame_ms);
+                    let (film_ms, film_samples) = self.perf.marks.iter().rev()
+                        .filter_map(|mark| mark.film_ms)
+                        .take(30)
+                        .fold((0.0, 0), |(sum, count), ms| (sum + ms, count + 1));
                     ui.label(format!(
-                        "frame {}   |   {}",
-                        fms.map_or("–".into(), |v| format!("{v:.1} ms")),
-                        fms.map_or("–".into(), |v| format!("{:.0} fps", 1000.0 / v))
+                        "UI {}   |   film {:.3} fps   |   rendered {}",
+                        fms.map_or("–".into(), |v| format!("{:.1} fps", 1000.0 / v)),
+                        self.fps(),
+                        if film_samples == 0 { "–".into() } else {
+                            format!("{:.1} fps", 1000.0 * film_samples as f32 / film_ms)
+                        }
                     ));
                     ui.label(format!(
-                        "gpu {}   |   dropped {}",
+                        "gpu {}   |   skipped {}",
                         avg(&self.perf.gpu_ms).map_or("n/a".into(), |v| format!("{v:.2} ms")),
-                        self.perf.dropped
+                        self.perf.skipped
                     ))
-                    .on_hover_text("frames that missed the display refresh while rendering");
+                    .on_hover_text("film frames skipped between successful renders during playback");
                     let (frames, bytes) = self.renderer.footage_resident();
                     if frames > 0 || self.renderer.footage_misses > 0 {
                         ui.label(format!(
@@ -1447,9 +1510,11 @@ impl Player {
                         &self.perf.gpu_ms,
                         &self.perf.marks,
                         self.perf.vsync_ms(),
+                        1000.0 / self.fps(),
                     );
                     if ui.small_button("reset counters").clicked() {
-                        self.perf.dropped = 0;
+                        self.perf.skipped = 0;
+                        self.perf.reset_render_timing();
                         self.perf.stalled = 0;
                         self.perf.stalled_sound = 0;
                         self.perf.worst_sound = None;
@@ -1587,7 +1652,7 @@ impl eframe::App for Player {
                 .resizable(true)
                 .show(ui, |ui| self.side_panel(ui));
         }
-        let mut rendered = false;
+        let mut rendered = None;
         egui::CentralPanel::default().frame(egui::Frame::NONE.fill(Color32::from_gray(8))).show(ui, |ui| {
             let avail = ui.available_rect_before_wrap();
             let aspect = self.movie.as_ref().map_or(16.0 / 9.0, |m| m.aspect);
@@ -1763,6 +1828,7 @@ fn graph(
     gpu: &VecDeque<f32>,
     marks: &VecDeque<Marks>,
     vsync: f32,
+    film_target: f32,
 ) {
     const N: f32 = 240.0;
     const TICKS: f32 = 4.0 * 3.0; // four rows of 3 px
@@ -1775,12 +1841,14 @@ fn graph(
     let p = ui.painter_at(full);
     p.rect_filled(rect, 3.0, Color32::from_gray(18));
     let plot = Rect::from_min_max(rect.min, Pos2::new(rect.right(), rect.bottom() - TICKS));
-    let top = (vsync * 3.0).max(20.0);
+    let top = (vsync * 3.0).max(film_target * 2.0).max(20.0);
+    let film_color = Color32::from_rgb(190, 150, 245);
     let y = |ms: f32| plot.bottom() - (ms / top).min(1.0) * plot.height();
     let x = |len: usize, i: usize| rect.right() - (len - 1 - i) as f32 * rect.width() / N;
     for (ms, c) in [
         (vsync, Color32::from_rgb(90, 160, 90)),
         (vsync * 2.0, Color32::from_rgb(160, 90, 70)),
+        (film_target, film_color.gamma_multiply(0.45)),
     ] {
         p.line_segment(
             [
@@ -1820,9 +1888,23 @@ fn graph(
     };
     line(gpu, Color32::from_rgb(120, 180, 255));
     line(frame, Color32::from_rgb(255, 220, 140));
+    let mut previous = None;
+    for (i, mark) in marks.iter().enumerate() {
+        if let Some(ms) = mark.film_ms {
+            let point = Pos2::new(x(marks.len(), i), y(ms));
+            if let Some(last) = previous {
+                p.line_segment([last, point], Stroke::new(1.0, film_color));
+            }
+            p.circle_filled(point, 2.0, film_color);
+            previous = Some(point);
+        } else if mark.rendered {
+            previous = None;
+        }
+    }
     let mut lx = rect.left() + 4.0;
     for (label, c) in [
-        ("frame", Color32::from_rgb(255, 220, 140)),
+        ("UI", Color32::from_rgb(255, 220, 140)),
+        ("film interval", film_color),
         ("gpu", Color32::from_rgb(120, 180, 255)),
         ("render", MARK_RENDER),
         ("sound queued", MARK_QUEUED),
@@ -1852,8 +1934,11 @@ fn graph(
                 ],
                 Stroke::new(1.0, Color32::from_white_alpha(60)),
             );
-            let mut text = format!("frame {:.1} ms", frame[i]);
+            let mut text = format!("UI {:.1} ms", frame[i]);
             if let Some(m) = marks.get(i) {
+                if let Some(ms) = m.film_ms {
+                    text += &format!(", film interval {ms:.1} ms (target {film_target:.1} ms)");
+                }
                 if let Some(g) = m.gpu_ms {
                     text += &format!(", scene gpu {g:.1} ms");
                 }

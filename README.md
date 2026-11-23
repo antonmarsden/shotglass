@@ -326,11 +326,13 @@ Text is a texture: name fonts in `[fonts]` and text blocks in `[texts]`, and bin
 to a channel like an image (needs `shotglass = "0.1.3"`):
 
 ```toml
+# Google Fonts families, added with `shotglass fonts add` (see "Getting fonts")
 [fonts]
-body = { file = "fonts/Inter-Regular.ttf", licence = "OFL-1.1" }
-bold = { file = "fonts/Inter-Variable.ttf", variations = { wght = 700 }, licence = "OFL-1.1" }
-display = { file = "<kit/fonts/Bungee-Regular.ttf>", fallback = ["body"] }   # from a library
-arabic = "fonts/NotoNaskhArabic-Regular.ttf"
+body = "<inter/Inter[opsz,wght].ttf>"
+bold = { file = "<inter/Inter[opsz,wght].ttf>", variations = { wght = 700 } }
+display = { file = "<bungee/Bungee-Regular.ttf>", fallback = ["body"] }
+arabic = "<notonaskharabic/NotoNaskhArabic[wght].ttf>"
+hand = { file = "fonts/MyHand.otf", licence = "OFL-1.1" }   # a font file in the film folder
 
 [texts]
 title = { text = "Big Shadow", font = "display", size = 160 }
@@ -794,7 +796,11 @@ To scrub, click or drag on the timeline. Hatched blocks are transitions;
   sound can start a frame or two late. Where the driver supports it (GL 4.4), the
   sound buffers stay mapped, so reading results and writing mix inputs need no
   driver call at all (`SHOTGLASS_NO_PERSISTENT=1` turns this off). The Performance
-  panel splits stalls into sound and compiling, and shows where the worst sound
+  panel reports UI update FPS, the film's target FPS, and the rate of successful
+  film renders. The purple trace shows the interval between film renders against
+  the film's target interval. Skipped frames are counted between successful
+  renders during continuous playback. The panel splits stalls into sound and
+  compiling, and shows where the worst sound
   stall's time went, down to the GL call. Ticks under its frame graph mark the
   frames that rendered a film frame, queued or collected sound, or compiled;
   hover a frame for its numbers.
