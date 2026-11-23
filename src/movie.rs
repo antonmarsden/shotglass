@@ -1116,12 +1116,7 @@ impl Movie {
             if !ids.insert(s.id.clone()) {
                 bail!("duplicate shot id \"{}\"", s.id);
             }
-            if s.id.is_empty()
-                || !s
-                    .id
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-            {
+            if !is_pass_id(&s.id) {
                 bail!("shot id \"{}\" may only use letters, digits, _ and -", s.id);
             }
             path_rule(format!("{}: scene", ctx()), &s.scene)?;
@@ -1326,12 +1321,7 @@ impl Movie {
         };
         for (index, l) in f.layers.into_iter().enumerate() {
             let what = format!("layer \"{}\"", l.id);
-            if l.id.is_empty()
-                || !l
-                    .id
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-            {
+            if !is_pass_id(&l.id) {
                 bail!(
                     "layer id \"{}\" may only use letters, digits, _ and -",
                     l.id
@@ -2275,7 +2265,7 @@ fn texture_spec(
                 if names.is_none() {
                     bail!("{what}: \"{s}\" isn't a file; @ sources go in a shot's channels");
                 }
-                if !is_ident(out) {
+                if !is_pass_id(out) {
                     bail!(
                         "{what}: \"{s}\": after @ comes input, picture, or the id of a layer or comp"
                     );
@@ -2514,6 +2504,12 @@ pub fn glsl_float(x: f32) -> String {
     } else {
         format!("{s}.0")
     }
+}
+
+fn is_pass_id(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
 fn is_ident(s: &str) -> bool {
@@ -3462,8 +3458,8 @@ glsl = 450
     #[test]
     fn blends_and_layer_references() {
         let m = layers_film(
-            "[[layer]]\nid = \"glow\"\nscene = \"l.glsl\"\nopacity = 0\n\
-             [[layer]]\nid = \"screen\"\nscene = \"l.glsl\"\nblend = \"fx/screen\"\nchannels = [\"@glow\", \"@picture\", \"@input\"]\n\
+            "[[layer]]\nid = \"bright-pass\"\nscene = \"l.glsl\"\nopacity = 0\n\
+             [[layer]]\nid = \"screen\"\nscene = \"l.glsl\"\nblend = \"fx/screen\"\nchannels = [\"@bright-pass\", \"@picture\", \"@input\"]\n\
              [[layer]]\nid = \"local\"\nscene = \"l.glsl\"\nblend = \"fx/my-blend.glsl\"\n\
              [[layer]]\nid = \"plain\"\nscene = \"l.glsl\"\nblend = \"over\"\n",
         )
@@ -3481,13 +3477,13 @@ glsl = 450
             [
                 &Source::Layer {
                     index: 0,
-                    id: "glow".into()
+                    id: "bright-pass".into()
                 },
                 &Source::Picture,
                 &Source::Input
             ]
         );
-        assert_eq!(screen.channels[0].as_ref().unwrap().label(), "@glow");
+        assert_eq!(screen.channels[0].as_ref().unwrap().label(), "@bright-pass");
         assert_eq!(m.layers[2].blend.as_deref(), Some("fx/my-blend.glsl"));
         // "over" is the engine's source-over: no blend pass.
         assert_eq!(m.layers[3].blend, None);
