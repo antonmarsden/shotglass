@@ -1531,19 +1531,36 @@ impl Movie {
 
     /// Time of frame `n`: exactly `n * den / num`, rounded once to f32.
     pub fn frame_time(&self, n: u64) -> f32 {
-        (n as f64 * self.fps_den as f64 / self.fps_num as f64) as f32
+        self.frame_time_precise(n) as f32
+    }
+
+    pub fn frame_time_precise(&self, n: u64) -> f64 {
+        n as f64 * self.fps_den as f64 / self.fps_num as f64
+    }
+
+    /// Select a frame before rounding the live clock to a shader timestamp.
+    pub fn frame_at_precise(&self, t: f64) -> u64 {
+        let n = (t.max(0.0) * self.fps_num as f64 / self.fps_den as f64).round() as u64;
+        if t < self.frame_time_precise(n) {
+            n.saturating_sub(1)
+        } else {
+            n
+        }
     }
 
     /// The frame on screen at `t` (the inverse of `frame_time`: `frame_at(frame_time(n)) == n`).
     pub fn frame_at(&self, t: f32) -> i64 {
         let f = t.max(0.0) as f64 * self.fps_num as f64 / self.fps_den as f64;
-        // frame_time rounds to f32, which can land just below n/fps; don't drop a frame for that.
-        let n = f.round();
-        if (f - n).abs() < 1e-4 * n.max(1.0) {
-            n as i64
+        // Compare against the same rounded boundary used by frame_time.
+        let n = f.round() as u64;
+        // Wrapping an already rounded timestamp can land just below a boundary.
+        let rounded_loop_boundary = self.loop_frames.is_some() && (f - n as f64).abs() < 0.001;
+        let index = if t < self.frame_time(n) && !rounded_loop_boundary {
+            n.saturating_sub(1)
         } else {
-            f.floor() as i64
-        }
+            n
+        };
+        index.min(i64::MAX as u64) as i64
     }
 
     /// Frames in the film: every n with `frame_time(n) < duration` (one period of a
@@ -2580,6 +2597,11 @@ mod tests {
             // Halfway between frames is still the earlier frame.
             let mid = (m.frame_time(10) + m.frame_time(11)) / 2.0;
             assert_eq!(m.frame_at(mid), 10);
+            let mid = (m.frame_time(10_000) + m.frame_time(10_001)) / 2.0;
+            assert_eq!(m.frame_at(mid), 10_000);
+            let boundary = m.frame_time_precise(10_001);
+            assert_eq!(m.frame_at_precise(boundary - 1e-9), 10_000);
+            assert_eq!(m.frame_at_precise(boundary), 10_001);
             let n = m.frame_count();
             assert!(m.frame_time(n - 1) < m.duration && m.frame_time(n) >= m.duration);
         }

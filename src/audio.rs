@@ -407,12 +407,16 @@ impl Clock {
     /// The movie time being *heard* right now. Never decreases while playing, except
     /// that a loop film's time wraps to 0 at the end of each period.
     pub fn time(&self) -> f32 {
+        self.time_precise() as f32
+    }
+
+    pub fn time_precise(&self) -> f64 {
         if !self.playing {
-            return self.wrap(self.floor) as f32;
+            return self.wrap(self.floor);
         }
         let t = self.source_time().max(self.reported.get());
         self.reported.set(t);
-        self.wrap(t) as f32
+        self.wrap(t)
     }
 
     /// Unwrapped playback time (seconds since the last play/seek's origin).
@@ -486,7 +490,11 @@ impl Clock {
     }
 
     pub fn seek(&mut self, t: f32) {
-        let t = self.wrap(t.max(0.0) as f64);
+        self.seek_precise(f64::from(t));
+    }
+
+    pub fn seek_precise(&mut self, t: f64) {
+        let t = self.wrap(t.max(0.0));
         if self.playing {
             self.start_at(t);
         } else {

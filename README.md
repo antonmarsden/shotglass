@@ -725,7 +725,11 @@ To scrub, click or drag on the timeline. Hatched blocks are transitions;
   sound can start a frame or two late. Where the driver supports it (GL 4.4), the
   sound buffers stay mapped, so reading results and writing mix inputs need no
   driver call at all (`SHOTGLASS_NO_PERSISTENT=1` turns this off). The Performance
-  panel splits stalls into sound and compiling, and shows where the worst sound
+  panel reports UI update FPS, the film's target FPS, and the rate of successful
+  film renders. The purple trace shows the interval between film renders against
+  the film's target interval. Skipped frames are counted between successful
+  renders during continuous playback. The panel splits stalls into sound and
+  compiling, and shows where the worst sound
   stall's time went, down to the GL call. Ticks under its frame graph mark the
   frames that rendered a film frame, queued or collected sound, or compiled;
   hover a frame for its numbers.
