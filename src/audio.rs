@@ -183,7 +183,11 @@ fn build<T: SizedSample + FromSample<f32>>(
                 // WASAPI can also report a fatal render error as a generic backend error.
                 status.failed.store(true, Ordering::Release);
             }
-            eprintln!("audio: {e}");
+            // The next Play reports the result of reopening the output. A failed
+            // stream can emit follow-up errors while it is being torn down.
+            if !status.failed.load(Ordering::Acquire) {
+                eprintln!("audio: {e}");
+            }
         },
         None,
     )?;
