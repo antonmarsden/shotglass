@@ -692,24 +692,56 @@ impl Player {
     }
 
     fn toggle_play(&mut self) {
-        if !self.clock.playing() && self.clock.time() >= self.duration() - 1e-3 {
-            self.clock.seek(self.loop_region.map_or(0.0, |r| r.0));
+        if self.clock.playing() {
+            self.clock.pause();
+        } else {
+            if self.clock.time() >= self.duration() - 1e-3 {
+                self.clock.seek(self.loop_region.map_or(0.0, |r| r.0));
+            }
+            self.resume_playback();
         }
-        self.clock.toggle();
         self.last_input = Instant::now();
+    }
+
+    fn resume_playback(&mut self) {
+        let previous_rate = self.clock.sample_rate();
+        match self.clock.reconnect_audio() {
+            Ok(Some(a)) => {
+                self.sound_info = format!("{} | {} Hz", a.device_name, a.sample_rate);
+                eprintln!("audio: reopened output ({})", self.sound_info);
+                self.clock
+                    .set_gain(if self.muted { 0.0 } else { self.volume });
+                self.clock.set_loop(self.desired_loop_samples());
+                if self.clock.sample_rate() != previous_rate
+                    && let Some(m) = self.movie.clone()
+                {
+                    self.update_sound(&m);
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                eprintln!("audio: could not reopen output: {e}");
+                self.sound_info = format!("no audio output ({e}); using the system clock");
+            }
+        }
+        self.clock.play();
     }
 
     // ------------------------------------------------------------ frame logic
 
     /// Loop the clock (seamless: the sound card plays across the wrap) when a loop
     /// film plays with "repeat movie" on and no shot loop.
-    fn sync_loop(&mut self) {
-        let want = match &self.movie {
+    fn desired_loop_samples(&self) -> Option<usize> {
+        match &self.movie {
             Some(m) if m.loop_frames.is_some() && self.loop_all && self.loop_region.is_none() => {
                 Some(m.sound_samples(self.clock.sample_rate()))
             }
             _ => None,
-        };
+        }
+    }
+
+    fn sync_loop(&mut self) {
+        let want = self.desired_loop_samples();
         if want != self.clock.loop_samples() {
             self.clock.set_loop(want);
         }
@@ -1267,7 +1299,7 @@ impl Player {
         }
         if resp.drag_stopped() || (resp.clicked() && !resp.dragged()) {
             if let Some(true) = self.scrub_resume.take() {
-                self.clock.play();
+                self.resume_playback();
             }
             self.scrub_resume = None;
         }
