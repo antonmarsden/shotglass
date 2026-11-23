@@ -593,6 +593,11 @@ A layer's channels can read other passes' pictures:
 | `"@picture"` | the picture track, before any layer (for a picture-in-picture, a clean plate) |
 | `"@<id>"` | an earlier layer's own picture, at its own size, before it's composited and whatever its opacity: a layer at `opacity = 0` is a hidden helper pass. Black, with resolution 0, while that layer isn't active |
 
+Layer IDs in declarations and channel references use one or more ASCII letters,
+digits, underscores, or hyphens. For example, a later layer can read
+`id = "bright-pass"` with `channels = ["@bright-pass"]`. The names `@input` and
+`@picture` keep their meanings above.
+
 A layer can read only layers below it (earlier in `movie.toml`), so passes never loop.
 Comps (sequences inside a layer) and mattes come next (see
 `docs/design/layers-compositing.md`).
