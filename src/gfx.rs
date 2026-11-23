@@ -1283,29 +1283,20 @@ impl Renderer {
             self.evict_textures(&tex_order);
         }
         self.texture_ms = ms_since(t_tex);
-        // Drop fallbacks once their replacement works (footage on screen: at the
-        // playhead's frame; elsewhere its frames aren't needed yet).
+        // A ready frame only proves that one frame of a sequence works. Keep
+        // the previous version available for other frames, subject to texture eviction.
         if !self.fallback.is_empty() {
-            let n = film_frame(movie, t);
-            let n_shots = movie.shots.len();
-            let mut ready = vec![];
-            for i in 0..self.wanted.len().min(self.wanted_ids.len()) {
-                if !self.fallback.contains_key(&self.wanted_ids[i]) {
-                    continue;
-                }
-                let on_screen = match movie.shots.get(i) {
-                    Some(shot) => distance(movie, shot, t) == 0.0,
-                    None => movie
-                        .layers
-                        .get(i - n_shots)
-                        .is_some_and(|l| layer_distance(movie, l, t) == 0.0),
-                };
-                let k = self.wanted[i];
-                let k = if on_screen { self.resolve(k, n) } else { k };
-                if self.keys_ready(k) {
-                    ready.push(self.wanted_ids[i].clone());
-                }
-            }
+            let ready: Vec<_> = self
+                .wanted_ids
+                .iter()
+                .zip(&self.wanted)
+                .filter(|(id, k)| {
+                    self.fallback.contains_key(*id)
+                        && k.channels.iter().flatten().all(|c| c.footage.is_none())
+                        && self.keys_ready(**k)
+                })
+                .map(|(id, _)| id.clone())
+                .collect();
             for id in ready {
                 self.fallback.remove(&id);
             }

@@ -3143,6 +3143,14 @@ fn footage_broken(gl: &Gl, dir: &Path) -> Result<String> {
     r.set_movie(&m2).map_err(|_| {
         anyhow!("set_movie refused a version with a broken frame (should fall back)")
     })?;
+    // Reload on a healthy frame, then run the fallback cleanup before seeking.
+    r.render(&m2, W, H, &FrameInfo::frame(&m2, 4), true)
+        .ok_or_else(|| anyhow!("healthy frame 4: nothing rendered"))?;
+    let healthy = px(&r.read_output().unwrap(), 80, 45);
+    if frame_of(healthy) != Some(4) {
+        bail!("the replacement version didn't draw healthy frame 4");
+    }
+    r.pump(&m2, m2.frame_time(4), false);
     if draw(&mut r, &m2, false)? != Some(5) || draw(&mut r, &m2, true)? != Some(5) {
         bail!("a broken frame didn't fall back to the last working version's frame");
     }
