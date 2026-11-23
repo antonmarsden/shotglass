@@ -31,7 +31,10 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
   zuv.x += 0.32;
   if (fragCoord.y < res.y * 0.5 && all(greaterThanEqual(zuv, vec2(0.0))) && all(lessThanEqual(zuv, vec2(1.0)))) {
     float d = texture(iChannel0, zuv).g;           // 0.5 at the outline
-    float w = fwidth(d) * 0.75;
+    // Edge width from the known scale, not fwidth(d): derivatives of a texture
+    // fetch differ between drivers. d moves 0.5 per spread (meta.w) texels, and a
+    // pixel here covers size.y / (4h) texels.
+    float w = 0.75 * (0.5 / meta.w) * size.y / (h * 4.0);
     float fill = smoothstep(0.5 - w, 0.5 + w, d);
     float band = smoothstep(0.42 - w, 0.42 + w, d) - fill;   // outline outside the ink
     float glow = smoothstep(0.1, 0.42, d) * (1.0 - fill - band);
