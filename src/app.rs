@@ -1466,6 +1466,19 @@ impl Player {
                         self.perf.skipped
                     ))
                     .on_hover_text("film frames skipped between successful renders during playback");
+                    let (frames, bytes) = self.renderer.footage_resident();
+                    if frames > 0 || self.renderer.footage_misses > 0 {
+                        ui.label(format!(
+                            "footage {frames} frames ({}) on the GPU   |   waited {}",
+                            crate::texture::describe_bytes(bytes),
+                            self.renderer.footage_misses
+                        ))
+                        .on_hover_text(
+                            "image-sequence frames uploaded ahead of the playhead, and how \
+                             often playback waited for one (decoding can't keep up: try JPEG \
+                             or smaller frames)",
+                        );
+                    }
                     if self.perf.stalled > 0 {
                         ui.label(format!(
                             "stalls {} (sound {}, compiling {})",
@@ -1583,8 +1596,19 @@ impl eframe::App for Player {
         let gap = self.last_ui.map(|t| now - t);
         self.last_ui = Some(now);
         // Debounced live reload: editors often write a file in several steps.
+        // A renderer writing an image sequence saves many files in a row: wait for
+        // ~300 ms of quiet before reloading a film with footage.
+        let quiet = if self
+            .movie
+            .as_ref()
+            .is_some_and(|m| m.channels().any(|c| c.sequence().is_some()))
+        {
+            300
+        } else {
+            120
+        };
         while self.rx.try_recv().is_ok() {
-            self.reload_at = Some(Instant::now() + Duration::from_millis(120));
+            self.reload_at = Some(Instant::now() + Duration::from_millis(quiet));
         }
         if self.reload_at.is_some_and(|t| Instant::now() >= t) {
             self.reload_at = None;

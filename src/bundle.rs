@@ -58,6 +58,12 @@ pub fn used_files(m: &Movie) -> (BTreeMap<String, BTreeSet<String>>, Vec<String>
             used.entry(lib.clone()).or_default().insert(f.rel.clone());
         }
     }
+    // A library sequence's frames, as its scan found them.
+    for f in m.channels().flat_map(crate::movie::Channel::sequence_files) {
+        if let Some(lib) = &f.library {
+            used.entry(lib.clone()).or_default().insert(f.rel);
+        }
+    }
     (used, errors)
 }
 

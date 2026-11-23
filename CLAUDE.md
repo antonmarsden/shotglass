@@ -47,12 +47,13 @@ cargo fmt && cargo clippy --all-targets -- -D warnings
 
 | file | what |
 |---|---|
-| `main.rs` | CLI (clap): play, still, strip, check, wav, export, new, fetch, update, licenses, fonts add, bundle, freeze, unfreeze, test, selftest |
+| `main.rs` | CLI (clap): play, still, strip, check (`--deep`: every sequence frame), wav, export, new, fetch, update, licenses, fonts add, bundle, freeze, unfreeze, test, selftest |
 | `fonts.rs` | Google Fonts families as libraries (`[libraries] x = { google = "Family" }`): google/fonts folders (`ofl/`, `apache/`, `ufl/`) and `METADATA.pb` → `Library::google` (licence, no `library.toml`); `shotglass fonts add` writes the library and `[fonts]` entries (`toml_edit`) and fetches; tests use a local fixture repo through a `Fetcher` with its own `google_source` |
 | `golden.rs` | `strip`/`wav --compare/--bless`: golden-image comparison (per-pixel tolerance, pixel budget, mean limit, diff image); soundtrack comparison (RMS/peak of the difference per 50 ms window, first differing time), WAV reader |
-| `export.rs` | offline export: frame n at `frame_time(n)`, raw RGBA piped to ffmpeg (or PNGs), WAV muxed in |
-| `movie.rs` | `movie.toml` (+ its project) → `Movie`; timeline (`at(t)`), rational fps (`frame_time`/`frame_at`), cue defines, sound gains/windows, `[[layer]]` → `Movie::layers` (spans, `opacity_at`, `layers_at`), `channels`/`[textures]`/`[fonts]`/`[texts]` → `Shot::channels` (`Channel { source: Image(FileRef) \| Text(TextSource) }`, `files()` = every file it reads), `loop` (`loop_frames`, `loop_period`, `wrap`, `sound_samples`) |
-| `texture.rs` | iChannel textures, CPU side: PNG/JPEG → RGBA8 (flipped for `vflip`), `load_text` (layout + raster → RGBA8 + `meta`), size limits, GPU memory, error messages (HTML page, Git LFS pointer, half-saved file) |
+| `export.rs` | offline export: frame n at `frame_time(n)`, raw RGBA piped to ffmpeg (or PNGs), WAV muxed in; fails on a footage frame that didn't decode (`footage_failure`) |
+| `footage.rs` | image sequences (#70), CPU side: `Pattern` (`fog_####.png`: prefix, digits, suffix; wider numbers as Blender writes), `scan` once at `Movie::load` (`first`, contiguous `count`, frame 0's size; gap / padding / case errors), `check_frames` for `check --deep`, `MIN_FRAMES` (3 per sequence in the shot budget) |
+| `movie.rs` | `movie.toml` (+ its project) → `Movie`; timeline (`at(t)`), rational fps (`frame_time`/`frame_at`), cue defines, sound gains/windows, `[[layer]]` → `Movie::layers` (spans, `opacity_at`, `layers_at`), `channels`/`[textures]`/`[fonts]`/`[texts]` → `Shot::channels` (`Channel { source: Image(FileRef) \| Text(TextSource) \| Frames(Sequence) \| …, timing }`, `files()` = every single file it reads, `written()` adds a sequence's pattern, `sequence_files()` its scanned frames), footage (#70): `frames`/`texture = "…"` re-timing, `Timing` (`in`/`in_frame`, `speed`, `clock`, `end`), `scan_footage`, `FrameMap::source_frame` (the pure film frame → source frame map: exact rationals, `source_snap`, wraps loop films) and `Movie::frame_map`/`source_frame(ItemRef, c, n)`, `loop` (`loop_frames`, `loop_period`, `wrap`, `sound_samples`) |
+| `texture.rs` | iChannel textures, CPU side: PNG/JPEG → RGBA8 (flipped for `vflip`), `load_text` (layout + raster → RGBA8 + `meta`), size limits, GPU memory (`frame_bytes`: footage without mipmaps; `shot_memory` counts a sequence's minimum window), error messages (HTML page, Git LFS pointer, half-saved file) |
 | `text.rs` | text (#68): fonts (ttf-parser; no system fonts, no hinting), shaping (rustybuzz), bidi per paragraph, greedy UAX #14 breaking, layout → `Layout` (glyphs, size, `meta` = iChannelMeta); raster: 4×4 coverage (R, A) + exact EDT signed distance on a 2×2 grid (G); fixture fonts in `tests/films/text/fonts` |
 | `anim.rs` | constants/keyframes, eases; `glsl_fn` turns keyframes into GLSL for sound shaders |
 | `shader.rs` | source assembly, `#include` (film-relative, `<lib/file>`, include-once), `#line 1 N` per file, driver-log → file:line; `Dialect` (fixed `330 core` / `300 es` baseline, `glsl` opt-in) |
@@ -61,13 +62,13 @@ cargo fmt && cargo clippy --all-targets -- -D warnings
 | `bundle.rs` | `licenses` (libraries a film includes, SPDX licences, non-commercial flag; film-folder fonts with their `licence`), `freeze`/`unfreeze` and `bundle` (one writer: exactly the included library files in `shotglass-libs/`, a `shotglass.toml` marked frozen, lock `path` entries; `bundle` adds the film folder and `LIBRARY-LICENSES.md`) |
 | `glsl_test.rs` | `shotglass test` (#63): `*.test.glsl` discovery, `test_*` scan (`Param`, `Grid`, `// samples:`), `number_assertions` (id inserted into each `expect*(` call), the test prelude (engine contract), dispatcher (pixel → test sample, RGBA32UI MRT results), banded draws, decode → first failure per test |
 | `validate.rs` | strict, driver-independent check (glslang) of every assembled shader; `validate_movie(m, dialect)` is the API `check`/`check --web` and the web player use |
-| `gfx.rs` | `Renderer`: lazy prioritised compiles, program cache (disk + LRU), textures (decode thread → banded uploads in `pump` → `glGenerateMipmap`; sampler objects; LRU under a 256 MB budget), off-screen targets, transitions/freeze, layers (picture → `picture`; each active layer drawn into `layer` at its scale, or its own exact-size `held[j]` when a later layer reads it, then the over pass or its blend pass (in `ShotKeys::trans`) into a `work` picture; final copy; pass keys `INPUT_TEX`/`PICTURE_TEX`/`LAYER_TEX - j`; layers follow shots in `wanted`; `set_hidden_layers` for the player's mute/solo), strips, GPU timer, audio blocks (submit → PBO + fence → poll/wait) |
+| `gfx.rs` | `Renderer`: lazy prioritised compiles, program cache (disk + LRU), textures (decode thread → banded uploads in `pump` → `glGenerateMipmap`; sampler objects; LRU under a 256 MB budget), off-screen targets, transitions/freeze, layers (picture → `picture`; each active layer drawn into `layer` at its scale, or its own exact-size `held[j]` when a later layer reads it, then the over pass or its blend pass (in `ShotKeys::trans`) into a `work` picture; final copy; pass keys `INPUT_TEX`/`PICTURE_TEX`/`LAYER_TEX - j`; layers follow shots in `wanted`; `set_hidden_layers` for the player's mute/solo), strips, GPU timer, audio blocks (submit → PBO + fence → poll/wait); footage (#70): a `FootageEntry` per footage channel and version (`ChanKey::footage`, `tex` = `FOOTAGE_UNRESOLVED` until `resolve(keys, n)` puts in the frame's texture or `FOOTAGE_BLACK`), frames are ordinary store textures keyed by file path + size + mtime (`frame_tex`, one stat per version and frame), `footage_order` (window `n − 2 .. n + ½ s` and heads of items starting within 2 s, by `source_frame`), decode pool (`Decoder`, `min(4, cores − 2)` workers), separate footage upload budget and in-flight cap, eviction every pump (passed frames first, their GL textures to `spare` for reuse), `blocking_footage_loads`, `footage_misses`, `footage_failure` |
 | `sound.rs` | `Soundtrack`: music / per-shot / mix tracks synthesised in cached chunks; `chunk` blocks, `stream` never does |
 | `audio.rs` | cpal output, lock-free `fill` callback, chunk store (wraps for loop films, `wrap_span`), master `Clock` (f64, `set_loop`), WAV writer |
 | `app.rs` | egui player: transport, timeline, panels, live reload, auto scale, sound streaming |
 | `headless.rs` | hidden-window GL context for CLI commands |
 | `selftest.rs` | GPU/sound checks on fixture films written to a temp dir |
-| `tests/golden.rs`, `tests/golden/` | golden tests: 8-frame 320x180 strips and 8 kHz soundtracks of the demo and the template, a strip of `tests/films/channels` (textures), a strip of `tests/films/text` (text blocks, distance field, RTL, iChannel6/7), a strip of `tests/films/layers` (spans, fades, fixed scale, `@input`), a strip of `tests/films/blends` (blend passes, `@picture`, `@<layer>`), and a two-period strip and the soundtrack of `tests/films/loop` (`loop = true`), vs reference PNGs / WAVs |
+| `tests/golden.rs`, `tests/golden/` | golden tests: 8-frame 320x180 strips and 8 kHz soundtracks of the demo and the template, a strip of `tests/films/channels` (textures), a strip of `tests/films/text` (text blocks, distance field, RTL, iChannel6/7), a strip of `tests/films/layers` (spans, fades, fixed scale, `@input`), a strip of `tests/films/blends` (blend passes, `@picture`, `@<layer>`), a strip of `tests/films/footage` (image sequences: 24 in 30, re-timing, `clock = "movie"`, `end = "black"`, `iChannelTime`; tiny CC0 frames), and a two-period strip and the soundtrack of `tests/films/loop` (`loop = true`), vs reference PNGs / WAVs |
 | `glsl/copy.glsl`, `glsl/over.glsl` | the engine's internal copy pass and layer composite (premultiplied over, × opacity); not transitions films can name |
 | `movies/big-shadow/` | demo film; `templates/new/` is what `shotglass new` writes |
 
@@ -148,7 +149,7 @@ cargo fmt && cargo clippy --all-targets -- -D warnings
   what a layer at opacity o *is*. Every other blend mode and effect is kit GLSL.
 - **Channel entries are classified in one place**, `movie::ChannelSource::of`, by spelling
   (`""`, `@output`, `[textures]` name, image / `####` sequence / video path); kinds not built
-  yet are refused with the version that brings them. The count is `movie::N_CHANNELS`
+  yet (video) are refused with what brings them. The count is `movie::N_CHANNELS`
   (8: `iChannel0..7`, `iChannelResolution`/`iChannelTime`/`iChannelMeta[8]` in the scene
   header). Engine-internal units in the scene pass go above the channels (layers: 8–9).
   Never bake the count into a file format or data layout.
@@ -160,6 +161,18 @@ cargo fmt && cargo clippy --all-targets -- -D warnings
   Opacity is applied by the composite, not the footer, so `@<layer>` sees the layer itself
   (an `opacity = 0` helper pass works). Hidden layers are a preview-only thing: export never
   sets them (selftest "layers: hidden…").
+- **Footage: exact frame or stall** (#70). Which source frame a channel shows is
+  `FrameMap::source_frame(n)`, a pure function of the film frame (`film_frame(movie, t)` =
+  `frame_at(wrap(t))`, as `iFrame`; a frozen transition's outgoing shot uses the
+  transition's first frame), so playback, `still` and `export` show the same frame. A
+  shot is usable only when *that* frame is `Ready` on every footage channel (or the
+  fallback version has it), never a neighbour. Frames decode on the pool and upload in
+  bands in `pump` with their own budget; only `usable(.., blocking=true)` loads one on the
+  spot, counted in `blocking_footage_loads` (selftest: 0 while playing). Footage entries
+  are per version (`generation` in the key), so a re-rendered frame reloads and a
+  half-written one falls back to the previous version's frame; a missing frame in the
+  middle (a gap) refuses the version at `Movie::load`. Don't use `floor_snap` for source
+  frames: its 1e-4 relative tolerance rounds frame 2000.8 up (`source_snap` is tight).
 - **Text blocks are deterministic and laid out off the render thread.** Bytes depend only on
   the font files, the `[texts]` entry and the engine (no system fonts, no hinting, plain
   IEEE maths, exact EDT; `text::tests::raster_is_pinned` pins a sha256: bump it on purpose,

@@ -1,0 +1,30 @@
+# Golden-image film for image sequences (tests/golden.rs, #70): a 24 fps plate (JPEG,
+# a frame counter and a bar that moves 2 px a frame) in a 30 fps film, with a 12 fps
+# RGBA matte over it that runs on the film's clock across the cuts and loops. The
+# second shot re-times the plate (from 0.5 s at half speed), the third starts it at
+# frame 16 and reads black past its end. The bottom bar is iChannelTime[0] (the
+# plate's source time), the top-right corner checks iChannelResolution[0].
+title = "footage"
+fps = 30
+
+[textures]
+plate = { frames = "frames/plate_####.jpg", fps = 24 }
+matte = { frames = "frames/matte_##.png", fps = 12, clock = "movie", end = "loop" }
+
+[[shot]]
+id = "plate"
+scene = "scenes/comp.glsl"
+duration = 1.5
+channels = ["plate", "matte"]
+
+[[shot]]
+id = "slow"
+scene = "scenes/comp.glsl"
+duration = 1.5
+channels = [{ texture = "plate", in = 0.5, speed = 0.5 }, "matte"]
+
+[[shot]]
+id = "tail"
+scene = "scenes/comp.glsl"
+duration = 1.0
+channels = [{ texture = "plate", in_frame = 16, end = "black" }, "matte"]

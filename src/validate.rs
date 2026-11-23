@@ -500,6 +500,18 @@ mod tests {
         }
     }
 
+    /// The golden film for image sequences has no libraries; its frames are in the film.
+    #[test]
+    fn footage_film_passes_everywhere() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/films/footage");
+        let m = Movie::load(&root).unwrap();
+        assert!(m.warnings.is_empty(), "{:?}", m.warnings);
+        assert!(m.channels().any(|c| c.sequence().is_some()) && m.contract_warning().is_none());
+        for d in all_dialects() {
+            expect_clean(&m, d);
+        }
+    }
+
     /// The template's transition comes from shotglass-kit (no built-ins, so no warnings).
     #[test]
     fn template_passes_everywhere() {

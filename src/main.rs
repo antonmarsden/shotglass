@@ -6,6 +6,7 @@ mod audio;
 mod bundle;
 mod export;
 mod fonts;
+mod footage;
 mod gfx;
 mod glsl_test;
 mod golden;
@@ -129,6 +130,9 @@ enum Cmd {
         /// Only validate (movie.toml and the strict GLSL check); no GPU needed.
         #[arg(long)]
         no_gpu: bool,
+        /// Also decode every frame of every image sequence (sizes, broken files).
+        #[arg(long)]
+        deep: bool,
     },
     /// Write the GLSL soundtrack to a WAV file.
     Wav {
@@ -309,7 +313,8 @@ fn real_main() -> Result<()> {
             frames,
             web,
             no_gpu,
-        } => for_each_film(&movie, |f| check(f, &size, frames, web, no_gpu)),
+            deep,
+        } => for_each_film(&movie, |f| check(f, &size, frames, web, no_gpu, deep)),
         Cmd::Wav {
             movie,
             out,
@@ -637,6 +642,9 @@ fn still(movie: &Path, at: &str, size: &str, out: &Path) -> Result<()> {
         for t in times {
             r.render(&m, w, h, &frame_info(&m, t), true)
                 .ok_or_else(|| anyhow!("nothing rendered"))?;
+            if let Some(e) = r.footage_failure() {
+                bail!("{t:.3}s: {e}");
+            }
             let frame = r.read_output().ok_or_else(|| anyhow!("nothing rendered"))?;
             let path = out.join(format!("t{:08.3}.png", t));
             save_png(&path, &frame)?;
@@ -689,6 +697,9 @@ fn strip(
         for (i, t) in times.iter().enumerate() {
             r.render(&m, w as i32, h as i32, &frame_info(&m, *t), true)
                 .ok_or_else(|| anyhow!("nothing rendered"))?;
+            if let Some(e) = r.footage_failure() {
+                bail!("{t:.3}s: {e}");
+            }
             let (x, y) = ((i % cols) * (w + gap) + gap, (i / cols) * (h + gap) + gap);
             r.read_output_into(&mut sheet, (x, y));
             println!("#{i:<3} {:>7.2}s  {}", t, describe(&m, *t));
@@ -829,13 +840,15 @@ fn strict_check(m: &Movie, web: bool) -> Result<()> {
 }
 
 /// The texture part of `check` (no GPU needed): decode every texture and lay out every
-/// text, check the limits and each shot's memory, and point out channels a scene reads
-/// but nothing is bound to.
-fn check_textures(m: &Movie, web: bool) -> Result<()> {
+/// text (and each sequence's first frame, or with `deep` every frame), check the limits
+/// and each shot's memory, and point out channels a scene reads but nothing is bound to.
+fn check_textures(m: &Movie, web: bool, deep: bool) -> Result<()> {
     if let Some(w) = m.contract_warning() {
         println!("warning: {w}");
     }
-    let mut sizes: Vec<(&movie::Source, (usize, usize))> = vec![];
+    // (source, size, GPU bytes it needs at once)
+    let mut sizes: Vec<(&movie::Source, (usize, usize), usize)> = vec![];
+    let mut web_footage_bytes = 0u64;
     let mut failed = 0;
     let flags = |c: &movie::Channel| match (c.srgb, c.vflip) {
         (true, true) => ", srgb",
@@ -844,8 +857,67 @@ fn check_textures(m: &Movie, web: bool) -> Result<()> {
         (false, true) => "",
     };
     for c in m.textures() {
+        let mut bytes = None;
         let size = match &c.source {
             movie::Source::Input | movie::Source::Picture | movie::Source::Layer { .. } => continue,
+            movie::Source::Frames(seq) => {
+                let label = &seq.pattern.label;
+                let Some(scan) = &seq.scan else {
+                    eprintln!("{label}: not scanned");
+                    failed += 1;
+                    continue;
+                };
+                let (num, den) = seq.fps.unwrap_or((m.fps_num, m.fps_den));
+                let fps = if den == 1 {
+                    format!("{num}")
+                } else {
+                    format!("{num}/{den}")
+                };
+                // The first frame always; every frame with --deep.
+                let first = texture::load(&scan.path(0), label, c.vflip);
+                let problems = match (&first, deep) {
+                    (Err(e), _) => vec![e.clone()],
+                    (Ok(_), true) => footage::check_frames(scan, label, 10),
+                    (Ok(_), false) => vec![],
+                };
+                for p in &problems {
+                    eprintln!("{p}");
+                }
+                if web {
+                    web_footage_bytes += (0..scan.count)
+                        .filter_map(|k| std::fs::metadata(scan.path(k)).ok())
+                        .map(|md| md.len())
+                        .sum::<u64>();
+                }
+                match (first, problems.is_empty()) {
+                    (Ok(img), true) => {
+                        let (w, h) = (img.width, img.height);
+                        let b = texture::frame_bytes(w, h, c.filter == texture::Filter::Mipmap);
+                        println!(
+                            "frames {label}: {} frames ({}), {w}×{h} at {fps} fps, {:.2} s, {} \
+                             per frame on the GPU{}{}",
+                            scan.count,
+                            scan.range(),
+                            scan.count as f64 * den as f64 / num as f64,
+                            texture::describe_bytes(b),
+                            flags(c),
+                            if deep { ", every frame decoded" } else { "" }
+                        );
+                        for warning in &img.warnings {
+                            println!("warning: {warning}");
+                        }
+                        if w * h > 1920 * 1080 {
+                            println!(
+                                "warning: {label}: {w}×{h} frames are over 1920×1080; footage \
+                                 this large may not play in real time (and is heavy for the web)"
+                            );
+                        }
+                        bytes = Some(footage::MIN_FRAMES * b);
+                        Some((w, h))
+                    }
+                    _ => None,
+                }
+            }
             movie::Source::Image(f) => match texture::load(&f.file, &f.label, c.vflip) {
                 Ok(img) => {
                     let (w, h) = (img.width, img.height);
@@ -920,11 +992,19 @@ fn check_textures(m: &Movie, web: bool) -> Result<()> {
                 }
             );
         }
-        sizes.push((&c.source, (w, h)));
+        sizes.push((&c.source, (w, h), bytes.unwrap_or(texture::gpu_bytes(w, h))));
     }
     if failed > 0 {
         bail!("{failed} texture(s) can't be used");
     }
+    if web_footage_bytes > 200 << 20 {
+        println!(
+            "warning: the film's image sequences are {} on disk; the web player preloads \
+             footage, so keep it under about 200 MB (smaller frames, JPEG)",
+            texture::describe_bytes(web_footage_bytes as usize)
+        );
+    }
+    footage_warnings(m);
     let mut largest: Option<(usize, &str)> = None;
     let cues = m.cue_defines();
     for s in &m.shots {
@@ -938,8 +1018,8 @@ fn check_textures(m: &Movie, web: bool) -> Result<()> {
                 continue;
             }
             counted.push(src);
-            if let Some((_, (w, h))) = sizes.iter().find(|(s, _)| *s == src) {
-                total += texture::gpu_bytes(*w, *h);
+            if let Some((_, _, b)) = sizes.iter().find(|(s, _, _)| *s == src) {
+                total += b;
             }
         }
         if total > 0 && largest.is_none_or(|(b, _)| total > b) {
@@ -973,7 +1053,84 @@ fn check_textures(m: &Movie, web: bool) -> Result<()> {
     Ok(())
 }
 
-fn check(movie: &Path, size: &str, frames: usize, web: bool, no_gpu: bool) -> Result<()> {
+/// `check`'s footage warnings: a shot or layer that runs past the end of its sequence
+/// (`end = "hold"` freezes the last frame), and a loop film's `end = "loop"` channel
+/// whose clip doesn't fit the period a whole number of times (a jump at the seam).
+fn footage_warnings(m: &Movie) {
+    use movie::{End, FootageClock, ItemRef};
+    let items = (0..m.shots.len())
+        .map(|i| {
+            (
+                ItemRef::Shot(i),
+                format!("shot \"{}\"", m.shots[i].id),
+                m.shots[i].start,
+                m.shots[i].end(),
+            )
+        })
+        .chain((0..m.layers.len()).map(|j| {
+            let l = &m.layers[j];
+            (
+                ItemRef::Layer(j),
+                format!("layer \"{}\"", l.id),
+                l.start,
+                l.end,
+            )
+        }));
+    for (item, who, start, end) in items {
+        for c in 0..movie::N_CHANNELS {
+            let Some(map) = m.frame_map(item, c) else {
+                continue;
+            };
+            let label = match item {
+                ItemRef::Shot(i) => m.shots[i].channels[c].as_ref(),
+                ItemRef::Layer(j) => m.layers[j].channels[c].as_ref(),
+            }
+            .map(|c| c.label())
+            .unwrap_or_default();
+            let last = (m.frame_at(end) - 1).max(m.frame_at(start)) as u64;
+            if map.timing.end == End::Hold && map.timing.speed > 0.0 {
+                let open = movie::FrameMap {
+                    timing: movie::Timing {
+                        end: End::Black,
+                        ..map.timing
+                    },
+                    ..map
+                };
+                if open.source_frame(last).is_none() {
+                    println!(
+                        "warning: {who} ({:.2} s) runs past the end of {label} ({} frames); \
+                         end = \"hold\" freezes its last frame",
+                        end - start,
+                        map.count
+                    );
+                }
+            }
+            if let Some(period) = m.loop_period()
+                && map.timing.end == End::Loop
+                && map.timing.clock == FootageClock::Movie
+            {
+                let frames = period * map.timing.speed * map.src.0 as f64 / map.src.1 as f64;
+                let laps = frames / map.count as f64;
+                if (laps - laps.round()).abs() > 1e-6 {
+                    println!(
+                        "warning: {who}: {label} ({} frames) doesn't fit the loop period \
+                         ({period:.2} s) a whole number of times: a visible jump at the seam",
+                        map.count
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn check(
+    movie: &Path,
+    size: &str,
+    frames: usize,
+    web: bool,
+    no_gpu: bool,
+    deep: bool,
+) -> Result<()> {
     let m = load_movie(movie)?;
     let (w, h) = parse_size(size)?;
     println!(
@@ -1009,7 +1166,7 @@ fn check(movie: &Path, size: &str, frames: usize, web: bool, no_gpu: bool) -> Re
         );
     }
     strict_check(&m, web)?;
-    check_textures(&m, web)?;
+    check_textures(&m, web, deep)?;
     if no_gpu {
         println!(
             "

@@ -1,8 +1,8 @@
 //! Golden regression tests: renders a contact sheet and the soundtrack of the demo film
 //! and of the `shotglass new` template (and contact sheets of tests/films/channels, the
 //! iChannel textures film, tests/films/text, the text film, tests/films/layers and
-//! tests/films/blends, the layer films, and both of tests/films/loop, a `loop = true`
-//! film) and compares them with reference PNGs and WAVs in tests/golden/, so "compiles but looks (or sounds) wrong" fails `cargo test` (and
+//! tests/films/blends, the layer films, tests/films/footage, image sequences, and both
+//! of tests/films/loop, a `loop = true` film) and compares them with reference PNGs and WAVs in tests/golden/, so "compiles but looks (or sounds) wrong" fails `cargo test` (and
 //! CI, on software OpenGL).
 //!
 //! - On a mismatch the actual strip and a diff image (differences in magenta), or the
@@ -257,6 +257,23 @@ fn blends_film() {
     golden_frames(
         "blends",
         &root().join("tests").join("films").join("blends"),
+        &["--count", COUNT],
+        &[],
+    );
+}
+
+/// Footage (#70): tests/films/footage, a 24 fps plate (a frame counter and a bar that
+/// moves 2 px a frame) in a 30 fps film under a 12 fps matte on the film's clock;
+/// re-timed (`in`, `speed`), started at a frame and black past its end, with
+/// iChannelTime as a bar. A timing error shows as a wrong counter.
+#[test]
+fn footage_film() {
+    if skip() {
+        return;
+    }
+    golden_frames(
+        "footage",
+        &root().join("tests").join("films").join("footage"),
         &["--count", COUNT],
         &[],
     );
