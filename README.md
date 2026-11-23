@@ -1153,7 +1153,7 @@ shotglass strip  <movie> [--count 12 | --at ...] [--size 384x216] [--cols 4] [--
 shotglass check  <movie> [--web] [--no-gpu] [--deep] [--size 1280x720] [--frames 8]
                  # validate movie.toml and the GLSL (strictly), compile, synth, time
                  # --deep: also decode every frame of every image sequence
-shotglass wav    <movie> [--out sound.wav] [--rate 48000]
+shotglass wav    <movie> [--out sound.wav] [--rate 48000] [--allow-silence]
                  [--compare ref.wav [--bless] [--max-rms 0.0015] [--max-peak 0.01]]
                  # --compare: fail if the sound differs from ref.wav (writes sound.diff.wav)
 shotglass export <movie> --out film.webm [--size 1920x1080] [--format webm|av1|ffv1|png|ffmpeg] [--rate 48000]
@@ -1172,6 +1172,10 @@ shotglass selftest [filter]                                # GPU + sound checks 
 
 `still`, `strip`, `check`, `wav` and `export` render off-screen (`check --no-gpu` doesn't need OpenGL). On a Linux machine with
 no display, run them under `xvfb-run`; Mesa's software OpenGL works.
+
+For a film without music or shot sounds, `wav --allow-silence` writes a silent stereo
+WAV for the full film duration at the requested sample rate. This path needs no
+OpenGL and supports `--compare` and `--bless`.
 
 ## Export
 
