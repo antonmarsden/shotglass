@@ -7,11 +7,15 @@ use crate::gfx::FrameInfo;
 use crate::shader::{Assembled, Dialect};
 use anyhow::{Result, anyhow, bail};
 use eframe::glow::{self, HasContext};
+use toodee::{TooDee, TooDeeOps};
+
+/// Float RGBA texels as GL lays them out: bottom row first.
+pub type Texels = TooDee<[f32; 4]>;
 
 /// One reduction pass: each output texel combines a 4×4 block. The first pass reads
 /// the measure (`.a` of the metric map); later ones read the previous level's two
 /// targets: (sum, max, finite, non-finite) and (over, min, -, -). Non-finite is
-/// tested on the bits (exponent all ones), which no optimiser drops.
+/// tested on the bits ([`NONFINITE`]).
 const REDUCE: &str = "
 uniform sampler2D sg_src;
 uniform sampler2D sg_src2;
@@ -29,7 +33,7 @@ void main() {
       if (p.x >= sg_size.x || p.y >= sg_size.y) continue;
       vec4 v = texelFetch(sg_src, p, 0);
       if (sg_first == 1) {
-        if ((floatBitsToUint(v.a) & 0x7f800000u) == 0x7f800000u) {
+        if (sg_nonfinite(v.a)) {
           bad += 1.0;
         } else {
           sum += v.a;
@@ -54,6 +58,12 @@ void main() {
 }
 ";
 
+/// NaN or Inf: the exponent bits are all ones. A bit test no optimiser can fold away,
+/// unlike `isnan`/`isinf` or `x != x`; both passes use it, so they agree.
+const NONFINITE: &str = "
+bool sg_nonfinite(float x) { return (floatBitsToUint(x) & 0x7f800000u) == 0x7f800000u; }
+";
+
 /// The histogram: one point per pixel of the metric map, added (blending ONE, ONE)
 /// into the bin its finite measure falls in; non-finite ones are drawn off-target.
 const HISTOGRAM_VS: &str = "
@@ -64,7 +74,7 @@ void main() {
   ivec2 p = ivec2(gl_VertexID % sg_width, gl_VertexID / sg_width);
   float v = texelFetch(sg_src, p, 0).a;
   gl_PointSize = 1.0;
-  if ((floatBitsToUint(v) & 0x7f800000u) == 0x7f800000u) {
+  if (sg_nonfinite(v)) {
     gl_Position = vec4(2.0, 2.0, 0.0, 1.0);
     return;
   }
@@ -159,15 +169,16 @@ impl Target {
         }
     }
 
-    /// Attachment `i`'s texels, bottom row first.
-    pub unsafe fn read(&self, gl: &glow::Context, i: u32) -> Vec<[f32; 4]> {
+    /// Attachment `i`'s texels.
+    pub unsafe fn read(&self, gl: &glow::Context, i: u32) -> Texels {
         let (w, h) = self.size;
-        let mut bytes = vec![0u8; (w * h * 16) as usize];
+        let mut px = Texels::init(w as usize, h as usize, [0.0; 4]);
         unsafe {
             gl.bind_buffer(glow::PIXEL_PACK_BUFFER, None);
             gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.fbo));
             gl.read_buffer(glow::COLOR_ATTACHMENT0 + i);
             gl.pixel_store_i32(glow::PACK_ALIGNMENT, 4);
+            let bytes: &mut [u8] = bytemuck_bytes(px.data_mut());
             gl.read_pixels(
                 0,
                 0,
@@ -175,29 +186,25 @@ impl Target {
                 h,
                 glow::RGBA,
                 glow::FLOAT,
-                glow::PixelPackData::Slice(Some(&mut bytes)),
+                glow::PixelPackData::Slice(Some(bytes)),
             );
             gl.read_buffer(glow::COLOR_ATTACHMENT0);
             gl.bind_framebuffer(glow::FRAMEBUFFER, None);
         }
-        bytes
-            .as_chunks::<16>()
-            .0
-            .iter()
-            .map(|c| {
-                std::array::from_fn(|i| f32::from_ne_bytes(*c[i * 4..].first_chunk().unwrap()))
-            })
-            .collect()
+        px
     }
 }
 
-/// Upload texels (bottom row first, as GL wants) as an RGBA32F texture.
-pub unsafe fn upload(
-    gl: &glow::Context,
-    w: usize,
-    h: usize,
-    px: &[[f32; 4]],
-) -> Result<glow::Texture> {
+/// Texels as the bytes GL reads into and uploads from.
+fn bytemuck_bytes(px: &mut [[f32; 4]]) -> &mut [u8] {
+    let len = std::mem::size_of_val(px);
+    // SAFETY: [f32; 4] has no padding and every bit pattern is a valid f32.
+    unsafe { std::slice::from_raw_parts_mut(px.as_mut_ptr().cast::<u8>(), len) }
+}
+
+/// Upload texels as an RGBA32F texture.
+pub unsafe fn upload(gl: &glow::Context, px: &Texels) -> Result<glow::Texture> {
+    let mut data = px.data().to_vec();
     unsafe {
         let tex = gl.create_texture().map_err(|e| anyhow!(e))?;
         gl.bind_buffer(glow::PIXEL_UNPACK_BUFFER, None);
@@ -206,60 +213,20 @@ pub unsafe fn upload(
         gl.pixel_store_i32(glow::UNPACK_SKIP_PIXELS, 0);
         gl.pixel_store_i32(glow::UNPACK_SKIP_ROWS, 0);
         gl.bind_texture(glow::TEXTURE_2D, Some(tex));
-        let bytes: Vec<u8> = px
-            .iter()
-            .flat_map(|p| p.iter().flat_map(|c| c.to_ne_bytes()))
-            .collect();
         gl.tex_image_2d(
             glow::TEXTURE_2D,
             0,
             glow::RGBA32F as i32,
-            w as i32,
-            h as i32,
+            px.num_cols() as i32,
+            px.num_rows() as i32,
             0,
             glow::RGBA,
             glow::FLOAT,
-            glow::PixelUnpackData::Slice(Some(&bytes)),
+            glow::PixelUnpackData::Slice(Some(bytemuck_bytes(&mut data))),
         );
         nearest(gl);
         gl.bind_texture(glow::TEXTURE_2D, None);
         Ok(tex)
-    }
-}
-
-/// Link a vertex and a fragment shader; errors mapped like `shotglass test`'s.
-unsafe fn link(gl: &glow::Context, vs: &str, fs: &str, what: &str) -> Result<glow::Program> {
-    unsafe {
-        let prog = gl.create_program().map_err(|e| anyhow!(e))?;
-        let mut shaders = vec![];
-        for (kind, src) in [(glow::VERTEX_SHADER, vs), (glow::FRAGMENT_SHADER, fs)] {
-            let s = gl.create_shader(kind).map_err(|e| anyhow!(e))?;
-            gl.shader_source(s, src);
-            gl.compile_shader(s);
-            gl.attach_shader(prog, s);
-            shaders.push(s);
-        }
-        gl.link_program(prog);
-        let ok = gl.get_program_link_status(prog);
-        let log = if ok {
-            String::new()
-        } else {
-            shaders
-                .iter()
-                .map(|s| gl.get_shader_info_log(*s))
-                .chain([gl.get_program_info_log(prog)])
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
-        for s in shaders {
-            gl.detach_shader(prog, s);
-            gl.delete_shader(s);
-        }
-        if !ok {
-            gl.delete_program(prog);
-            bail!("{what} failed to compile: {log}");
-        }
-        Ok(prog)
     }
 }
 
@@ -277,10 +244,10 @@ impl Gpu {
     pub unsafe fn new(gl: &glow::Context, d: Dialect, w: i32, h: i32) -> Result<Gpu> {
         unsafe {
             let v = d.version_line();
-            let reduce = crate::glsl_test::compile(
+            let reduce = crate::shader::compile(
                 gl,
                 &Assembled {
-                    text: format!("{v}{REDUCE}"),
+                    text: format!("{v}{NONFINITE}{REDUCE}"),
                     dialect: d,
                     files: vec!["<shotglass reduction>".into()],
                     warnings: vec![],
@@ -288,13 +255,13 @@ impl Gpu {
                 },
             )
             .map_err(|e| anyhow!("the reduction pass failed to compile: {}", e.join("; ")))?;
-            let defs = format!("#define BINS {BINS}.0\n");
-            let histogram = link(
+            let histogram = crate::shader::link(
                 gl,
-                &format!("{v}{defs}{HISTOGRAM_VS}"),
+                &format!("{v}#define BINS {BINS}.0\n{NONFINITE}{HISTOGRAM_VS}"),
                 &format!("{v}{HISTOGRAM_FS}"),
-                "the histogram pass",
-            )?;
+                &["<shotglass histogram>".into()],
+            )
+            .map_err(|e| anyhow!("the histogram pass failed to compile: {}", e.join("; ")))?;
             let vao = gl.create_vertex_array().map_err(|e| anyhow!(e))?;
             let map = Target::new(gl, w, h, 1)?;
             let mut levels = vec![];
@@ -397,7 +364,7 @@ impl Gpu {
             unbind(gl, 2);
             if self.levels.is_empty() {
                 // A 1×1 map: reduce on the CPU.
-                let v = self.map.read(gl, 0)[0][3];
+                let v = self.map.read(gl, 0).data()[0][3];
                 return if v.is_finite() {
                     let over = threshold.is_some_and(|t| v as f64 > t) as u8 as f32;
                     ([v, v, 1.0, 0.0], [over, v, 0.0, 0.0])
@@ -405,7 +372,7 @@ impl Gpu {
                     ([0.0, -3.0e38, 0.0, 1.0], [0.0, 3.0e38, 0.0, 0.0])
                 };
             }
-            (src.read(gl, 0)[0], src.read(gl, 1)[0])
+            (src.read(gl, 0).data()[0], src.read(gl, 1).data()[0])
         }
     }
 
@@ -440,6 +407,7 @@ impl Gpu {
             unbind(gl, 1);
             self.hist
                 .read(gl, 0)
+                .data()
                 .iter()
                 .map(|t| t[0].max(0.0).round() as u64)
                 .collect()

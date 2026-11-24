@@ -12,9 +12,8 @@
 //! `expect*(<id>, ` and the engine keeps id → (line, call text), so a failure names the
 //! exact call, even several on one line, without GLSL needing strings.
 
-use crate::gfx::vertex_source;
 use crate::library::Library;
-use crate::shader::{Assembled, Builder, Dialect, DriverGlsl, top_level_definitions};
+use crate::shader::{Assembled, Builder, Dialect, DriverGlsl, compile, top_level_definitions};
 use crate::validate::{Stage, validate};
 use anyhow::{Result, anyhow, bail};
 use eframe::glow::{self, HasContext};
@@ -836,51 +835,6 @@ pub fn run(
     }
     unsafe { gpu.delete(gl) };
     Ok(sum)
-}
-
-pub(crate) unsafe fn compile(
-    gl: &glow::Context,
-    src: &Assembled,
-) -> std::result::Result<glow::Program, Vec<String>> {
-    unsafe {
-        let vs = gl.create_shader(glow::VERTEX_SHADER).map_err(|e| vec![e])?;
-        gl.shader_source(vs, &vertex_source(src.dialect));
-        gl.compile_shader(vs);
-        let fs = gl
-            .create_shader(glow::FRAGMENT_SHADER)
-            .map_err(|e| vec![e])?;
-        gl.shader_source(fs, &src.text);
-        gl.compile_shader(fs);
-        let prog = gl.create_program().map_err(|e| vec![e])?;
-        gl.attach_shader(prog, vs);
-        gl.attach_shader(prog, fs);
-        gl.link_program(prog);
-        let mut errors = vec![];
-        if !gl.get_program_link_status(prog) {
-            if !gl.get_shader_compile_status(vs) {
-                errors.push(format!("vertex shader: {}", gl.get_shader_info_log(vs)));
-            }
-            if !gl.get_shader_compile_status(fs) {
-                errors.extend(crate::shader::remap_log(
-                    &gl.get_shader_info_log(fs),
-                    &src.files,
-                ));
-            }
-            if errors.is_empty() {
-                errors.push(format!("link: {}", gl.get_program_info_log(prog)));
-            }
-        }
-        gl.detach_shader(prog, vs);
-        gl.detach_shader(prog, fs);
-        gl.delete_shader(vs);
-        gl.delete_shader(fs);
-        if errors.is_empty() {
-            Ok(prog)
-        } else {
-            gl.delete_program(prog);
-            Err(errors)
-        }
-    }
 }
 
 impl Gpu {

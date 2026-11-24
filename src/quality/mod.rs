@@ -23,7 +23,7 @@ mod config;
 mod gpu;
 mod stats;
 
-pub use config::{Config, tighten};
+pub use config::{Config, QUALITY_FILE, tighten};
 pub use stats::Report;
 
 use crate::gfx::{Frame, FrameInfo, Renderer};
@@ -33,11 +33,10 @@ use crate::validate::{Source, Stage};
 use anyhow::{Context, Result, anyhow, bail};
 use config::Metric;
 use eframe::glow::{self, HasContext};
+use gpu::{Gpu, Texels};
 use stats::{FrameReport, MetricReport, Reduced, Totals};
 use std::sync::Arc;
-use toodee::TooDeeOps;
-
-pub const QUALITY_FILE: &str = "quality.toml";
+use toodee::{CopyOps, TooDeeOps, TooDeeOpsMut, TranslateOps};
 
 const METRIC_HEADER: &str = "\
 uniform vec3 iResolution;
@@ -109,21 +108,6 @@ pub fn sources(m: &Movie, d: Dialect) -> Result<Vec<Source>> {
         .collect())
 }
 
-impl Config {
-    /// The film's `quality.toml`, if it has one.
-    pub fn of_film(m: &Movie) -> Result<Option<Config>> {
-        let path = m.root.join(QUALITY_FILE);
-        if !path.exists() {
-            return Ok(None);
-        }
-        let text = std::fs::read_to_string(&path)
-            .with_context(|| format!("reading {}", path.display()))?;
-        Config::parse(&text)
-            .with_context(|| format!("{}", path.display()))
-            .map(Some)
-    }
-}
-
 /// The version of the library a metric comes from, for the report.
 fn library_version(m: &Movie, use_: &str) -> Option<String> {
     match crate::movie::transition_kind(use_) {
@@ -136,40 +120,41 @@ fn library_version(m: &Movie, use_: &str) -> Option<String> {
     }
 }
 
-/// A frame (top row first) as GL texels in 0..1, bottom row first.
-fn frame_texels(f: &Frame) -> Vec<[f32; 4]> {
-    let mut out = Vec::with_capacity(f.num_cols() * f.num_rows());
-    for y in (0..f.num_rows()).rev() {
-        out.extend(f[y].iter().map(|p| p.map(|c| c as f32 / 255.0)));
-    }
-    out
+/// A frame (top row first) as GL texels in 0..1.
+fn frame_texels(f: &Frame) -> Texels {
+    let px = f.data().iter().map(|p| p.map(|c| c as f32 / 255.0));
+    let mut t = Texels::from_vec(f.num_cols(), f.num_rows(), px.collect());
+    t.flip_rows();
+    t
 }
 
 /// The N×-sized frame `f` box-filtered down by `n` (averages of 8-bit values, as the
-/// 1× frame is), as GL texels, bottom row first.
-pub fn box_filter(f: &Frame, n: usize) -> Vec<[f32; 4]> {
+/// 1× frame is), as GL texels.
+pub fn box_filter(f: &Frame, n: usize) -> Texels {
     let (w, h) = (f.num_cols() / n, f.num_rows() / n);
-    let k = (n * n) as f32;
-    let mut out = Vec::with_capacity(w * h);
-    for y in (0..h).rev() {
-        for x in 0..w {
-            let mut s = [0u32; 4];
-            for dy in 0..n {
-                for p in &f[y * n + dy][x * n..x * n + n] {
-                    for c in 0..4 {
-                        s[c] += p[c] as u32;
-                    }
-                }
-            }
-            out.push(s.map(|c| c as f32 / (k * 255.0)));
+    let k = (n * n * 255) as f32;
+    let mut out = Texels::init(w, h, [0.0; 4]);
+    for (y, row) in out.rows_mut().enumerate() {
+        for (x, px) in row.iter_mut().enumerate() {
+            let block = f.view((x * n, y * n), (x * n + n, y * n + n));
+            let sum = block.cells().fold([0u32; 4], |s, p| {
+                std::array::from_fn(|c| s[c] + p[c] as u32)
+            });
+            *px = sum.map(|c| c as f32 / k);
         }
     }
+    out.flip_rows();
     out
 }
 
-/// A rendered variant: its texels (bottom row first) and the film frame it shows
-/// (`@prev`/`@next`; None for `@reference`).
-type Variant = (Vec<[f32; 4]>, Option<u64>);
+/// A metric map's heatmap colour (`.rgb`, clamped to 0..1) as a frame, top row first.
+fn heatmap(px: &Texels) -> Frame {
+    let c = |f: f32| (f.clamp(0.0, 1.0) * 255.0).round() as u8;
+    let rgb = px.data().iter().map(|v| [c(v[0]), c(v[1]), c(v[2]), 255]);
+    let mut f = Frame::from_vec(px.num_cols(), px.num_rows(), rgb.collect());
+    f.flip_rows();
+    f
+}
 
 /// Render the frame `info` at w×h and read it back.
 fn render(r: &mut Renderer, m: &Movie, (w, h): (usize, usize), info: &FrameInfo) -> Result<Frame> {
@@ -179,6 +164,157 @@ fn render(r: &mut Renderer, m: &Movie, (w, h): (usize, usize), info: &FrameInfo)
         bail!("{:.3}s: {e}", info.t);
     }
     r.read_output().ok_or_else(|| anyhow!("nothing rendered"))
+}
+
+/// The metrics compiled for this driver, and which variants each reads.
+struct Programs {
+    progs: Vec<glow::Program>,
+    reads: Vec<[bool; 3]>,
+}
+
+impl Programs {
+    fn compile(gl: &glow::Context, d: Dialect, m: &Movie, cfg: &Config) -> Result<Programs> {
+        let mut p = Programs {
+            progs: vec![],
+            reads: vec![],
+        };
+        for x in &cfg.metrics {
+            let built = metric_source(d, x, m)
+                .with_context(|| format!("metric \"{}\"", x.name))
+                .and_then(|src| {
+                    let prog = unsafe { crate::shader::compile(gl, &src) }.map_err(|e| {
+                        anyhow!(
+                            "metric \"{}\" ({}) failed to compile:\n  {}",
+                            x.name,
+                            x.use_,
+                            src.explain(e).join("\n  ")
+                        )
+                    })?;
+                    Ok((prog, variants_read(&src)))
+                });
+            match built {
+                Ok((prog, read)) => {
+                    p.progs.push(prog);
+                    p.reads.push(read);
+                }
+                Err(e) => {
+                    p.delete(gl);
+                    return Err(e);
+                }
+            }
+        }
+        Ok(p)
+    }
+
+    /// Whether any metric reads variant `v`.
+    fn wanted(&self) -> [bool; 3] {
+        std::array::from_fn(|v| self.reads.iter().any(|r| r[v]))
+    }
+
+    fn delete(&self, gl: &glow::Context) {
+        for p in &self.progs {
+            unsafe { gl.delete_program(*p) };
+        }
+    }
+}
+
+/// The variants of one sample frame that some metric reads, as GL textures (`VARIANTS`
+/// order), and the film frames `@prev`/`@next` showed.
+struct Variants {
+    tex: [Option<glow::Texture>; 3],
+    frames: [Option<u64>; 3],
+}
+
+impl Variants {
+    fn render(
+        gl: &glow::Context,
+        r: &mut Renderer,
+        m: &Movie,
+        info: &FrameInfo,
+        size: (usize, usize),
+        n: usize,
+        wanted: [bool; 3],
+    ) -> Result<Variants> {
+        let mut v = Variants {
+            tex: [None; 3],
+            frames: [None; 3],
+        };
+        let out = (|| -> Result<()> {
+            if wanted[0] {
+                let big = render(r, m, (size.0 * n, size.1 * n), info)?;
+                v.tex[0] = Some(unsafe { gpu::upload(gl, &box_filter(&big, n))? });
+            }
+            for (i, delta) in [(1, -1i64), (2, 1)] {
+                if wanted[i] {
+                    let k = neighbour(m, info.frame.max(0) as u64, delta);
+                    let f = render(r, m, size, &FrameInfo::frame(m, k))?;
+                    v.tex[i] = Some(unsafe { gpu::upload(gl, &frame_texels(&f))? });
+                    v.frames[i] = Some(k);
+                }
+            }
+            Ok(())
+        })();
+        match out {
+            Ok(()) => Ok(v),
+            Err(e) => {
+                v.delete(gl);
+                Err(e)
+            }
+        }
+    }
+
+    /// The samplers a metric binds: every variant, the frame for any not rendered.
+    fn inputs(&self, frame: glow::Texture) -> Vec<(&'static str, glow::Texture)> {
+        std::iter::once(("sg_frame", frame))
+            .chain(
+                VARIANTS
+                    .iter()
+                    .zip(self.tex)
+                    .map(|((_, _, s), t)| (*s, t.unwrap_or(frame))),
+            )
+            .collect()
+    }
+
+    fn delete(&self, gl: &glow::Context) {
+        for t in self.tex.iter().flatten() {
+            unsafe { gl.delete_texture(*t) };
+        }
+    }
+}
+
+/// One metric on one sample frame: reduced, its histogram, its heatmap if wanted.
+struct Measured {
+    reduced: Reduced,
+    histogram: Vec<u64>,
+    heatmap: Option<Frame>,
+}
+
+unsafe fn measure(
+    gl: &glow::Context,
+    g: &Gpu,
+    prog: glow::Program,
+    x: &Metric,
+    inputs: &[(&str, glow::Texture)],
+    info: &FrameInfo,
+    heat: bool,
+) -> Measured {
+    unsafe {
+        g.draw_metric(gl, prog, inputs, info);
+        let (a, b) = g.reduce(gl, x.threshold);
+        Measured {
+            reduced: Reduced::from_texels(a, b, x.threshold.is_some()),
+            histogram: g.histogram(gl, x.range),
+            heatmap: heat.then(|| heatmap(&g.map.read(gl, 0))),
+        }
+    }
+}
+
+/// What `run` collects per metric over the sample frames.
+#[derive(Default)]
+struct Collected {
+    frames: Vec<Reduced>,
+    histograms: Vec<Vec<u64>>,
+    sheet: Option<Frame>,
 }
 
 /// Render `times` of `m` and measure them with `cfg`'s metrics. `heatmaps` keeps a
@@ -199,128 +335,71 @@ pub fn run(
         );
     }
     let dialect = r.dialect_for(m).map_err(|e| anyhow!(e))?;
-    let (w, h) = (cfg.size.0 as usize, cfg.size.1 as usize);
+    let size = (cfg.size.0 as usize, cfg.size.1 as usize);
     let n = cfg.reference as usize;
-
-    let mut progs = vec![];
-    let mut reads = vec![];
-    for x in &cfg.metrics {
-        let src = metric_source(dialect, x, m).with_context(|| format!("metric \"{}\"", x.name))?;
-        reads.push(variants_read(&src));
-        match unsafe { crate::glsl_test::compile(&gl, &src) } {
-            Ok(p) => progs.push(p),
-            Err(e) => {
-                for p in progs {
-                    unsafe { gl.delete_program(p) };
-                }
+    let progs = Programs::compile(&gl, dialect, m, cfg)?;
+    let wanted = progs.wanted();
+    let layout = crate::Sheet::new(times.len(), 4, size.0, size.1);
+    let mut collected: Vec<Collected> = cfg
+        .metrics
+        .iter()
+        .map(|_| Collected {
+            sheet: heatmaps.then(|| layout.blank()),
+            ..Default::default()
+        })
+        .collect();
+    let mut frames = vec![];
+    let result = (|| -> Result<()> {
+        if wanted[0] {
+            let max = unsafe { gl.get_parameter_i32(glow::MAX_TEXTURE_SIZE) } as usize;
+            if size.0 * n > max || size.1 * n > max {
                 bail!(
-                    "metric \"{}\" ({}) failed to compile:\n  {}",
-                    x.name,
-                    x.use_,
-                    src.explain(e).join("\n  ")
+                    "@reference at {}x{} ({}x{} × {n}) is larger than this GPU's limit of {max}; \
+                     lower reference or size in {QUALITY_FILE}",
+                    size.0 * n,
+                    size.1 * n,
+                    size.0,
+                    size.1
                 );
             }
         }
-    }
-    let wanted: [bool; 3] = std::array::from_fn(|v| reads.iter().any(|r| r[v]));
-    if wanted[0] {
-        let max = unsafe { gl.get_parameter_i32(glow::MAX_TEXTURE_SIZE) } as usize;
-        if w * n > max || h * n > max {
-            for p in &progs {
-                unsafe { gl.delete_program(*p) };
-            }
-            bail!(
-                "@reference at {}x{} ({w}x{h} × {n}) is larger than this GPU's limit of {max}; \
-                 lower reference or size in {QUALITY_FILE}",
-                w * n,
-                h * n
-            );
-        }
-    }
-
-    let layout = crate::Sheet::new(times.len(), 4, w, h);
-    let mut sheets: Vec<Option<Frame>> = cfg
-        .metrics
-        .iter()
-        .map(|_| heatmaps.then(|| layout.blank()))
-        .collect();
-    let mut per_metric: Vec<Vec<Reduced>> = vec![vec![]; cfg.metrics.len()];
-    let mut hists: Vec<Vec<Vec<u64>>> = vec![vec![]; cfg.metrics.len()];
-    let mut frames = vec![];
-
-    let result = (|| -> Result<()> {
-        let g = unsafe { gpu::Gpu::new(&gl, dialect, w as i32, h as i32)? };
+        let g = unsafe { Gpu::new(&gl, dialect, size.0 as i32, size.1 as i32)? };
         let out = (|| -> Result<()> {
             for (i, &t) in times.iter().enumerate() {
                 let info = FrameInfo::at(m, t);
-                let fnum = info.frame.max(0) as u64;
                 r.gpu_ms(); // drop older samples
-                let frame = render(&mut r, m, (w, h), &info)?;
+                let frame = render(&mut r, m, size, &info)?;
                 r.finish();
                 let cost_ms = r.gpu_ms();
-                // Variants: (texels, film frame shown) for reference, prev, next.
-                let mut variants: [Option<Variant>; 3] = [None, None, None];
-                if wanted[0] {
-                    let big = render(&mut r, m, (w * n, h * n), &info)?;
-                    variants[0] = Some((box_filter(&big, n), None));
-                }
-                for (v, delta) in [(1, -1i64), (2, 1)] {
-                    if wanted[v] {
-                        let k = neighbour(m, fnum, delta);
-                        let f = render(&mut r, m, (w, h), &FrameInfo::frame(m, k))?;
-                        variants[v] = Some((frame_texels(&f), Some(k)));
+                let variants = Variants::render(&gl, &mut r, m, &info, size, n, wanted)?;
+                let frame_tex = match unsafe { gpu::upload(&gl, &frame_texels(&frame)) } {
+                    Ok(t) => t,
+                    Err(e) => {
+                        variants.delete(&gl);
+                        return Err(e);
                     }
-                }
-                let frame_tex = unsafe { gpu::upload(&gl, w, h, &frame_texels(&frame))? };
-                let mut textures = vec![("sg_frame", frame_tex)];
-                for (v, var) in variants.iter().enumerate() {
-                    if let Some((px, _)) = var {
-                        textures.push((VARIANTS[v].2, unsafe { gpu::upload(&gl, w, h, px)? }));
-                    }
-                }
-                for (k, prog) in progs.iter().enumerate() {
-                    let x = &cfg.metrics[k];
-                    // Unread variants' samplers still need a texture: the frame.
-                    let inputs: Vec<(&str, glow::Texture)> =
-                        std::iter::once(("sg_frame", frame_tex))
-                            .chain(VARIANTS.iter().map(|(_, _, s)| {
-                                let t = textures
-                                    .iter()
-                                    .find(|(n, _)| n == s)
-                                    .map_or(frame_tex, |t| t.1);
-                                (*s, t)
-                            }))
-                            .collect();
-                    let (a, b, hist) = unsafe {
-                        g.draw_metric(&gl, *prog, &inputs, &info);
-                        let (a, b) = g.reduce(&gl, x.threshold);
-                        (a, b, g.histogram(&gl, x.range))
-                    };
-                    per_metric[k].push(Reduced::from_texels(a, b, x.threshold.is_some()));
-                    hists[k].push(hist);
-                    if let Some(sheet) = &mut sheets[k] {
-                        let px = unsafe { g.map.read(&gl, 0) };
+                };
+                let inputs = variants.inputs(frame_tex);
+                for ((x, prog), c) in cfg.metrics.iter().zip(&progs.progs).zip(&mut collected) {
+                    let got =
+                        unsafe { measure(&gl, &g, *prog, x, &inputs, &info, c.sheet.is_some()) };
+                    c.frames.push(got.reduced);
+                    c.histograms.push(got.histogram);
+                    if let (Some(sheet), Some(heat)) = (&mut c.sheet, &got.heatmap) {
                         let (x0, y0) = layout.origin(i);
-                        for y in 0..h {
-                            let row = &px[(h - 1 - y) * w..(h - y) * w];
-                            for (x, v) in row.iter().enumerate() {
-                                let c = |f: f32| (f.clamp(0.0, 1.0) * 255.0).round() as u8;
-                                sheet[y0 + y][x0 + x] = [c(v[0]), c(v[1]), c(v[2]), 255];
-                            }
-                        }
+                        sheet
+                            .view_mut((x0, y0), (x0 + size.0, y0 + size.1))
+                            .copy_from_toodee(heat);
                     }
                 }
-                unsafe {
-                    for (_, t) in &textures {
-                        gl.delete_texture(*t);
-                    }
-                }
+                unsafe { gl.delete_texture(frame_tex) };
+                variants.delete(&gl);
                 frames.push(FrameReport {
                     index: i,
                     time: t,
                     frame: info.frame,
-                    prev: variants[1].as_ref().and_then(|v| v.1),
-                    next: variants[2].as_ref().and_then(|v| v.1),
+                    prev: variants.frames[1],
+                    next: variants.frames[2],
                     cost_ms,
                 });
             }
@@ -329,29 +408,33 @@ pub fn run(
         unsafe { g.delete(&gl) };
         out
     })();
-    unsafe {
-        for p in &progs {
-            gl.delete_program(*p);
-        }
-    }
+    progs.delete(&gl);
     result?;
+    Ok(report(m, cfg, &progs.reads, collected, frames))
+}
 
+/// The report: each metric's totals over the frames, judged against its limits.
+fn report(
+    m: &Movie,
+    cfg: &Config,
+    reads: &[[bool; 3]],
+    collected: Vec<Collected>,
+    frames: Vec<FrameReport>,
+) -> Report {
     let metrics: Vec<MetricReport> = cfg
         .metrics
         .iter()
-        .zip(per_metric)
-        .zip(hists)
-        .zip(sheets)
+        .zip(collected)
         .zip(reads)
-        .map(|((((x, frames), hists), heatmap), read)| {
-            let total = Totals::combine(x, &frames, &hists);
+        .map(|((x, c), read)| {
+            let total = Totals::combine(x, &c.frames, &c.histograms);
             let failures = stats::judge(x, &total);
             let mut variants = vec!["frame"];
             variants.extend(
                 VARIANTS
                     .iter()
                     .zip(read)
-                    .filter(|(_, r)| *r)
+                    .filter(|(_, r)| **r)
                     .map(|(v, _)| v.0),
             );
             MetricReport {
@@ -360,16 +443,16 @@ pub fn run(
                 library_version: library_version(m, &x.use_),
                 variants,
                 threshold: x.threshold,
-                frames,
+                frames: c.frames,
                 total,
                 limits: x.limits.iter().map(|(s, b)| (s.to_string(), *b)).collect(),
                 pass: failures.is_empty(),
                 failures,
-                heatmap,
+                heatmap: c.sheet,
             }
         })
         .collect();
-    Ok(Report {
+    Report {
         schema: 2,
         engine: env!("CARGO_PKG_VERSION"),
         film: m
@@ -382,7 +465,7 @@ pub fn run(
         frames,
         pass: metrics.iter().all(|x| x.pass),
         metrics,
-    })
+    }
 }
 
 #[cfg(test)]
@@ -395,9 +478,17 @@ mod tests {
         f[0][0] = [255, 0, 0, 255];
         f[1][3] = [0, 255, 0, 255];
         let px = box_filter(&f, 2);
-        assert_eq!(px.len(), 2);
-        assert_eq!(px[0], [0.25, 0.0, 0.0, 1.0]);
-        assert_eq!(px[1], [0.0, 0.25, 0.0, 1.0]);
+        assert_eq!((px.num_cols(), px.num_rows()), (2, 1));
+        assert_eq!(px.data(), [[0.25, 0.0, 0.0, 1.0], [0.0, 0.25, 0.0, 1.0]]);
+    }
+
+    #[test]
+    fn frame_texels_and_heatmaps_flip_rows() {
+        let mut f = Frame::init(2, 2, [0, 0, 0, 255]);
+        f[0][1] = [255, 0, 0, 255]; // top right
+        let t = frame_texels(&f);
+        assert_eq!(t[1][1], [1.0, 0.0, 0.0, 1.0]); // GL: top row last
+        assert_eq!(heatmap(&t), f);
     }
 
     #[test]

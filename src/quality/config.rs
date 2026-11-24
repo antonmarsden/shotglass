@@ -3,7 +3,11 @@
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::movie::Movie;
 use crate::shader::define_value;
+
+/// The config's file name, next to `movie.toml`.
+pub const QUALITY_FILE: &str = "quality.toml";
 
 /// The largest supersampling factor for `@reference`.
 pub const MAX_REFERENCE: u32 = 8;
@@ -331,6 +335,21 @@ impl Config {
             reference,
             metrics,
         })
+    }
+}
+
+impl Config {
+    /// The film's `quality.toml`, if it has one.
+    pub fn of_film(m: &Movie) -> Result<Option<Config>> {
+        let path = m.root.join(QUALITY_FILE);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading {}", path.display()))?;
+        Config::parse(&text)
+            .with_context(|| format!("{}", path.display()))
+            .map(Some)
     }
 }
 
