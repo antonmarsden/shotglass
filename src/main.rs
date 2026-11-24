@@ -898,7 +898,7 @@ fn quality_cmd(
                 &text,
                 margin,
                 quality::SOUND_MARGIN_DB,
-                |i, s| report.value(i, s),
+                |k, i, s| report.value(k, i, s),
                 sound,
             )?;
             if changes.is_empty() {

@@ -209,7 +209,95 @@ const CHECKS: &[Check] = &[
         name: "quality sound: BS.1770 loudness and true peak of a synthesised sine, sound-only config, limits",
         run: quality_sound,
     },
+    Check {
+        name: "quality sound metrics: a click across a block edge, its time, halo, partial last block",
+        run: quality_clicks,
+    },
 ];
+
+/// `[[sound.metric]]`: a quiet 220 Hz sine with a 0.2 step at sample 2^20, the first
+/// sample of the second block, so the second difference there reads the previous
+/// block's samples through the halo. |second difference| is ~1.7e-4 everywhere but
+/// at the step (0.2, at samples 2^20 and 2^20 + 1). 25 s is two blocks, the second
+/// partly empty: every sample is counted once.
+fn quality_clicks(gl: &Gl, dir: &Path) -> Result<String> {
+    const K: usize = 1 << 20;
+    write(
+        dir,
+        &[
+            ("s.glsl", &scene("fragColor = vec4(0.0, 0.0, 0.0, 1.0);")),
+            (
+                "music.glsl",
+                &format!(
+                    "vec2 mainSound(int samp, float time) {{\n  \
+                     float s = 0.2 * sin(6.2831853 * 220.0 * float(samp % 48000) / 48000.0) + (samp >= {K} ? 0.2 : 0.0);\n  \
+                     return vec2(s, 0.5 * s);\n}}\n"
+                ),
+            ),
+            (
+                "q/clicks.glsl",
+                "void mainSoundMetric(out float value, in int samp) {
+  vec2 d = getSound(samp) - 2.0 * getSound(samp - 1) + getSound(samp - 2);
+  value = max(abs(d.x), abs(d.y));
+}
+",
+            ),
+            (
+                "quality.toml",
+                "[sound]\n[[sound.metric]]\nuse = \"q/clicks.glsl\"\nthreshold = 0.1\nmax = { max = 0.01 }\n",
+            ),
+        ],
+    )?;
+    let m = movie(
+        dir,
+        "shotglass = \"0.1.4\"\nfps = 30\n[sound]\nmusic = \"music.glsl\"\n[[shot]]\nid=\"a\"\nscene=\"s.glsl\"\nduration=25\n",
+    )?;
+    strict_metrics(&m)?;
+    let cfg = crate::quality::Config::of_film(&m)?.ok_or_else(|| anyhow!("no quality.toml"))?;
+    let rep = crate::quality::run(gl.clone(), &m, &cfg, &[0.0], false)?;
+    let s = rep
+        .sound
+        .as_ref()
+        .ok_or_else(|| anyhow!("no sound report"))?;
+    let c = s
+        .metrics
+        .first()
+        .ok_or_else(|| anyhow!("no sound metric"))?;
+    let n = m.sound_samples(48_000) as u64;
+    let t = &c.total;
+    if c.frames.len() != 2 || t.pixels != n || t.invalid != 0 {
+        bail!(
+            "{} blocks, {} samples measured of {n}, {} invalid",
+            c.frames.len(),
+            t.pixels,
+            t.invalid
+        );
+    }
+    if t.max.is_none_or(|x| (x - 0.2).abs() > 1e-3) {
+        bail!("max {:?}, want 0.2", t.max);
+    }
+    let at = c.max_at.unwrap_or(-1.0) * 48_000.0;
+    if !(K as f64 - 0.01..=K as f64 + 1.01).contains(&at) {
+        bail!("max at sample {at}, want {K} or {}", K + 1);
+    }
+    let over = t.over.unwrap_or(0.0) * n as f64;
+    if (over - 2.0).abs() > 1e-3 {
+        bail!("{over} samples over the threshold, want 2");
+    }
+    // Block 1 never sees the click: its largest is the film's start (silence before
+    // sample 0, so 0.2·sin(2π·220/48000) ≈ 0.0058 at sample 1).
+    if c.frames[0].max.is_none_or(|x| x > 0.01) {
+        bail!("block 1 max {:?}: the step leaked into it", c.frames[0].max);
+    }
+    if c.pass || rep.pass || !c.failures[0].starts_with("max 0.2") {
+        bail!("failures: {:?}", c.failures);
+    }
+    Ok(format!(
+        "max {:.4} at {:.5}s",
+        t.max.unwrap(),
+        c.max_at.unwrap()
+    ))
+}
 
 /// Phase 3 of `shotglass quality` (#96): music is a 997 Hz sine at amplitude 0.1 in
 /// both channels, which BS.1770 defines as -20 LUFS (K-weighting is ~0 dB there);
@@ -341,18 +429,7 @@ scene=\"s.glsl\"
 duration=2
 ",
     )?;
-    if crate::validate::AVAILABLE {
-        for d in [Dialect::BASELINE, Dialect::WEB] {
-            let errors = crate::validate::validate_sources(&crate::quality::sources(&m, d)?);
-            if !errors.is_empty() {
-                bail!(
-                    "metric fixtures aren't strictly valid {d}:
-{}",
-                    crate::gfx::join_errors(&errors)
-                );
-            }
-        }
-    }
+    strict_metrics(&m)?;
     let last = m.frame_count() - 1;
     let cfg = crate::quality::Config::of_film(&m)?.ok_or_else(|| anyhow!("no quality.toml"))?;
     let times = [0.0, m.frame_time(30), m.frame_time(last)];
@@ -448,17 +525,7 @@ fn quality_metrics(gl: &Gl, dir: &Path) -> Result<String> {
         dir,
         "shotglass = \"0.1.4\"\n[[shot]]\nid=\"a\"\nscene=\"s.glsl\"\nduration=2\n",
     )?;
-    if crate::validate::AVAILABLE {
-        for d in [Dialect::BASELINE, Dialect::WEB] {
-            let errors = crate::validate::validate_sources(&crate::quality::sources(&m, d)?);
-            if !errors.is_empty() {
-                bail!(
-                    "metric fixtures aren't strictly valid {d}:\n{}",
-                    crate::gfx::join_errors(&errors)
-                );
-            }
-        }
-    }
+    strict_metrics(&m)?;
     let cfg = crate::quality::Config::of_film(&m)?.ok_or_else(|| anyhow!("no quality.toml"))?;
     let rep = crate::quality::run(gl.clone(), &m, &cfg, &[1.0], true)?;
     let close = |what: &str, got: Option<f64>, want: f64| -> Result<()> {
@@ -724,6 +791,24 @@ fn info(t: f32, scale: f32) -> FrameInfo {
         frame: (t * 30.0) as i32,
         scale,
     }
+}
+
+/// A fixture film's metric shaders (`quality.toml`) must pass the strict check, at the
+/// baseline and as GLSL ES, like its other shaders ([`strict`]).
+fn strict_metrics(m: &Movie) -> Result<()> {
+    if !crate::validate::AVAILABLE {
+        return Ok(());
+    }
+    for d in [Dialect::BASELINE, Dialect::WEB] {
+        let errors = crate::validate::validate_sources(&crate::quality::sources(m, d)?);
+        if !errors.is_empty() {
+            bail!(
+                "metric fixtures aren't strictly valid {d}:\n{}",
+                crate::gfx::join_errors(&errors)
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Fixture films must pass the strict check too, at the baseline and as GLSL ES, so

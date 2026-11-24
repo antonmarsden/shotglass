@@ -19,3 +19,11 @@ mean = { max = 0.001 }   # share of clipped pixels; measured 0.00002
 [sound]
 integrated = { min = -24, max = -18 }   # measured -21.1
 true_peak = { max = -3 }                 # measured -7.6
+
+# Sound metrics run over every sample (`mainSoundMetric`, `getSound`).
+[[sound.metric]]
+use = "metrics/clicks.glsl"
+name = "clicks"
+range = [0, 50]
+threshold = 20
+max = { max = 20 }    # measured 11.9 at 6.06 s: the candle's crackle, on purpose

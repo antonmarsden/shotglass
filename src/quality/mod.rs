@@ -24,7 +24,7 @@ mod gpu;
 mod loudness;
 mod stats;
 
-pub use config::{Config, QUALITY_FILE, SOUND_MARGIN_DB, tighten};
+pub use config::{Config, Kind, QUALITY_FILE, SOUND_MARGIN_DB, tighten};
 pub use stats::Report;
 
 use crate::gfx::{Frame, FrameInfo, Renderer};
@@ -54,6 +54,35 @@ vec4 getPrev(vec2 uv) { return texture(sg_prev, uv); }
 vec4 getNext(vec2 uv) { return texture(sg_next, uv); }
 ";
 
+/// The header of a sound metric (`[[sound.metric]]`): the soundtrack at
+/// `iSampleRate`, `iSoundSamples` long, through `getSound` (silence outside the film,
+/// wrapped in a loop film). Only `SOUND_HALO` samples either side of the block being
+/// measured are there; further reads are silent.
+const SOUND_HEADER: &str = "\
+uniform vec3 iResolution;
+uniform int iSampleRate;
+uniform int iSoundSamples;
+uniform int sg_first;
+uniform int sg_tex_start;
+uniform int sg_tex_len;
+uniform sampler2D sg_sound;
+out vec4 shotglass_out;
+vec2 getSound(int samp) {
+  int i = samp - sg_tex_start;
+  if (i < 0 || i >= sg_tex_len) return vec2(0.0);
+  return texelFetch(sg_sound, ivec2(i % SG_SOUND_W, i / SG_SOUND_W), 0).rg;
+}
+";
+
+const SOUND_FOOTER: &str = "void main(){\n  ivec2 p = ivec2(gl_FragCoord.xy);\n  float v = 0.0;\n  mainSoundMetric(v, sg_first + p.y * SG_SOUND_W + p.x);\n  shotglass_out = vec4(0.0, 0.0, 0.0, v);\n}";
+
+/// Sound metrics measure blocks of `SOUND_W × SOUND_ROWS` samples (the map), each
+/// with `SOUND_HALO` samples (100 ms) of context either side in its texture.
+const SOUND_W: usize = 4096;
+const SOUND_ROWS: usize = 256;
+const SOUND_BLOCK: usize = SOUND_W * SOUND_ROWS;
+const SOUND_HALO: usize = loudness::RATE as usize / 10;
+
 const METRIC_FOOTER: &str = "void main(){\n  vec4 v = vec4(0.0);\n  mainMetric(v, gl_FragCoord.xy);\n  shotglass_out = v;\n}";
 
 /// Render variants beyond `@frame`: (name, the function that reads it, its sampler).
@@ -65,8 +94,15 @@ const VARIANTS: [(&str, &str, &str); 3] = [
 
 /// The fragment shader for a metric: the metric header, its params as `#define`s,
 /// the metric (a library's or a film file), the footer that calls `mainMetric`.
-pub fn metric_source(d: Dialect, metric: &Metric, m: &Movie) -> Result<Assembled> {
-    let mut header = METRIC_HEADER.to_string();
+pub fn metric_source(d: Dialect, metric: &Metric, m: &Movie, kind: Kind) -> Result<Assembled> {
+    let (header, footer) = match kind {
+        Kind::Picture => (METRIC_HEADER, METRIC_FOOTER),
+        Kind::Sound => (SOUND_HEADER, SOUND_FOOTER),
+    };
+    let mut header = match kind {
+        Kind::Picture => header.to_string(),
+        Kind::Sound => format!("#define SG_SOUND_W {SOUND_W}\n{header}"),
+    };
     for (k, v) in &metric.defines {
         header += &format!("#define {k} {v}\n");
     }
@@ -74,7 +110,7 @@ pub fn metric_source(d: Dialect, metric: &Metric, m: &Movie) -> Result<Assembled
     let b = b.pass(&m.root, "metric", &metric.use_, |n| {
         anyhow!("metric \"{n}\" needs a library or a .glsl file")
     })?;
-    Ok(b.footer(METRIC_FOOTER).build())
+    Ok(b.footer(footer).build())
 }
 
 /// Which of `VARIANTS` a metric reads (calls their function outside the header).
@@ -99,12 +135,11 @@ pub fn sources(m: &Movie, d: Dialect) -> Result<Vec<Source>> {
         return Ok(vec![]);
     };
     Ok(cfg
-        .metrics
-        .iter()
-        .map(|x| Source {
+        .all_metrics()
+        .map(|(kind, x)| Source {
             what: format!("metric \"{}\" ({})", x.name, x.use_),
             stage: Stage::Fragment,
-            src: metric_source(d, x, m),
+            src: metric_source(d, x, m, kind),
         })
         .collect())
 }
@@ -174,13 +209,19 @@ struct Programs {
 }
 
 impl Programs {
-    fn compile(gl: &glow::Context, d: Dialect, m: &Movie, cfg: &Config) -> Result<Programs> {
+    fn compile(
+        gl: &glow::Context,
+        d: Dialect,
+        m: &Movie,
+        metrics: &[Metric],
+        kind: Kind,
+    ) -> Result<Programs> {
         let mut p = Programs {
             progs: vec![],
             reads: vec![],
         };
-        for x in &cfg.metrics {
-            let built = metric_source(d, x, m)
+        for x in metrics {
+            let built = metric_source(d, x, m, kind)
                 .with_context(|| format!("metric \"{}\"", x.name))
                 .and_then(|src| {
                     let prog = unsafe { crate::shader::compile(gl, &src) }.map_err(|e| {
@@ -191,7 +232,11 @@ impl Programs {
                             src.explain(e).join("\n  ")
                         )
                     })?;
-                    Ok((prog, variants_read(&src)))
+                    let read = match kind {
+                        Kind::Picture => variants_read(&src),
+                        Kind::Sound => [false; 3],
+                    };
+                    Ok((prog, read))
                 });
             match built {
                 Ok((prog, read)) => {
@@ -301,10 +346,11 @@ unsafe fn measure(
 ) -> Measured {
     unsafe {
         g.draw_metric(gl, prog, inputs, info);
-        let (a, b) = g.reduce(gl, x.threshold);
+        let count = g.map.size.0 * g.map.size.1;
+        let (a, b) = g.reduce(gl, x.threshold, count);
         Measured {
             reduced: Reduced::from_texels(a, b, x.threshold.is_some()),
-            histogram: g.histogram(gl, x.range),
+            histogram: g.histogram(gl, x.range, count),
             heatmap: heat.then(|| heatmap(&g.map.read(gl, 0))),
         }
     }
@@ -319,16 +365,114 @@ struct Collected {
 }
 
 /// Synthesise the whole soundtrack (one period of a loop film) at
-/// [`loudness::RATE`] and meter it. None: the film has no sound.
-fn measure_sound(r: &mut Renderer, m: &Movie) -> Result<Option<loudness::Loudness>> {
+/// [`loudness::RATE`] and meter it; `keep` also returns the samples (interleaved
+/// stereo) for sound metrics. None: the film has no sound.
+fn measure_sound(
+    r: &mut Renderer,
+    m: &Movie,
+    keep: bool,
+) -> Result<Option<(loudness::Loudness, Vec<f32>)>> {
     if !m.has_sound() {
         return Ok(None);
     }
     let mut st = crate::export::soundtrack(r, m, loudness::RATE)?;
     let mut meter = loudness::Meter::new();
-    st.render_all(r, |d| meter.push(d))
-        .map_err(|e| anyhow!(e))?;
-    Ok(Some(meter.finish()))
+    let mut kept = vec![];
+    st.render_all(r, |d| {
+        meter.push(d);
+        if keep {
+            kept.extend_from_slice(d);
+        }
+    })
+    .map_err(|e| anyhow!(e))?;
+    Ok(Some((meter.finish(), kept)))
+}
+
+/// The texture of the sound block starting at sample `start`: samples from
+/// `start - SOUND_HALO` to the block's end plus the halo, as (L, R, 0, 0) texels
+/// `SOUND_W` wide; the first sample's index and the length. Outside the film is
+/// silence, or wraps in a loop film.
+fn sound_texels(samples: &[f32], start: usize, wrap: bool) -> (Texels, i64, usize) {
+    let n = (samples.len() / 2) as i64;
+    let first = start as i64 - SOUND_HALO as i64;
+    let len = (SOUND_BLOCK + 2 * SOUND_HALO).min((n - first) as usize + SOUND_HALO);
+    let mut t = Texels::init(SOUND_W, len.div_ceil(SOUND_W), [0.0; 4]);
+    for (i, px) in t.data_mut().iter_mut().take(len).enumerate() {
+        let k = first + i as i64;
+        let k = if wrap { k.rem_euclid(n) } else { k };
+        if (0..n).contains(&k) {
+            let k = k as usize * 2;
+            *px = [samples[k], samples[k + 1], 0.0, 0.0];
+        }
+    }
+    (t, first, len)
+}
+
+/// The largest finite measure (`.a`) among a map's first `count` texels, and its index.
+fn largest(map: &Texels, count: usize) -> Option<(f32, usize)> {
+    map.data()[..count]
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| v[3].is_finite())
+        .max_by(|a, b| a.1[3].total_cmp(&b.1[3]))
+        .map(|(i, v)| (v[3], i))
+}
+
+/// Sound metrics over the whole soundtrack, block by block, through the same
+/// reductions and histogram as frames; and the time of each one's largest measure.
+fn run_sound_metrics(
+    gl: &glow::Context,
+    d: Dialect,
+    m: &Movie,
+    metrics: &[Metric],
+    samples: &[f32],
+) -> Result<(Vec<Collected>, Vec<Option<f64>>)> {
+    let n = samples.len() / 2;
+    let progs = Programs::compile(gl, d, m, metrics, Kind::Sound)?;
+    let mut collected: Vec<Collected> = metrics.iter().map(|_| Collected::default()).collect();
+    let mut worst: Vec<Option<(f32, usize)>> = vec![None; metrics.len()];
+    let result = Gpu::with(gl, d, (SOUND_W, SOUND_ROWS), |g| {
+        let info = FrameInfo::at(m, 0.0);
+        for start in (0..n).step_by(SOUND_BLOCK) {
+            let count = SOUND_BLOCK.min(n - start);
+            let (texels, first, len) = sound_texels(samples, start, m.loop_frames.is_some());
+            let tex = unsafe { gpu::upload(gl, &texels)? };
+            let metric = metrics.iter().zip(&progs.progs);
+            for ((x, prog), (c, w)) in metric.zip(collected.iter_mut().zip(&mut worst)) {
+                unsafe {
+                    gl.use_program(Some(*prog));
+                    let loc = |s: &str| gl.get_uniform_location(*prog, s);
+                    gl.uniform_1_i32(loc("iSampleRate").as_ref(), loudness::RATE as i32);
+                    gl.uniform_1_i32(loc("iSoundSamples").as_ref(), n as i32);
+                    gl.uniform_1_i32(loc("sg_first").as_ref(), start as i32);
+                    gl.uniform_1_i32(loc("sg_tex_start").as_ref(), first as i32);
+                    gl.uniform_1_i32(loc("sg_tex_len").as_ref(), len as i32);
+                    g.draw_metric(gl, *prog, &[("sg_sound", tex)], &info);
+                    let (a, b) = g.reduce(gl, x.threshold, count as i32);
+                    let reduced = Reduced::from_texels(a, b, x.threshold.is_some());
+                    // Where the maximum is: read back only a block that beats the
+                    // largest so far.
+                    if let Some(mx) = reduced.max
+                        && w.is_none_or(|(v, _)| mx as f32 > v)
+                    {
+                        let at = largest(&g.map.read(gl, 0), count);
+                        *w = at.map(|(v, i)| (v, start + i)).or(*w);
+                    }
+                    c.frames.push(reduced);
+                    c.histograms.push(g.histogram(gl, x.range, count as i32));
+                }
+            }
+            unsafe { gl.delete_texture(tex) };
+        }
+        Ok(())
+    });
+    progs.delete(gl);
+    result?;
+    let at = worst
+        .iter()
+        .map(|w| w.map(|(_, i)| i as f64 / loudness::RATE as f64))
+        .collect();
+    Ok((collected, at))
 }
 
 /// Render `times` of `m` and measure them with `cfg`'s metrics, and the soundtrack
@@ -346,16 +490,30 @@ pub fn run(
     if let Err(errors) = r.load_all(m) {
         bail!("shader errors:\n{}", crate::gfx::join_errors(&errors));
     }
+    let dialect = r.dialect_for(m).map_err(|e| anyhow!(e))?;
     let sound = match &cfg.sound {
-        Some(sc) => Some(SoundReport::judge(sc, measure_sound(&mut r, m)?)),
+        Some(sc) => {
+            let measured = measure_sound(&mut r, m, !sc.metrics.is_empty())?;
+            let mut metrics = vec![];
+            if let Some((_, samples)) = &measured
+                && !sc.metrics.is_empty()
+            {
+                let (c, at) = run_sound_metrics(&gl, dialect, m, &sc.metrics, samples)?;
+                for ((x, c), at) in sc.metrics.iter().zip(c).zip(at) {
+                    let mut rep = metric_report(m, x, c, vec!["sound"]);
+                    rep.max_at = at;
+                    metrics.push(rep);
+                }
+            }
+            Some(SoundReport::judge(sc, measured.map(|(l, _)| l), metrics))
+        }
         None => None,
     };
     // Sound only: no picture to render.
     let times = if cfg.metrics.is_empty() { &[] } else { times };
-    let dialect = r.dialect_for(m).map_err(|e| anyhow!(e))?;
     let size = (cfg.size.0 as usize, cfg.size.1 as usize);
     let n = cfg.reference as usize;
-    let progs = Programs::compile(&gl, dialect, m, cfg)?;
+    let progs = Programs::compile(&gl, dialect, m, &cfg.metrics, Kind::Picture)?;
     let wanted = progs.wanted();
     let layout = crate::Sheet::new(times.len(), 4, size.0, size.1);
     let mut collected: Vec<Collected> = cfg
@@ -384,8 +542,7 @@ pub fn run(
         if times.is_empty() {
             return Ok(());
         }
-        let g = unsafe { Gpu::new(&gl, dialect, size.0 as i32, size.1 as i32)? };
-        let out = (|| -> Result<()> {
+        Gpu::with(&gl, dialect, size, |g| {
             for (i, &t) in times.iter().enumerate() {
                 let info = FrameInfo::at(m, t);
                 r.gpu_ms(); // drop older samples
@@ -403,7 +560,7 @@ pub fn run(
                 let inputs = variants.inputs(frame_tex);
                 for ((x, prog), c) in cfg.metrics.iter().zip(&progs.progs).zip(&mut collected) {
                     let got =
-                        unsafe { measure(&gl, &g, *prog, x, &inputs, &info, c.sheet.is_some()) };
+                        unsafe { measure(&gl, g, *prog, x, &inputs, &info, c.sheet.is_some()) };
                     c.frames.push(got.reduced);
                     c.histograms.push(got.histogram);
                     if let (Some(sheet), Some(heat)) = (&mut c.sheet, &got.heatmap) {
@@ -425,13 +582,31 @@ pub fn run(
                 });
             }
             Ok(())
-        })();
-        unsafe { g.delete(&gl) };
-        out
+        })
     })();
     progs.delete(&gl);
     result?;
     Ok(report(m, cfg, &progs.reads, collected, frames, sound))
+}
+
+/// One metric's totals over what it measured (frames, or sound blocks), judged.
+fn metric_report(m: &Movie, x: &Metric, c: Collected, variants: Vec<&'static str>) -> MetricReport {
+    let total = Totals::combine(x, &c.frames, &c.histograms);
+    let failures = stats::judge(x, &total);
+    MetricReport {
+        name: x.name.clone(),
+        use_: x.use_.clone(),
+        library_version: library_version(m, &x.use_),
+        variants,
+        threshold: x.threshold,
+        frames: c.frames,
+        total,
+        limits: x.limits.iter().map(|(s, b)| (s.to_string(), *b)).collect(),
+        pass: failures.is_empty(),
+        failures,
+        max_at: None,
+        heatmap: c.sheet,
+    }
 }
 
 /// The report: each metric's totals over the frames, judged against its limits.
@@ -449,8 +624,6 @@ fn report(
         .zip(collected)
         .zip(reads)
         .map(|((x, c), read)| {
-            let total = Totals::combine(x, &c.frames, &c.histograms);
-            let failures = stats::judge(x, &total);
             let mut variants = vec!["frame"];
             variants.extend(
                 VARIANTS
@@ -459,19 +632,7 @@ fn report(
                     .filter(|(_, r)| **r)
                     .map(|(v, _)| v.0),
             );
-            MetricReport {
-                name: x.name.clone(),
-                use_: x.use_.clone(),
-                library_version: library_version(m, &x.use_),
-                variants,
-                threshold: x.threshold,
-                frames: c.frames,
-                total,
-                limits: x.limits.iter().map(|(s, b)| (s.to_string(), *b)).collect(),
-                pass: failures.is_empty(),
-                failures,
-                heatmap: c.sheet,
-            }
+            metric_report(m, x, c, variants)
         })
         .collect();
     Report {
