@@ -7,3 +7,5 @@
 
 pub mod av1;
 pub mod mux;
+#[cfg(feature = "webm")]
+pub mod encode;

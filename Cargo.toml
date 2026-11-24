@@ -23,6 +23,8 @@ glutin = "0.32"
 glutin-winit = "0.5"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
 notify = "8.2.2"
+# Built-in WebM export (#116): libopus, built from its bundled source (BSD-3-Clause).
+opus = { version = "0.4.0", optional = true }
 raw-window-handle = "0.6"
 # Text (#68): font parsing and shaping (pure-Rust HarfBuzz port), bidi, line breaking.
 rustybuzz = "0.20.1"
@@ -52,8 +54,17 @@ opt-level = 2
 name = "gpu"
 harness = false
 
+[build-dependencies]
+# Built-in WebM export (#116): SVT-AV1 is built with CMake, the shim over it with cc.
+cc = { version = "1.11.2", optional = true }
+cmake = { version = "0.1.54", optional = true }
+
 [features]
-default = ["strict-glsl"]
+default = ["strict-glsl", "webm"]
+# `export --format webm` without ffmpeg: SVT-AV1 (vendor/SVT-AV1, or SVT_AV1_SRC /
+# SVT_AV1_DIR) + libopus, muxed by shotglass. Needs CMake, and nasm for SVT-AV1's
+# SIMD on x86 (without it, a much slower C-only build). See docs/building.md.
+webm = ["dep:opus", "dep:cc", "dep:cmake"]
 # Strict GLSL validation in `check` (needs a C++ compiler at build time).
 strict-glsl = ["dep:glslang"]
 
