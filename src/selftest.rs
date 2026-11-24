@@ -850,9 +850,10 @@ fn metric_tests(gl: &Gl, dir: &Path) -> Result<String> {
                 "t/in/ink.glsl",
                 "void mainImage(out vec4 fragColor, in vec2 fragCoord) {\n  fragColor = vec4(fragCoord.x < 5.0 ? 0.0 : 1.0, step(5.0, fragCoord.x), 0.0, 1.0);\n}\n",
             ),
+            // Exactly representable pulses keep the report independent of GLSL sin accuracy.
             (
-                "t/in/sine.glsl",
-                "vec2 mainSound(int samp, float time) {\n  return vec2(0.5 * sin(6.2831853 * 440.0 * time));\n}\n",
+                "t/in/pulses.glsl",
+                "vec2 mainSound(int samp, float time) {\n  return vec2(samp % 4 == 0 ? 0.015625 : 0.0);\n}\n",
             ),
             (
                 "t/q.test.toml",
@@ -863,9 +864,9 @@ fn metric_tests(gl: &Gl, dir: &Path) -> Result<String> {
                  [[case]]\nname = \"behind: GLSL frame and prev\"\nuse = \"q/behind\"\nframe = \"in/ink.glsl\"\nprev = \"in/soft.glsl\"\nsize = \"8x4\"\nmean = { min = 0.5 }\n\
                  [[case]]\nname = \"ahead: next only\"\nuse = \"q/ahead\"\nframe = \"in/half.png\"\nnext = \"in/soft.glsl\"\nmean = { min = 0.1 }\n\
                  [[case]]\nname = \"flicker: no prev\"\nuse = \"q/flicker\"\nframe = \"in/half.png\"\nnext = \"in/half.png\"\n\
-                 [[case]]\nname = \"clicks: sine\"\nuse = \"q/clicks\"\nsound = \"in/sine.glsl\"\nsamples = 4800\nmax = { max = 0.05 }\n\
+                 [[case]]\nname = \"clicks: quiet pulses\"\nuse = \"q/clicks\"\nsound = \"in/pulses.glsl\"\nsamples = 4800\nmax = { max = 0.05 }\n\
                  [[case]]\nname = \"clicks: click\"\nuse = \"q/clicks\"\nsound = \"in/click.wav\"\nexpect = \"fail\"\nmax = { max = 0.01 }\n\
-                 [[case]]\nname = \"clicks: unexpected pass\"\nuse = \"q/clicks\"\nsound = \"in/sine.glsl\"\nsamples = 4800\nexpect = \"fail\"\nmax = { max = 0.5 }\n",
+                 [[case]]\nname = \"clicks: unexpected pass\"\nuse = \"q/clicks\"\nsound = \"in/pulses.glsl\"\nsamples = 4800\nexpect = \"fail\"\nmax = { max = 0.5 }\n",
             ),
         ],
     )?;
@@ -904,10 +905,10 @@ t/q.test.toml
   ok    ahead: next only  mean 0.125490  max 0.250980  (32 measured)
   ERROR flicker: no prev
         the metric reads @prev: give prev = \"…\"
-  ok    clicks: sine  mean 0.001062  max 0.028782  (4800 measured)
+  ok    clicks: quiet pulses  mean 0.015625  max 0.031250  (4800 measured)
   ok    clicks: click  mean 0.019999  max 0.999969  (100 measured); fails as expected: max 0.999969 > max 0.01
   FAIL  clicks: unexpected pass
-        expected to fail, but every limit holds: mean 0.001062  max 0.028782  (4800 measured)
+        expected to fail, but every limit holds: mean 0.015625  max 0.031250  (4800 measured)
 ";
     if report != expected {
         bail!("report differs:\n--- expected\n{expected}--- got\n{report}");
