@@ -200,9 +200,9 @@ cargo fmt && cargo clippy --all-targets -- -D warnings
   the check fails.
 - Working in parallel with other sessions: see "Working with AI agents" in CONTRIBUTING.md
   (one issue per branch; `gfx.rs`, `sound.rs`, `audio.rs` take one change at a time).
-- Keep user-facing docs in README.md. Open work is in GitHub issues: #1 export (follow-ups: PBO readback), #2 web player,
-  #3 libraries by name and version, #4 kit core/transitions, #5 the shotglass-kit repo,
-  #6 portable GLSL (done: fixed baseline, `glsl` opt-in, strict `check` / `check --web`).
+- Keep user-facing docs in README.md. Open work is in GitHub issues: #35 roadmap to 1.0,
+  #66 text/layers/footage epic (next: #74 comps and mattes, then #71 glyph runs/subtitles,
+  #73 video; later items in #75), #2 web player, #51 live mode (#53–#56), #60 real-time mode.
 
 ## Conventions
 
