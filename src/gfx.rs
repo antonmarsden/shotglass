@@ -496,7 +496,7 @@ struct AudioJob {
     pbo: GpuBuf,
     /// Mix inputs written for the GPU to copy from (persistent buffers only).
     staging: Option<GpuBuf>,
-    fence: glow::Fence,
+    fence: AudioFence,
     count: usize,
     submitted: std::time::Instant,
 }
@@ -505,11 +505,70 @@ struct AudioJob {
 /// persistent mapping (`ptr` non-null) it stays mapped for its whole life, so reading
 /// or writing it needs no GL call at all; it's only touched while no GPU command that
 /// uses it is pending (its block's fence has passed, or it was just taken from the pool).
-#[derive(Clone, Copy)]
 struct GpuBuf {
+    gl: Arc<glow::Context>,
     buf: glow::Buffer,
     bytes: i32,
     ptr: *mut u8,
+}
+
+impl Drop for GpuBuf {
+    fn drop(&mut self) {
+        // Deletion unmaps the buffer. GL keeps storage alive for queued commands.
+        unsafe { self.gl.delete_buffer(self.buf) };
+    }
+}
+
+/// A temporary pack mapping borrows its buffer and owns the pack binding.
+struct AudioReadMapping<'a> {
+    buffer: &'a GpuBuf,
+    ptr: *mut u8,
+}
+
+impl Drop for AudioReadMapping<'_> {
+    fn drop(&mut self) {
+        let gl = &self.buffer.gl;
+        unsafe {
+            if !self.ptr.is_null() {
+                gl.unmap_buffer(glow::PIXEL_PACK_BUFFER);
+            }
+            gl.bind_buffer(glow::PIXEL_PACK_BUFFER, None);
+        }
+    }
+}
+
+struct AudioFence {
+    gl: Arc<glow::Context>,
+    sync: glow::Fence,
+}
+
+impl Drop for AudioFence {
+    fn drop(&mut self) {
+        unsafe { self.gl.delete_sync(self.sync) };
+    }
+}
+
+/// Restores the bindings used by submission, including on an early return.
+struct AudioSubmit<'a> {
+    gl: &'a glow::Context,
+    input_tex: Vec<glow::Texture>,
+}
+
+impl Drop for AudioSubmit<'_> {
+    fn drop(&mut self) {
+        let gl = self.gl;
+        unsafe {
+            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            for (unit, tex) in self.input_tex.drain(..).enumerate() {
+                gl.active_texture(glow::TEXTURE0 + unit as u32);
+                gl.bind_texture(glow::TEXTURE_2D, None);
+                gl.delete_texture(tex);
+            }
+            gl.active_texture(glow::TEXTURE0);
+            gl.use_program(None);
+            gl.bind_vertex_array(None);
+        }
+    }
 }
 
 /// Where the GL calls of sound streaming spent their time (reset by the caller).
@@ -3143,7 +3202,9 @@ impl Renderer {
                     glow::NEAREST as i32,
                 );
                 gl.bind_texture(glow::TEXTURE_2D, None);
-                let fbo = gl.create_framebuffer()?;
+                let fbo = gl
+                    .create_framebuffer()
+                    .inspect_err(|_| gl.delete_texture(tex))?;
                 gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
                 gl.framebuffer_texture_2d(
                     glow::FRAMEBUFFER,
@@ -3167,7 +3228,10 @@ impl Renderer {
             }
             let (fbo, _) = self.audio_target.unwrap();
             gl.use_program(Some(prog.prog));
-            let mut input_tex = vec![];
+            let mut bindings = AudioSubmit {
+                gl: &gl,
+                input_tex: vec![],
+            };
             let mut staging = None;
             let t_upload = std::time::Instant::now();
             if let Some((music, sfx, base)) = inputs {
@@ -3193,35 +3257,26 @@ impl Renderer {
                         let bytes =
                             std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4);
                         let off = k * rows * row;
-                        if st.ptr.is_null() {
-                            let mut padded = vec![0u8; rows * row];
-                            padded[..bytes.len()].copy_from_slice(bytes);
-                            gl.bind_buffer(glow::PIXEL_UNPACK_BUFFER, Some(st.buf));
-                            gl.buffer_sub_data_u8_slice(
-                                glow::PIXEL_UNPACK_BUFFER,
-                                off as i32,
-                                &padded,
-                            );
-                        } else {
-                            let dst = std::slice::from_raw_parts_mut(st.ptr.add(off), rows * row);
-                            dst[..bytes.len()].copy_from_slice(bytes);
-                            dst[bytes.len()..].fill(0);
+                        let dst = std::slice::from_raw_parts_mut(st.ptr.add(off), rows * row);
+                        dst[..bytes.len()].copy_from_slice(bytes);
+                        dst[bytes.len()..].fill(0);
+                    }
+                    // Allocate before binding the unpack buffer: tex_image_2d uses a
+                    // null client pointer to reserve storage for the texture.
+                    for unit in 0..self.audio_inputs.len() {
+                        if self.audio_inputs[unit].is_some_and(|(_, r)| r >= rows) {
+                            continue;
+                        }
+                        gl.active_texture(glow::TEXTURE0 + unit as u32);
+                        let tex = new_track_texture(&gl, rows)?;
+                        if let Some((old, _)) = self.audio_inputs[unit].replace((tex, rows)) {
+                            gl.delete_texture(old);
                         }
                     }
                     gl.bind_buffer(glow::PIXEL_UNPACK_BUFFER, Some(st.buf));
                     for (unit, name) in ["sg_music", "sg_sfx"].into_iter().enumerate() {
                         gl.active_texture(glow::TEXTURE0 + unit as u32);
-                        let tex = match self.audio_inputs[unit] {
-                            Some((t, r)) if r >= rows => t,
-                            old => {
-                                if let Some((t, _)) = old {
-                                    gl.delete_texture(t);
-                                }
-                                let t = new_track_texture(&gl, rows)?;
-                                self.audio_inputs[unit] = Some((t, rows));
-                                t
-                            }
-                        };
+                        let (tex, _) = self.audio_inputs[unit].unwrap();
                         gl.bind_texture(glow::TEXTURE_2D, Some(tex));
                         gl.tex_sub_image_2d(
                             glow::TEXTURE_2D,
@@ -3252,7 +3307,7 @@ impl Renderer {
                         if let Some(l) = prog.loc(name) {
                             gl.uniform_1_i32(Some(l), unit as i32);
                         }
-                        input_tex.push(tex);
+                        bindings.input_tex.push(tex);
                     }
                 }
                 if let Some(l) = prog.loc("sg_len") {
@@ -3320,19 +3375,13 @@ impl Renderer {
             gl.bind_buffer(glow::PIXEL_PACK_BUFFER, None);
             self.audio_timing.draw_ms += ms_since(t_draw);
             let t_fence = std::time::Instant::now();
-            let fence = gl.fence_sync(glow::SYNC_GPU_COMMANDS_COMPLETE, 0)?;
+            let fence = AudioFence {
+                gl: gl.clone(),
+                sync: gl.fence_sync(glow::SYNC_GPU_COMMANDS_COMPLETE, 0)?,
+            };
             // Make sure the fence reaches the GPU without anyone waiting on it.
             gl.flush();
             self.audio_timing.fence_ms += ms_since(t_fence);
-            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
-            for (unit, t) in input_tex.iter().enumerate() {
-                gl.active_texture(glow::TEXTURE0 + unit as u32);
-                gl.bind_texture(glow::TEXTURE_2D, None);
-                gl.delete_texture(*t); // deletion waits for the draw that uses it
-            }
-            gl.active_texture(glow::TEXTURE0);
-            gl.use_program(None);
-            gl.bind_vertex_array(None);
             self.audio_ticket += 1;
             self.audio_jobs.insert(
                 self.audio_ticket,
@@ -3355,7 +3404,7 @@ impl Renderer {
             return Some(Err("unknown sound block".into()));
         };
         let t_poll = std::time::Instant::now();
-        let status = unsafe { self.gl.client_wait_sync(job.fence, 0, 0) };
+        let status = unsafe { self.gl.client_wait_sync(job.fence.sync, 0, 0) };
         self.audio_timing.poll_ms += ms_since(t_poll);
         match status {
             glow::ALREADY_SIGNALED | glow::CONDITION_SATISFIED => {}
@@ -3366,7 +3415,7 @@ impl Renderer {
             _ => return None,
         }
         let job = self.audio_jobs.remove(&t.0).unwrap();
-        Some(Ok(self.finish_audio(job, false)))
+        Some(self.finish_audio(job, false))
     }
 
     /// The samples of a submitted block, waiting for the GPU if needed. This is a
@@ -3378,74 +3427,71 @@ impl Renderer {
         loop {
             match unsafe {
                 self.gl
-                    .client_wait_sync(job.fence, glow::SYNC_FLUSH_COMMANDS_BIT, 100_000_000)
+                    .client_wait_sync(job.fence.sync, glow::SYNC_FLUSH_COMMANDS_BIT, 100_000_000)
             } {
                 glow::ALREADY_SIGNALED | glow::CONDITION_SATISFIED => break,
                 glow::WAIT_FAILED => {
-                    self.release_audio(job);
                     return Err("waiting for a sound block failed".into());
                 }
                 _ => {}
             }
         }
-        Ok(self.finish_audio(job, true))
+        self.finish_audio(job, true)
     }
 
     /// Forget a submitted block (its result is no longer wanted).
     pub fn cancel_audio(&mut self, t: AudioTicket) {
-        if let Some(job) = self.audio_jobs.remove(&t.0) {
-            self.release_audio(job);
-        }
+        // The GPU may still be using these buffers, so only completed jobs
+        // can return their storage to the pools.
+        self.audio_jobs.remove(&t.0);
     }
 
-    /// Read a finished block's samples and recycle its buffer, fence and query.
-    fn finish_audio(&mut self, job: AudioJob, waited: bool) -> Vec<f32> {
-        let gl = self.gl.clone();
+    /// Read a finished block's samples and recycle its buffers.
+    fn finish_audio(
+        &mut self,
+        job: AudioJob,
+        waited: bool,
+    ) -> std::result::Result<Vec<f32>, String> {
         let n = job.count;
         let mut out = Vec::with_capacity(n * 2);
         let t_read = std::time::Instant::now();
         unsafe {
-            let mapped = !job.pbo.ptr.is_null();
-            let p = if mapped {
-                // Persistent and coherent: once the fence has passed the samples are
-                // simply there. No GL call, so nothing can wait for the driver.
-                job.pbo.ptr
-            } else {
+            let mapping = if job.pbo.ptr.is_null() {
                 // The fence has passed, so mapping doesn't wait for the GPU (it is still
                 // a driver round trip). WebGL 2 would use getBufferSubData here.
+                let gl = &job.pbo.gl;
                 gl.bind_buffer(glow::PIXEL_PACK_BUFFER, Some(job.pbo.buf));
-                gl.map_buffer_range(
-                    glow::PIXEL_PACK_BUFFER,
-                    0,
-                    (n * 16) as i32,
-                    glow::MAP_READ_BIT,
-                )
-            };
-            if p.is_null() {
-                out.resize(n * 2, 0.0);
+                Some(AudioReadMapping {
+                    buffer: &job.pbo,
+                    ptr: gl.map_buffer_range(
+                        glow::PIXEL_PACK_BUFFER,
+                        0,
+                        (n * 16) as i32,
+                        glow::MAP_READ_BIT,
+                    ),
+                })
             } else {
-                // RGBA32F texels. Mappings are aligned (GL guarantees ≥ 64 bytes), but
-                // don't bet on it.
-                if (p as usize).is_multiple_of(std::mem::align_of::<f32>()) {
-                    let px = std::slice::from_raw_parts(p as *const [f32; 4], n);
-                    for t in px {
-                        out.push(sanitize(t[0]));
-                        out.push(sanitize(t[1]));
-                    }
-                } else {
-                    let px = std::slice::from_raw_parts(p as *const [u8; 16], n);
-                    for t in px {
-                        let f = |i: usize| f32::from_ne_bytes(t[i..i + 4].try_into().unwrap());
-                        out.push(sanitize(f(0)));
-                        out.push(sanitize(f(4)));
-                    }
-                }
-                if !mapped {
-                    gl.unmap_buffer(glow::PIXEL_PACK_BUFFER);
-                }
+                // Persistent and coherent: the fence makes the samples available.
+                None
+            };
+            let p = mapping.as_ref().map_or(job.pbo.ptr, |m| m.ptr);
+            if p.is_null() {
+                return Err("mapping a finished sound block failed".into());
             }
-            if !mapped {
-                gl.bind_buffer(glow::PIXEL_PACK_BUFFER, None);
+            // RGBA32F texels. Mappings are aligned on recent GL versions.
+            if (p as usize).is_multiple_of(std::mem::align_of::<f32>()) {
+                let px = std::slice::from_raw_parts(p as *const [f32; 4], n);
+                for t in px {
+                    out.push(sanitize(t[0]));
+                    out.push(sanitize(t[1]));
+                }
+            } else {
+                let px = std::slice::from_raw_parts(p as *const [u8; 16], n);
+                for t in px {
+                    let f = |i: usize| f32::from_ne_bytes(t[i..i + 4].try_into().unwrap());
+                    out.push(sanitize(f(0)));
+                    out.push(sanitize(f(4)));
+                }
             }
         }
         self.audio_timing.read_ms += ms_since(t_read);
@@ -3458,12 +3504,11 @@ impl Renderer {
         let ms = job.submitted.elapsed().as_secs_f32() * 1000.0;
         let (on, off) = if waited { (50.0, 20.0) } else { (250.0, 100.0) };
         self.audio_banded = if self.audio_banded { ms > off } else { ms > on };
-        self.release_audio(job);
-        out
+        self.recycle_audio_buffers(job);
+        Ok(out)
     }
 
-    fn release_audio(&mut self, job: AudioJob) {
-        unsafe { self.gl.delete_sync(job.fence) };
+    fn recycle_audio_buffers(&mut self, job: AudioJob) {
         for (pool, b) in [(true, Some(job.pbo)), (false, job.staging)] {
             let Some(b) = b else { continue };
             let pool = if pool {
@@ -3473,8 +3518,6 @@ impl Renderer {
             };
             if pool.len() < 8 {
                 pool.push(b);
-            } else {
-                unsafe { self.gl.delete_buffer(b.buf) };
             }
         }
     }
@@ -3625,7 +3668,7 @@ pub fn vertex_source(dialect: Dialect) -> String {
 /// A readback (`pack`) or staging buffer of at least `bytes`, from the pool or new.
 /// New ones are persistently mapped when the driver can.
 unsafe fn take_buf(
-    gl: &glow::Context,
+    gl: &Arc<glow::Context>,
     pool: &mut Vec<GpuBuf>,
     persistent: bool,
     pack: bool,
@@ -3664,7 +3707,16 @@ unsafe fn take_buf(
             gl.buffer_data_size(target, bytes, usage);
         }
         gl.bind_buffer(target, None);
-        Ok(GpuBuf { buf, bytes, ptr })
+        let buffer = GpuBuf {
+            gl: gl.clone(),
+            buf,
+            bytes,
+            ptr,
+        };
+        if persistent && ptr.is_null() {
+            return Err("mapping a persistent sound buffer failed".into());
+        }
+        Ok(buffer)
     }
 }
 
@@ -3753,15 +3805,9 @@ impl Drop for Renderer {
             for (_, p) in std::mem::take(&mut self.audio) {
                 self.gl.delete_program(p.prog);
             }
-            for (_, j) in std::mem::take(&mut self.audio_jobs) {
-                self.release_audio(j);
-            }
-            for b in std::mem::take(&mut self.audio_pbos)
-                .into_iter()
-                .chain(std::mem::take(&mut self.audio_staging))
-            {
-                self.gl.delete_buffer(b.buf);
-            }
+            self.audio_jobs.clear();
+            self.audio_pbos.clear();
+            self.audio_staging.clear();
             for (t, _) in self.audio_inputs.iter().flatten() {
                 self.gl.delete_texture(*t);
             }

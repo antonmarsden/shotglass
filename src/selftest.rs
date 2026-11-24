@@ -1963,6 +1963,7 @@ fn sound_streaming(gl: &Gl, dir: &Path) -> Result<String> {
         let mut got: Vec<Option<Arc<Vec<f32>>>> = vec![None; n];
         let mut frames = 0;
         let mut max_in_flight = 0;
+        let mut cancelled = false;
         let start = Instant::now();
         while got.iter().any(|c| c.is_none()) {
             if start.elapsed().as_secs() > 60 {
@@ -1977,6 +1978,13 @@ fn sound_streaming(gl: &Gl, dir: &Path) -> Result<String> {
                 got[c] = Some(d);
             }
             max_in_flight = max_in_flight.max(r.audio_in_flight());
+            if !cancelled && r.audio_in_flight() > 0 {
+                st.cancel_all(&mut r);
+                if st.in_flight() != 0 || r.audio_in_flight() != 0 {
+                    bail!("chunk {chunk}: cancellation left blocks in flight");
+                }
+                cancelled = true;
+            }
             frames += 1;
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
