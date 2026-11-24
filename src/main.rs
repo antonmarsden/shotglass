@@ -217,10 +217,10 @@ enum Cmd {
     Freeze { movie: PathBuf },
     /// Undo freeze: the film follows its project's libraries again.
     Unfreeze { movie: PathBuf },
-    /// Run GLSL unit and property tests (*.test.glsl) on the GPU, with the libraries of
-    /// each file's project. Takes a file or a folder (searched recursively).
+    /// Run GLSL unit and property tests (*.test.glsl) and quality metric tests (*.test.toml)
+    /// on the GPU, with the libraries of each file's project. Takes a file or a folder.
     Test {
-        /// A test file, or a folder to search for *.test.glsl files.
+        /// A test file, or a folder to search for *.test.glsl and *.test.toml files.
         #[arg(default_value = ".")]
         target: PathBuf,
         /// Only run tests whose name contains this text.
@@ -240,8 +240,9 @@ enum Cmd {
         /// Frame size (default: quality.toml's size, else 384x216).
         #[arg(long)]
         size: Option<String>,
-        /// Folder for quality.json and the heatmaps (a project gets one per film).
-        #[arg(long, default_value = "quality")]
+        /// Folder for quality.json and the heatmaps (a project gets one per film). A
+        /// folder holding GLSL or a library.toml (a library's own `quality/`) is refused.
+        #[arg(long, default_value = "quality-out")]
         out: PathBuf,
         /// Compare each metric's heatmap with <DIR>/<metric>.png (golden images, with
         /// `strip --compare`'s default tolerance); writes <metric>.diff.png on a mismatch.
@@ -497,7 +498,7 @@ fn test_glsl(target: &Path, filter: Option<String>) -> Result<()> {
     let paths = glsl_test::find_files(target)?;
     if paths.is_empty() {
         bail!(
-            "no test files (*.test.glsl) at or under {}",
+            "no test files (*.test.glsl, *.test.toml) at or under {}",
             target.display()
         );
     }
@@ -528,7 +529,15 @@ fn test_glsl(target: &Path, filter: Option<String>) -> Result<()> {
     let sum = headless::with_gl(move |gl| {
         use eframe::glow::HasContext;
         let renderer = unsafe { gl.get_parameter_string(eframe::glow::RENDERER) };
-        let sum = glsl_test::run(&gl, &files, filter.as_deref(), &mut |l| println!("{l}"))?;
+        let (metric, glsl): (Vec<_>, Vec<_>) = files
+            .into_iter()
+            .partition(|f| quality::testing::is_test_file(&f.path));
+        let mut sum = glsl_test::run(&gl, &glsl, filter.as_deref(), &mut |l| println!("{l}"))?;
+        let m = quality::testing::run(&gl, &metric, filter.as_deref(), &mut |l| println!("{l}"))?;
+        sum.passed += m.passed;
+        sum.failed += m.failed;
+        sum.broken += m.broken;
+        sum.samples += m.samples;
         Ok((sum, renderer))
     })?;
     let (sum, renderer) = sum;
@@ -825,6 +834,24 @@ fn strip(
     })
 }
 
+/// `quality --out` writes reports, never into a folder of sources: a library's
+/// `quality/` (metric GLSL, `library.toml`) is a likely accident.
+fn refuse_source_folder(out: &Path) -> Result<()> {
+    let Ok(entries) = std::fs::read_dir(out) else {
+        return Ok(()); // not there yet
+    };
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        if name == "library.toml" || name.ends_with(".glsl") {
+            bail!(
+                "--out {}: that folder holds sources ({name}); write the report elsewhere                  (the default is quality-out/)",
+                out.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 fn quality_cmd(
     movie: &Path,
     count: Option<usize>,
@@ -846,8 +873,14 @@ fn quality_cmd(
     if let Some(s) = size {
         cfg.size = parse_size(s)?;
     }
-    let times = match at {
-        Some(a) => parse_times(a, &m)?,
+    // --at, then --count, then quality.toml's at, then its count.
+    let toml_at = cfg
+        .at
+        .as_ref()
+        .filter(|_| count.is_none())
+        .map(|a| a.join(","));
+    let times = match at.or(toml_at.as_deref()) {
+        Some(a) => parse_times(a, &m).with_context(|| format!("sample times \"{a}\""))?,
         None => {
             let n = count.unwrap_or(cfg.count).max(1);
             (0..n)
@@ -855,6 +888,7 @@ fn quality_cmd(
                 .collect()
         }
     };
+    refuse_source_folder(out)?;
     let out = out.to_path_buf();
     headless::with_gl(move |gl| {
         let report = quality::run(gl, &m, &cfg, &times, true)?;

@@ -191,6 +191,10 @@ const CHECKS: &[Check] = &[
         run: glsl_tests,
     },
     Check {
+        name: "shotglass test: metric tests on PNG, GLSL and WAV inputs, expected failures",
+        run: metric_tests,
+    },
+    Check {
         name: "loop films: the frame at t + k·period is the frame at t",
         run: loop_picture,
     },
@@ -514,11 +518,16 @@ fn quality_metrics(gl: &Gl, dir: &Path) -> Result<String> {
                 "void mainMetric(out vec4 value, in vec2 fragCoord) {\n  float x = 1.0;\n  if (fragCoord.x < 10.0) x = uintBitsToFloat(0x7fc00000u);\n  if (fragCoord.y > 89.0) x = uintBitsToFloat(0x7f800000u);\n  value = vec4(0.0, 0.0, 0.0, x);\n}\n",
             ),
             (
+                "q/skip.glsl",
+                "void mainMetric(out vec4 value, in vec2 fragCoord) {\n  value = vec4(0.0, 0.0, 0.0, fragCoord.x < 79.0 ? notMeasured() : 1.0);\n}\n",
+            ),
+            (
                 "quality.toml",
                 "size = \"158x90\"\nreference = 4\n\
                  [[metric]]\nuse = \"q/green.glsl\"\nparams = { GAIN = 2 }\nmean = { max = 2.0 }\n\
                  [[metric]]\nuse = \"q/alias.glsl\"\nmax = { max = 0.4 }\n\
-                 [[metric]]\nuse = \"q/bad.glsl\"\n",
+                 [[metric]]\nuse = \"q/bad.glsl\"\n\
+                 [[metric]]\nuse = \"q/skip.glsl\"\nrange = [0, 2]\nmin = { min = 1 }\np50 = { min = 0.99 }\n",
             ),
         ],
     )?;
@@ -572,6 +581,18 @@ fn quality_metrics(gl: &Gl, dir: &Path) -> Result<String> {
         bail!("bad: {:?}, failures {:?}", b.total, b.failures);
     }
     close("bad mean (finite only)", b.total.mean, 1.0)?;
+    // skip: the left 79 columns are notMeasured(): in no reduction, not invalid.
+    let k = &rep.metrics[3];
+    let left = 79 * 90;
+    if k.total.unmeasured != left
+        || k.total.pixels != 158 * 90 - left
+        || k.total.invalid != 0
+        || k.total.histogram.iter().sum::<u64>() != k.total.pixels
+        || !k.pass
+    {
+        bail!("skip: {:?}, failures {:?}", k.total, k.failures);
+    }
+    close("skip mean (measured only)", k.total.mean, 1.0)?;
     if rep.pass {
         bail!("the report passes with failing metrics");
     }
@@ -780,6 +801,107 @@ unit/fx.test.glsl
         bail!("summary {sum:?}, expected 2 passed, 9 failed, 1 broken");
     }
     Ok(format!("{} samples", sum.samples))
+}
+
+/// Metric tests (`*.test.toml`, #106): library metrics on PNG and GLSL pictures
+/// (`@frame`, `@reference`), `notMeasured()` pixels, a missing variant, and GLSL and WAV
+/// sound; must-pass and must-fail cases, an unexpected pass. Pins the whole report.
+fn metric_tests(gl: &Gl, dir: &Path) -> Result<String> {
+    write(
+        dir,
+        &[
+            (
+                "shotglass.toml",
+                "shotglass = \"0.1\"\n[libraries]\nq = { path = \"lib\" }\n",
+            ),
+            (
+                "lib/library.toml",
+                "name = \"selftest/q\"\nversion = \"0.1.0\"\nlicences = [\"MIT\"]\n",
+            ),
+            (
+                "lib/edge.glsl",
+                "void mainMetric(out vec4 value, in vec2 fragCoord) {\n  vec2 uv = fragCoord / iResolution.xy;\n  float d = abs(getFrame(uv).r - getReference(uv).r);\n  value = vec4(vec3(d), d);\n}\n",
+            ),
+            (
+                "lib/ink.glsl",
+                "void mainMetric(out vec4 value, in vec2 fragCoord) {\n  vec4 c = getFrame(fragCoord / iResolution.xy);\n  value = vec4(c.rgb, c.g < 0.5 ? notMeasured() : c.r);\n}\n",
+            ),
+            (
+                "lib/flicker.glsl",
+                "void mainMetric(out vec4 value, in vec2 fragCoord) {\n  vec2 uv = fragCoord / iResolution.xy;\n  float d = abs(getNext(uv).r - getPrev(uv).r);\n  value = vec4(vec3(d), d);\n}\n",
+            ),
+            (
+                "lib/clicks.glsl",
+                "void mainSoundMetric(out float value, in int samp) {\n  vec2 d = getSound(samp) - 2.0 * getSound(samp - 1) + getSound(samp - 2);\n  value = max(abs(d.x), abs(d.y));\n}\n",
+            ),
+            (
+                "t/in/soft.glsl",
+                "void mainImage(out vec4 fragColor, in vec2 fragCoord) {\n  fragColor = vec4(fragCoord.x < 4.0 ? 0.75 : 0.0, 0.0, 0.0, 1.0);\n}\n",
+            ),
+            (
+                "t/in/ink.glsl",
+                "void mainImage(out vec4 fragColor, in vec2 fragCoord) {\n  fragColor = vec4(fragCoord.x < 5.0 ? 0.0 : 1.0, step(5.0, fragCoord.x), 0.0, 1.0);\n}\n",
+            ),
+            (
+                "t/in/sine.glsl",
+                "vec2 mainSound(int samp, float time) {\n  return vec2(0.5 * sin(6.2831853 * 440.0 * time));\n}\n",
+            ),
+            (
+                "t/q.test.toml",
+                "[[case]]\nname = \"edge: same picture\"\nuse = \"q/edge\"\nframe = \"in/half.png\"\nreference = \"in/half.png\"\nmax = { max = 0 }\n\
+                 [[case]]\nname = \"edge: soft reference\"\nuse = \"q/edge\"\nframe = \"in/half.png\"\nreference = \"in/soft.glsl\"\nexpect = \"fail\"\nmax = { max = 0.1 }\n\
+                 [[case]]\nname = \"ink: left half not measured\"\nuse = \"q/ink\"\nframe = \"in/ink.glsl\"\nsize = \"10x4\"\nmean = { min = 1 }\n\
+                 [[case]]\nname = \"flicker: no prev\"\nuse = \"q/flicker\"\nframe = \"in/half.png\"\nnext = \"in/half.png\"\n\
+                 [[case]]\nname = \"clicks: sine\"\nuse = \"q/clicks\"\nsound = \"in/sine.glsl\"\nsamples = 4800\nmax = { max = 0.05 }\n\
+                 [[case]]\nname = \"clicks: click\"\nuse = \"q/clicks\"\nsound = \"in/click.wav\"\nexpect = \"fail\"\nmax = { max = 0.01 }\n\
+                 [[case]]\nname = \"clicks: unexpected pass\"\nuse = \"q/clicks\"\nsound = \"in/sine.glsl\"\nsamples = 4800\nexpect = \"fail\"\nmax = { max = 0.5 }\n",
+            ),
+        ],
+    )?;
+    // 8x4, the left half red.
+    let mut half = Frame::init(8, 4, [0, 0, 0, 255]);
+    for row in half.rows_mut() {
+        row[..4].fill([255, 0, 0, 255]);
+    }
+    crate::save_png(&dir.join("t/in/half.png"), &half)?;
+    // 100 silent stereo samples, one of them 0.5.
+    let mut wav = crate::audio::WavWriter::create(&dir.join("t/in/click.wav"), 100, 48000)?;
+    let mut click = vec![0.0f32; 200];
+    click[100] = 0.5;
+    wav.write(&click)?;
+    wav.finish()?;
+    let p = crate::project::Project::read(dir)?;
+    let libs = crate::library::resolve(dir, &p.specs, &Default::default(), None, dir)?;
+    let files = [crate::glsl_test::TestFile {
+        path: dir.join("t/q.test.toml"),
+        root: dir.to_path_buf(),
+        libs,
+        display: "t/q.test.toml".into(),
+    }];
+    let mut report = String::new();
+    let sum = crate::quality::testing::run(gl, &files, None, &mut |l| {
+        report += l;
+        report.push('\n');
+    })?;
+    let expected = "\
+t/q.test.toml
+  ok    edge: same picture  mean 0.000000  max 0.000000  (32 measured)
+  ok    edge: soft reference  mean 0.125490  max 0.250980  (32 measured); fails as expected: max 0.250980 > max 0.1
+  ok    ink: left half not measured  mean 1.000000  max 1.000000  (20 measured, 20 not measured)
+  ERROR flicker: no prev
+        the metric reads @prev: give prev = \"…\"
+  ok    clicks: sine  mean 0.001062  max 0.028782  (4800 measured)
+  ok    clicks: click  mean 0.019999  max 0.999969  (100 measured); fails as expected: max 0.999969 > max 0.01
+  FAIL  clicks: unexpected pass
+        expected to fail, but every limit holds: mean 0.001062  max 0.028782  (4800 measured)
+";
+    if report != expected {
+        bail!("report differs:\n--- expected\n{expected}--- got\n{report}");
+    }
+    if (sum.passed, sum.failed, sum.broken) != (5, 1, 1) {
+        bail!("summary {sum:?}, expected 5 passed, 1 failed, 1 broken");
+    }
+    Ok(format!("{} cases", sum.passed + sum.failed + sum.broken))
 }
 
 fn scene(body: &str) -> String {

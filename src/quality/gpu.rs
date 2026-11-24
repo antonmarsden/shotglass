@@ -15,8 +15,8 @@ pub type Texels = TooDee<[f32; 4]>;
 /// One reduction pass: each output texel combines a 4×4 block. The first pass reads
 /// the measure (`.a` of the metric map) of the first `sg_count` texels in row order
 /// (a sound metric's last block is partly empty); later ones read the previous level's two
-/// targets: (sum, max, finite, non-finite) and (over, min, -, -). Non-finite is
-/// tested on the bits ([`NONFINITE`]).
+/// targets: (sum, max, finite, non-finite) and (over, min, not measured, -).
+/// Non-finite and not measured (-Inf) are tested on the bits ([`NONFINITE`]).
 const REDUCE: &str = "
 uniform sampler2D sg_src;
 uniform sampler2D sg_src2;
@@ -28,7 +28,7 @@ layout(location = 0) out vec4 o0;
 layout(location = 1) out vec4 o1;
 void main() {
   ivec2 base = ivec2(gl_FragCoord.xy) * 4;
-  float sum = 0.0, mx = -3.0e38, n = 0.0, bad = 0.0, over = 0.0, mn = 3.0e38;
+  float sum = 0.0, mx = -3.0e38, n = 0.0, bad = 0.0, over = 0.0, mn = 3.0e38, skip = 0.0;
   for (int y = 0; y < 4; y++) {
     for (int x = 0; x < 4; x++) {
       ivec2 p = base + ivec2(x, y);
@@ -36,7 +36,9 @@ void main() {
       vec4 v = texelFetch(sg_src, p, 0);
       if (sg_first == 1) {
         if (p.y * sg_size.x + p.x >= sg_count) continue;
-        if (sg_nonfinite(v.a)) {
+        if (sg_unmeasured(v.a)) {
+          skip += 1.0;
+        } else if (sg_nonfinite(v.a)) {
           bad += 1.0;
         } else {
           sum += v.a;
@@ -53,11 +55,12 @@ void main() {
         bad += v.a;
         over += w.r;
         mn = min(mn, w.g);
+        skip += w.b;
       }
     }
   }
   o0 = vec4(sum, mx, n, bad);
-  o1 = vec4(over, mn, 0.0, 0.0);
+  o1 = vec4(over, mn, skip, 0.0);
 }
 ";
 
@@ -65,6 +68,7 @@ void main() {
 /// unlike `isnan`/`isinf` or `x != x`; both passes use it, so they agree.
 const NONFINITE: &str = "
 bool sg_nonfinite(float x) { return (floatBitsToUint(x) & 0x7f800000u) == 0x7f800000u; }
+bool sg_unmeasured(float x) { return floatBitsToUint(x) == 0xff800000u; }
 ";
 
 /// The histogram: one point per pixel of the metric map, added (blending ONE, ONE)
@@ -377,6 +381,8 @@ impl Gpu {
                 return if v.is_finite() {
                     let over = threshold.is_some_and(|t| v as f64 > t) as u8 as f32;
                     ([v, v, 1.0, 0.0], [over, v, 0.0, 0.0])
+                } else if v == f32::NEG_INFINITY {
+                    ([0.0, -3.0e38, 0.0, 0.0], [0.0, 3.0e38, 1.0, 0.0])
                 } else {
                     ([0.0, -3.0e38, 0.0, 1.0], [0.0, 3.0e38, 0.0, 0.0])
                 };

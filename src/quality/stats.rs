@@ -18,14 +18,16 @@ pub struct Reduced {
     pub max: Option<f64>,
     /// Share of finite pixels above the metric's threshold (None without one).
     pub over: Option<f64>,
-    /// Pixels with a finite measure, and with NaN/Inf (`invalid`).
+    /// Pixels with a finite measure, and with NaN/+Inf (`invalid`).
     pub pixels: u64,
     pub invalid: u64,
+    /// Pixels the metric left out (`notMeasured()`, -Inf): in no reduction.
+    pub unmeasured: u64,
 }
 
 impl Reduced {
     /// From the reduction's last texels: (sum, max, finite, non-finite) and
-    /// (over, min, -, -).
+    /// (over, min, not measured, -).
     pub fn from_texels(a: [f32; 4], b: [f32; 4], threshold: bool) -> Reduced {
         let n = a[2].max(0.0) as u64;
         let some = |v: f64| (n > 0).then_some(v);
@@ -40,6 +42,7 @@ impl Reduced {
             },
             pixels: n,
             invalid: a[3].max(0.0) as u64,
+            unmeasured: b[2].max(0.0) as u64,
         }
     }
 }
@@ -56,6 +59,7 @@ pub struct Totals {
     pub percentiles: BTreeMap<String, f64>,
     pub pixels: u64,
     pub invalid: u64,
+    pub unmeasured: u64,
     /// The histogram's range and its counts of finite measures (`BINS` bins; values
     /// outside the range are counted in the end bins).
     pub range: [f64; 2],
@@ -123,6 +127,7 @@ impl Totals {
             percentiles,
             pixels,
             invalid: xs.iter().map(|r| r.invalid).sum(),
+            unmeasured: xs.iter().map(|r| r.unmeasured).sum(),
             range: [metric.range.0, metric.range.1],
             histogram,
         }
@@ -144,12 +149,16 @@ pub fn judge(metric: &Metric, total: &Totals) -> Vec<String> {
     let mut f = vec![];
     if total.invalid > 0 {
         f.push(format!(
-            "invalid: {} pixel(s) with a NaN or Inf measure",
+            "invalid: {} pixel(s) with a NaN or +Inf measure",
             total.invalid
         ));
     }
     for (s, b) in &metric.limits {
-        f.extend(b.violation(&s.to_string(), total.get(*s), "no finite pixels to measure"));
+        f.extend(b.violation(
+            &s.to_string(),
+            total.get(*s),
+            "no measured pixels (all left out, or NaN/Inf)",
+        ));
     }
     f
 }
@@ -237,19 +246,23 @@ impl SoundReport {
         self.measured.as_ref()?.get(s)
     }
 
+    /// The `sound` line judges the loudness limits (`[sound]`) only; each sound metric
+    /// has its own line.
     fn print(&self) {
+        let ok = if self.failures.is_empty() {
+            "ok"
+        } else {
+            "FAIL"
+        };
         let Some(l) = &self.measured else {
-            println!(
-                "{:<5} sound            (the film has no sound)",
-                if self.pass { "ok" } else { "FAIL" }
-            );
+            println!("{ok:<5} sound            (the film has no sound)");
             return self.failures.iter().for_each(|f| println!("      {f}"));
         };
         let db = |v: Option<f64>| v.map_or("-".into(), |v| format!("{v:.2}"));
         println!(
             "{:<5} sound            integrated {} LUFS  momentary max {}  short-term max {}  \
              sample peak {} dBFS  true peak {} dBTP   ({:.2} s)",
-            if self.pass { "ok" } else { "FAIL" },
+            ok,
             db(l.integrated),
             db(l.momentary_max),
             db(l.short_term_max),
@@ -346,8 +359,16 @@ impl Report {
             .iter()
             .filter(|x| !x.pass)
             .map(|x| x.name.as_str());
-        let sound = self.sound.as_ref().filter(|s| !s.pass).map(|_| "sound");
-        metrics.chain(sound).collect()
+        let sound = self.sound.iter();
+        let limits = sound
+            .clone()
+            .filter(|s| !s.failures.is_empty())
+            .map(|_| "sound");
+        let sound_metrics = sound
+            .flat_map(|s| &s.metrics)
+            .filter(|x| !x.pass)
+            .map(|x| x.name.as_str());
+        metrics.chain(limits).chain(sound_metrics).collect()
     }
 
     /// Metric `i`'s value of `s` (a picture or a sound metric), for `--tighten`.
@@ -383,6 +404,7 @@ mod tests {
             over: Some(over),
             pixels,
             invalid,
+            unmeasured: 0,
         }
     }
 
