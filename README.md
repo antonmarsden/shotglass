@@ -1233,7 +1233,7 @@ shotglass freeze <movie>                                   # copy the library fi
 shotglass unfreeze <movie>                                 # follow the project's libraries again
 shotglass test   [file|folder] [filter]                    # GLSL unit and property tests (*.test.glsl) on the GPU
 shotglass quality <movie> [--count 8 | --at ...] [--size 384x216] [--out quality/]
-                 [--compare <dir> [--bless]]   # heatmaps vs <dir>/<metric>.png
+                 [--compare <dir> [--bless] [--budget 0.1%]] # heatmaps vs <dir>/<metric>.png
                  [--tighten [--margin 25%]]    # move limits towards the measured values
                  # metrics from quality.toml: report, quality.json, heatmaps; fails outside limits
 shotglass selftest [filter]                                # GPU + sound checks on this machine
