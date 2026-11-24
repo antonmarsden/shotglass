@@ -251,14 +251,16 @@ fn codec_args(format: &Format, encoders: &str, sound: bool) -> Result<Vec<String
 /// Returns the number of stereo frames: `ceil(duration × rate)` from sample 0, or for
 /// a loop film `loops` periods (`Movie::sound_samples` each). A loop film's mix reads
 /// across the seam, so the file itself loops seamlessly.
-pub fn write_wav(r: &mut Renderer, m: &Movie, rate: u32, out: &Path, loops: u64) -> Result<usize> {
+/// `m`'s soundtrack, ready to synthesise at `rate`.
+pub fn soundtrack(r: &mut Renderer, m: &Movie, rate: u32) -> Result<Soundtrack> {
     let mut st = Soundtrack::new();
-    st.set_movie(r, m, rate).map_err(|errors| {
-        anyhow!(
-            "{}",
-            errors.iter().map(|e| e.to_string()).collect::<String>()
-        )
-    })?;
+    st.set_movie(r, m, rate)
+        .map_err(|errors| anyhow!("{}", crate::gfx::join_errors(&errors)))?;
+    Ok(st)
+}
+
+pub fn write_wav(r: &mut Renderer, m: &Movie, rate: u32, out: &Path, loops: u64) -> Result<usize> {
+    let mut st = soundtrack(r, m, rate)?;
     let loops = loops.max(1) as usize;
     let frames = m.sound_samples(rate) * loops;
     let mut w = audio::WavWriter::create(out, frames, rate)

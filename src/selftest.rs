@@ -205,7 +205,86 @@ const CHECKS: &[Check] = &[
         name: "quality metrics: @prev/@next (clamped at the ends), min, over, GPU histogram and percentiles",
         run: quality_temporal,
     },
+    Check {
+        name: "quality sound: BS.1770 loudness and true peak of a synthesised sine, sound-only config, limits",
+        run: quality_sound,
+    },
 ];
+
+/// Phase 3 of `shotglass quality` (#96): music is a 997 Hz sine at amplitude 0.1 in
+/// both channels, which BS.1770 defines as -20 LUFS (K-weighting is ~0 dB there);
+/// its peaks are -20 dBFS / dBTP. A `[sound]`-only config renders no picture, and a
+/// true-peak limit below the peak fails.
+fn quality_sound(gl: &Gl, dir: &Path) -> Result<String> {
+    write(
+        dir,
+        &[
+            ("s.glsl", &scene("fragColor = vec4(0.0, 0.0, 0.0, 1.0);")),
+            (
+                "music.glsl",
+                "vec2 mainSound(int samp, float time) {
+  return vec2(0.1 * sin(6.2831853 * 997.0 * time));
+}
+",
+            ),
+            (
+                "quality.toml",
+                "[sound]
+integrated = { min = -21, max = -19 }
+true_peak = { max = -21 }
+",
+            ),
+        ],
+    )?;
+    let m = movie(
+        dir,
+        "shotglass = \"0.1.4\"
+fps = 30
+[sound]
+music = \"music.glsl\"
+[[shot]]
+id=\"a\"
+scene=\"s.glsl\"
+duration=5
+",
+    )?;
+    let cfg = crate::quality::Config::of_film(&m)?.ok_or_else(|| anyhow!("no quality.toml"))?;
+    let rep = crate::quality::run(gl.clone(), &m, &cfg, &[0.0, 1.0], false)?;
+    if !rep.frames.is_empty() || !rep.metrics.is_empty() {
+        bail!("a [sound]-only config rendered {} frames", rep.frames.len());
+    }
+    let s = rep
+        .sound
+        .as_ref()
+        .ok_or_else(|| anyhow!("no sound report"))?;
+    let l = s
+        .measured
+        .as_ref()
+        .ok_or_else(|| anyhow!("sound not measured"))?;
+    let checks = [
+        ("integrated", l.integrated, -20.0, 0.05),
+        ("momentary max", l.momentary_max, -20.0, 0.05),
+        ("short-term max", l.short_term_max, -20.0, 0.05),
+        ("sample peak", l.sample_peak, -20.0, 0.01),
+        ("true peak", l.true_peak, -20.0, 0.05),
+    ];
+    for (what, got, want, tol) in checks {
+        if got.is_none_or(|g| (g - want).abs() > tol) {
+            bail!("{what}: got {got:?}, want {want} ± {tol}");
+        }
+    }
+    if (l.seconds - 5.0).abs() > 0.01 {
+        bail!("measured {} s of a 5 s film", l.seconds);
+    }
+    if rep.pass || s.failures.len() != 1 || !s.failures[0].starts_with("true_peak -19.99") {
+        bail!("sound failures: {:?}", s.failures);
+    }
+    Ok(format!(
+        "integrated {:.3} LUFS, true peak {:.3} dBTP",
+        l.integrated.unwrap(),
+        l.true_peak.unwrap()
+    ))
+}
 
 /// Phase 2 of `shotglass quality` (#96): red flips every film frame (0, 1, 0, …), so
 /// |frame − prev| + 2·|frame − next| is 3 inside the film, 2 on frame 0 (prev clamps to
@@ -269,7 +348,7 @@ duration=2
                 bail!(
                     "metric fixtures aren't strictly valid {d}:
 {}",
-                    errors.iter().map(|e| e.to_string()).collect::<String>()
+                    crate::gfx::join_errors(&errors)
                 );
             }
         }
@@ -375,7 +454,7 @@ fn quality_metrics(gl: &Gl, dir: &Path) -> Result<String> {
             if !errors.is_empty() {
                 bail!(
                     "metric fixtures aren't strictly valid {d}:\n{}",
-                    errors.iter().map(|e| e.to_string()).collect::<String>()
+                    crate::gfx::join_errors(&errors)
                 );
             }
         }
@@ -658,7 +737,7 @@ fn strict(m: &Movie) -> Result<()> {
         if !errors.is_empty() {
             bail!(
                 "fixture isn't strictly valid {d}:\n{}",
-                errors.iter().map(|e| e.to_string()).collect::<String>()
+                crate::gfx::join_errors(&errors)
             );
         }
     }

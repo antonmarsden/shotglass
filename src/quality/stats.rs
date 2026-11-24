@@ -1,7 +1,8 @@
 //! Reduced values per frame and over frames, percentiles from histograms, limits,
 //! and the report (`quality.json`, heatmaps).
 
-use super::config::{BINS, Bound, Metric, Stat};
+use super::config::{BINS, Bound, Metric, SoundConfig, SoundStat, Stat};
+use super::loudness::Loudness;
 use crate::gfx::Frame;
 use anyhow::Result;
 use serde::Serialize;
@@ -148,7 +149,7 @@ pub fn judge(metric: &Metric, total: &Totals) -> Vec<String> {
         ));
     }
     for (s, b) in &metric.limits {
-        f.extend(b.violation(&s.to_string(), total.get(*s)));
+        f.extend(b.violation(&s.to_string(), total.get(*s), "no finite pixels to measure"));
     }
     f
 }
@@ -188,6 +189,67 @@ pub struct MetricReport {
     pub heatmap: Option<Frame>,
 }
 
+/// `[sound]`: the soundtrack's loudness and peaks, judged against its limits.
+#[derive(Debug, Clone, Serialize)]
+pub struct SoundReport {
+    /// None: the film has no sound.
+    pub measured: Option<Loudness>,
+    /// Limits by name (`integrated`, `true_peak`, …).
+    pub limits: BTreeMap<String, Bound>,
+    pub failures: Vec<String>,
+    pub pass: bool,
+}
+
+impl SoundReport {
+    pub fn judge(cfg: &SoundConfig, measured: Option<Loudness>) -> SoundReport {
+        let mut failures = vec![];
+        for (stat, b) in &cfg.limits {
+            let v = measured.as_ref().and_then(|l| l.get(*stat));
+            let missing = "not measured (no sound, silence, or too short)";
+            failures.extend(b.violation(stat.name(), v, missing));
+        }
+        SoundReport {
+            measured,
+            limits: cfg
+                .limits
+                .iter()
+                .map(|(s, b)| (s.name().to_string(), *b))
+                .collect(),
+            pass: failures.is_empty(),
+            failures,
+        }
+    }
+
+    pub fn value(&self, s: SoundStat) -> Option<f64> {
+        self.measured.as_ref()?.get(s)
+    }
+
+    fn print(&self) {
+        let Some(l) = &self.measured else {
+            println!(
+                "{:<5} sound            (the film has no sound)",
+                if self.pass { "ok" } else { "FAIL" }
+            );
+            return self.failures.iter().for_each(|f| println!("      {f}"));
+        };
+        let db = |v: Option<f64>| v.map_or("-".into(), |v| format!("{v:.2}"));
+        println!(
+            "{:<5} sound            integrated {} LUFS  momentary max {}  short-term max {}  \
+             sample peak {} dBFS  true peak {} dBTP   ({:.2} s)",
+            if self.pass { "ok" } else { "FAIL" },
+            db(l.integrated),
+            db(l.momentary_max),
+            db(l.short_term_max),
+            db(l.sample_peak),
+            db(l.true_peak),
+            l.seconds
+        );
+        for f in &self.failures {
+            println!("      {f}");
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Report {
     pub schema: u32,
@@ -197,6 +259,8 @@ pub struct Report {
     pub reference: u32,
     pub frames: Vec<FrameReport>,
     pub metrics: Vec<MetricReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sound: Option<SoundReport>,
     pub pass: bool,
 }
 
@@ -236,6 +300,9 @@ impl Report {
                 println!("      {f}");
             }
         }
+        if let Some(s) = &self.sound {
+            s.print();
+        }
     }
 
     /// `quality.json` plus one heatmap contact sheet per metric (`<name>.png`).
@@ -249,6 +316,17 @@ impl Report {
             }
         }
         Ok(())
+    }
+
+    /// The names of the metrics (and `sound`) that failed.
+    pub fn failed(&self) -> Vec<&str> {
+        let metrics = self
+            .metrics
+            .iter()
+            .filter(|x| !x.pass)
+            .map(|x| x.name.as_str());
+        let sound = self.sound.as_ref().filter(|s| !s.pass).map(|_| "sound");
+        metrics.chain(sound).collect()
     }
 
     /// Metric `i`'s value of `s`, for `--tighten`.

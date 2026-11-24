@@ -886,19 +886,21 @@ fn quality_cmd(
                 mismatched.join(", ")
             );
         }
-        let failed: Vec<&str> = report
-            .metrics
-            .iter()
-            .filter(|x| !x.pass)
-            .map(|x| x.name.as_str())
-            .collect();
+        let failed = report.failed();
         if !failed.is_empty() {
             bail!("quality: {} failed", failed.join(", "));
         }
         if let Some(margin) = tighten {
             let path = m.root.join(quality::QUALITY_FILE);
             let text = std::fs::read_to_string(&path)?;
-            let (new, changes) = quality::tighten(&text, margin, |i, s| report.value(i, s))?;
+            let sound = |s| report.sound.as_ref().and_then(|x| x.value(s));
+            let (new, changes) = quality::tighten(
+                &text,
+                margin,
+                quality::SOUND_MARGIN_DB,
+                |i, s| report.value(i, s),
+                sound,
+            )?;
             if changes.is_empty() {
                 println!("tighten: every limit is already within the measured values + margin");
             } else {
