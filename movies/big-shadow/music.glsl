@@ -9,7 +9,7 @@ float window(float t, float a0, float a1, float b0, float b1){
   return smoothstep(a0, a1, t) * (1.0 - smoothstep(b0, b1, t));
 }
 
-// FM bells (kit_inst_bell) on a slow pentatonic walk. Each rings 2.4 s, under the
+// FM bells (bs_inst_bell) on a slow pentatonic walk. Each rings 2.4 s, under the
 // 4 steps of tail the loop keeps, so no note is cut off.
 vec2 bells(float t, float t0, float step, int seed){
   vec2 s = vec2(0.0);
@@ -19,11 +19,11 @@ vec2 bells(float t, float t0, float step, int seed){
   for (int k = 0; k <= 4; k++){
     int i = n - k;
     if (i < 0) break;
-    if (kit_hash(i * 7 + seed) < 0.25) continue;            // rests
+    if (bs_hash(i * 7 + seed) < 0.25) continue;            // rests
     float dt = local - float(i) * step;
-    float f = penta_hz(5 + int(kit_hash(i * 7 + seed + 1) * 8.0), 57);
-    float b = kit_inst_bell(dt, f, 2.4, 3.0);
-    float pan = kit_hash(i * 7 + seed + 2);
+    float f = penta_hz(5 + int(bs_hash(i * 7 + seed + 1) * 8.0), 57);
+    float b = bs_inst_bell(dt, f, 2.4, 3.0);
+    float pan = bs_hash(i * 7 + seed + 2);
     s += b * vec2(1.0 - 0.6 * pan, 0.4 + 0.6 * pan);
   }
   return s;

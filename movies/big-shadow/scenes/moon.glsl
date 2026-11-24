@@ -12,13 +12,13 @@ float roofHeight(float x, out float id){
   float i = floor(x / W);
   float f = fract(x / W);
   id = i;
-  float base = 0.11 + 0.14 * kit_hash(ivec2(int(i), 1));
+  float base = 0.11 + 0.14 * bs_hash(ivec2(int(i), 1));
   float h = base;
   // gable roofs on some houses
-  if (kit_hash(ivec2(int(i), 2)) > 0.35) h += 0.07 * (1.0 - abs(f * 2.0 - 1.0));
+  if (bs_hash(ivec2(int(i), 2)) > 0.35) h += 0.07 * (1.0 - abs(f * 2.0 - 1.0));
   // chimneys
-  float cx = 0.2 + 0.5 * kit_hash(ivec2(int(i), 3));
-  if (kit_hash(ivec2(int(i), 4)) > 0.4 && abs(f - cx) < 0.045) h = max(h, base + 0.055 + 0.03 * kit_hash(ivec2(int(i), 5)));
+  float cx = 0.2 + 0.5 * bs_hash(ivec2(int(i), 3));
+  if (bs_hash(ivec2(int(i), 4)) > 0.4 && abs(f - cx) < 0.045) h = max(h, base + 0.055 + 0.03 * bs_hash(ivec2(int(i), 5)));
   // small gaps between houses
   if (f < 0.02 || f > 0.98) h = 0.06;
   return h;
@@ -60,9 +60,9 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord){
   // stars
   vec2 sg = p * 70.0;
   vec2 si = floor(sg);
-  float sh = kit_hash(ivec2(si));
+  float sh = bs_hash(ivec2(si));
   if (sh > 0.82){
-    vec2 sp = si + 0.2 + 0.6 * vec2(kit_hash(ivec3(ivec2(si), 1)), kit_hash(ivec3(ivec2(si), 2)));
+    vec2 sp = si + 0.2 + 0.6 * vec2(bs_hash(ivec3(ivec2(si), 1)), bs_hash(ivec3(ivec2(si), 2)));
     float tw = 0.6 + 0.4 * sin(iTime * (1.5 + 3.0 * sh) + sh * 40.0);
     float star = smoothstep(1.6, 0.0, length(sg - sp) * 14.0 * (1.0 - sh + 0.25));
     col += vec3(0.9, 0.92, 1.0) * star * tw * smoothstep(0.25, 0.5, p.y) * smoothstep(0.08, 0.2, dm);
@@ -73,16 +73,16 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord){
   float disc = smoothstep(R + px, R - px, dm);
   if (disc > 0.0){
     vec2 q = (p - mc) / R;
-    float cr = kit_fbm(q * 3.0 + 4.0, 4);
+    float cr = bs_fbm(q * 3.0 + 4.0, 4);
     float limb = sqrt(max(0.0, 1.0 - dot(q, q)));
     vec3 mcol = vec3(0.98, 0.94, 0.82) * (0.78 + 0.22 * limb) * (0.82 + 0.3 * cr);
-    mcol *= 1.0 - 0.18 * smoothstep(0.55, 0.62, kit_value_noise(q * 2.2 + 1.3));   // maria
+    mcol *= 1.0 - 0.18 * smoothstep(0.55, 0.62, bs_value_noise(q * 2.2 + 1.3));   // maria
     col = mix(col, mcol, disc);
   }
 
   // clouds drifting across the moon
   vec2 cp = vec2(p.x * 1.4 + iTime * uWind, p.y * 4.0);
-  float cl = kit_fbm(cp + vec2(0.0, kit_fbm(cp * 0.7 + iTime * 0.02, 4)), 4);
+  float cl = bs_fbm(cp + vec2(0.0, bs_fbm(cp * 0.7 + iTime * 0.02, 4)), 4);
   float band = smoothstep(0.45, 0.75, p.y) * smoothstep(1.0, 0.8, p.y);
   float cloud = smoothstep(0.52, 0.8, cl) * band * 0.8;
   vec3 ccol = mix(vec3(0.12, 0.12, 0.22), vec3(0.75, 0.75, 0.85), exp(-dm * 4.0));
@@ -97,10 +97,10 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord){
     // lit windows
     vec2 wg = vec2(p.x * 26.0, p.y * 34.0);
     vec2 wi = floor(wg), wf = fract(wg);
-    float lit = step(0.78, kit_hash(ivec3(ivec2(wi), int(id))));
+    float lit = step(0.78, bs_hash(ivec3(ivec2(wi), int(id))));
     float win = step(0.3, wf.x) * step(wf.x, 0.75) * step(0.25, wf.y) * step(wf.y, 0.75);
     win *= step(p.y, h - 0.03) * step(0.03, p.y);
-    float flick = 0.85 + 0.15 * sin(iTime * 0.7 + kit_hash(ivec2(wi)) * 30.0);
+    float flick = 0.85 + 0.15 * sin(iTime * 0.7 + bs_hash(ivec2(wi)) * 30.0);
     bcol += vec3(1.0, 0.72, 0.35) * win * lit * 0.55 * flick;
     col = mix(col, bcol, build);
   }
@@ -115,6 +115,6 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord){
   // vignette & grain
   vec2 v = fragCoord / iResolution.xy;
   col *= 0.6 + 0.4 * pow(16.0 * v.x * v.y * (1.0 - v.x) * (1.0 - v.y), 0.2);
-  col = kit_grain(col, fragCoord, iFrame, 0.012);
+  col = bs_grain(col, fragCoord, iFrame, 0.012);
   fragColor = vec4(pow(max(col, 0.0), vec3(0.92)), 1.0);
 }

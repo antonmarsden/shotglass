@@ -8,10 +8,10 @@ float crackle(int samp, float t){
   const float RATE = 70.0;
   int cell = int(t * RATE);
   for (int c = cell - 2; c <= cell; c++){
-    if (kit_hash(c * 3 + 1) < 0.18){
-      float t0 = (float(c) + kit_hash(c * 3 + 2)) / RATE;
+    if (bs_hash(c * 3 + 1) < 0.18){
+      float t0 = (float(c) + bs_hash(c * 3 + 2)) / RATE;
       float dt = t - t0;
-      if (dt > 0.0) v += (kit_hash(samp) * 2.0 - 1.0) * exp(-dt * 380.0) * (0.3 + 0.7 * kit_hash(c * 3 + 3));
+      if (dt > 0.0) v += (bs_hash(samp) * 2.0 - 1.0) * exp(-dt * 380.0) * (0.3 + 0.7 * bs_hash(c * 3 + 3));
     }
   }
   return v;

@@ -6,5 +6,5 @@ vec2 mainSound(int samp, float time){
   float dt = time - (CUE_END_SETTLED - CUE_END_START);
   if (dt < 0.0) return vec2(0.0);
   // a deep kick that settles at 42 Hz and rings out for 1.5 s
-  return vec2(kit_drum_kick(dt, 42.0, 1.5)) * 0.45;
+  return vec2(bs_drum_kick(dt, 42.0, 1.5)) * 0.45;
 }

@@ -8,7 +8,7 @@
 #define TAU 6.28318530718
 
 // the film's scale: minor pentatonic (0 3 5 7 10) on MIDI note `root` (57 = A3, 220 Hz)
-float penta_hz(int degree, int root){ return kit_note_hz(kit_scale_minor_pentatonic(degree, root)); }
+float penta_hz(int degree, int root){ return bs_note_hz(bs_scale_minor_pentatonic(degree, root)); }
 
 // a warm drone: a few soft harmonics with slow vibrato
 float drone(float t, float f){
