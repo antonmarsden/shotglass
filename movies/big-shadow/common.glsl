@@ -1,12 +1,12 @@
 // Shared helpers for the Big Shadow scenes. Include with:  #include "../common.glsl"
-// Noise, shapes and tonemapping come from shotglass-kit (see [libraries] in movie.toml).
+// Noise, shapes and tonemapping come from lib/base (see [libraries] in shotglass.toml).
 
-#include <kit/noise.glsl>
-#include <kit/sdf.glsl>
-#include <kit/color.glsl>
+#include <base/noise.glsl>
+#include <base/sdf.glsl>
+#include <base/color.glsl>
 
 // 1D smooth noise in 0..1 (flame wobble and flicker).
-float noise1(float x){ return kit_value_noise(vec2(x, 0.0)); }
+float noise1(float x){ return bs_value_noise(vec2(x, 0.0)); }
 // sin and cos to float precision (Taylor series, |x| <= pi after range reduction). The
 // built-ins can be much rougher: the Apple Software Renderer's cos is ~5e-4 off, which
 // swings the zoomed-in close-up camera by a third of a pixel and moves every point

@@ -33,21 +33,21 @@ vec2 mouseSDF(vec3 q){
   float breathe = 1.0 + 0.025*sin(t*3.1);
   // body, rearing up and leaning forward
   vec3 b = q-vec3(0.004,0.075,0.0); b.xy = rot(-0.32)*b.xy;
-  float d = kit_sd_ellipsoid(b, vec3(0.033*breathe,0.056,0.030*breathe));
+  float d = bs_sd_ellipsoid(b, vec3(0.033*breathe,0.056,0.030*breathe));
   // haunches
-  d = kit_op_smin(d, kit_sd_ellipsoid(q-vec3(-0.010,0.030,0.0), vec3(0.032,0.028,0.034)), 0.016);
+  d = bs_op_smin(d, bs_sd_ellipsoid(q-vec3(-0.010,0.030,0.0), vec3(0.032,0.028,0.034)), 0.016);
   // head with a pointy snout, tilted down a touch
   float bob = 0.004*sin(t*1.7);
   vec3 h = q-vec3(0.034,0.138+bob,0.0); h.xy = rot(-0.22)*h.xy;
-  float dh = kit_sd_ellipsoid(h, vec3(0.036,0.024,0.023));
-  dh = kit_op_smin(dh, kit_sd_ellipsoid(h-vec3(0.022,-0.004,0.0), vec3(0.022,0.012,0.012)), 0.01);
-  d = kit_op_smin(d, dh, 0.014);
+  float dh = bs_sd_ellipsoid(h, vec3(0.036,0.024,0.023));
+  dh = bs_op_smin(dh, bs_sd_ellipsoid(h-vec3(0.022,-0.004,0.0), vec3(0.022,0.012,0.012)), 0.01);
+  d = bs_op_smin(d, dh, 0.014);
 
   // arms raised in a "fear me" pose
   float claw = 0.007*sin(t*2.3);
   for(int s=-1; s<=1; s+=2){
     float z = float(s)*0.019;
-    d = kit_op_smin(d, kit_sd_capsule(q, vec3(0.022,0.098,z), vec3(0.056,0.112+claw,z*1.1), 0.0065), 0.008);
+    d = bs_op_smin(d, bs_sd_capsule(q, vec3(0.022,0.098,z), vec3(0.056,0.112+claw,z*1.1), 0.0065), 0.008);
   }
   vec2 res = vec2(d, 3.0);
 
@@ -57,20 +57,20 @@ vec2 mouseSDF(vec3 q){
     float z = float(s)*0.019;
     // ears: thin discs facing the light, offset in x so both show in profile
     vec3 e = q-vec3(0.012+0.010*float(s), 0.170+bob, z*0.85);
-    pk = min(pk, kit_sd_ellipsoid(e, vec3(0.018,0.020,0.0035)));
+    pk = min(pk, bs_sd_ellipsoid(e, vec3(0.018,0.020,0.0035)));
     // paws with little fingers
     vec3 pw = vec3(0.060,0.115+claw,z*1.1);
-    pk = min(pk, kit_sd_sphere(q-pw, 0.0068));
+    pk = min(pk, bs_sd_sphere(q-pw, 0.0068));
     for(int f=0; f<3; f++){
       float a = 0.6 - float(f)*0.55;
-      pk = min(pk, kit_sd_capsule(q, pw, pw+vec3(cos(a),sin(a),0.0)*0.012, 0.0024));
+      pk = min(pk, bs_sd_capsule(q, pw, pw+vec3(cos(a),sin(a),0.0)*0.012, 0.0024));
     }
     // hind feet
-    pk = min(pk, kit_sd_capsule(q, vec3(-0.002,0.004,z*1.1), vec3(0.036,0.004,z*1.2), 0.0045));
+    pk = min(pk, bs_sd_capsule(q, vec3(-0.002,0.004,z*1.1), vec3(0.036,0.004,z*1.2), 0.0045));
   }
   // nose
   vec3 nosePos = vec3(0.072,0.130+bob,0.0);
-  pk = min(pk, kit_sd_sphere(q-nosePos, 0.0055));
+  pk = min(pk, bs_sd_sphere(q-nosePos, 0.0055));
   // tail: a chain of tapering capsules, swishing in an S-curve
   vec3 prev = vec3(-0.036,0.022,0.0);
   for(int i=1; i<=10; i++){
@@ -78,7 +78,7 @@ vec2 mouseSDF(vec3 q){
     vec3 cur = vec3(-0.036-0.14*s,
                     0.014 + s*s*(0.05+0.03*sin(t*2.0-s*4.0)),
                     0.035*s*sin(t*1.3+s*3.0));
-    pk = min(pk, kit_sd_capsule(q, prev, cur, mix(0.0058,0.0016,s)));
+    pk = min(pk, bs_sd_capsule(q, prev, cur, mix(0.0058,0.0016,s)));
     prev = cur;
   }
   if(pk < res.x) res = vec2(pk, 4.0);
@@ -89,13 +89,13 @@ vec2 mouseSDF(vec3 q){
   for(int k=-1; k<=1; k++){
     vec3 a = nosePos+vec3(-0.004,-0.002,float(s)*0.006);
     vec3 b2 = a+vec3(0.030,0.010*float(k)+0.002*sin(t*5.0+float(k)),float(s)*0.020);
-    wk = min(wk, kit_sd_capsule(q, a, b2, 0.0007));
+    wk = min(wk, bs_sd_capsule(q, a, b2, 0.0007));
   }
   if(wk < res.x) res = vec2(wk, 3.5);
 
   // eyes
   for(int s=-1; s<=1; s+=2){
-    float de = kit_sd_sphere(q-vec3(0.052,0.146+bob,float(s)*0.0165), 0.0048);
+    float de = bs_sd_sphere(q-vec3(0.052,0.146+bob,float(s)*0.0165), 0.0048);
     if(de < res.x) res = vec2(de, 6.0);
   }
   return res;
@@ -104,8 +104,8 @@ vec2 mouseSDF(vec3 q){
 // tealight sitting under the flame
 float tealightSDF(vec3 p){
   vec3 c = p-vec3(0.0,0.0105,MOUSE_Z+uDist);
-  float cup = kit_sd_cylinder(c, 0.028, 0.0105)-0.0008;
-  float wick = kit_sd_capsule(p, vec3(0.0,0.02,MOUSE_Z+uDist), vec3(0.0,0.029,MOUSE_Z+uDist), 0.0011);
+  float cup = bs_sd_cylinder(c, 0.028, 0.0105)-0.0008;
+  float wick = bs_sd_capsule(p, vec3(0.0,0.02,MOUSE_Z+uDist), vec3(0.0,0.029,MOUSE_Z+uDist), 0.0011);
   return min(cup, wick);
 }
 
@@ -173,14 +173,14 @@ vec3 albedo(vec3 p, float m, vec3 n, float fp, vec3 rd){
     float wz = fp/max(abs(rd.y), 0.05);            // and along them (grazing: stretched)
     float id = floor(p.x/bw);
     float gx = fract(p.x/bw);
-    float zoff = kit_hash(ivec2(int(id), 6))*3.0;
+    float zoff = bs_hash(ivec2(int(id), 6))*3.0;
     float u = (p.z+zoff)/bl;
     float k = floor(u+0.5);                        // the nearest board end
     float sz = (u-k)*bl;                           // signed distance to it
-    float grain = kit_fbm(vec2(p.x*30.0, p.z*2.0+id*7.0), 4);
+    float grain = bs_fbm(vec2(p.x*30.0, p.z*2.0+id*7.0), 4);
     vec3 c = mix(vec3(0.28,0.16,0.08), vec3(0.42,0.26,0.13), grain);
     // each board's shade, blended across its end over the footprint
-    float shade = mix(kit_hash(ivec2(int(id), int(k)-1)), kit_hash(ivec2(int(id), int(k))),
+    float shade = mix(bs_hash(ivec2(int(id), int(k)-1)), bs_hash(ivec2(int(id), int(k))),
                       smoothstep(-wz, wz, sz));
     c *= 0.8+0.35*shade;
     float dark = max(seamLine(min(gx, 1.0-gx)*bw, 0.0032, wx),
@@ -188,12 +188,12 @@ vec3 albedo(vec3 p, float m, vec3 n, float fp, vec3 rd){
     return c*(1.0-0.75*dark);
   }
   if(m < 2.5){                                     // plaster wall
-    float n1 = kit_fbm(p.xy*6.0, 4);
+    float n1 = bs_fbm(p.xy*6.0, 4);
     vec3 c = vec3(0.60,0.55,0.48)*(0.88+0.2*n1);
     float sk = step(p.y,0.09);                     // skirting board
     return mix(c, vec3(0.30,0.24,0.18), sk);
   }
-  if(m < 3.2) return vec3(0.31,0.25,0.20)*(0.85+0.3*kit_value_noise(p.xy*400.0));   // fur
+  if(m < 3.2) return vec3(0.31,0.25,0.20)*(0.85+0.3*bs_value_noise(p.xy*400.0));   // fur
   if(m < 3.7) return vec3(0.75);                                           // whiskers
   if(m < 4.5) return vec3(0.78,0.47,0.46);                                 // pink skin
   if(m < 6.5) return vec3(0.01);                                           // eye
@@ -281,7 +281,7 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord){
     col += flame + halo;
   }
 
-  col = kit_aces(col*1.15);
+  col = bs_aces(col*1.15);
   col = pow(col, vec3(1.0/2.2));
   vec2 v = fragCoord/iResolution.xy;
   col *= 0.55+0.45*pow(16.0*v.x*v.y*(1.0-v.x)*(1.0-v.y), 0.18);

@@ -28,9 +28,10 @@ jobs:
       - name: Clippy without the strict GLSL checker (glslang)
         run: cargo clippy --no-default-features -- -D warnings
       # The selftest's fixture films must also pass the strict GLSL check (330 and ES),
-      # and the unit tests run it on the demo and the template.
+      # and the unit tests run it on the demo. Nothing here fetches shotglass-kit (the
+      # template follows kit main and is checked by canary.yml).
       # Includes the golden tests (tests/golden.rs): strips and soundtracks of the demo
-      # and the template compared with tests/golden/*.png and *.wav.
+      # and the test films compared with tests/golden/*.png and *.wav.
       - name: Unit tests, GPU selftest, golden images and soundtracks (software OpenGL)
         run: xvfb-run -a cargo test
       - name: Upload the actual and diff images / WAVs of failed golden tests
@@ -48,7 +49,7 @@ jobs:
           xvfb-run -a ./target/release/shotglass check movies/big-shadow --web --size 320x180 --frames 1
           xvfb-run -a ./target/release/shotglass strip movies/big-shadow --count 8 --size 320x180 --out strip.png
           xvfb-run -a ./target/release/shotglass export movies/big-shadow --size 320x180 --out big-shadow.webm
-      - name: Strict GLSL check (glslang, no GPU) on the demo movie, the test films and the template
+      - name: Strict GLSL check (glslang, no GPU) on the demo movie and the test films
         run: |
           ./target/release/shotglass check movies/big-shadow --web --no-gpu
           ./target/release/shotglass check tests/films/channels --web --no-gpu
@@ -56,8 +57,6 @@ jobs:
           ./target/release/shotglass check tests/films/layers --web --no-gpu
           ./target/release/shotglass check tests/films/blends --web --no-gpu
           ./target/release/shotglass check tests/films/loop --web --no-gpu
-          ./target/release/shotglass new "$RUNNER_TEMP/template"
-          ./target/release/shotglass check "$RUNNER_TEMP/template" --web --no-gpu
       - uses: actions/upload-artifact@v4
         with:
           name: big-shadow-strip
@@ -94,12 +93,10 @@ jobs:
           if-no-files-found: ignore
       - run: cargo build --release
       # Needs no OpenGL (and proves glslang builds with MSVC).
-      - name: Strict GLSL check on the demo movie and the template
+      - name: Strict GLSL check on the demo movie
         shell: bash
         run: |
           ./target/release/shotglass check movies/big-shadow --web --no-gpu
-          ./target/release/shotglass new "$RUNNER_TEMP/template"
-          ./target/release/shotglass check "$RUNNER_TEMP/template" --web --no-gpu
 
   # The slowest job, so only after a merge to main (or when started by hand, e.g. on a
   # branch that changes the renderer or the demo's shaders).
@@ -128,8 +125,6 @@ jobs:
             target/tmp/golden/*.wav
           if-no-files-found: ignore
       - run: cargo build --release
-      - name: Strict GLSL check on the demo movie and the template
+      - name: Strict GLSL check on the demo movie
         run: |
           ./target/release/shotglass check movies/big-shadow --web --no-gpu
-          ./target/release/shotglass new "$RUNNER_TEMP/template"
-          ./target/release/shotglass check "$RUNNER_TEMP/template" --web --no-gpu

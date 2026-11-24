@@ -1,9 +1,9 @@
 name: Kit canary
 
-# Tests the engine against shotglass-kit's current main branch instead of the commit
-# pinned in movies/big-shadow/shotglass.lock (what ci.yml's tests use), so drift between
-# pin bumps shows up. Never runs on pushes or PRs, so it can't block a merge. A red run
-# means: bump the pin and re-bless, or fix the kit (see CONTRIBUTING.md, "CI").
+# Checks that `shotglass new`'s template works with shotglass-kit's current main branch
+# (what a new film gets). ci.yml never touches the kit: the demo keeps its own copies.
+# Never runs on pushes or PRs, so it can't block a merge. A red run means: fix the kit
+# or the template (see CONTRIBUTING.md, "Kit canary").
 on:
   schedule:
     - cron: "17 4 * * *" # daily
@@ -24,9 +24,9 @@ jobs:
       - name: System packages
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev xvfb libgl1-mesa-dri libegl-mesa0 libxkbcommon-x11-0 ffmpeg
       - run: cargo build --release
-      - name: Strict GLSL check and golden strips / soundtracks on kit main (software OpenGL)
+      - name: The template on kit main: strict check, a frame, strip and soundtrack (software OpenGL)
         run: xvfb-run -a .github/canary.sh
-      - name: Upload the actual and diff images / WAVs
+      - name: Upload the strip, soundtrack and lock
         if: failure()
         uses: actions/upload-artifact@v4
         with:

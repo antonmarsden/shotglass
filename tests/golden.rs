@@ -1,5 +1,5 @@
 //! Golden regression tests: renders a contact sheet and the soundtrack of the demo film
-//! and of the `shotglass new` template (and contact sheets of tests/films/channels, the
+//! (and contact sheets of tests/films/channels, the
 //! iChannel textures film, tests/films/text, the text film, tests/films/layers and
 //! tests/films/blends, the layer films, tests/films/footage, image sequences, and both
 //! of tests/films/loop, a `loop = true` film) and compares them with reference PNGs and WAVs in tests/golden/, so "compiles but looks (or sounds) wrong" fails `cargo test` (and
@@ -11,10 +11,11 @@
 //! - To update the references on purpose, run `SHOTGLASS_BLESS=1 cargo test --test golden`
 //!   (on Linux without a display: under `xvfb-run -a`) and commit the PNGs and WAVs
 //!   with the change that caused them.
-//! - Needs OpenGL like tests/gpu.rs; SHOTGLASS_SKIP_GPU_TESTS=1 skips it. The films'
-//!   libraries are fetched (pinned by shotglass.lock) on first use. If that fails
-//!   outside CI (no `CI` env var, e.g. offline), the test is skipped with a message;
-//!   in CI it fails.
+//! - Needs OpenGL like tests/gpu.rs; SHOTGLASS_SKIP_GPU_TESTS=1 skips it.
+//! - Every film here is self-contained: the demo keeps copies of the kit files it uses
+//!   in `movies/big-shadow/lib/`, so nothing is fetched and a kit change never moves a
+//!   reference. The `shotglass new` template follows the kit's main branch and has no
+//!   golden: the kit canary (.github/canary.sh) checks it.
 //!
 //! The references are rendered with Mesa's software OpenGL (llvmpipe), as in CI.
 //! The tolerance (`strip --compare`'s defaults, see `golden::Tolerance`) absorbs the
@@ -70,25 +71,6 @@ fn bless(args: &mut Vec<&std::ffi::OsStr>) {
     }
 }
 
-/// `shotglass fetch <movie>`: false (skip the test) if the libraries can't be fetched
-/// outside CI, e.g. offline; a failure in CI panics.
-fn fetch_libraries(movie: &Path) -> bool {
-    let out = shotglass(&["fetch".as_ref(), movie.as_os_str()]);
-    if out.status.success() {
-        return true;
-    }
-    assert!(
-        std::env::var_os("CI").is_none(),
-        "couldn't fetch the libraries of {} (see the message above)",
-        movie.display()
-    );
-    println!(
-        "golden test skipped: can't fetch the libraries of {} (offline?)",
-        movie.display()
-    );
-    false
-}
-
 /// `shotglass strip <movie> --compare tests/golden/<name>.png` (or `--bless`).
 fn golden(name: &str, movie: &Path) {
     golden_frames(name, movie, &["--count", COUNT], &[]);
@@ -97,9 +79,6 @@ fn golden(name: &str, movie: &Path) {
 /// `golden` with these frames (`--count n` or `--at times`) and extra `strip` options
 /// (a looser tolerance).
 fn golden_frames(name: &str, movie: &Path, frames: &[&str], extra: &[&str]) {
-    if !fetch_libraries(movie) {
-        return;
-    }
     let reference = reference(&format!("{name}.png"));
     let actual = out_dir().join(format!("{name}.png"));
     let mut args: Vec<&std::ffi::OsStr> = vec![
@@ -129,9 +108,6 @@ fn golden_frames(name: &str, movie: &Path, frames: &[&str], extra: &[&str]) {
 
 /// `shotglass wav <movie> --compare tests/golden/<name>.wav` (or `--bless`).
 fn golden_sound(name: &str, movie: &Path) {
-    if !fetch_libraries(movie) {
-        return;
-    }
     let reference = reference(&format!("{name}.wav"));
     let actual = out_dir().join(format!("{name}.wav"));
     let mut args: Vec<&std::ffi::OsStr> = vec![
@@ -152,29 +128,6 @@ fn golden_sound(name: &str, movie: &Path) {
          the actual soundtrack and the difference are in {})",
         out_dir().display()
     );
-}
-
-/// `shotglass new` into target/tmp/golden/<dir>, with the template's `transitions`
-/// library pinned to the demo's commit (the template follows the kit's main branch), so
-/// the result only changes when this repo does. Each test uses its own folder.
-fn template_film(dir: &str) -> PathBuf {
-    let dir = out_dir().join(dir);
-    let _ = std::fs::remove_dir_all(&dir);
-    let out = shotglass(&["new".as_ref(), dir.as_os_str()]);
-    assert!(out.status.success(), "shotglass new failed");
-    let lock = std::fs::read_to_string(root().join("movies/big-shadow/shotglass.lock")).unwrap();
-    let mut blocks = lock.split("[[library]]");
-    let mut pinned = blocks.next().unwrap().to_string();
-    for b in blocks.filter(|b| b.contains("name = \"transitions\"")) {
-        pinned += "[[library]]";
-        pinned += b;
-    }
-    assert!(
-        pinned.contains("transitions"),
-        "no transitions pin in the demo's lock"
-    );
-    std::fs::write(dir.join("shotglass.lock"), pinned).unwrap();
-    dir
 }
 
 #[test]
@@ -201,9 +154,6 @@ fn demo_quality_heatmaps() {
         return;
     }
     let movie = root().join("movies").join("big-shadow");
-    if !fetch_libraries(&movie) {
-        return;
-    }
     let refs = root()
         .join("tests")
         .join("golden")
@@ -232,14 +182,6 @@ fn demo_quality_heatmaps() {
          failed (see the message above; actual and diff images are in {})",
         actual.display()
     );
-}
-
-#[test]
-fn new_template() {
-    if skip() {
-        return;
-    }
-    golden("template", &template_film("template-film"));
 }
 
 /// iChannel textures: a small film with a checked-in 64×64 PNG and JPEG (mipmaps,
@@ -359,12 +301,4 @@ fn demo_soundtrack() {
         return;
     }
     golden_sound("big-shadow", &root().join("movies").join("big-shadow"));
-}
-
-#[test]
-fn template_soundtrack() {
-    if skip() {
-        return;
-    }
-    golden_sound("template", &template_film("template-film-sound"));
 }

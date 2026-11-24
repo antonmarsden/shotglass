@@ -126,30 +126,26 @@ None of the machines has a real GPU:
 
 ### Kit canary
 
-The tests above use shotglass-kit at the commit pinned in
-`movies/big-shadow/shotglass.lock` (the template test reuses its `transitions` pin), so
-a kit change can't turn CI red on its own. The flip side is that nothing notices drift
-until someone moves the pin. The kit canary (`.github/workflows/canary.yml`, script
-`.github/canary.sh`) does: daily and by hand ("Run workflow" on the Actions tab), never
-on pushes or PRs, so it can't block a merge. On Linux (Mesa llvmpipe under Xvfb) it
-copies the demo and `shotglass new`'s template to a scratch folder, moves their pins to
-the kit's current `main` (`shotglass update` / `shotglass fetch`), and runs
-`check --web --no-gpu` and the same golden strip and soundtrack comparisons as
-`tests/golden.rs`. On failure it uploads the actual and diff images / WAVs and the
-moved locks as `kit-canary-failures`. Locally: `xvfb-run -a .github/canary.sh`.
+The tests above never use shotglass-kit: the demo keeps its own shared GLSL
+in `movies/big-shadow/lib/` (path libraries), and
+the test films have no libraries. So a kit change can't turn CI red, and nothing is
+fetched. `shotglass new`'s template does follow the kit's `main` (a new film gets the
+kit's newest commit), so it has no golden reference; the kit canary
+(`.github/workflows/canary.yml`, script `.github/canary.sh`) checks it instead: daily
+and by hand ("Run workflow" on the Actions tab), never on pushes or PRs, so it can't
+block a merge. On Linux (Mesa llvmpipe under Xvfb) it writes the template to a scratch
+folder, fetches the kit's current `main`, and runs `check --web --no-gpu`, a one-frame
+GPU check, and renders a strip and the soundtrack. On failure it uploads them and the
+lock as `kit-canary-failures`. Locally: `xvfb-run -a .github/canary.sh`.
 
-A red canary means the kit's `main` no longer gives the demo or the template the
-blessed look and sound (or no longer passes the strict check). Either the change is
-intended: bump the pin (`shotglass update movies/big-shadow`) and re-bless in the same
-commit (see below); or it isn't: fix the kit (or the engine, if it broke the kit's
-contract).
+A red canary means the template no longer works with the kit's `main`: fix the kit (or
+the engine, if it broke the kit's contract), or the template.
 
 ## Golden images
 
 CI catches "compiles but looks wrong" (or sounds wrong): tests/golden.rs renders a
 contact sheet (`shotglass strip`, 8 frames at 320x180) and the soundtrack
-(`shotglass wav`, at 8 kHz) of the demo film and of the `shotglass new` template (and
-of the test films in `tests/films/`: strips of `channels`, `text`, `layers`, `blends` and
+(`shotglass wav`, at 8 kHz) of the demo film (and of the test films in `tests/films/`: strips of `channels`, `text`, `layers`, `blends` and
 `footage`, a two-period strip and the soundtrack of `loop`), and compares them with reference PNGs and WAVs in `tests/golden/`.
 
 - A strip matches when few pixels differ by more than a small per-pixel tolerance
