@@ -124,6 +124,81 @@ const TRANSITION_FOOTER: &str = "void main(){\n  vec2 fc = gl_FragCoord.xy;\n  i
 /// An RGBA8 image, one `[r, g, b, a]` cell per pixel, top row first.
 pub type Frame = toodee::TooDee<[u8; 4]>;
 
+/// CPU readback formats. The GL format, type and byte size must agree.
+pub(crate) enum ReadFormat {
+    Rgba8,
+    RgbaF32,
+    RgbaU32,
+}
+
+/// Read a rectangle into a byte slice with `row_length` pixels per row at `offset`.
+/// Leaves the pack buffer unbound and restores the default pack layout.
+pub(crate) fn read_pixels_into(
+    gl: &glow::Context,
+    (fbo, attachment): (glow::Framebuffer, u32),
+    [x, y, w, h]: [i32; 4],
+    format: ReadFormat,
+    dst: &mut [u8],
+    (row_length, (dx, dy)): (usize, (usize, usize)),
+) {
+    let (format, ty, pixel_bytes) = match format {
+        ReadFormat::Rgba8 => (glow::RGBA, glow::UNSIGNED_BYTE, 4),
+        ReadFormat::RgbaF32 => (glow::RGBA, glow::FLOAT, 16),
+        ReadFormat::RgbaU32 => (glow::RGBA_INTEGER, glow::UNSIGNED_INT, 16),
+    };
+    assert!(w > 0 && h > 0, "readback rectangle must be nonempty");
+    let right = dx
+        .checked_add(w as usize)
+        .filter(|&right| right <= row_length)
+        .expect("readback extends past the destination row");
+    let end = dy
+        .checked_add(h as usize - 1)
+        .and_then(|row| row.checked_mul(row_length))
+        .and_then(|row| row.checked_add(right))
+        .and_then(|pixels| pixels.checked_mul(pixel_bytes));
+    assert!(
+        end.is_some_and(|end| end <= dst.len()),
+        "readback extends past the destination slice"
+    );
+    let row_length = i32::try_from(row_length).expect("readback row length exceeds GL limits");
+    let dx = i32::try_from(dx).expect("readback column offset exceeds GL limits");
+    let dy = i32::try_from(dy).expect("readback row offset exceeds GL limits");
+
+    let pack = [
+        (glow::PACK_ALIGNMENT, 1, 4),
+        (glow::PACK_ROW_LENGTH, row_length, 0),
+        (glow::PACK_SKIP_PIXELS, dx, 0),
+        (glow::PACK_SKIP_ROWS, dy, 0),
+    ];
+    // SAFETY: The layout above bounds every byte GL can write, and unbinding
+    // the pack buffer makes GL interpret the slice pointer as client memory.
+    unsafe {
+        gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+        gl.read_buffer(attachment);
+        gl.bind_buffer(glow::PIXEL_PACK_BUFFER, None);
+        if !gl.version().is_embedded {
+            gl.pixel_store_i32(glow::PACK_SWAP_BYTES, 0);
+        }
+        for (name, value, _) in pack {
+            gl.pixel_store_i32(name, value);
+        }
+        gl.read_pixels(
+            x,
+            y,
+            w,
+            h,
+            format,
+            ty,
+            glow::PixelPackData::Slice(Some(dst)),
+        );
+        for (name, _, default) in pack {
+            gl.pixel_store_i32(name, default);
+        }
+        gl.read_buffer(glow::COLOR_ATTACHMENT0);
+        gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+    }
+}
+
 /// Error messages one after another (each `Display` ends with its own newline).
 pub fn join_errors<E: std::fmt::Display>(errors: &[E]) -> String {
     errors.iter().map(|e| e.to_string()).collect()
@@ -3006,53 +3081,33 @@ impl Renderer {
             .out
             .as_ref()
             .expect("read_output_into before any render");
-        let (w, h) = (t.alloc.0 as usize, t.alloc.1 as usize);
-        let (dw, dh) = (dst.num_cols(), dst.num_rows());
-        // glReadPixels writes wherever the pack state points; it never sees the
-        // slice length. Everything below relies on this check.
-        assert!(
-            x.checked_add(w).is_some_and(|r| r <= dw) && y.checked_add(h).is_some_and(|b| b <= dh),
-            "read_output_into: {w}x{h} at ({x}, {y}) doesn't fit in {dw}x{dh}"
-        );
+        let (w, h) = t.alloc;
+        let dw = dst.num_cols();
         // GL fills rows bottom-up; with a flipped output, GL's first row is the
         // image's top row, so it goes at row y. Otherwise we flip afterwards.
-        let buf = dst.data_mut().as_flattened_mut();
-        unsafe {
-            let gl = &self.gl;
-            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(t.fbo));
-            gl.pixel_store_i32(glow::PACK_ALIGNMENT, 1);
-            gl.pixel_store_i32(glow::PACK_ROW_LENGTH, dw as i32);
-            gl.pixel_store_i32(glow::PACK_SKIP_PIXELS, x as i32);
-            gl.pixel_store_i32(glow::PACK_SKIP_ROWS, y as i32);
-            gl.read_pixels(
-                0,
-                0,
-                w as i32,
-                h as i32,
-                glow::RGBA,
-                glow::UNSIGNED_BYTE,
-                glow::PixelPackData::Slice(Some(buf)),
-            );
-            // Global state that egui and every other readback assume is default.
-            gl.pixel_store_i32(glow::PACK_ROW_LENGTH, 0);
-            gl.pixel_store_i32(glow::PACK_SKIP_PIXELS, 0);
-            gl.pixel_store_i32(glow::PACK_SKIP_ROWS, 0);
-            gl.pixel_store_i32(glow::PACK_ALIGNMENT, 4);
-            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
-        }
+        read_pixels_into(
+            &self.gl,
+            (t.fbo, glow::COLOR_ATTACHMENT0),
+            [0, 0, w, h],
+            ReadFormat::Rgba8,
+            dst.data_mut().as_flattened_mut(),
+            (dw, (x, y)),
+        );
         if !self.out_flipped {
-            dst.view_mut((x, y), (x + w, y + h)).flip_rows();
+            dst.view_mut((x, y), (x + w as usize, y + h as usize))
+                .flip_rows();
         }
     }
 
-    /// The pack state (alignment, row length, skip pixels, skip rows), for tests.
-    pub fn pack_state(&self) -> [i32; 4] {
+    /// The pack state (alignment, row length, skips, buffer), for tests.
+    pub fn pack_state(&self) -> [i32; 5] {
         unsafe {
             [
                 glow::PACK_ALIGNMENT,
                 glow::PACK_ROW_LENGTH,
                 glow::PACK_SKIP_PIXELS,
                 glow::PACK_SKIP_ROWS,
+                glow::PIXEL_PACK_BUFFER_BINDING,
             ]
             .map(|p| self.gl.get_parameter_i32(p))
         }
