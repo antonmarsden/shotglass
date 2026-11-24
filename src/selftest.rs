@@ -513,11 +513,16 @@ fn quality_metrics(gl: &Gl, dir: &Path) -> Result<String> {
                 "void mainMetric(out vec4 value, in vec2 fragCoord) {\n  float x = 1.0;\n  if (fragCoord.x < 10.0) x = uintBitsToFloat(0x7fc00000u);\n  if (fragCoord.y > 89.0) x = uintBitsToFloat(0x7f800000u);\n  value = vec4(0.0, 0.0, 0.0, x);\n}\n",
             ),
             (
+                "q/skip.glsl",
+                "void mainMetric(out vec4 value, in vec2 fragCoord) {\n  value = vec4(0.0, 0.0, 0.0, fragCoord.x < 79.0 ? notMeasured() : 1.0);\n}\n",
+            ),
+            (
                 "quality.toml",
                 "size = \"158x90\"\nreference = 4\n\
                  [[metric]]\nuse = \"q/green.glsl\"\nparams = { GAIN = 2 }\nmean = { max = 2.0 }\n\
                  [[metric]]\nuse = \"q/alias.glsl\"\nmax = { max = 0.4 }\n\
-                 [[metric]]\nuse = \"q/bad.glsl\"\n",
+                 [[metric]]\nuse = \"q/bad.glsl\"\n\
+                 [[metric]]\nuse = \"q/skip.glsl\"\nrange = [0, 2]\nmin = { min = 1 }\np50 = { min = 0.99 }\n",
             ),
         ],
     )?;
@@ -571,6 +576,18 @@ fn quality_metrics(gl: &Gl, dir: &Path) -> Result<String> {
         bail!("bad: {:?}, failures {:?}", b.total, b.failures);
     }
     close("bad mean (finite only)", b.total.mean, 1.0)?;
+    // skip: the left 79 columns are notMeasured(): in no reduction, not invalid.
+    let k = &rep.metrics[3];
+    let left = 79 * 90;
+    if k.total.unmeasured != left
+        || k.total.pixels != 158 * 90 - left
+        || k.total.invalid != 0
+        || k.total.histogram.iter().sum::<u64>() != k.total.pixels
+        || !k.pass
+    {
+        bail!("skip: {:?}, failures {:?}", k.total, k.failures);
+    }
+    close("skip mean (measured only)", k.total.mean, 1.0)?;
     if rep.pass {
         bail!("the report passes with failing metrics");
     }

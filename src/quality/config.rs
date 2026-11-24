@@ -94,6 +94,7 @@ impl Bound {
 #[serde(deny_unknown_fields)]
 struct RawConfig {
     count: Option<usize>,
+    at: Option<Vec<toml::Value>>,
     size: Option<String>,
     reference: Option<u32>,
     #[serde(default)]
@@ -190,6 +191,9 @@ fn parse_sound(t: &toml::Table, taken: &[Metric]) -> Result<SoundConfig> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     pub count: usize,
+    /// `at = [...]`: explicit sample times (as `--at` spells them: seconds, `shot`,
+    /// `shot+offset`), instead of `count` evenly spaced frames.
+    pub at: Option<Vec<String>>,
     pub size: (i32, i32),
     /// Supersampling factor N of `@reference` (N×N samples per pixel).
     pub reference: u32,
@@ -402,6 +406,23 @@ impl Config {
                 "reference must be 2 to {MAX_REFERENCE} (samples per pixel along each axis), not {reference}"
             );
         }
+        let at = match raw.at {
+            None => None,
+            Some(_) if raw.count.is_some() => bail!("set count or at, not both"),
+            Some(xs) if xs.is_empty() => bail!("at = [] has no times"),
+            Some(xs) => Some(
+                xs.iter()
+                    .map(|v| match v {
+                        toml::Value::String(s) if !s.contains(',') && !s.trim().is_empty() => {
+                            Ok(s.trim().to_string())
+                        }
+                        v => number(v).map(|x| x.to_string()).ok_or_else(|| {
+                            anyhow!("at: {v} isn't a time (seconds, \"shot\" or \"shot+offset\")")
+                        }),
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            ),
+        };
         if raw.metric.is_empty() && raw.sound.is_none() {
             bail!("nothing to measure: no [[metric]] entries and no [sound] table");
         }
@@ -417,6 +438,7 @@ impl Config {
             .transpose()?;
         Ok(Config {
             count,
+            at,
             size,
             reference,
             metrics,
@@ -671,6 +693,33 @@ over = { max = 0.01 }
         let c = Config::parse("[[metric]]\nuse = \"q/m\"\n").unwrap();
         assert_eq!((c.count, c.size, c.reference), (8, (384, 216), 4));
         assert!(c.metrics[0].limits.is_empty());
+    }
+
+    #[test]
+    fn at_lists_sample_times() {
+        let c = Config::parse(
+            "at = [\"intro+0.5\", 1.25, 2, \"outro\"]
+[[metric]]
+use = \"q/m\"
+",
+        )
+        .unwrap();
+        assert_eq!(c.at.unwrap(), ["intro+0.5", "1.25", "2", "outro"]);
+        for bad in [
+            "at = []",
+            "at = [true]",
+            "at = [\"a,b\"]",
+            "count = 3
+at = [1]",
+        ] {
+            let text = format!(
+                "{bad}
+[[metric]]
+use = \"q/m\"
+"
+            );
+            assert!(Config::parse(&text).is_err(), "{bad}");
+        }
     }
 
     #[test]

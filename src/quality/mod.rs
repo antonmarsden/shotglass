@@ -14,8 +14,9 @@
 //!
 //! Measures are reduced on the GPU (`gpu.rs`: sum, min, max, over-threshold, finite and
 //! non-finite counts in 4×4 blocks, and a 256-bin histogram for percentiles). Two
-//! checks are fixed in the engine: `invalid` (non-finite measures: always fails, and
-//! left out of every reduction) and `cost` (GPU time per frame: reported, never gated).
+//! checks are fixed in the engine: `invalid` (NaN/+Inf measures: always fails, and
+//! left out of every reduction). A metric leaves a pixel out on purpose with
+//! `notMeasured()` (-Inf): counted as `unmeasured`, in no reduction, never a failure and `cost` (GPU time per frame: reported, never gated).
 //! The config is `quality.toml` next to `movie.toml` (`config.rs`), and `--tighten`
 //! moves its limits towards the measured values (the ratchet).
 
@@ -52,6 +53,7 @@ vec4 getFrame(vec2 uv) { return texture(sg_frame, uv); }
 vec4 getReference(vec2 uv) { return texture(sg_reference, uv); }
 vec4 getPrev(vec2 uv) { return texture(sg_prev, uv); }
 vec4 getNext(vec2 uv) { return texture(sg_next, uv); }
+float notMeasured() { return uintBitsToFloat(0xff800000u); }
 ";
 
 /// The header of a sound metric (`[[sound.metric]]`): the soundtrack at
@@ -72,6 +74,7 @@ vec2 getSound(int samp) {
   if (i < 0 || i >= sg_tex_len) return vec2(0.0);
   return texelFetch(sg_sound, ivec2(i % SG_SOUND_W, i / SG_SOUND_W), 0).rg;
 }
+float notMeasured() { return uintBitsToFloat(0xff800000u); }
 ";
 
 const SOUND_FOOTER: &str = "void main(){\n  ivec2 p = ivec2(gl_FragCoord.xy);\n  float v = 0.0;\n  mainSoundMetric(v, sg_first + p.y * SG_SOUND_W + p.x);\n  shotglass_out = vec4(0.0, 0.0, 0.0, v);\n}";
@@ -636,7 +639,7 @@ fn report(
         })
         .collect();
     Report {
-        schema: 3,
+        schema: 4,
         engine: env!("CARGO_PKG_VERSION"),
         film: m
             .root
