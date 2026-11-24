@@ -34,8 +34,10 @@ cd shotglass
 cargo run --release -- play movies/big-shadow
 ```
 
-The demo uses [shotglass-kit](https://github.com/antonmarsden/shotglass-kit), so the
-first run downloads it with `git` (see [Libraries](#libraries)).
+The demo carries copies of the [shotglass-kit](https://github.com/antonmarsden/shotglass-kit)
+files it uses in `lib/` (path libraries), so it needs no download. A new film
+(`shotglass new`) uses the kit itself, downloaded with `git` on the first run (see
+[Libraries](#libraries)).
 
 To start your own film:
 
@@ -66,7 +68,7 @@ A movie is a folder:
 movies/big-shadow/
 ├── movie.toml          the edit: shots, timings, uniforms, transitions
 ├── shotglass.toml      the project: engine contract and libraries (see "Projects")
-├── shotglass.lock      the exact library versions (written by `shotglass fetch`)
+├── lib/                copies of the kit files it uses: kit/, sound/, transitions/
 ├── common.glsl         shared helpers (#include "../common.glsl"), built on the kit
 ├── scenes/
 │   ├── shadow.glsl
@@ -1355,8 +1357,9 @@ shotglass selftest strips   # only checks whose name contains "strips"
   the render-scale logic and the master clock (against a simulated sound card that
   can lag, stall or run away). Random timelines and malformed `movie.toml` files
   are generated too, to check the parser never panics. The strict GLSL checker is
-  tested on non-portable snippets, and the demo film and the `shotglass new` template
-  must pass it at every `glsl` version and as GLSL ES.
+  tested on non-portable snippets, and the demo film must pass it at every `glsl`
+  version and as GLSL ES (the `shotglass new` template, which follows shotglass-kit's
+  `main`, is checked daily by the kit canary instead).
 - **`selftest`** writes small fixture films to a temporary folder (each must also
   pass the strict GLSL check, at the baseline and as GLSL ES) and checks on the
   actual GPU and driver that:
@@ -1394,14 +1397,14 @@ shotglass selftest strips   # only checks whose name contains "strips"
   - `shotglass test` reports exactly the expected failures (first failure per test,
     inputs, NaN, grid endpoints, banded draws, "ran no assertions") on a fixture
     project, and a broken test file doesn't stop the others.
-- **Golden images** (`tests/golden.rs`): contact sheets of the demo film, the
-  `shotglass new` template, `tests/films/channels` (iChannel textures: mipmaps,
+- **Golden images** (`tests/golden.rs`): contact sheets of the demo film,
+  `tests/films/channels` (iChannel textures: mipmaps,
   wrap and filter modes, `vflip`) and `tests/films/loop` (a `loop = true` film over
   two periods) are compared with reference PNGs in `tests/golden/`, so
   a change that compiles but looks wrong fails the tests. A small per-pixel
   tolerance absorbs the differences between software OpenGL and real GPUs. To
   update the references on purpose, see [CONTRIBUTING.md](CONTRIBUTING.md#golden-images).
-- **Golden soundtracks** (same file): the soundtracks of the demo, the template and
+- **Golden soundtracks** (same file): the soundtracks of the demo and
   the loop film are compared with
   reference WAVs, window by window (RMS and peak of the difference), and a failure
   names the first time that differs.
