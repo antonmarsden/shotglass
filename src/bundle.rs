@@ -31,7 +31,7 @@ pub fn used_files(m: &Movie) -> (BTreeMap<String, BTreeSet<String>>, Vec<String>
     let mut used: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut errors = vec![];
     // Includes are expanded textually (not under #if), so one dialect finds them all.
-    for s in validate::movie_sources(m, Dialect::desktop(m.glsl)) {
+    for s in validate::movie_sources_with_provenance(m, Dialect::desktop(m.glsl)) {
         let a = match s.src {
             Ok(a) => a,
             Err(e) => {
@@ -964,6 +964,58 @@ mod tests {
         assert!(nc.non_commercial);
         assert_eq!(nc.source, "in the film (lib/nc)");
         std::fs::remove_dir_all(film.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn identical_glsl_keeps_both_library_dependencies() {
+        let root = tmp("identical-glsl");
+        let film = root.join("film");
+        let cache = root.join("cache");
+        let glsl = "void mainImage(out vec4 c, in vec2 p) { c = vec4(1.0); }\n";
+        write(
+            &root,
+            &[
+                (
+                    project::PROJECT_FILE,
+                    "[libraries]\na = { path = \"lib/a\" }\nb = { path = \"lib/b\" }\n",
+                ),
+                (
+                    "lib/a/library.toml",
+                    "name = \"test/a\"\nversion = \"1.0.0\"\nlicences = [\"MIT\"]\n",
+                ),
+                (
+                    "lib/b/library.toml",
+                    "name = \"test/b\"\nversion = \"1.0.0\"\nlicences = [\"CC0-1.0\"]\n",
+                ),
+                ("lib/a/a.glsl", glsl),
+                ("lib/b/b.glsl", glsl),
+                (
+                    "film/movie.toml",
+                    "[[shot]]\nid = \"a\"\nscene = \"a.glsl\"\nduration = 1\n\
+                     [[shot]]\nid = \"b\"\nscene = \"b.glsl\"\nduration = 1\n",
+                ),
+                ("film/a.glsl", "#include <a/a.glsl>\n"),
+                ("film/b.glsl", "#include <b/b.glsl>\n"),
+            ],
+        );
+        let m = Movie::load_locked(&film, &cache).unwrap();
+        let scene_count = validate::movie_sources(&m, Dialect::BASELINE)
+            .iter()
+            .filter(|s| s.what.starts_with("shot "))
+            .count();
+        assert_eq!(scene_count, 1);
+
+        let report = licence_report(&m).unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        let names: Vec<_> = report.rows.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["a", "b"]);
+
+        let out = root.join("bundle");
+        bundle(&film, &out, &cache).unwrap();
+        for path in ["a/a.glsl", "b/b.glsl"] {
+            assert!(out.join(LIBS_DIR).join(path).is_file(), "{path}");
+        }
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
