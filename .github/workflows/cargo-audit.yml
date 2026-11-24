@@ -1,0 +1,30 @@
+name: Cargo audit
+
+on:
+  schedule:
+    - cron: '17 4 * * 1' # Mondays at 04:17 UTC
+  pull_request:
+    paths:
+      - Cargo.lock
+      - '**/Cargo.toml'
+      - .github/workflows/cargo-audit.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit@0.23.0
+      - name: Fetch current RustSec advisory database
+        run: git clone --depth 1 https://github.com/RustSec/advisory-db.git "$RUNNER_TEMP/rustsec-advisory-db"
+      - name: Audit Cargo.lock
+        run: cargo audit --file Cargo.lock --db "$RUNNER_TEMP/rustsec-advisory-db" --no-fetch
