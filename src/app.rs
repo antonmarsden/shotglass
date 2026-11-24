@@ -367,7 +367,7 @@ impl Player {
 
     /// Rebuild the soundtrack (cached per track). Returns a note about what was re-synthesized.
     /// Prepare the new soundtrack version. Chunks are synthesised as the playhead
-    /// needs them (see `stream_sound`); until then the old version keeps playing.
+    /// needs them (see `stream_sound`); compatible old chunks can play until then.
     fn update_sound(&mut self, m: &Movie) -> Option<String> {
         if !m.has_sound() {
             self.soundtrack.cancel_all(&mut self.renderer);
@@ -381,6 +381,10 @@ impl Player {
         {
             Ok(()) => None,
             Err(errors) => {
+                if self.soundtrack.version().is_none() {
+                    self.clock.clear_chunks();
+                    self.buffered = 0.0;
+                }
                 self.sound_errors = errors;
                 None
             }
@@ -415,10 +419,7 @@ impl Player {
         } else {
             1
         };
-        let total = self
-            .movie
-            .as_ref()
-            .map_or(0, |m| m.sound_samples(sr as u32));
+        let total = self.soundtrack.total_samples();
         // Paused or scrubbing, the chunk under the playhead is made at once (this may
         // wait for the GPU, like a blocking compile). While playing, nothing waits:
         // blocks are queued on the GPU and collected on later frames.
