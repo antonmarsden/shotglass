@@ -4,7 +4,7 @@ Compose short films, cartoons and full-length episodes from GLSL shaders. Shots,
 GPU-synthesised sound sit on one scrubbable timeline, with live reload and
 headless stills. Rust + OpenGL, no browser.
 
-![Big Shadow contact sheet](docs/big-shadow-strip.png)
+![A contact sheet of a shotglass film](docs/big-shadow-strip.png)
 
 - **Shots are Shadertoy-style `.glsl` files.** Write `mainImage`, use `iTime` and
   `iResolution`, and declare nothing else. Most Shadertoy code pastes straight in.
@@ -31,19 +31,17 @@ You need [Rust](https://rustup.rs) and a GPU with OpenGL 3.3 or newer.
 ```sh
 git clone https://github.com/antonmarsden/shotglass
 cd shotglass
-cargo run --release -- play movies/big-shadow
-```
-
-The demo keeps its shared GLSL in `lib/` (path libraries), so it needs no download. A
-new film (`shotglass new`) uses [shotglass-kit](https://github.com/antonmarsden/shotglass-kit),
-downloaded with `git` on the first run (see [Libraries](#libraries)).
-
-To start your own film:
-
-```sh
 cargo run --release -- new movies/my-film
 cargo run --release -- play movies/my-film
 ```
+
+`shotglass new` writes a small two-shot film with music, a shot sound and a
+transition, commented as a starting point. It uses
+[shotglass-kit](https://github.com/antonmarsden/shotglass-kit) for its transition,
+downloaded with `git` on the first run (see [Libraries](#libraries)).
+
+A finished film is in `movies/big-shadow` (`cargo run --release -- play movies/big-shadow`).
+It's also what the golden tests render, so it keeps its shared GLSL in its own `lib/`.
 
 Or install it with `cargo install --path .`, then run `shotglass play movies/my-film`.
 
@@ -61,39 +59,35 @@ from crates.io.
 
 ## A movie
 
-A movie is a folder:
+A movie is a folder. This is what `shotglass new movies/my-film` writes:
 
 ```
-movies/big-shadow/
+movies/my-film/
 ├── movie.toml          the edit: shots, timings, uniforms, transitions
 ├── shotglass.toml      the project: engine contract and libraries (see "Projects")
-├── lib/                its own shared GLSL: base/, sound/, transitions/
-├── common.glsl         shared helpers (#include "../common.glsl"), built on the kit
 ├── scenes/
-│   ├── shadow.glsl
-│   ├── moon.glsl
-│   └── black.glsl
+│   ├── first.glsl      void mainImage(out vec4 fragColor, in vec2 fragCoord)
+│   └── second.glsl
 ├── music.glsl          vec2 mainSound(int samp, float time), movie time
-├── sfx/                one sound per shot, shot time
-│   ├── candle.glsl
-│   ├── plucks.glsl
-│   └── thump.glsl
-└── mix.glsl            vec2 mainMix(int samp, float time)
+└── sfx/                one sound per shot, shot time
+    └── chime.glsl
 ```
 
-Big Shadow is a project of its own: its `shotglass.toml` sits next to `movie.toml`
-and names the engine contract and the [libraries](#libraries) it uses:
+Add folders as the film grows: shared helpers (`common.glsl`, `#include`d), a mix
+pass (`mix.glsl`), `textures/`, `fonts/`. A movie with its own `shotglass.toml` is a
+project of its own; that file names the engine contract and the
+[libraries](#libraries) it uses:
 
 ```toml
 shotglass = "0.1"             # optional: the engine contract the film was made for
 [libraries]
-kit = { source = "https://github.com/antonmarsden/shotglass-kit", subdir = "core" }
+transitions = { source = "https://github.com/antonmarsden/shotglass-kit", subdir = "transitions" }
 ```
 
-`movie.toml`:
+A fuller `movie.toml`:
 
 ```toml
-title = "Big Shadow"
+title = "My short"
 aspect = [16, 9]
 fps = 30                      # or 29.97, or "30000/1001"; frame stepping, iFrame and export
 # glsl = "430"                # opt in to a later GLSL; see "Portable shaders" (default 330)
@@ -336,7 +330,7 @@ arabic = "<notonaskharabic/NotoNaskhArabic[wght].ttf>"
 hand = { file = "fonts/MyHand.otf", licence = "OFL-1.1" }   # a font file in the film folder
 
 [texts]
-title = { text = "Big Shadow", font = "display", size = 160 }
+title = { text = "My Short", font = "display", size = 160 }
 tagline = { text = "a tiny mouse, a tealight,\nand a lot of wall", font = "body", size = 72, width = 1400, align = "center" }
 hello = { text = "مرحبا بالعالم", font = "arabic", size = 96 }
 credits = { file = "credits.txt", font = "body", size = 48, align = "center" }
@@ -626,7 +620,7 @@ vec2 mainSound(int samp, float time) {
 
 **Shot sounds** (`sound = "sfx/candle.glsl"` on a shot) use the same signature, but
 `time` is shot-local (like `iTime`) and the shot's uniforms are available, evaluated
-at that time. The candle in the demo multiplies by `uLight`, so its crackle dies
+at that time. A candle's sound that multiplies by the `uLight` its scene uses dies
 exactly when the flame does. Shot sounds move with their shot when you retime the
 edit. During a transition the outgoing and incoming sounds crossfade, using the
 transition's ease and equal-power gains. `sound_lead` starts a sound before its
@@ -651,7 +645,7 @@ vec2 mainMix(int samp, float time) {
 The mix can read up to `mix_lookback` seconds back (default 1) and 50 ms ahead.
 Reads outside that range return silence. For ready-made effects (multi-tap delay,
 reverb, smoothed ducking, a look-ahead limiter and soft clip), include shotglass-kit's
-`<sound/mix.glsl>`, as the demo's `mix.glsl` does.
+`<sound/mix.glsl>`.
 
 Sound is synthesised in chunks of about 0.7 s, just ahead of the playhead (see
 [Long films](#long-films)). Each chunk of each track is cached by its source and
@@ -1220,7 +1214,7 @@ window. A `quality.toml` may have only `[sound]`; then no frames are rendered.
 every sample of the soundtrack at 48 kHz:
 
 ```glsl
-// metrics/clicks.glsl (the demo's, abridged)
+// metrics/clicks.glsl (abridged)
 void mainSoundMetric(out float value, in int samp) {
     vec2 d = getSound(samp) - 2.0 * getSound(samp - 1) + getSound(samp - 2);
     value = max(abs(d.x), abs(d.y));   // the jump in slope
@@ -1242,9 +1236,9 @@ software OpenGL and real GPUs differ by several percent on some metrics, so tigh
 with a margin that covers both (or on the renderer CI uses).
 `[sound]` limits move to the measured value ± 0.5 dB, rounded outward to tenths.
 
-The demo (`movies/big-shadow`) has a `quality.toml` with two film metrics in
-`metrics/` (aliasing against `@reference`, clipped highlights) as examples, and `[sound]` loudness and true-peak limits, and a clicks metric (`metrics/clicks.glsl`: the
-second difference against its local level).
+The demo's `quality.toml` (`movies/big-shadow`) uses all of these: two film metrics
+(aliasing against `@reference`, clipped highlights), loudness and true-peak limits,
+and a clicks metric. Its metrics are there to test `shotglass quality`, not for reuse.
 
 ## Command line
 
@@ -1291,9 +1285,9 @@ OpenGL and supports `--compare` and `--bless`.
 is a separate path that never drops a frame or lowers the resolution.
 
 ```sh
-shotglass export movies/big-shadow --out big-shadow.webm                  # VP9 + Opus
-shotglass export movies/big-shadow --out big-shadow.mkv --size 3840x2160  # lossless FFV1 + FLAC
-shotglass export movies/big-shadow --out frames/                          # PNG sequence + sound.wav
+shotglass export movies/my-film --out my-film.webm                  # VP9 + Opus
+shotglass export movies/my-film --out my-film.mkv --size 3840x2160  # lossless FFV1 + FLAC
+shotglass export movies/my-film --out frames/                       # PNG sequence + sound.wav
 ```
 
 - **Frame-accurate.** Frame *n* is rendered at exactly *n* / `fps` (`fps` can be a
@@ -1325,7 +1319,7 @@ output arguments; the container comes from the `--out` extension, and you choose
 the colour handling yourself:
 
 ```sh
-shotglass export movies/big-shadow --out film.mov --format ffmpeg \
+shotglass export movies/my-film --out film.mov --format ffmpeg \
   --ffmpeg-args "-c:v prores_ks -profile:v 3 -c:a pcm_s16le"
 ```
 
