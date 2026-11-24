@@ -297,8 +297,11 @@ impl YuvReader {
 
     /// The oldest frame in flight, if it's finished (or, with `block`, once it is).
     /// None when nothing is in flight, or without `block` when the oldest isn't ready.
-    pub fn collect(&mut self, block: bool) -> Option<YuvFrame> {
-        let slot = self.in_flight.front()?;
+    /// Fails if the read-back buffer can't be mapped.
+    pub fn collect(&mut self, block: bool) -> Result<Option<YuvFrame>> {
+        let Some(slot) = self.in_flight.front() else {
+            return Ok(None);
+        };
         let gl = &self.gl;
         unsafe {
             let ready = matches!(
@@ -307,7 +310,7 @@ impl YuvReader {
             );
             if !ready {
                 if !block {
-                    return None;
+                    return Ok(None);
                 }
                 self.waits += 1;
                 loop {
@@ -331,14 +334,18 @@ impl YuvReader {
             gl.bind_buffer(glow::PIXEL_PACK_BUFFER, Some(slot.pbo));
             let p =
                 gl.map_buffer_range(glow::PIXEL_PACK_BUFFER, 0, bytes as i32, glow::MAP_READ_BIT);
-            if !p.is_null() {
+            let mapped = !p.is_null();
+            if mapped {
                 std::ptr::copy_nonoverlapping(p, data.as_mut_ptr(), bytes);
                 gl.unmap_buffer(glow::PIXEL_PACK_BUFFER);
             }
             gl.bind_buffer(glow::PIXEL_PACK_BUFFER, None);
+            self.free.push(slot.pbo);
+            if !mapped {
+                bail!("frame {}: couldn't map the YUV read-back buffer", slot.n);
+            }
         }
-        self.free.push(slot.pbo);
-        Some(YuvFrame { n: slot.n, data })
+        Ok(Some(YuvFrame { n: slot.n, data }))
     }
 }
 

@@ -595,15 +595,15 @@ pub fn render_yuv(
             bail!("the GPU driver reset at frame {n} ({t:.3}s); a shader probably ran too long");
         }
         while !reader.has_room() {
-            let f = reader.collect(true).expect("a full ring has a frame");
+            let f = reader.collect(true)?.expect("a full ring has a frame");
             sink(reader, f)?;
         }
         reader.submit(r, tex, n)?;
-        while let Some(f) = reader.collect(false) {
+        while let Some(f) = reader.collect(false)? {
             sink(reader, f)?;
         }
     }
-    while let Some(f) = reader.collect(true) {
+    while let Some(f) = reader.collect(true)? {
         sink(reader, f)?;
     }
     Ok(())

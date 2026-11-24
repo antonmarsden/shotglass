@@ -1508,7 +1508,7 @@ fn yuv_pass(gl: &Gl, dir: &Path) -> Result<String> {
                 .render(&m, W, H, &FrameInfo::frame(&m, 0), true)
                 .ok_or_else(|| anyhow!("frame 0 didn't render"))?;
             reader.submit(&r, tex, 0)?;
-            samples(&reader.collect(true).unwrap().data, depth)
+            samples(&reader.collect(true)?.unwrap().data, depth)
         };
         let y = |x: usize, yy: usize| got[yy * w + x];
         let corners = [

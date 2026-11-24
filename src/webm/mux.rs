@@ -828,9 +828,9 @@ mod tests {
             "codec_name=av1",
             "pix_fmt=yuv420p10le",
             "color_range=tv",
-            "color_space=bt709",
-            "color_transfer=bt709",
-            "color_primaries=bt709",
+            // Not color_space/transfer/primaries: the fixture's sequence header has no
+            // colour description, and ffmpeg ≤ 6.1 (with dav1d) reports the bitstream's
+            // "unspecified" over our Colour element (checked in `writes_a_readable_webm`).
             "nb_read_frames=6",
         ] {
             assert!(

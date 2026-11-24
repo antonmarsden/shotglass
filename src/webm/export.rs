@@ -13,7 +13,7 @@ use crate::yuv::YuvReader;
 use anyhow::{Context, Result, anyhow, bail};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 
 /// Opus bitrate (stereo).
 pub const OPUS_KBPS: u32 = 160;
@@ -150,6 +150,10 @@ pub fn export(
     let duration_ns = frame_ns((m.fps_num, m.fps_den), total);
     let file = staged.as_file().try_clone()?;
     let fps = (m.fps_num, m.fps_den);
+    // Set when rendering stops early (cancelled or failed): the encoder thread then
+    // drops what it has instead of flushing SVT-AV1 and muxing a file nobody keeps.
+    let abandon = Arc::new(AtomicBool::new(false));
+    let abandoned = abandon.clone();
     let (to_encoder, jobs) = mpsc::sync_channel::<Job>(QUEUE);
     let (to_main, spare) = mpsc::channel::<Vec<u8>>();
     let encoder = std::thread::Builder::new()
@@ -178,11 +182,17 @@ pub fn export(
                 Ok(())
             };
             for job in jobs {
+                if abandoned.load(Ordering::Relaxed) {
+                    return Ok(());
+                }
                 enc.send(&job.data, job.n as i64)?;
                 let _ = to_main.send(job.data);
                 while let Some(p) = enc.receive()? {
                     write(&mut mux, p)?;
                 }
+            }
+            if abandoned.load(Ordering::Relaxed) {
+                return Ok(());
             }
             enc.finish()?;
             while let Some(p) = enc.receive()? {
@@ -208,6 +218,9 @@ pub fn export(
             progress(n + 1, total);
             Ok(())
         });
+    if rendered.is_err() {
+        abandon.store(true, Ordering::Relaxed);
+    }
     drop(to_encoder);
     let encoded = encoder
         .join()
