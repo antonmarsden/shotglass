@@ -2207,7 +2207,31 @@ fn export_lossless(gl: &Gl, dir: &Path) -> Result<String> {
     }
     // FFV1 + FLAC: lossless, so frames and samples must come back exactly.
     let mkv = dir.join("film.mkv");
+    let previous = b"previous export";
+    std::fs::write(&mkv, previous)?;
+    let old_wav_path = dir.join("film.mkv.shotglass-sound.wav");
+    std::fs::write(&old_wav_path, b"unrelated WAV")?;
+    let snapshot = || -> Result<Vec<_>> {
+        let mut names = std::fs::read_dir(dir)?
+            .map(|entry| entry.map(|e| e.file_name()))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        names.sort();
+        Ok(names)
+    };
+    let before = snapshot()?;
+    let bad = Format::Ffmpeg(vec!["-c:v".into(), "shotglass_no_such_encoder".into()]);
+    match run(bad, mkv.clone(), &no_cancel, u64::MAX) {
+        Err(e) if e.to_string().starts_with("ffmpeg failed") => {}
+        Err(e) => bail!("failed video export reported: {e:#}"),
+        Ok(_) => bail!("export accepted an invalid encoder"),
+    }
+    if std::fs::read(&mkv)? != previous || snapshot()? != before {
+        bail!("failed export changed the existing output or left staged files");
+    }
     let s = run(Format::Ffv1, mkv.clone(), &no_cancel, u64::MAX)?;
+    if snapshot()? != before || std::fs::read(&old_wav_path)? != b"unrelated WAV" {
+        bail!("video export changed an unrelated file or left staged files");
+    }
     let video = decode(
         &mkv,
         &["-map", "0:v:0", "-f", "rawvideo", "-pix_fmt", "rgba"],
@@ -2248,8 +2272,19 @@ fn export_lossless(gl: &Gl, dir: &Path) -> Result<String> {
         Err(e) => bail!("cancelled export failed oddly: {e:#}"),
         Ok(_) => bail!("cancelling didn't stop the export"),
     }
-    if cancelled.exists() {
-        bail!("a cancelled export left {}", cancelled.display());
+    if snapshot()? != before {
+        bail!("a cancelled export left files behind");
+    }
+    // A cancellation reported by the final progress callback must also abort.
+    let video_file = std::fs::read(&mkv)?;
+    let stop = AtomicBool::new(false);
+    match run(Format::Ffv1, mkv.clone(), &stop, total) {
+        Err(e) if e.to_string() == "cancelled" => {}
+        Err(e) => bail!("last-frame cancellation failed oddly: {e:#}"),
+        Ok(_) => bail!("last-frame cancellation published a video"),
+    }
+    if std::fs::read(&mkv)? != video_file || snapshot()? != before {
+        bail!("last-frame cancellation changed the existing video or left staged files");
     }
     notes.insert(
         0,
