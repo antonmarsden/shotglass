@@ -8,7 +8,14 @@ repository = "https://github.com/antonmarsden/shotglass"
 readme = "README.md"
 keywords = ["glsl", "shader", "shadertoy", "animation", "demoscene"]
 categories = ["multimedia", "graphics", "command-line-utilities"]
-exclude = ["movies/*/stills", "*.wav"]
+exclude = [
+    "movies/*/stills",
+    "*.wav",
+    # SVT-AV1's docs, tests and CI files aren't needed to build it.
+    "vendor/SVT-AV1/Docs",
+    "vendor/SVT-AV1/test",
+    "vendor/SVT-AV1/.git*",
+]
 
 [dependencies]
 anyhow = "1.0.104"

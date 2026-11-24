@@ -10,21 +10,16 @@
 //! library is built C-only, which works but encodes several times slower, and the
 //! build says so.
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
-
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
-    if std::env::var_os("CARGO_FEATURE_WEBM").is_none() {
-        return;
-    }
     #[cfg(feature = "webm")]
     webm::build();
 }
 
 #[cfg(feature = "webm")]
 mod webm {
-    use super::*;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
 
     pub fn build() {
         for v in ["SVT_AV1_DIR", "SVT_AV1_SRC", "NASM"] {
@@ -119,10 +114,7 @@ mod webm {
         }
         let out = cfg.build();
         for lib in ["lib", "lib64"] {
-            println!(
-                "cargo:rustc-link-search=native={}",
-                out.join(lib).display()
-            );
+            println!("cargo:rustc-link-search=native={}", out.join(lib).display());
         }
     }
 }

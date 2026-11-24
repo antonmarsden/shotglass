@@ -162,7 +162,8 @@ enum Cmd {
         max_peak: f32,
     },
     /// Render the film to a video file (or a PNG sequence), frame- and sample-accurate.
-    /// Needs ffmpeg on the PATH (or SHOTGLASS_FFMPEG), except for --format png.
+    /// WebM (AV1 + Opus) is encoded by shotglass itself; the other formats need ffmpeg on
+    /// the PATH (or SHOTGLASS_FFMPEG), except for --format png.
     Export {
         movie: PathBuf,
         /// Output file (.webm, .mkv) or folder (PNG sequence + sound.wav).
@@ -170,8 +171,9 @@ enum Cmd {
         out: PathBuf,
         #[arg(long, default_value = "1920x1080")]
         size: String,
-        /// webm (VP9 + Opus), av1 (AV1 + Opus), ffv1 (lossless, + FLAC), png (frames + WAV),
-        /// or ffmpeg (with --ffmpeg-args). Default: from the --out extension.
+        /// webm (AV1 + Opus, built in), av1 (the same in .webm or .mkv), ffv1 (lossless
+        /// with FLAC), png (frames + WAV), or ffmpeg (with --ffmpeg-args). Default: from
+        /// the --out extension.
         #[arg(long)]
         format: Option<String>,
         /// Your own ffmpeg output arguments, e.g. "-c:v libx264 -crf 18 -c:a aac".
@@ -184,6 +186,22 @@ enum Cmd {
         /// (the default) loops seamlessly itself, picture and sound, when the file loops.
         #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..))]
         loops: u64,
+        /// webm/av1: constant quality, 0 (best) to 63 (SVT-AV1 CRF). Default 30.
+        #[arg(long, value_parser = clap::value_parser!(u8).range(0..=63), conflicts_with = "bitrate")]
+        quality: Option<u8>,
+        /// webm/av1: aim for this many kbit/s of video instead of a constant quality.
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+        bitrate: Option<u32>,
+        /// webm/av1: encoder speed, 0 (slowest, smallest) to 13 (fastest). Default 6.
+        #[arg(long, value_parser = clap::value_parser!(u8).range(0..=13))]
+        speed: Option<u8>,
+        /// webm/av1: bits per sample, 10 (default: no banding on gradients) or 8.
+        #[arg(long, value_parser = ["8", "10"])]
+        depth: Option<String>,
+        /// webm/av1: film grain, 1 (light) to 50: denoised before encoding, synthesised
+        /// again by the player. Default off.
+        #[arg(long, value_parser = clap::value_parser!(u8).range(1..=50))]
+        grain: Option<u8>,
     },
     /// Create a new movie folder from a template.
     New { dir: PathBuf },
@@ -391,6 +409,11 @@ fn real_main() -> Result<()> {
             ffmpeg_args,
             rate,
             loops,
+            quality,
+            bitrate,
+            speed,
+            depth,
+            grain,
         } => export(
             &movie,
             out,
@@ -399,6 +422,13 @@ fn real_main() -> Result<()> {
             ffmpeg_args.as_deref(),
             rate,
             loops,
+            EncoderFlags {
+                quality,
+                bitrate,
+                speed,
+                depth: depth.map(|d| d.parse().unwrap()),
+                grain,
+            },
         ),
         Cmd::New { dir } => new_movie(&dir),
         Cmd::Fetch { movie } => fetch_libraries(
@@ -1669,6 +1699,37 @@ fn compare_golden_sound(out: &Path, g: &GoldenSound) -> Result<()> {
     )
 }
 
+/// `export`'s built-in encoder flags, as given (None = not given).
+struct EncoderFlags {
+    quality: Option<u8>,
+    bitrate: Option<u32>,
+    speed: Option<u8>,
+    depth: Option<u8>,
+    grain: Option<u8>,
+}
+
+impl EncoderFlags {
+    fn any(&self) -> bool {
+        self.quality.is_some()
+            || self.bitrate.is_some()
+            || self.speed.is_some()
+            || self.depth.is_some()
+            || self.grain.is_some()
+    }
+
+    fn options(&self) -> export::Av1Options {
+        let d = export::Av1Options::default();
+        export::Av1Options {
+            quality: self.quality.unwrap_or(d.quality),
+            bitrate: self.bitrate,
+            speed: self.speed.unwrap_or(d.speed),
+            depth: self.depth.unwrap_or(d.depth),
+            grain: self.grain.unwrap_or(d.grain),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn export(
     movie: &Path,
     out: PathBuf,
@@ -1677,6 +1738,7 @@ fn export(
     ffmpeg_args: Option<&str>,
     rate: u32,
     loops: u64,
+    flags: EncoderFlags,
 ) -> Result<()> {
     use std::io::IsTerminal;
     use std::sync::Arc;
@@ -1688,7 +1750,25 @@ fn export(
     let (w, h) = parse_size(size)?;
     let format = export::Format::choose(format, &out, ffmpeg_args)?;
     format.check_size(w as usize, h as usize)?;
-    if format != export::Format::Png {
+    if flags.any() && !format.builtin() {
+        if matches!(format, export::Format::Webm | export::Format::Av1) {
+            bail!(
+                "--quality, --bitrate, --speed, --depth and --grain set the built-in AV1 encoder,                  and this shotglass was built without it (the webm feature);                  use --format ffmpeg --ffmpeg-args for your own settings"
+            );
+        }
+        bail!(
+            "--quality, --bitrate, --speed, --depth and --grain only go with --format webm or av1;              for other formats use --format ffmpeg --ffmpeg-args"
+        );
+    }
+    if format == export::Format::Webm && !format.builtin() {
+        println!(
+            "note: this shotglass was built without the webm feature, so WebM goes through              ffmpeg as VP9 + Opus"
+        );
+    }
+    if format.builtin() && rate != 48_000 && m.has_sound() {
+        println!("note: Opus is always 48 kHz, so --rate {rate} is ignored");
+    }
+    if format.needs_ffmpeg() {
         export::ffmpeg_encoders()?; // a clear message before any rendering
     }
     let cancel = Arc::new(AtomicBool::new(false));
@@ -1708,6 +1788,7 @@ fn export(
         format,
         rate,
         loops,
+        av1: flags.options(),
     };
     println!(
         "{} — {:.2}s{} at {}/{} fps, {w}x{h} → {} ({:?})",
@@ -1727,6 +1808,27 @@ fn export(
         let mut r = load_renderer(gl, &m)?;
         r.set_readback(true);
         println!("GPU: {}", r.gl_info);
+        #[cfg(feature = "webm")]
+        if opts.format.builtin() {
+            let a = &opts.av1;
+            let rate = match a.bitrate {
+                Some(k) => format!("{k} kbit/s"),
+                None => format!("quality {}", a.quality),
+            };
+            println!(
+                "encoder: SVT-AV1 {} ({}-bit, {rate}, speed {}{}), libopus {} ({} kbit/s)",
+                webm::encode::svt_version(),
+                a.depth,
+                a.speed,
+                if a.grain > 0 {
+                    format!(", grain {}", a.grain)
+                } else {
+                    String::new()
+                },
+                webm::encode::opus_version(),
+                webm::export::OPUS_KBPS
+            );
+        }
         let start = Instant::now();
         let tty = std::io::stderr().is_terminal();
         let mut last = Instant::now();

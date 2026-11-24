@@ -2488,6 +2488,7 @@ fn export_lossless(gl: &Gl, dir: &Path) -> Result<String> {
             format,
             rate: 48000,
             loops: 1,
+            av1: export::Av1Options::default(),
         };
         export::export(&mut r, &m, &opts, cancel, |done, _| {
             if done == stop_at {
@@ -2526,6 +2527,16 @@ fn export_lossless(gl: &Gl, dir: &Path) -> Result<String> {
         let got = Frame::from_vec(w, h, img.pixels().map(|p| p.0).collect());
         expect_same(&format!("png frame {n}"), &got, &still(n)?, 0, 0.0)?;
     }
+
+    #[cfg(feature = "webm")]
+    notes.push(export_webm(
+        &m,
+        &mut still,
+        &pcm,
+        samples,
+        dir,
+        &|f, out, c, stop| run(f, out, c, stop),
+    )?);
 
     if let Err(e) = export::ffmpeg_encoders() {
         let first = e.to_string().lines().next().unwrap_or_default().to_string();
@@ -2618,6 +2629,168 @@ fn export_lossless(gl: &Gl, dir: &Path) -> Result<String> {
         format!("{total} frames, {samples} samples, as PNG + WAV and FFV1 + FLAC"),
     );
     Ok(notes.join("; "))
+}
+
+/// The built-in WebM export (#116): its structure read back with our own EBML reader
+/// (one block per frame at its time, keyframes cued, Opus with its delay), a cancelled
+/// export leaves nothing, and, where ffmpeg is installed, the decoded planes are close
+/// to `yuv::reference` of `still`'s frames (much closer than to the neighbouring
+/// frame) and the decoded sound has exactly `wav`'s length and is close to it.
+#[cfg(feature = "webm")]
+#[allow(clippy::type_complexity)]
+fn export_webm(
+    m: &Movie,
+    still: &mut dyn FnMut(u64) -> Result<Frame>,
+    pcm: &[u8],
+    samples: usize,
+    dir: &Path,
+    run: &dyn Fn(
+        crate::export::Format,
+        PathBuf,
+        &std::sync::atomic::AtomicBool,
+        u64,
+    ) -> Result<crate::export::Summary>,
+) -> Result<String> {
+    use crate::export::Format;
+    use crate::webm::mux::{id, read};
+    use std::sync::atomic::AtomicBool;
+    let total = m.frame_count();
+    let (w, h) = (W as usize, H as usize);
+    let out = dir.join("film.webm");
+    let s = run(Format::Webm, out.clone(), &AtomicBool::new(false), u64::MAX)?;
+    if s.frames != total || s.audio_frames != samples {
+        bail!(
+            "webm: {} frames, {} samples reported",
+            s.frames,
+            s.audio_frames
+        );
+    }
+    let file = std::fs::read(&out)?;
+    let top = read::children(&file, 0)?;
+    let seg = read::children(top[1].data, 0)?;
+    let mut video_blocks = vec![];
+    let mut audio_blocks = 0;
+    for c in seg.iter().filter(|e| e.id == id::CLUSTER) {
+        let kids = read::children(c.data, 0)?;
+        let base = read::uint(kids[0].data) as i64;
+        for b in &kids[1..] {
+            let data = if b.id == id::BLOCK_GROUP {
+                read::find(&read::children(b.data, 0)?, id::BLOCK)
+                    .unwrap()
+                    .data
+            } else {
+                b.data
+            };
+            let t = base + i16::from_be_bytes([data[1], data[2]]) as i64;
+            if data[0] & 0x7f == 1 {
+                video_blocks.push((t, data[3] & 0x80 != 0));
+            } else {
+                audio_blocks += 1;
+            }
+        }
+    }
+    let want: Vec<i64> = (0..total)
+        .map(|n| ((n as f64 * 1001.0 / 30.0).round()) as i64)
+        .collect();
+    let times: Vec<i64> = video_blocks.iter().map(|b| b.0).collect();
+    if times != want {
+        bail!("webm: video block times {times:?}, want {want:?}");
+    }
+    if !video_blocks[0].1 {
+        bail!("webm: the first frame isn't a keyframe");
+    }
+    if audio_blocks != (samples + 312).div_ceil(960) {
+        bail!("webm: {audio_blocks} Opus packets for {samples} samples");
+    }
+    if read::find(&seg, id::CUES).is_none() {
+        bail!("webm: no cues");
+    }
+
+    // Cancelling leaves no file and no staged part.
+    let cancelled = dir.join("cancelled.webm");
+    let names = || -> Result<usize> { Ok(std::fs::read_dir(dir)?.count()) };
+    let before = names()?;
+    match run(Format::Webm, cancelled.clone(), &AtomicBool::new(false), 3) {
+        Err(e) if e.to_string() == "cancelled" => {}
+        Err(e) => bail!("cancelled webm export failed oddly: {e:#}"),
+        Ok(_) => bail!("cancelling didn't stop the webm export"),
+    }
+    if cancelled.exists() || names()? != before {
+        bail!("a cancelled webm export left files behind");
+    }
+
+    if crate::export::ffmpeg_encoders().is_err() {
+        return Ok(format!("webm: {total} frames (not decoded: no ffmpeg)"));
+    }
+    let planes = decode(
+        &out,
+        &["-map", "0:v:0", "-f", "rawvideo", "-pix_fmt", "yuv420p10le"],
+    )?;
+    let per = w * h * 3 / 2 * 2;
+    if planes.len() != per * total as usize {
+        bail!(
+            "webm: decoded {} bytes of video, want {}",
+            planes.len(),
+            per * total as usize
+        );
+    }
+    // Our interleaved-row I420 as planar (ffmpeg's yuv420p10le).
+    let planar = |i420: Vec<u16>| -> Vec<u16> {
+        let (cw, ch) = (w / 2, h / 2);
+        let mut v = i420[..w * h].to_vec();
+        for plane in 0..2 {
+            for row in 0..ch {
+                let at = w * h + row * w + plane * cw;
+                v.extend_from_slice(&i420[at..at + cw]);
+            }
+        }
+        v
+    };
+    let mean_err = |a: &[u16], b: &[u16]| -> f64 {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| x.abs_diff(*y) as f64)
+            .sum::<f64>()
+            / a.len() as f64
+    };
+    let mut worst: f64 = 0.0;
+    for n in [0, 1, total / 2, total - 1] {
+        let got = crate::yuv::samples(&planes[n as usize * per..][..per], 10);
+        let want = planar(crate::yuv::reference(&still(n)?, 10));
+        let err = mean_err(&got, &want);
+        let other = if n == 0 { 1 } else { n - 1 };
+        let neighbour = mean_err(&got, &planar(crate::yuv::reference(&still(other)?, 10)));
+        if err > 6.0 || err * 2.0 > neighbour {
+            bail!(
+                "webm frame {n}: mean error {err:.2} (10-bit codes), {neighbour:.2} against frame {other}"
+            );
+        }
+        worst = worst.max(err);
+    }
+    let audio = decode(&out, &["-map", "0:a:0", "-f", "s16le", "-ar", "48000"])?;
+    if audio.len() != samples * 4 {
+        bail!(
+            "webm: decoded {} stereo samples, want {samples}",
+            audio.len() / 4
+        );
+    }
+    let pcm16 = |b: &[u8]| -> Vec<f64> {
+        b.as_chunks::<2>()
+            .0
+            .iter()
+            .map(|s| i16::from_le_bytes(*s) as f64)
+            .collect()
+    };
+    let (a, b) = (pcm16(&audio), pcm16(pcm));
+    let noise = a.iter().zip(&b).map(|(x, y)| (x - y).powi(2)).sum::<f64>();
+    let signal = b.iter().map(|y| y * y).sum::<f64>();
+    let snr = 10.0 * (signal / noise.max(1.0)).log10();
+    if snr < 20.0 {
+        bail!("webm: the decoded sound is {snr:.1} dB from `wav`");
+    }
+    Ok(format!(
+        "webm: {total} frames, mean error ≤ {worst:.2} (10-bit codes), sound {snr:.0} dB SNR"
+    ))
 }
 
 // ------------------------------------------------------------------ texture checks

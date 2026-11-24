@@ -69,7 +69,6 @@ pub mod id {
     pub const CUE_TRACK_POSITIONS: u32 = 0xB7;
     pub const CUE_TRACK: u32 = 0xF7;
     pub const CUE_CLUSTER_POSITION: u32 = 0xF1;
-    pub const VOID: u32 = 0xEC;
 }
 
 /// Nanoseconds per Matroska tick: 1 ms, as WebM recommends.
@@ -497,6 +496,7 @@ pub mod read {
     pub struct Element<'a> {
         pub id: u32,
         /// Offset of the element's first byte in the buffer it was read from.
+        #[allow(dead_code)] // read by tests
         pub offset: usize,
         pub data: &'a [u8],
     }
@@ -589,7 +589,7 @@ mod tests {
         assert_eq!(i(-129), [0xff, 0x7f]);
         let mut o = vec![];
         ebml::id(&mut o, id::SEGMENT);
-        ebml::id(&mut o, id::VOID);
+        ebml::id(&mut o, 0xEC); // Void: a one-byte ID
         assert_eq!(o, [0x18, 0x53, 0x80, 0x67, 0xec]);
         assert_eq!(read::vint(&[0x41, 0x2c], false).unwrap(), (300, 2));
     }

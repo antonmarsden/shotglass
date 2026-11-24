@@ -252,6 +252,16 @@ pub fn print_licences(movie: &Path) -> Result<()> {
             );
         }
     }
+    let encoders = crate::webm::ENCODER_LICENCES;
+    if !encoders.is_empty() {
+        println!(
+            "
+built into shotglass, used by export --format webm (not part of the film):"
+        );
+        for (name, licence) in encoders {
+            println!("  {name}  {licence}");
+        }
+    }
     Ok(())
 }
 

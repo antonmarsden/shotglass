@@ -76,6 +76,7 @@ pub fn strip_temporal_delimiters(data: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+#[cfg(test)]
 /// Split a whole `.obu` stream into temporal units (each starts at a temporal delimiter).
 pub fn temporal_units(data: &[u8]) -> Result<Vec<&[u8]>> {
     let all = obus(data)?;

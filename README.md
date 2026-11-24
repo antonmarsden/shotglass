@@ -58,6 +58,14 @@ assertions aborts `shotglass check` on valid shaders. Inside this repository,
 `.cargo/config.toml` sets it for you, but Cargo ignores that file when installing
 from crates.io.
 
+The built-in WebM export (`export --format webm`, the `webm` cargo feature) builds
+SVT-AV1 and libopus from source, so building shotglass needs
+[CMake](https://cmake.org), and [nasm](https://nasm.us) 2.14 or newer for SVT-AV1's
+fast paths (without nasm it still builds, warns, and encodes several times slower).
+In a clone, fetch SVT-AV1 first: `git submodule update --init`. To link an installed
+SVT-AV1 instead, set `SVT_AV1_DIR` to its prefix; `--no-default-features --features
+strict-glsl` leaves the encoders out (WebM then goes through ffmpeg).
+
 ## Main concepts
 
 - **Movie:** a folder with a `movie.toml` (the edit: shots, timings, uniforms,
@@ -84,7 +92,7 @@ The detailed user documentation lives in [`docs/`](docs/):
 - [The player](docs/player.md): The interactive player, avoiding frame drops, and how long films stay fast.
 - [Projects and libraries](docs/libraries.md): Projects (`shotglass.toml`), shared GLSL libraries, `shotglass.lock`, local overrides, licences, freezing and bundling.
 - [Testing GLSL and quality metrics](docs/testing-and-quality.md): `shotglass test` (GLSL unit/property tests, metric tests) and `shotglass quality` (picture and sound metrics with limits).
-- [Command line and export](docs/cli.md): Every `shotglass` command and its options, and exporting a film to video with ffmpeg.
+- [Command line and export](docs/cli.md): Every `shotglass` command and its options, and exporting a film to video (WebM built in, other formats with ffmpeg).
 - [Testing shotglass](docs/testing.md): How shotglass itself is tested (unit, property, selftest, golden images and sounds) and its robustness measures.
 
 Design notes for features (past and planned) are in [`docs/design/`](docs/design/).

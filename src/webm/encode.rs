@@ -1,7 +1,7 @@
 //! The encoders behind `export --format webm`: SVT-AV1 (through `svt_shim.c`) and
 //! libopus (through the `opus` crate). Built only with the `webm` feature.
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Result, anyhow, bail};
 use std::ffi::{CStr, CString, c_char, c_int};
 
 #[repr(C)]
@@ -254,55 +254,73 @@ impl Drop for Av1Encoder {
 /// Opus at 48 kHz in 20 ms packets.
 pub const OPUS_FRAME: usize = 960;
 
-/// Encoded Opus: packets and the encoder's lookahead (pre-skip), in 48 kHz samples.
-pub struct OpusStream {
+/// Opus encoding of interleaved stereo f32 at 48 kHz, pushed in pieces of any size.
+/// The decoder drops `pre_skip` samples at the start and `padding` at the end (the
+/// last packet's DiscardPadding), so what plays is exactly what was pushed.
+pub struct OpusPackets {
+    enc: opus::Encoder,
+    pending: Vec<f32>,
+    out: Vec<u8>,
     pub packets: Vec<Vec<u8>>,
     pub pre_skip: u16,
-    /// Samples of padding at the end of the last packet (beyond the input).
+    /// Sample frames pushed.
+    pub samples: usize,
+    /// Samples of silence in the last packet beyond the input (set by `finish`).
     pub padding: usize,
 }
 
-/// Encode interleaved stereo f32 at 48 kHz. `samples` counts sample frames.
-/// The decoder drops `pre_skip` samples at the start and `padding` at the end, so
-/// what plays is exactly the input.
-pub fn encode_opus(
-    mut fill: impl FnMut(&mut Vec<f32>) -> Result<bool>,
-    samples: usize,
-    kbps: u32,
-) -> Result<OpusStream> {
-    let mut enc = opus::Encoder::new(48_000, opus::Channels::Stereo, opus::Application::Audio)
-        .map_err(|e| anyhow!("libopus: {e}"))?;
-    enc.set_bitrate(opus::Bitrate::Bits(kbps as i32 * 1000))
-        .map_err(|e| anyhow!("libopus: {e}"))?;
-    let pre_skip = enc.get_lookahead().map_err(|e| anyhow!("libopus: {e}"))? as usize;
-    let total = samples + pre_skip;
-    let count = total.div_ceil(OPUS_FRAME);
-    let padding = count * OPUS_FRAME - total;
-    let mut pending: Vec<f32> = Vec::new();
-    let mut more = true;
-    let mut packets = Vec::with_capacity(count);
-    let mut out = vec![0u8; 4000];
-    let mut fed = 0usize;
-    for _ in 0..count {
-        while more && pending.len() < OPUS_FRAME * 2 {
-            more = fill(&mut pending).context("synthesising the soundtrack")?;
-        }
-        let mut frame: Vec<f32> = pending.drain(..(OPUS_FRAME * 2).min(pending.len())).collect();
-        // Stop at exactly `samples` (the soundtrack's length), then pad with silence.
-        let keep = samples.saturating_sub(fed).min(frame.len() / 2);
-        frame.truncate(keep * 2);
-        fed += keep;
-        frame.resize(OPUS_FRAME * 2, 0.0);
-        let n = enc
-            .encode_float(&frame, &mut out)
-            .map_err(|e| anyhow!("libopus: {e}"))?;
-        packets.push(out[..n].to_vec());
+impl OpusPackets {
+    pub fn new(kbps: u32) -> Result<OpusPackets> {
+        let e = |e: opus::Error| anyhow!("libopus: {e}");
+        let mut enc = opus::Encoder::new(48_000, opus::Channels::Stereo, opus::Application::Audio)
+            .map_err(e)?;
+        enc.set_bitrate(opus::Bitrate::Bits(kbps as i32 * 1000))
+            .map_err(e)?;
+        let pre_skip = enc.get_lookahead().map_err(e)? as u16;
+        Ok(OpusPackets {
+            enc,
+            pending: Vec::with_capacity(OPUS_FRAME * 4),
+            out: vec![0; 4000],
+            packets: vec![],
+            pre_skip,
+            samples: 0,
+            padding: 0,
+        })
     }
-    Ok(OpusStream {
-        packets,
-        pre_skip: pre_skip as u16,
-        padding,
-    })
+
+    fn encode_pending(&mut self) -> Result<()> {
+        let mut start = 0;
+        while self.pending.len() - start >= OPUS_FRAME * 2 {
+            let n = self
+                .enc
+                .encode_float(&self.pending[start..start + OPUS_FRAME * 2], &mut self.out)
+                .map_err(|e| anyhow!("libopus: {e}"))?;
+            self.packets.push(self.out[..n].to_vec());
+            start += OPUS_FRAME * 2;
+        }
+        self.pending.drain(..start);
+        Ok(())
+    }
+
+    /// Interleaved stereo samples.
+    pub fn push(&mut self, stereo: &[f32]) -> Result<()> {
+        self.samples += stereo.len() / 2;
+        self.pending.extend_from_slice(stereo);
+        self.encode_pending()
+    }
+
+    /// Flush the encoder's lookahead with silence and pad the last packet.
+    pub fn finish(&mut self) -> Result<()> {
+        let total = self.samples + self.pre_skip as usize;
+        let count = total.div_ceil(OPUS_FRAME);
+        self.padding = count * OPUS_FRAME - total;
+        let fed = self.packets.len() * OPUS_FRAME + self.pending.len() / 2;
+        self.pending
+            .resize(self.pending.len() + (count * OPUS_FRAME - fed) * 2, 0.0);
+        self.encode_pending()?;
+        debug_assert_eq!(self.packets.len(), count);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -313,24 +331,21 @@ mod tests {
     #[test]
     fn opus_drops_exactly_its_padding() {
         let n = 48_000 + 123;
+        let mut o = OpusPackets::new(160).unwrap();
         let mut left = n;
-        let s = encode_opus(
-            |buf| {
-                let k = left.min(1000);
-                left -= k;
-                buf.extend(std::iter::repeat_n(0.1f32, k * 2));
-                Ok(left > 0)
-            },
-            n,
-            160,
-        )
-        .unwrap();
+        while left > 0 {
+            let k = left.min(777);
+            o.push(&vec![0.1f32; k * 2]).unwrap();
+            left -= k;
+        }
+        o.finish().unwrap();
+        assert_eq!(o.samples, n);
         assert_eq!(
-            s.packets.len() * OPUS_FRAME,
-            n + s.pre_skip as usize + s.padding
+            o.packets.len() * OPUS_FRAME,
+            n + o.pre_skip as usize + o.padding
         );
-        assert!(s.padding < OPUS_FRAME);
-        assert!(s.pre_skip > 0);
+        assert!(o.padding < OPUS_FRAME);
+        assert!(o.pre_skip > 0);
     }
 
     #[test]
@@ -369,7 +384,11 @@ mod tests {
             got.push((p.pts, p.keyframe));
         }
         let pts: Vec<i64> = got.iter().map(|g| g.0).collect();
-        assert_eq!(pts, (0..frames as i64).collect::<Vec<_>>(), "one packet per frame, in order");
+        assert_eq!(
+            pts,
+            (0..frames as i64).collect::<Vec<_>>(),
+            "one packet per frame, in order"
+        );
         let keys: Vec<i64> = got.iter().filter(|g| g.1).map(|g| g.0).collect();
         assert_eq!(keys, [0, 8, 16]);
     }
