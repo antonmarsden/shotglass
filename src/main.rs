@@ -250,6 +250,14 @@ enum Cmd {
         /// With --compare: write the heatmaps as the new references instead of comparing.
         #[arg(long, requires = "compare")]
         bless: bool,
+        /// After a passing run, move each limit in quality.toml to the measured value plus
+        /// --margin (only ever stricter: a max goes down, a min goes up). The ratchet.
+        #[arg(long)]
+        tighten: bool,
+        /// With --tighten: headroom over the measured value, e.g. 25% or 0.25. Leave room
+        /// for other renderers: CI's llvmpipe and real GPUs can differ by over 10%.
+        #[arg(long, default_value = "25%", requires = "tighten")]
+        margin: String,
     },
     /// Check the renderer and soundtrack on this GPU and driver with built-in test films.
     Selftest {
@@ -409,7 +417,11 @@ fn real_main() -> Result<()> {
             out,
             compare,
             bless,
+            tighten,
+            margin,
         } => {
+            let margin = golden::parse_budget(&margin).context("--margin")? as f64;
+            let tighten = tighten.then_some(margin);
             let single = matches!(project::target(&movie)?, project::Target::Film(_));
             for_each_film(&movie, |f| {
                 let dir = if single {
@@ -431,6 +443,7 @@ fn real_main() -> Result<()> {
                     size.as_deref(),
                     &dir,
                     golden.as_deref().map(|g| (g, bless)),
+                    tighten,
                 )
             })
         }
@@ -814,6 +827,7 @@ fn quality_cmd(
     size: Option<&str>,
     out: &Path,
     golden: Option<(&Path, bool)>,
+    tighten: Option<f64>,
 ) -> Result<()> {
     let m = load_movie(movie)?;
     let golden = golden.map(|(d, b)| (d.to_path_buf(), b));
@@ -872,6 +886,20 @@ fn quality_cmd(
             .collect();
         if !failed.is_empty() {
             bail!("quality: {} failed", failed.join(", "));
+        }
+        if let Some(margin) = tighten {
+            let path = m.root.join(quality::QUALITY_FILE);
+            let text = std::fs::read_to_string(&path)?;
+            let (new, changes) = quality::tighten(&text, margin, |i, s| report.value(i, s))?;
+            if changes.is_empty() {
+                println!("tighten: every limit is already within the measured values + margin");
+            } else {
+                std::fs::write(&path, new)?;
+                for c in &changes {
+                    println!("tighten: {c}");
+                }
+                println!("wrote {}", path.display());
+            }
         }
         Ok(())
     })

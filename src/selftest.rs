@@ -201,7 +201,133 @@ const CHECKS: &[Check] = &[
         name: "quality metrics: @frame, @reference, GPU mean/max reductions, invalid, limits, heatmaps",
         run: quality_metrics,
     },
+    Check {
+        name: "quality metrics: @prev/@next (clamped at the ends), min, over, GPU histogram and percentiles",
+        run: quality_temporal,
+    },
 ];
+
+/// Phase 2 of `shotglass quality` (#96): red flips every film frame (0, 1, 0, …), so
+/// |frame − prev| + 2·|frame − next| is 3 inside the film, 2 on frame 0 (prev clamps to
+/// it) and 1 on the last frame (next clamps). A second metric measures (x + ½)/256 per
+/// column: exact in float, so its histogram is exactly 270 per bin for bins 0..157,
+/// and min, max, over-threshold and percentiles have exact values.
+fn quality_temporal(gl: &Gl, dir: &Path) -> Result<String> {
+    write(
+        dir,
+        &[
+            (
+                "s.glsl",
+                &scene("fragColor = vec4(float(iFrame % 2), 0.0, 0.0, 1.0);"),
+            ),
+            (
+                "q/flip.glsl",
+                "void mainMetric(out vec4 value, in vec2 fragCoord) {
+  vec2 uv = fragCoord / iResolution.xy;
+  float r = getFrame(uv).r;
+  float d = abs(r - getPrev(uv).r) + 2.0 * abs(r - getNext(uv).r);
+  value = vec4(vec3(d / 3.0), d);
+}
+",
+            ),
+            (
+                "q/ramp.glsl",
+                "void mainMetric(out vec4 value, in vec2 fragCoord) {
+  float v = (floor(fragCoord.x) + 0.5) / 256.0;
+  value = vec4(vec3(v), v);
+}
+",
+            ),
+            (
+                "quality.toml",
+                "size = \"158x90\"
+                 [[metric]]
+use = \"q/flip.glsl\"
+                 [[metric]]
+use = \"q/ramp.glsl\"
+threshold = 0.3
+p95 = { max = 0.5 }
+over = { max = 1 }
+",
+            ),
+        ],
+    )?;
+    let m = movie(
+        dir,
+        "shotglass = \"0.1.4\"
+fps = 30
+[[shot]]
+id=\"a\"
+scene=\"s.glsl\"
+duration=2
+",
+    )?;
+    if crate::validate::AVAILABLE {
+        for d in [Dialect::BASELINE, Dialect::WEB] {
+            let errors = crate::validate::validate_sources(&crate::quality::sources(&m, d)?);
+            if !errors.is_empty() {
+                bail!(
+                    "metric fixtures aren't strictly valid {d}:
+{}",
+                    errors.iter().map(|e| e.to_string()).collect::<String>()
+                );
+            }
+        }
+    }
+    let last = m.frame_count() - 1;
+    let cfg = crate::quality::Config::of_film(&m)?.ok_or_else(|| anyhow!("no quality.toml"))?;
+    let times = [0.0, m.frame_time(30), m.frame_time(last)];
+    let rep = crate::quality::run(gl.clone(), &m, &cfg, &times, false)?;
+    let ends: Vec<_> = rep
+        .frames
+        .iter()
+        .map(|f| (f.frame, f.prev, f.next))
+        .collect();
+    let want = [
+        (0, Some(0), Some(1)),
+        (30, Some(29), Some(31)),
+        (last as i32, Some(last - 1), Some(last)),
+    ];
+    if ends != want {
+        bail!("frames (n, prev, next): {ends:?}, want {want:?}");
+    }
+    let flip = &rep.metrics[0];
+    let means: Vec<_> = flip.frames.iter().map(|f| f.mean).collect();
+    if means != [Some(2.0), Some(3.0), Some(1.0)] || flip.variants != ["frame", "prev", "next"] {
+        bail!("flip: means {means:?}, variants {:?}", flip.variants);
+    }
+    let ramp = &rep.metrics[1];
+    let t = &ramp.total;
+    let n = 158 * 90 * 3;
+    let hist_ok = t
+        .histogram
+        .iter()
+        .enumerate()
+        .all(|(i, &c)| c == if i < 158 { 270 } else { 0 });
+    if !hist_ok || t.pixels != n {
+        bail!("ramp histogram: {:?} ({} pixels)", t.histogram, t.pixels);
+    }
+    let checks = [
+        ("min", t.min, 0.5 / 256.0),
+        ("max", t.max, 157.5 / 256.0),
+        ("over", t.over, 81.0 / 158.0), // (x + ½)/256 > 0.3 from x = 77
+        ("p50", t.percentiles.get("p50").copied(), 79.0 / 256.0),
+        ("p95", t.percentiles.get("p95").copied(), 150.1 / 256.0),
+    ];
+    for (what, got, want) in checks {
+        if got.is_none_or(|g| (g - want).abs() > 1e-6) {
+            bail!("ramp {what}: got {got:?}, want {want}");
+        }
+    }
+    if ramp.pass || ramp.failures.len() != 1 || !ramp.failures[0].starts_with("p95 0.58") {
+        bail!("ramp failures: {:?}", ramp.failures);
+    }
+    Ok(format!(
+        "p95 {:.4}, over {:.4}",
+        t.percentiles["p95"],
+        t.over.unwrap()
+    ))
+}
 
 /// `shotglass quality` (#96) on a fixture film: an edge at x = 0.5094 (pixel 80 of
 /// 158 is lit at 1×, half lit in the 4×4 reference) and a green ramp of exact 8-bit values. Pins the reduced
@@ -268,17 +394,20 @@ fn quality_metrics(gl: &Gl, dir: &Path) -> Result<String> {
     let g = &rep.metrics[0];
     close("green mean", g.total.mean, mean)?;
     close("green max", g.total.max, 2.0 * ramp(157))?;
-    if g.reference || !g.pass || g.total.pixels != 158 * 90 {
+    if g.variants != ["frame"] || !g.pass || g.total.pixels != 158 * 90 {
         bail!("green: {g:?}");
     }
     // alias: one column differs by 0.5.
     let a = &rep.metrics[1];
     close("alias mean", a.total.mean, 0.5 / 158.0)?;
     close("alias max", a.total.max, 0.5)?;
-    if !a.reference || a.pass || !a.failures.iter().any(|f| f.starts_with("max 0.5")) {
+    if a.variants != ["frame", "reference"]
+        || a.pass
+        || !a.failures.iter().any(|f| f.starts_with("max 0.5"))
+    {
         bail!(
-            "alias: reference {}, failures {:?}",
-            a.reference,
+            "alias: variants {:?}, failures {:?}",
+            a.variants,
             a.failures
         );
     }
