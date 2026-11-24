@@ -860,6 +860,7 @@ fn metric_tests(gl: &Gl, dir: &Path) -> Result<String> {
                  [[case]]\nname = \"edge: soft reference\"\nuse = \"q/edge\"\nframe = \"in/half.png\"\nreference = \"in/soft.glsl\"\nexpect = \"fail\"\nmax = { max = 0.1 }\n\
                  [[case]]\nname = \"ink: left half not measured\"\nuse = \"q/ink\"\nframe = \"in/ink.glsl\"\nsize = \"10x4\"\nmean = { min = 1 }\n\
                  [[case]]\nname = \"behind: prev only\"\nuse = \"q/behind\"\nframe = \"in/half.png\"\nprev = \"in/soft.glsl\"\nmean = { min = 0.1 }\n\
+                 [[case]]\nname = \"behind: GLSL frame and prev\"\nuse = \"q/behind\"\nframe = \"in/ink.glsl\"\nprev = \"in/soft.glsl\"\nsize = \"8x4\"\nmean = { min = 0.5 }\n\
                  [[case]]\nname = \"ahead: next only\"\nuse = \"q/ahead\"\nframe = \"in/half.png\"\nnext = \"in/soft.glsl\"\nmean = { min = 0.1 }\n\
                  [[case]]\nname = \"flicker: no prev\"\nuse = \"q/flicker\"\nframe = \"in/half.png\"\nnext = \"in/half.png\"\n\
                  [[case]]\nname = \"clicks: sine\"\nuse = \"q/clicks\"\nsound = \"in/sine.glsl\"\nsamples = 4800\nmax = { max = 0.05 }\n\
@@ -899,6 +900,7 @@ t/q.test.toml
   ok    edge: soft reference  mean 0.125490  max 0.250980  (32 measured); fails as expected: max 0.250980 > max 0.1
   ok    ink: left half not measured  mean 1.000000  max 1.000000  (20 measured, 20 not measured)
   ok    behind: prev only  mean 0.125490  max 0.250980  (32 measured)
+  ok    behind: GLSL frame and prev  mean 0.749510  max 1.000000  (32 measured)
   ok    ahead: next only  mean 0.125490  max 0.250980  (32 measured)
   ERROR flicker: no prev
         the metric reads @prev: give prev = \"…\"
@@ -910,8 +912,8 @@ t/q.test.toml
     if report != expected {
         bail!("report differs:\n--- expected\n{expected}--- got\n{report}");
     }
-    if (sum.passed, sum.failed, sum.broken) != (7, 1, 1) {
-        bail!("summary {sum:?}, expected 7 passed, 1 failed, 1 broken");
+    if (sum.passed, sum.failed, sum.broken) != (8, 1, 1) {
+        bail!("summary {sum:?}, expected 8 passed, 1 failed, 1 broken");
     }
     Ok(format!("{} cases", sum.passed + sum.failed + sum.broken))
 }
