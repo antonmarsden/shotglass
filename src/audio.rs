@@ -829,8 +829,11 @@ mod tests {
         h.join().unwrap();
         assert!(monotonic(&v));
         let last = *v.last().unwrap();
-        // follows the timer, not the device (which would be ~100× ahead)
-        assert!((at - 0.05..at + 0.1).contains(&last), "{last} at {at}");
+        // Follows the timer, not the device (which would be ~100× ahead, i.e. seconds).
+        // The lower bound is loose: the device's first report after play (position 0,
+        // minus LATENCY) agrees with the timer and is taken, and on a busy runner that
+        // callback can run tens of ms late, pulling the clock back by as much.
+        assert!((at - 0.15..at + 0.1).contains(&last), "{last} at {at}");
     }
 
     #[test]
