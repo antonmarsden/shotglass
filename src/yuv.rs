@@ -95,6 +95,8 @@ pub struct YuvReader {
     vao: glow::VertexArray,
     fbo: glow::Framebuffer,
     tex: glow::Texture,
+    /// Uniform locations, asked once (every glGet is a driver round trip).
+    locs: [Option<glow::UniformLocation>; 5],
     w: usize,
     h: usize,
     depth: u8,
@@ -181,12 +183,15 @@ impl YuvReader {
             );
             let ok = gl.check_framebuffer_status(glow::FRAMEBUFFER) == glow::FRAMEBUFFER_COMPLETE;
             gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            let locs = ["sg_src", "sg_size", "sg_flipped", "sg_scale", "sg_max"]
+                .map(|n| gl.get_uniform_location(prog, n));
             let reader = YuvReader {
                 gl: gl.clone(),
                 prog,
                 vao,
                 fbo,
                 tex,
+                locs,
                 w,
                 h,
                 depth,
@@ -229,6 +234,11 @@ impl YuvReader {
 
     /// Convert the renderer's current output (frame `n`) and start reading it back.
     /// Never waits for the GPU. Panics if the ring is full (`has_room`).
+    ///
+    /// Leaves the default framebuffer, program, VAO, texture and pack buffer unbound
+    /// and pack alignment at 4; the viewport stays at the YUV target's size and blend
+    /// and scissor stay off (as the renderer leaves them). Renderer passes set their
+    /// own viewport.
     pub fn submit(&mut self, r: &Renderer, src: glow::Texture, n: u64) -> Result<()> {
         assert!(self.has_room(), "YUV readback ring full");
         let gl = &self.gl;
@@ -246,15 +256,12 @@ impl YuvReader {
             gl.active_texture(glow::TEXTURE0);
             gl.bind_texture(glow::TEXTURE_2D, Some(src));
             gl.bind_sampler(0, None);
-            let loc = |n: &str| gl.get_uniform_location(self.prog, n);
-            gl.uniform_1_i32(loc("sg_src").as_ref(), 0);
-            gl.uniform_2_i32(loc("sg_size").as_ref(), w, h);
-            gl.uniform_1_i32(loc("sg_flipped").as_ref(), r.output_flipped() as i32);
-            gl.uniform_1_f32(
-                loc("sg_scale").as_ref(),
-                f32::from(1u16 << (self.depth - 8)),
-            );
-            gl.uniform_1_f32(loc("sg_max").as_ref(), ((1u32 << self.depth) - 1) as f32);
+            let [src_loc, size_loc, flipped_loc, scale_loc, max_loc] = &self.locs;
+            gl.uniform_1_i32(src_loc.as_ref(), 0);
+            gl.uniform_2_i32(size_loc.as_ref(), w, h);
+            gl.uniform_1_i32(flipped_loc.as_ref(), r.output_flipped() as i32);
+            gl.uniform_1_f32(scale_loc.as_ref(), f32::from(1u16 << (self.depth - 8)));
+            gl.uniform_1_f32(max_loc.as_ref(), ((1u32 << self.depth) - 1) as f32);
             gl.draw_arrays(glow::TRIANGLES, 0, 3);
             gl.bind_texture(glow::TEXTURE_2D, None);
             gl.bind_vertex_array(None);
