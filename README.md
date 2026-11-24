@@ -1305,7 +1305,11 @@ shotglass export movies/my-film --out frames/                       # PNG sequen
   as rendered (full range, tagged as RGB). VP9 and AV1 store colour at half
   resolution, so the size must be even.
 - **Progress and Ctrl-C.** Progress goes to the terminal. Ctrl-C stops the export
-  and removes the half-written file (a second Ctrl-C quits at once).
+  (a second Ctrl-C quits at once). Video exports replace the destination only
+  after encoding succeeds.
+- **PNG retries.** Export PNGs to a fresh folder for each retry. Frames and
+  `sound.wav` are written directly into the folder, so an interrupted export can
+  leave partial results and a shorter or silent export can leave older files there.
 
 | `--format` | default for | video | audio | use it for |
 |---|---|---|---|---|
