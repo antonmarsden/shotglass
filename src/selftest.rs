@@ -804,7 +804,7 @@ unit/fx.test.glsl
 }
 
 /// Metric tests (`*.test.toml`, #106): library metrics on PNG and GLSL pictures
-/// (`@frame`, `@reference`), `notMeasured()` pixels, a missing variant, and GLSL and WAV
+/// (`@frame`, `@reference`, `@prev` or `@next` alone), `notMeasured()` pixels, a missing variant, and GLSL and WAV
 /// sound; must-pass and must-fail cases, an unexpected pass. Pins the whole report.
 fn metric_tests(gl: &Gl, dir: &Path) -> Result<String> {
     write(
@@ -825,6 +825,14 @@ fn metric_tests(gl: &Gl, dir: &Path) -> Result<String> {
             (
                 "lib/ink.glsl",
                 "void mainMetric(out vec4 value, in vec2 fragCoord) {\n  vec4 c = getFrame(fragCoord / iResolution.xy);\n  value = vec4(c.rgb, c.g < 0.5 ? notMeasured() : c.r);\n}\n",
+            ),
+            (
+                "lib/behind.glsl",
+                "void mainMetric(out vec4 value, in vec2 fragCoord) {\n  vec2 uv = fragCoord / iResolution.xy;\n  float d = abs(getFrame(uv).r - getPrev(uv).r);\n  value = vec4(vec3(d), d);\n}\n",
+            ),
+            (
+                "lib/ahead.glsl",
+                "void mainMetric(out vec4 value, in vec2 fragCoord) {\n  vec2 uv = fragCoord / iResolution.xy;\n  float d = abs(getFrame(uv).r - getNext(uv).r);\n  value = vec4(vec3(d), d);\n}\n",
             ),
             (
                 "lib/flicker.glsl",
@@ -851,6 +859,9 @@ fn metric_tests(gl: &Gl, dir: &Path) -> Result<String> {
                 "[[case]]\nname = \"edge: same picture\"\nuse = \"q/edge\"\nframe = \"in/half.png\"\nreference = \"in/half.png\"\nmax = { max = 0 }\n\
                  [[case]]\nname = \"edge: soft reference\"\nuse = \"q/edge\"\nframe = \"in/half.png\"\nreference = \"in/soft.glsl\"\nexpect = \"fail\"\nmax = { max = 0.1 }\n\
                  [[case]]\nname = \"ink: left half not measured\"\nuse = \"q/ink\"\nframe = \"in/ink.glsl\"\nsize = \"10x4\"\nmean = { min = 1 }\n\
+                 [[case]]\nname = \"behind: prev only\"\nuse = \"q/behind\"\nframe = \"in/half.png\"\nprev = \"in/soft.glsl\"\nmean = { min = 0.1 }\n\
+                 [[case]]\nname = \"behind: GLSL frame and prev\"\nuse = \"q/behind\"\nframe = \"in/ink.glsl\"\nprev = \"in/soft.glsl\"\nsize = \"8x4\"\nmean = { min = 0.5 }\n\
+                 [[case]]\nname = \"ahead: next only\"\nuse = \"q/ahead\"\nframe = \"in/half.png\"\nnext = \"in/soft.glsl\"\nmean = { min = 0.1 }\n\
                  [[case]]\nname = \"flicker: no prev\"\nuse = \"q/flicker\"\nframe = \"in/half.png\"\nnext = \"in/half.png\"\n\
                  [[case]]\nname = \"clicks: sine\"\nuse = \"q/clicks\"\nsound = \"in/sine.glsl\"\nsamples = 4800\nmax = { max = 0.05 }\n\
                  [[case]]\nname = \"clicks: click\"\nuse = \"q/clicks\"\nsound = \"in/click.wav\"\nexpect = \"fail\"\nmax = { max = 0.01 }\n\
@@ -888,6 +899,9 @@ t/q.test.toml
   ok    edge: same picture  mean 0.000000  max 0.000000  (32 measured)
   ok    edge: soft reference  mean 0.125490  max 0.250980  (32 measured); fails as expected: max 0.250980 > max 0.1
   ok    ink: left half not measured  mean 1.000000  max 1.000000  (20 measured, 20 not measured)
+  ok    behind: prev only  mean 0.125490  max 0.250980  (32 measured)
+  ok    behind: GLSL frame and prev  mean 0.749510  max 1.000000  (32 measured)
+  ok    ahead: next only  mean 0.125490  max 0.250980  (32 measured)
   ERROR flicker: no prev
         the metric reads @prev: give prev = \"…\"
   ok    clicks: sine  mean 0.001062  max 0.028782  (4800 measured)
@@ -898,8 +912,8 @@ t/q.test.toml
     if report != expected {
         bail!("report differs:\n--- expected\n{expected}--- got\n{report}");
     }
-    if (sum.passed, sum.failed, sum.broken) != (5, 1, 1) {
-        bail!("summary {sum:?}, expected 5 passed, 1 failed, 1 broken");
+    if (sum.passed, sum.failed, sum.broken) != (8, 1, 1) {
+        bail!("summary {sum:?}, expected 8 passed, 1 failed, 1 broken");
     }
     Ok(format!("{} cases", sum.passed + sum.failed + sum.broken))
 }
