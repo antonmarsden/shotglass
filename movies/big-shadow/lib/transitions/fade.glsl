@@ -1,5 +1,4 @@
-// shotglass-kit/transitions: fade
-// (a copy from shotglass-kit 48313cf, cut down to what Big Shadow uses)
+// Big Shadow, lib/transitions: fade
 //
 // Fade out to a colour, then fade in. Only one shot is visible at a time,
 // so combined with freeze = true it costs about one normal frame.

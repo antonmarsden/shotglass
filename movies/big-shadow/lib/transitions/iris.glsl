@@ -1,5 +1,4 @@
-// shotglass-kit/transitions: iris
-// (a copy from shotglass-kit 48313cf, cut down to what Big Shadow uses)
+// Big Shadow, lib/transitions: iris
 //
 // Classic cartoon iris. Opening (default): the new shot appears in a growing circle.
 // Closing: the old shot shrinks into a circle and the new shot is outside it.

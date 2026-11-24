@@ -1,5 +1,4 @@
-// shotglass-kit/sound: master.glsl
-// (a copy from shotglass-kit 48313cf, cut down to what Big Shadow uses)
+// Big Shadow, lib/sound: master.glsl
 //
 // Per-sample shaping for the end of a mix: stereo width, a ducking gain from a level,
 // and a soft clip. Each looks at one sample (or one level) only, so they work in

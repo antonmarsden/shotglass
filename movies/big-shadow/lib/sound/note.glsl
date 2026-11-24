@@ -1,5 +1,4 @@
-// shotglass-kit/sound: note.glsl
-// (a copy from shotglass-kit 48313cf, cut down to what Big Shadow uses)
+// Big Shadow, lib/sound: note.glsl
 //
 // Pitch: MIDI note numbers, scales and chords. Notes are integers in MIDI numbering
 // (60 = middle C, 69 = A 440 Hz, one step per semitone), so melodies are plain

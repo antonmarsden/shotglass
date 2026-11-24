@@ -1,5 +1,4 @@
-// shotglass-kit/core: color.glsl
-// (a copy from shotglass-kit 48313cf, cut down to what Big Shadow uses)
+// Big Shadow, lib/kit: color.glsl
 //
 // Getting from "light" to pixels: tonemapping and grain.
 // sound: yes

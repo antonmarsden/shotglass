@@ -1,5 +1,4 @@
-// shotglass-kit/core: sdf.glsl
-// (a copy from shotglass-kit 48313cf, cut down to what Big Shadow uses)
+// Big Shadow, lib/kit: sdf.glsl
 //
 // Signed distance functions: the distance from p to a shape's surface, negative
 // inside. Build a scene by combining them with the kit_op_ functions, then draw it

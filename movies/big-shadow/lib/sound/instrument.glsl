@@ -1,5 +1,4 @@
-// shotglass-kit/sound: instrument.glsl
-// (a copy from shotglass-kit 48313cf, cut down to what Big Shadow uses)
+// Big Shadow, lib/sound: instrument.glsl
 //
 // Pitched instruments: a plucked string and an FM bell.
 // Each is one function of the time since the note began (`t`, seconds; negative gives

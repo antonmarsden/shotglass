@@ -1,5 +1,5 @@
-// Shared audio helpers. Notes, scales and instruments come from shotglass-kit/sound,
-// random numbers from shotglass-kit/core's integer hash.
+// Shared audio helpers. Notes, scales and instruments come from lib/sound,
+// random numbers from lib/kit's integer hash.
 #include <kit/noise.glsl>
 #include <sound/note.glsl>
 #include <sound/instrument.glsl>

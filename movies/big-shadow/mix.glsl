@@ -1,7 +1,7 @@
 // ============================================================
 //  BIG SHADOW — final mix. Runs after every track is synthesised and can read
 //  them at any sample: music(samp), sfx(samp) (all shot sounds, already faded
-//  for transitions). The effects come from shotglass-kit/sound's mix.glsl.
+//  for transitions). The effects come from lib/sound/mix.glsl.
 // ============================================================
 #include <sound/mix.glsl>
 

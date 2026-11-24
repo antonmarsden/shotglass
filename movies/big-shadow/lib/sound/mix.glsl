@@ -1,5 +1,4 @@
-// shotglass-kit/sound: mix.glsl
-// (a copy from shotglass-kit 48313cf, cut down to what Big Shadow uses)
+// Big Shadow, lib/sound: mix.glsl
 //
 // Effects for `mainMix`: a multi-tap delay, a reverb made of many short delays, a
 // smoothed level for ducking. They read the engine's two buses through

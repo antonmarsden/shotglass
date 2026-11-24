@@ -1,5 +1,4 @@
-// shotglass-kit/core: noise.glsl
-// (a copy from shotglass-kit 48313cf, cut down to what Big Shadow uses)
+// Big Shadow, lib/kit: noise.glsl
 //
 // Hashes and noise built on integer arithmetic, so they give the same bits on every
 // GPU and in browsers (sin()-based hashes don't). Same input, same output, always.

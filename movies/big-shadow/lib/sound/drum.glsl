@@ -1,5 +1,4 @@
-// shotglass-kit/sound: drum.glsl
-// (a copy from shotglass-kit 48313cf, cut down to what Big Shadow uses)
+// Big Shadow, lib/sound: drum.glsl
 //
 // Drums: a kick. Like instrument.glsl, each is one function of the
 // time since the hit (`t`, seconds; negative gives 0), a frequency and a few
@@ -15,7 +14,7 @@
 
 #include "envelope.glsl"
 
-// lowbias32 integer hash, as core/noise.glsl's kit_hash_u (the sound library doesn't
+// lowbias32 integer hash, as lib/kit/noise.glsl's kit_hash_u (the sound library doesn't
 // depend on core).
 uint kit__drum_hash(uint x) {
     x ^= x >> 16;

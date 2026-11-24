@@ -1,5 +1,4 @@
-// shotglass-kit/sound: envelope.glsl
-// (a copy from shotglass-kit 48313cf, cut down to what Big Shadow uses)
+// Big Shadow, lib/sound: envelope.glsl
 //
 // Envelopes: how loud a note is at a time since it started. Each takes `t`, seconds
 // since the note began (negative: not started yet, gives 0), and returns a level in

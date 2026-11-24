@@ -1,5 +1,5 @@
 // Shared helpers for the Big Shadow scenes. Include with:  #include "../common.glsl"
-// Noise, shapes and tonemapping come from shotglass-kit (see [libraries] in movie.toml).
+// Noise, shapes and tonemapping come from lib/kit (see [libraries] in shotglass.toml).
 
 #include <kit/noise.glsl>
 #include <kit/sdf.glsl>
