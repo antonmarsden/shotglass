@@ -395,7 +395,20 @@ impl Builder {
                 Scope::Film => display_path(&p, root),
                 Scope::Lib(_) => format!("{} ({})", self.display(&p, *s), p.display()),
             };
-            if !absolute(&p).starts_with(absolute(root)) {
+            let inside_root = absolute(&p).starts_with(absolute(root));
+            let is_file = inside_root && p.is_file();
+            let inside_resolved_root = !is_file || {
+                // Keep the written path for nested includes, diagnostics and case checks.
+                // Use canonical paths only to check where the file actually resides.
+                p.canonicalize()
+                    .and_then(|file| {
+                        normalize(root)
+                            .canonicalize()
+                            .map(|root| file.starts_with(root))
+                    })
+                    .map_err(|e| format!("can't resolve #include \"{name}\" at {label}: {e}"))?
+            };
+            if !inside_root || !inside_resolved_root {
                 searched.push(format!(
                     "{label} (outside the {}, not allowed)",
                     match s {
@@ -406,7 +419,7 @@ impl Builder {
                 continue;
             }
             let rel = display_path(&p, root);
-            if p.is_file() {
+            if is_file {
                 if let Some(actual) = crate::library::case_mismatch(root, &rel) {
                     self.warnings.push(format!(
                         "#include \"{name}\" only matches {actual} when ignoring case; \
@@ -1151,6 +1164,88 @@ mod tests {
             .err()
             .expect("should fail");
         format!("{e:#}")
+    }
+
+    #[cfg(any(unix, windows))]
+    fn link_dir(target: &Path, link: &Path) {
+        #[cfg(unix)]
+        let result = std::os::unix::fs::symlink(target, link);
+        #[cfg(windows)]
+        let result = std::os::windows::fs::symlink_dir(target, link);
+        #[cfg(windows)]
+        if matches!(&result, Err(e) if e.raw_os_error() == Some(1314)) {
+            // Junctions can be created without the Windows symlink privilege.
+            let output = std::process::Command::new("powershell.exe")
+                .args([
+                    "-NoProfile",
+                    "-Command",
+                    "New-Item -ItemType Junction -Path $env:SHOTGLASS_TEST_LINK -Target $env:SHOTGLASS_TEST_TARGET -ErrorAction Stop",
+                ])
+                .env("SHOTGLASS_TEST_LINK", link)
+                .env("SHOTGLASS_TEST_TARGET", target)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        result.unwrap();
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn include_links_stay_within_their_scope() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("film");
+        let library = dir.join("vendor/kit");
+        write(&dir, &[("local/helper.glsl", "float film_helper;\n")]);
+        write(
+            &library,
+            &[
+                ("library.toml", "name = \"kit/core\"\nversion = \"0.4.0\"\n"),
+                ("local/helper.glsl", "float kit_helper;\n"),
+            ],
+        );
+        let outside = temp.path().join("film-other");
+        write(&outside, &[("helper.glsl", "float outside_helper;\n")]);
+        link_dir(&dir.join("local"), &dir.join("inside"));
+        link_dir(&outside, &dir.join("outside"));
+        link_dir(&library.join("local"), &library.join("inside"));
+        // This target is inside the film, but outside the library.
+        link_dir(&dir.join("local"), &library.join("outside"));
+        let libs = [Library::read("kit", &library, crate::library::Origin::Path).unwrap()];
+        let film_link = temp.path().join("film-link");
+        link_dir(&dir, &film_link);
+        let dir = film_link;
+        let entry = dir.join("main.glsl");
+        std::fs::write(
+            &entry,
+            "#include \"inside/helper.glsl\"\n#include <kit/inside/helper.glsl>\n",
+        )
+        .unwrap();
+        let source = Builder::new(D, "", &dir)
+            .libraries(&libs)
+            .file(&entry)
+            .unwrap()
+            .build();
+        assert!(source.text.contains("float film_helper;"));
+        assert!(source.text.contains("float kit_helper;"));
+        assert!(source.files.iter().any(|f| f == "inside/helper.glsl"));
+        assert!(source.files.iter().any(|f| f == "kit/inside/helper.glsl"));
+
+        let error = include_error(&dir, &libs, "#include \"outside/helper.glsl\"\n");
+        assert!(
+            error.contains("outside/helper.glsl (outside the film folder, not allowed)"),
+            "{error}"
+        );
+        let error = include_error(&dir, &libs, "#include <kit/outside/helper.glsl>\n");
+        assert!(
+            error.contains("outside the library \"kit\", not allowed"),
+            "{error}"
+        );
     }
 
     #[test]

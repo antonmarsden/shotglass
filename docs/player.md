@@ -8,6 +8,9 @@ The interactive player, avoiding frame drops, and how long films stay fast.
 
 `shotglass play <movie> [--at 12.5 | --at moon | --at moon+2] [--scale auto | 1.0]`
 
+Desktop playback compiles and runs GLSL from the film and its libraries on your GPU.
+Play films and load libraries from sources you trust.
+
 | key | action |
 |---|---|
 | Space | play / pause |
