@@ -882,7 +882,7 @@ fn quality_cmd(
     let golden = golden.map(|(d, b, budget)| (d.to_path_buf(), b, budget));
     let mut cfg = quality::Config::of_film(&m)?.ok_or_else(|| {
         anyhow!(
-            "{} has no {} (metrics to run: see README, \"Quality metrics\")",
+            "{} has no {} (metrics to run: see docs/testing-and-quality.md, \"Quality metrics\")",
             m.root.display(),
             quality::QUALITY_FILE
         )

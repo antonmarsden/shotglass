@@ -226,7 +226,7 @@ pub struct ShotSound {
 pub const N_CHANNELS: usize = 8;
 
 /// What a `channels` entry or `[textures]` value names, from its spelling alone. The
-/// one place that tells the kinds apart (README "Channel sources"):
+/// one place that tells the kinds apart (docs/channels.md, "Channel sources"):
 ///
 /// - `""` binds nothing;
 /// - `@word` is another pass's picture (`@input`, `@picture`, `@<layer>`, `@<comp>`);

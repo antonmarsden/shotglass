@@ -1,9 +1,9 @@
 # The project file: the engine contract and the libraries for every film in this folder
 # (here, one film). For several films sharing a lib/ folder, put shotglass.toml in the
-# folder above them instead (see README, "Projects").
+# folder above them instead (see shotglass docs/libraries.md, "Projects").
 shotglass = "0.1"         # engine contract this film was made for
 
-# Shared GLSL by name; shaders use #include <kit/file.glsl>. See README, "Libraries".
+# Shared GLSL by name; shaders use #include <kit/file.glsl>. See shotglass docs/libraries.md.
 # `shotglass play` fetches them with git and pins them in shotglass.lock (commit it).
 # No version: follow the kit's main branch until it has releases.
 [libraries]

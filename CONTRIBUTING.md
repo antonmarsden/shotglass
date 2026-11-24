@@ -2,7 +2,7 @@
 
 Thanks for helping. Notes for working on the code are in [CLAUDE.md](CLAUDE.md)
 (it is written for agents, but it's the most complete map of the code and its
-invariants); user docs are in [README.md](README.md).
+invariants); user docs are in [README.md](README.md) and [docs/](docs/).
 
 ## Before you push
 

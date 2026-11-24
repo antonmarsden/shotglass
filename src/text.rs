@@ -7,7 +7,7 @@
 //! files, the text options and the engine version. The renderer rasterises blocks on its
 //! decode worker; `Movie::parse` lays them out (cheap) to know their sizes early.
 //!
-//! Layout model (README "Text"): sizes are texture pixels (`size` = the em), the block is
+//! Layout model (docs/channels.md, "Text"): sizes are texture pixels (`size` = the em), the block is
 //! the text's content box plus `padding` (= the distance-field spread) on every side.
 //! Lines break greedily at UAX #14 opportunities; paragraphs (`\n`) get their own bidi
 //! base direction (UAX #9) and are reordered per line; each grapheme takes the first font

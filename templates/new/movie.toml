@@ -5,7 +5,7 @@ aspect = [16, 9]
 fps = 30                  # or 29.97, or "30000/1001"
 # Shaders compile as GLSL 3.30 everywhere, so the film runs on any OpenGL 3.3 machine.
 # glsl = "430"           # opt in to a later GLSL ("410" or "430"); fewer machines run it
-# loop = true             # play forever (shotglass = "0.1.2" in shotglass.toml); see README, "Loop films"
+# loop = true             # play forever (shotglass = "0.1.2" in shotglass.toml); see docs/loop-films.md
 
 [sound]
 music = "music.glsl"      # vec2 mainSound(int samp, float time); time = movie time
@@ -19,7 +19,7 @@ duration = 5.0
 # Uniforms are declared for you. Constants, vectors, or keyframes in shot-local seconds.
 uniforms.uHue = { keys = [[0, 0.0], [5, 0.3]], ease = "smooth" }
 # Images or texts on iChannel0..7 (PNG or JPEG; shotglass = "0.1.1" in shotglass.toml, "0.1.3"
-# for text or channels 4–7). See README, "Textures".
+# for text or channels 4–7). See docs/channels.md in shotglass.
 # channels = ["textures/brick.png", "", { file = "textures/grid.png", filter = "nearest", wrap = "clamp" }]
 
 [[shot]]
@@ -33,7 +33,7 @@ transition = { type = "transitions/iris", duration = 1.2, freeze = true, params 
 # start it early or let it ring on; otherwise it fades with the transitions.
 sound = "sfx/chime.glsl"
 
-# A layer over a span of the film (shotglass = "0.1.4"; see README, "Layers"):
+# A layer over a span of the film (shotglass = "0.1.4"; see docs/layers.md):
 # [[layer]]
 # id = "title"
 # scene = "layers/title.glsl"   # mainImage writes vec4(colour, alpha)
@@ -41,7 +41,7 @@ sound = "sfx/chime.glsl"
 # to = "second.settled"
 # fade = [0.5, 0.5]
 #
-# Text, bound to channels like a texture (shotglass = "0.1.3"; see README, "Text"):
+# Text, bound to channels like a texture (shotglass = "0.1.3"; see docs/channels.md, "Text"):
 # `shotglass fonts add "Inter"` (in the film folder) adds a Google Fonts family and writes, e.g.:
 # [fonts]
 # inter = "<inter/Inter[opsz,wght].ttf>"
@@ -52,7 +52,7 @@ sound = "sfx/chime.glsl"
 # [textures]
 # brick = "textures/brick.png"
 # noise = { file = "<kit/textures/noise.png>", filter = "linear" }   # from a library
-# Image sequences, one file per frame (shotglass = "0.1.6"; see README, "Footage"):
+# Image sequences, one file per frame (shotglass = "0.1.6"; see docs/channels.md, "Footage"):
 # fog = "renders/fog_####.png"
 # plate = { frames = "renders/plate_####.jpg", fps = 24, first = 1001, end = "loop" }
 # and in a shot, re-timed: channels = [{ texture = "plate", in = 2.0, speed = 0.5, clock = "shot" }]

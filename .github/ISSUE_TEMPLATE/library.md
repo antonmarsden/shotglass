@@ -22,4 +22,4 @@ labels: lane:kit
 
 **Done when**
 - [ ] 
-- [ ] Unit test in `library.rs`, README.md updated
+- [ ] Unit test in `library.rs`, docs/libraries.md updated

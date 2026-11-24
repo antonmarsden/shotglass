@@ -23,4 +23,4 @@ labels: enhancement
 
 **Done when**
 - [ ] 
-- [ ] Tested (unit test, selftest check or golden case) and documented in README.md
+- [ ] Tested (unit test, selftest check or golden case) and documented in README.md / docs/
