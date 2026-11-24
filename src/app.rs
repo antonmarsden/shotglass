@@ -6,9 +6,10 @@ use crate::movie::{At, Movie};
 use crate::sound::Soundtrack;
 use eframe::egui::{self, Color32, Key, Modifiers, Pos2, Rect, RichText, Sense, Stroke, Vec2};
 use eframe::glow;
-use std::collections::VecDeque;
-use std::path::PathBuf;
-use std::sync::mpsc::{Receiver, channel};
+use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+use std::collections::{BTreeMap, VecDeque};
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 
 /// Seconds of sound synthesised ahead of the playhead while playing.
@@ -125,6 +126,139 @@ impl Perf {
     }
 }
 
+struct LiveReload {
+    tx: Sender<()>,
+    ctx: egui::Context,
+    watcher: Option<RecommendedWatcher>,
+    desired: BTreeMap<PathBuf, RecursiveMode>,
+    active: BTreeMap<PathBuf, RecursiveMode>,
+    warning: Option<String>,
+}
+
+impl LiveReload {
+    fn new(root: &Path, tx: Sender<()>, ctx: egui::Context) -> Self {
+        Self {
+            tx,
+            ctx,
+            watcher: None,
+            desired: BTreeMap::from([(Self::absolute(root), RecursiveMode::Recursive)]),
+            active: BTreeMap::new(),
+            warning: None,
+        }
+    }
+
+    fn absolute(path: &Path) -> PathBuf {
+        // A bare movie.toml has an empty parent, meaning the current directory.
+        let path = if path.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            path
+        };
+        std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
+    }
+
+    fn follow_movie(&mut self, movie: &Movie) {
+        let film = Self::absolute(&movie.root);
+        let project = Self::absolute(&movie.project);
+        self.desired.clear();
+        if project != film {
+            // Watch the project manifest and lockfile without following sibling films.
+            self.desired.insert(project, RecursiveMode::NonRecursive);
+        }
+        for library in &movie.libraries {
+            let root = Self::absolute(&library.root);
+            if !root.starts_with(&film) {
+                self.desired.insert(root, RecursiveMode::Recursive);
+            }
+        }
+        self.desired.insert(film, RecursiveMode::Recursive);
+    }
+
+    fn sync(&mut self) {
+        let warning = self.sync_watches().err();
+        if warning != self.warning {
+            if let Some(message) = &warning {
+                eprintln!("warning: live reload is limited ({message}). Press R to retry.");
+            }
+            self.warning = warning;
+        }
+    }
+
+    fn sync_watches(&mut self) -> Result<(), String> {
+        if self.watcher.is_none() {
+            self.watcher = Some(
+                Self::create_watcher(self.tx.clone(), self.ctx.clone())
+                    .map_err(|e| format!("couldn't start file watcher: {e}"))?,
+            );
+        }
+        let watcher = self.watcher.as_mut().unwrap();
+        self.active.retain(|path, mode| {
+            if self.desired.get(path) == Some(mode) {
+                true
+            } else {
+                let _ = watcher.unwatch(path);
+                false
+            }
+        });
+        let mut errors = Vec::new();
+        for (path, mode) in &self.desired {
+            if self.active.contains_key(path) {
+                continue;
+            }
+            match watcher.watch(path, *mode) {
+                Ok(()) => {
+                    self.active.insert(path.clone(), *mode);
+                }
+                Err(e) => errors.push(format!("couldn't watch {}: {e}", path.display())),
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("\n"))
+        }
+    }
+
+    fn create_watcher(tx: Sender<()>, ctx: egui::Context) -> notify::Result<RecommendedWatcher> {
+        notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+            if let Ok(ev) = res {
+                use notify::EventKind::*;
+                let relevant = matches!(ev.kind, Modify(_) | Create(_) | Remove(_))
+                    && ev.paths.iter().any(|p| {
+                        matches!(
+                            p.extension().and_then(|e| e.to_str()),
+                            Some(
+                                "glsl"
+                                    | "toml"
+                                    | "lock"
+                                    | "frag"
+                                    | "inc"
+                                    | "h"
+                                    | "png"
+                                    | "jpg"
+                                    | "jpeg"
+                                    | "PNG"
+                                    | "JPG"
+                                    | "JPEG"
+                                    | "ttf"
+                                    | "otf"
+                                    | "ttc"
+                                    | "TTF"
+                                    | "OTF"
+                                    | "TTC"
+                                    | "txt"
+                            )
+                        )
+                    });
+                if relevant {
+                    let _ = tx.send(());
+                    ctx.request_repaint();
+                }
+            }
+        })
+    }
+}
+
 struct Player {
     path: PathBuf,
     movie: Option<Movie>,
@@ -144,11 +278,7 @@ struct Player {
     perf_frame: u64,
     soundtrack: Soundtrack,
     sound_info: String,
-    watcher: Option<notify::RecommendedWatcher>,
-    /// Library folders outside the film folder that the watcher also follows.
-    watched_libs: Vec<PathBuf>,
-    /// The project root, when it isn't the film folder (watched, not recursively).
-    watched_project: Option<PathBuf>,
+    live_reload: LiveReload,
     rx: Receiver<()>,
     reload_at: Option<Instant>,
     reloads: u32,
@@ -203,54 +333,11 @@ impl Player {
         clock.seek(start);
 
         let (tx, rx) = channel();
-        let ctx = cc.egui_ctx.clone();
         let root = if path.is_dir() {
             path.clone()
         } else {
             path.parent().map(PathBuf::from).unwrap_or_default()
         };
-        let watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-            if let Ok(ev) = res {
-                use notify::EventKind::*;
-                let relevant = matches!(ev.kind, Modify(_) | Create(_) | Remove(_))
-                    && ev.paths.iter().any(|p| {
-                        matches!(
-                            p.extension().and_then(|e| e.to_str()),
-                            Some(
-                                "glsl"
-                                    | "toml"
-                                    | "lock"
-                                    | "frag"
-                                    | "inc"
-                                    | "h"
-                                    | "png"
-                                    | "jpg"
-                                    | "jpeg"
-                                    | "PNG"
-                                    | "JPG"
-                                    | "JPEG"
-                                    | "ttf"
-                                    | "otf"
-                                    | "ttc"
-                                    | "TTF"
-                                    | "OTF"
-                                    | "TTC"
-                                    | "txt"
-                            )
-                        )
-                    });
-                if relevant {
-                    let _ = tx.send(());
-                    ctx.request_repaint();
-                }
-            }
-        })
-        .and_then(|mut w| {
-            use notify::Watcher;
-            w.watch(&root, notify::RecursiveMode::Recursive).map(|_| w)
-        })
-        .ok();
-
         let mut p = Player {
             path,
             movie: None,
@@ -266,9 +353,7 @@ impl Player {
             perf_frame: 0,
             soundtrack: Soundtrack::new(),
             sound_info,
-            watcher,
-            watched_libs: vec![],
-            watched_project: None,
+            live_reload: LiveReload::new(&root, tx, cc.egui_ctx.clone()),
             rx,
             reload_at: None,
             reloads: 0,
@@ -315,7 +400,12 @@ impl Player {
     // ------------------------------------------------------------ loading
 
     fn reload(&mut self) {
-        let m = match Movie::load(&self.path) {
+        let loaded = Movie::load(&self.path);
+        if let Ok(m) = &loaded {
+            self.live_reload.follow_movie(m);
+        }
+        self.live_reload.sync();
+        let m = match loaded {
             Ok(m) => m,
             Err(e) => {
                 self.load_error = Some(format!("{e:#}"));
@@ -323,7 +413,6 @@ impl Player {
             }
         };
         self.load_error = None;
-        self.watch_libraries(&m);
         for w in &m.warnings {
             eprintln!("warning: {w}");
         }
@@ -487,47 +576,6 @@ impl Player {
             self.soundtrack.evict_where(keep);
             self.clock.drop_chunks_where(keep);
         }
-    }
-
-    /// Live reload follows library folders too (in-film paths are already covered by
-    /// watching the film folder; project libraries, overrides and the cache usually live
-    /// elsewhere), and the project root's own files (`shotglass.toml`,
-    /// `shotglass.local.toml`, `shotglass.lock`) when the project is above the film.
-    fn watch_libraries(&mut self, m: &Movie) {
-        use notify::Watcher;
-        let Some(w) = self.watcher.as_mut() else {
-            return;
-        };
-        let film = std::path::absolute(&m.root).unwrap_or_else(|_| m.root.clone());
-        let want: Vec<PathBuf> = m
-            .libraries
-            .iter()
-            .map(|l| std::path::absolute(&l.root).unwrap_or_else(|_| l.root.clone()))
-            .filter(|p| !p.starts_with(&film))
-            .collect();
-        let project = std::path::absolute(&m.project).unwrap_or_else(|_| m.project.clone());
-        let project = Some(project).filter(|p| *p != film);
-        if self.watched_project != project {
-            if let Some(old) = &self.watched_project {
-                let _ = w.unwatch(old);
-            }
-            if let Some(p) = &project {
-                // Not recursive: the other films below it are none of this film's business.
-                let _ = w.watch(p, notify::RecursiveMode::NonRecursive);
-            }
-            self.watched_project = project;
-        }
-        for p in &self.watched_libs {
-            if !want.contains(p) {
-                let _ = w.unwatch(p);
-            }
-        }
-        for p in &want {
-            if !self.watched_libs.contains(p) {
-                let _ = w.watch(p, notify::RecursiveMode::Recursive);
-            }
-        }
-        self.watched_libs = want;
     }
 
     fn say(&mut self, s: String) {
@@ -1723,6 +1771,15 @@ impl eframe::App for Player {
                         Color32::from_white_alpha(200),
                     );
                 }
+            if self.live_reload.warning.is_some() {
+                ui.painter().text(
+                    view.left_top() + Vec2::new(10.0, 30.0),
+                    egui::Align2::LEFT_TOP,
+                    "Live reload is limited. Press R to retry.",
+                    egui::FontId::proportional(13.0),
+                    Color32::from_rgb(255, 205, 120),
+                );
+            }
             let (ready, total) = self.renderer.progress();
             let (loaded, textures) = self.renderer.texture_progress();
             let mut busy = vec![];
@@ -1985,7 +2042,43 @@ fn clock_text(t: f32) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::next_scale;
+    use super::{LiveReload, RecursiveMode, channel, egui, next_scale};
+    use std::{fs, time::Duration};
+
+    #[test]
+    fn live_reload_retries_a_failed_library_watch() {
+        let temp = tempfile::tempdir().unwrap();
+        let film = temp.path().join("film");
+        let library = temp.path().join("library");
+        fs::create_dir(&film).unwrap();
+        let (tx, rx) = channel();
+        let mut reload = LiveReload::new(&film, tx, egui::Context::default());
+        let library = LiveReload::absolute(&library);
+        reload
+            .desired
+            .insert(library.clone(), RecursiveMode::Recursive);
+
+        reload.sync();
+        let warning = reload.warning.as_ref().expect("missing library warning");
+        assert!(
+            warning.contains(&library.display().to_string()),
+            "{warning}"
+        );
+        assert!(!reload.active.contains_key(&library));
+        assert!(reload.active.contains_key(&LiveReload::absolute(&film)));
+
+        let nested = library.join("shaders");
+        fs::create_dir_all(&nested).unwrap();
+        let shader = nested.join("include.glsl");
+        fs::write(&shader, "// original").unwrap();
+        reload.sync();
+        assert!(reload.warning.is_none(), "{:?}", reload.warning);
+        assert_eq!(reload.active.get(&library), Some(&RecursiveMode::Recursive));
+
+        fs::write(shader, "// edited").unwrap();
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("edit should trigger a reload after recovery");
+    }
 
     #[test]
     fn stays_at_full_resolution_when_it_fits() {
