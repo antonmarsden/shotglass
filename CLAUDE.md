@@ -3,6 +3,13 @@
 Rust + OpenGL harness for composing short films from GLSL shaders. User docs are in
 README.md; this file is about working on the code.
 
+## Strategy and cross-repo work
+
+Goals, principles, the placement rule (engine / kit / film), quality metrics and the
+agent playbooks live in [shotglass-hq](https://github.com/antonmarsden/shotglass-hq)
+(private; cloned beside this repo as `../shotglass-hq`). Read its `STRATEGY.md` and
+`agents/` before cross-repo work; this file wins for anything local to this repo.
+
 ## Build and test
 
 ```sh
@@ -212,5 +219,5 @@ cargo fmt && cargo clippy --all-targets -- -D warnings
 
 ## Commits
 
-End commit messages with the Co-Authored-By / Claude-Session lines given in the session.
+End commit messages with the attribution lines (Co-Authored-By, session) your agent session gives.
 Run fmt, clippy and the full test suite before pushing.
