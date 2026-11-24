@@ -64,11 +64,20 @@ pub mod id {
     pub const BLOCK: u32 = 0xA1;
     pub const DISCARD_PADDING: u32 = 0x75A2;
     pub const CUES: u32 = 0x1C53BB6B;
+    pub const VOID: u32 = 0xEC;
     pub const CUE_POINT: u32 = 0xBB;
     pub const CUE_TIME: u32 = 0xB3;
     pub const CUE_TRACK_POSITIONS: u32 = 0xB7;
     pub const CUE_TRACK: u32 = 0xF7;
     pub const CUE_CLUSTER_POSITION: u32 = 0xF1;
+}
+
+/// An EBML Void element of exactly `len` bytes (at least 2).
+fn void(out: &mut Vec<u8>, len: usize) {
+    assert!((2..=128).contains(&len), "void of {len} bytes");
+    ebml::id(out, id::VOID);
+    ebml::sized(out, (len - 2) as u64, 1);
+    out.resize(out.len() + len - 2, 0);
 }
 
 /// Nanoseconds per Matroska tick: 1 ms, as WebM recommends.
@@ -225,9 +234,14 @@ fn ticks(ns: u64) -> u64 {
 
 /// Fixed-size SeekHead: three Seek entries, positions in 8 bytes, patched at the end.
 fn seek_head(positions: [(u32, u64); 3]) -> Vec<u8> {
+    seek_head_of(&positions)
+}
+
+/// A SeekHead with these entries, positions in 8 bytes.
+fn seek_head_of(positions: &[(u32, u64)]) -> Vec<u8> {
     let mut out = vec![];
     ebml::master(&mut out, id::SEEK_HEAD, |o| {
-        for (target, pos) in positions {
+        for &(target, pos) in positions {
             ebml::master(o, id::SEEK, |s| {
                 let mut tid = vec![];
                 ebml::id(&mut tid, target);
@@ -465,12 +479,16 @@ impl<W: Write + Seek> Writer<W> {
 
         self.w.seek(SeekFrom::Start(self.seek_head_at))?;
         let head = if self.cues.is_empty() {
-            // No cues: point the third entry at Tracks again rather than at nothing.
-            seek_head([
+            // No cues: a SeekHead without the Cues entry, then a Void over the space
+            // that entry took (the reserved head is fixed-size).
+            let full = seek_head([(id::INFO, 0), (id::TRACKS, 0), (id::CUES, 0)]).len();
+            let mut head = seek_head_of(&[
                 (id::INFO, self.info_offset),
                 (id::TRACKS, self.tracks_offset),
-                (id::TRACKS, self.tracks_offset),
-            ])
+            ]);
+            let gap = full - head.len();
+            void(&mut head, gap);
+            head
         } else {
             seek_head([
                 (id::INFO, self.info_offset),
@@ -564,6 +582,28 @@ mod tests {
             codec_private: vec![0x81, 0, 0x4c, 0, 0x0a, 0],
             bit_depth: 10,
             fps: (24, 1),
+        }
+    }
+
+    #[test]
+    fn no_cues_leaves_a_void() {
+        // No keyframes, so no cues: the SeekHead names Info and Tracks only, and a
+        // Void takes the Cues entry's space, so Info still starts where it did.
+        let mut w = Writer::new(Cursor::new(vec![]), "webm", &video(), None).unwrap();
+        w.video(0, false, &[1, 2, 3]).unwrap();
+        w.video(41_666_667, false, &[4, 5]).unwrap();
+        let file = w.finish(83_333_333).unwrap().into_inner();
+        let top = read::children(&file, 0).unwrap();
+        let seg = read::children(top[1].data, 0).unwrap();
+        let ids: Vec<u32> = seg.iter().map(|e| e.id).take(4).collect();
+        assert_eq!(ids, [id::SEEK_HEAD, id::VOID, id::INFO, id::TRACKS]);
+        assert!(read::find(&seg, id::CUES).is_none());
+        let seeks = read::children(seg[0].data, 0).unwrap();
+        assert_eq!(seeks.len(), 2);
+        for (s, el) in seeks.iter().zip([&seg[2], &seg[3]]) {
+            let kids = read::children(s.data, 0).unwrap();
+            let pos = read::uint(read::find(&kids, id::SEEK_POSITION).unwrap().data);
+            assert_eq!(pos as usize, el.offset, "seek position");
         }
     }
 

@@ -132,7 +132,9 @@ pub fn export(
             pre_skip: s.pre_skip,
         };
         let last = s.packets.len().saturating_sub(1);
-        let pad_ns = (s.padding as u64 * 1_000_000_000 / 48_000) as i64;
+        // Rounded to the nearest ns, so demuxers converting back to samples get exactly
+        // `padding` whichever way they round.
+        let pad_ns = ((s.padding as u64 * 1_000_000_000 + 24_000) / 48_000) as i64;
         let packets = s
             .packets
             .into_iter()

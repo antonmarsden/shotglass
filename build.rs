@@ -52,6 +52,8 @@ mod webm {
                     src.display()
                 );
             }
+            // A submodule bump or a local edit rebuilds it (cargo scans the tree).
+            println!("cargo:rerun-if-changed={}", src.display());
             build_svt(&src);
             src.join("Source").join("API")
         };
