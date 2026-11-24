@@ -166,9 +166,18 @@ contact sheet (`shotglass strip`, 8 frames at 320x180) and the soundtrack
   ```
 
   The references are rendered with Mesa's llvmpipe, like CI, so bless on Linux
-  (or in Docker: see below) when you can. On Windows/macOS,
-  `$env:SHOTGLASS_BLESS=1; cargo test --test golden` (PowerShell) works too, as long
-  as the result still passes on llvmpipe in CI.
+  or in Docker (see below). A real GPU can't bless them: see the next point.
+- **On a real GPU** (anything but llvmpipe or the Apple Software Renderer) the golden
+  tests don't use `tests/golden/`: a GPU draws too differently, and changes with each
+  driver. They compare against a local baseline in
+  `target/golden-local/<renderer>-<GL version>/` (never committed). The first run
+  writes it; later runs fail if the picture or sound moved since, with the same diff
+  files. After an intended change, refresh it with `SHOTGLASS_BLESS=1`
+  (`$env:SHOTGLASS_BLESS=1; cargo test --test golden` in PowerShell); a driver
+  update gets a new folder by itself. This is for fast local iteration: CI still
+  checks the committed references, so bless those on llvmpipe before you push a
+  visual change. `SHOTGLASS_GOLDEN=ci` forces the committed references (to check an
+  llvmpipe you installed yourself under another name), `=local` the local baseline.
 - Docker, from any OS:
 
   ```sh

@@ -32,7 +32,11 @@ cargo fmt && cargo clippy --all-targets -- -D warnings
   look at the new PNGs. Never bless to make an unexplained diff go away. A failing run
   leaves the actual strip and `<name>.diff.png` (magenta = differs), or the actual WAV
   and `<name>.diff.wav` (with the first differing time in the message), in
-  `target/tmp/golden/`; CI uploads them as `golden-image-failures`. Golden films never
+  `target/tmp/golden/`; CI uploads them as `golden-image-failures`. On a real GPU
+  (not llvmpipe / Apple Software Renderer) the tests compare against an uncommitted
+  local baseline in `target/golden-local/<renderer>-<version>/` instead (first run
+  writes it; `SHOTGLASS_BLESS=1` refreshes it; `SHOTGLASS_GOLDEN=ci|local` forces a
+  mode); it never replaces blessing `tests/golden/` on llvmpipe. Golden films never
   use kit GLSL: the demo keeps its shared GLSL in `movies/big-shadow/lib/` (`base`,
   `sound`, `transitions`: path libraries, no lock, nothing fetched). Keep it that way;
   the template (which follows kit `main`) has no golden.
