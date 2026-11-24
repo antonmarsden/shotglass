@@ -1,9 +1,8 @@
 # Big Shadow is a project of its own: the engine contract and the libraries it uses.
 shotglass = "0.1"
 
-# The film's own shared GLSL, in lib/ (it started as part of shotglass-kit, cut down
-# to what this film uses). Nothing is fetched, so the demo and the golden tests that
-# render it never depend on anything outside this repo.
+# The film's own shared GLSL, in lib/. Nothing is fetched, so the demo and the golden
+# tests that render it never depend on anything outside this repo.
 [libraries]
 kit = { path = "lib/kit" }
 transitions = { path = "lib/transitions" }

@@ -1,11 +1,4 @@
 // Big Shadow, lib/kit: noise.glsl
-//
-// Hashes and noise built on integer arithmetic, so they give the same bits on every
-// GPU and in browsers (sin()-based hashes don't). Same input, same output, always.
-// sound: yes
-
-// kit_hash_u(x): mixes the bits of x (lowbias32). Full 32-bit output.
-//   cost: 5 integer ops (uvec2: 2 rounds, uvec3: 3)
 uint kit_hash_u(uint x) {
     x ^= x >> 16;
     x *= 0x7feb352dU;
@@ -19,27 +12,15 @@ uint kit_hash_u(uvec3 v) {
     return kit_hash_u(v.x ^ kit_hash_u(v.y ^ kit_hash_u(v.z + 0x9e3779b9U) + 0x7f4a7c15U));
 }
 
-// 24 random bits as a float in 0..1 (exact in float32).
 float kit__unit(uint h) { return float(h >> 8) * (1.0 / 16777216.0); }
 
-// kit_hash(c): a random number in 0..1 for an integer cell (or frame, or seed).
-//   e.g. float r = kit_hash(ivec2(floor(uv * 10.0)));   // one value per grid cell
 float kit_hash(int c) { return kit__unit(kit_hash_u(uint(c))); }
 float kit_hash(ivec2 c) { return kit__unit(kit_hash_u(uvec2(c))); }
 float kit_hash(ivec3 c) { return kit__unit(kit_hash_u(uvec3(c))); }
 
-// kit_hash(p): a random number in 0..1 for a float position, from its exact bits:
-// any change to p gives an unrelated value (0.0 and -0.0 differ). For smooth
-// randomness use the noise below.
 float kit_hash(vec2 p) { return kit__unit(kit_hash_u(floatBitsToUint(p))); }
 float kit_hash(vec3 p) { return kit__unit(kit_hash_u(floatBitsToUint(p))); }
 
-// kit_value_noise(p): smooth noise, cells 1 unit wide.
-//   p   any position; scale it for bigger or smaller blobs
-//   ->  0..1
-//   cost: 4 hashes (vec2), 8 (vec3)
-//   e.g. float n = kit_value_noise(uv * 8.0);
-//        float n = kit_value_noise(vec3(uv * 8.0, iTime));   // animated
 float kit_value_noise(vec2 p) {
     vec2 i = floor(p), f = fract(p);
     ivec2 c = ivec2(i);
@@ -60,13 +41,6 @@ float kit_value_noise(vec3 p) {
                mix(mix(n001, n101, u.x), mix(n011, n111, u.x), u.y), u.z);
 }
 
-// kit_fbm(p, octaves): fractal (layered) value noise: clouds, terrain, smoke.
-// Each octave is twice as fine, half as strong, and rotated to hide the grid.
-//   p        any position
-//   octaves  1..12 (more = more detail, more cost)
-//   ->       0..1
-//   cost:    octaves x kit_value_noise
-//   e.g.     float clouds = kit_fbm(uv * 3.0 + vec2(iTime * 0.1, 0.0), 5);
 float kit_fbm(vec2 p, int octaves) {
     const mat2 turn = mat2(0.8, 0.6, -0.6, 0.8);
     float sum = 0.0, amp = 0.5, total = 0.0;

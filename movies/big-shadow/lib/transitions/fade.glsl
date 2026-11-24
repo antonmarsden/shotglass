@@ -1,10 +1,4 @@
 // Big Shadow, lib/transitions: fade
-//
-// Fade out to a colour, then fade in. Only one shot is visible at a time,
-// so combined with freeze = true it costs about one normal frame.
-//   color  vec3, 0..1     the colour in the middle (default black)
-//   hold   0..0.9         fraction of the transition spent fully on the colour (default 0)
-//   e.g.   transition = { type = "fx/fade.glsl", duration = 1.0, params = { hold = 0.2 } }
 #ifndef color
 #define color vec3(0.0)
 #endif
