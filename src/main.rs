@@ -268,6 +268,10 @@ enum Cmd {
         /// Only run checks whose name contains this text.
         filter: Option<String>,
     },
+    /// Print the OpenGL renderer (GL_RENDERER) and version (GL_VERSION), one per line.
+    /// The golden tests use them to pick CI's references or a local baseline.
+    #[command(hide = true)]
+    Renderer,
 }
 
 fn main() {
@@ -454,6 +458,19 @@ fn real_main() -> Result<()> {
             })
         }
         Cmd::Selftest { filter } => selftest::run(filter),
+        Cmd::Renderer => {
+            let name = headless::with_gl(|gl| {
+                use eframe::glow::HasContext;
+                Ok(unsafe {
+                    (
+                        gl.get_parameter_string(eframe::glow::RENDERER),
+                        gl.get_parameter_string(eframe::glow::VERSION),
+                    )
+                })
+            })?;
+            println!("{}\n{}", name.0, name.1);
+            Ok(())
+        }
     }
 }
 
