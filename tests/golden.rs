@@ -188,6 +188,13 @@ fn demo_film() {
 /// `shotglass quality` on the demo (its quality.toml: an `@reference` metric and a
 /// plain one): the heatmaps match tests/golden/quality/big-shadow/<metric>.png, and the
 /// metrics stay within the demo's limits.
+///
+/// Its pixel budget is looser than the default 0.1%: `alias` is the difference of two
+/// renders (1× and the 4× reference) magnified 4×, so a silhouette pixel where a
+/// raymarch hits on one CPU and misses on another lights up fully. llvmpipe JITs for
+/// the runner's CPU, and CI runners differ: one run of the same commit had 543 of
+/// 483600 pixels (0.112%) off, mean 0.048/255, while a parallel run matched. A broken
+/// metric or variant moves far more than 0.5%.
 #[test]
 fn demo_quality_heatmaps() {
     if skip() {
@@ -214,6 +221,8 @@ fn demo_quality_heatmaps() {
         actual.as_os_str(),
         "--compare".as_ref(),
         refs.as_os_str(),
+        "--budget".as_ref(),
+        "0.5%".as_ref(),
     ];
     bless(&mut args);
     let out = shotglass(&args);

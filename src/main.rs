@@ -250,6 +250,17 @@ enum Cmd {
         /// With --compare: write the heatmaps as the new references instead of comparing.
         #[arg(long, requires = "compare")]
         bless: bool,
+        /// With --compare: how many pixels of each heatmap may differ, e.g. 0.1% or 0.001.
+        #[arg(long, default_value = "0.1%", requires = "compare")]
+        budget: String,
+        /// After a passing run, move each limit in quality.toml to the measured value plus
+        /// --margin (only ever stricter: a max goes down, a min goes up). The ratchet.
+        #[arg(long)]
+        tighten: bool,
+        /// With --tighten: headroom over the measured value, e.g. 25% or 0.25. Leave room
+        /// for other renderers: CI's llvmpipe and real GPUs can differ by over 10%.
+        #[arg(long, default_value = "25%", requires = "tighten")]
+        margin: String,
     },
     /// Check the renderer and soundtrack on this GPU and driver with built-in test films.
     Selftest {
@@ -409,7 +420,13 @@ fn real_main() -> Result<()> {
             out,
             compare,
             bless,
+            budget,
+            tighten,
+            margin,
         } => {
+            let budget = golden::parse_budget(&budget).context("--budget")?;
+            let margin = golden::parse_budget(&margin).context("--margin")? as f64;
+            let tighten = tighten.then_some(margin);
             let single = matches!(project::target(&movie)?, project::Target::Film(_));
             for_each_film(&movie, |f| {
                 let dir = if single {
@@ -430,7 +447,8 @@ fn real_main() -> Result<()> {
                     at.as_deref(),
                     size.as_deref(),
                     &dir,
-                    golden.as_deref().map(|g| (g, bless)),
+                    golden.as_deref().map(|g| (g, bless, budget)),
+                    tighten,
                 )
             })
         }
@@ -813,10 +831,11 @@ fn quality_cmd(
     at: Option<&str>,
     size: Option<&str>,
     out: &Path,
-    golden: Option<(&Path, bool)>,
+    golden: Option<(&Path, bool, f32)>,
+    tighten: Option<f64>,
 ) -> Result<()> {
     let m = load_movie(movie)?;
-    let golden = golden.map(|(d, b)| (d.to_path_buf(), b));
+    let golden = golden.map(|(d, b, budget)| (d.to_path_buf(), b, budget));
     let mut cfg = quality::Config::of_film(&m)?.ok_or_else(|| {
         anyhow!(
             "{} has no {} (metrics to run: see README, \"Quality metrics\")",
@@ -844,13 +863,16 @@ fn quality_cmd(
         println!("wrote {}", out.join("quality.json").display());
         // Heatmaps against golden images first: a limit failure shouldn't hide them.
         let mut mismatched = vec![];
-        if let Some((dir, bless)) = &golden {
+        if let Some((dir, bless, budget)) = &golden {
             for x in &report.metrics {
                 let Some(heat) = &x.heatmap else { continue };
                 let g = Golden {
                     reference: dir.join(format!("{}.png", x.name)),
                     bless: *bless,
-                    tol: golden::Tolerance::default(),
+                    tol: golden::Tolerance {
+                        budget: *budget,
+                        ..Default::default()
+                    },
                 };
                 if let Err(e) = compare_golden(heat, &out.join(format!("{}.png", x.name)), &g) {
                     eprintln!("error: {e:#}");
@@ -872,6 +894,20 @@ fn quality_cmd(
             .collect();
         if !failed.is_empty() {
             bail!("quality: {} failed", failed.join(", "));
+        }
+        if let Some(margin) = tighten {
+            let path = m.root.join(quality::QUALITY_FILE);
+            let text = std::fs::read_to_string(&path)?;
+            let (new, changes) = quality::tighten(&text, margin, |i, s| report.value(i, s))?;
+            if changes.is_empty() {
+                println!("tighten: every limit is already within the measured values + margin");
+            } else {
+                std::fs::write(&path, new)?;
+                for c in &changes {
+                    println!("tighten: {c}");
+                }
+                println!("wrote {}", path.display());
+            }
         }
         Ok(())
     })

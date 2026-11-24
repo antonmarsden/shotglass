@@ -1161,8 +1161,11 @@ reference = 4        # @reference: N×N samples per pixel (2-8)
 use = "quality/alias"          # a library metric, or a film file: "fx/mine.glsl"
 name = "alias"                 # optional: names the heatmap; default from use
 params = { GAIN = 4, ink = "#ff8000", palette = ["#000000", "#ffffff"] }
-mean = { max = 0.02 }          # limits on the mean and the max over all frames
-max = { max = 0.5 }
+range = [0, 1]                 # histogram range, for percentiles (default [0, 1])
+threshold = 0.1                # `over` counts pixels whose measure is above this
+mean = { max = 0.02 }          # limits, over all frames: mean, min, max,
+p95 = { max = 0.1 }            #   p1..p99 (percentiles),
+over = { max = 0.01 }          #   over (share of pixels above threshold)
 ```
 
 A metric defines `void mainMetric(out vec4 value, in vec2 fragCoord)`: `value.a` is the
@@ -1172,19 +1175,34 @@ sample frame:
 | variant | read with | what |
 |---|---|---|
 | `@frame` | `getFrame(uv)` | the frame at 1× (8-bit, as exported) |
-| `@reference` | `getReference(uv)` | the frame rendered at N×N size and box-filtered to 1× (rendered only for metrics that call it) |
+| `@reference` | `getReference(uv)` | the frame rendered at N×N size and box-filtered to 1× |
+| `@prev` | `getPrev(uv)` | the previous film frame (n − 1; frame 0 at the start, the period's last frame in a loop film) |
+| `@next` | `getNext(uv)` | the next film frame (n + 1; the last frame at the end, frame 0 in a loop film) |
+
+Each variant other than `@frame` is rendered only for metrics that call its function.
 
 `iResolution`, `iTime` and `iFrame` are those of the sample frame. Params become
 `#define`s: a number is a float, 2–4 numbers a `vecN`, `"#rrggbb"` a `vec3` (0–1, as
 written), and a list of colours `vec3[n](…)` plus `<NAME>_COUNT`.
 
-Measures are reduced on the GPU to a mean and a max per frame, then over frames
-(pixel-weighted mean, largest max). Two checks are fixed: **invalid** counts NaN/Inf
-measures, which are left out of the mean and max and always fail the metric; **cost**
-reports the GPU time of each frame (never gated; meaningless on software OpenGL).
-`check` validates metric shaders strictly like every other shader (`check --web`
-too). `quality.json` (`schema` 1) records the engine and library versions, the size,
-each frame and each metric's per-frame and total values, limits and failures.
+Measures are reduced on the GPU per frame (mean, min, max, `over`) and counted into a
+256-bin histogram over `range`; over frames the mean and `over` are pixel-weighted,
+min and max are the extremes, and the histograms add up. Percentiles (p50, p95, p99
+and any a limit names) come from the histogram, exact to a bin: (range width) / 256.
+Values outside `range` count in the end bins. Two checks are fixed: **invalid** counts
+NaN/Inf measures, which are left out of everything else and always fail the metric;
+**cost** reports the GPU time of each frame (never gated; meaningless on software
+OpenGL). `check` validates metric shaders strictly like every other shader (`check
+--web` too). `quality.json` (`schema` 2) records the engine and library versions, the
+size, each frame (with the `@prev`/`@next` frames shown), and each metric's variants,
+per-frame values, totals (with percentiles and the histogram), limits and failures.
+
+**The ratchet.** `quality --tighten` runs the metrics and, if every one passes, moves
+each limit in `quality.toml` to the measured value plus `--margin` (default 25%, at
+least 1e-6), rounded outward to 3 significant digits. It only ever tightens: a max goes
+down, a min goes up; comments and layout are kept. Leave room for other renderers: CI's
+software OpenGL and real GPUs differ by several percent on some metrics, so tighten
+with a margin that covers both (or on the renderer CI uses).
 
 The demo (`movies/big-shadow`) has a `quality.toml` with two film metrics in
 `metrics/` (aliasing against `@reference`, clipped highlights) as examples.
@@ -1215,7 +1233,8 @@ shotglass freeze <movie>                                   # copy the library fi
 shotglass unfreeze <movie>                                 # follow the project's libraries again
 shotglass test   [file|folder] [filter]                    # GLSL unit and property tests (*.test.glsl) on the GPU
 shotglass quality <movie> [--count 8 | --at ...] [--size 384x216] [--out quality/]
-                 [--compare <dir> [--bless]]   # heatmaps vs <dir>/<metric>.png
+                 [--compare <dir> [--bless] [--budget 0.1%]] # heatmaps vs <dir>/<metric>.png
+                 [--tighten [--margin 25%]]    # move limits towards the measured values
                  # metrics from quality.toml: report, quality.json, heatmaps; fails outside limits
 shotglass selftest [filter]                                # GPU + sound checks on this machine
 ```

@@ -785,6 +785,69 @@ pub fn mentions_ident(text: &str, name: &str) -> bool {
     })
 }
 
+/// Compile and link a vertex and a fragment shader. Err = messages: the vertex
+/// shader's log (prefixed), the fragment shader's mapped to file:line through
+/// `fs_files` (the `#line` source strings), or the link log.
+pub unsafe fn link(
+    gl: &eframe::glow::Context,
+    vs: &str,
+    fs: &str,
+    fs_files: &[String],
+) -> std::result::Result<eframe::glow::Program, Vec<String>> {
+    use eframe::glow::{self, HasContext};
+    unsafe {
+        let v = gl.create_shader(glow::VERTEX_SHADER).map_err(|e| vec![e])?;
+        gl.shader_source(v, vs);
+        gl.compile_shader(v);
+        let f = gl
+            .create_shader(glow::FRAGMENT_SHADER)
+            .map_err(|e| vec![e])?;
+        gl.shader_source(f, fs);
+        gl.compile_shader(f);
+        let prog = gl.create_program().map_err(|e| vec![e])?;
+        gl.attach_shader(prog, v);
+        gl.attach_shader(prog, f);
+        gl.link_program(prog);
+        let mut errors = vec![];
+        if !gl.get_program_link_status(prog) {
+            if !gl.get_shader_compile_status(v) {
+                errors.push(format!("vertex shader: {}", gl.get_shader_info_log(v)));
+            }
+            if !gl.get_shader_compile_status(f) {
+                errors.extend(remap_log(&gl.get_shader_info_log(f), fs_files));
+            }
+            if errors.is_empty() {
+                errors.push(format!("link: {}", gl.get_program_info_log(prog)));
+            }
+        }
+        for sh in [v, f] {
+            gl.detach_shader(prog, sh);
+            gl.delete_shader(sh);
+        }
+        if errors.is_empty() {
+            Ok(prog)
+        } else {
+            gl.delete_program(prog);
+            Err(errors)
+        }
+    }
+}
+
+/// [`link`] an assembled fragment shader with the shared full-screen vertex shader.
+pub unsafe fn compile(
+    gl: &eframe::glow::Context,
+    src: &Assembled,
+) -> std::result::Result<eframe::glow::Program, Vec<String>> {
+    unsafe {
+        link(
+            gl,
+            &crate::gfx::vertex_source(src.dialect),
+            &src.text,
+            &src.files,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
