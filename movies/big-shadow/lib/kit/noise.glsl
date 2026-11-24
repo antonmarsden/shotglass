@@ -1,4 +1,5 @@
 // shotglass-kit/core: noise.glsl
+// (a copy from shotglass-kit 48313cf, cut down to what Big Shadow uses)
 //
 // Hashes and noise built on integer arithmetic, so they give the same bits on every
 // GPU and in browsers (sin()-based hashes don't). Same input, same output, always.
@@ -58,32 +59,6 @@ float kit_value_noise(vec3 p) {
     float n011 = kit_hash(c + ivec3(0, 1, 1)), n111 = kit_hash(c + ivec3(1, 1, 1));
     return mix(mix(mix(n000, n100, u.x), mix(n010, n110, u.x), u.y),
                mix(mix(n001, n101, u.x), mix(n011, n111, u.x), u.y), u.z);
-}
-
-// One of 8 gradient directions (4 diagonal, 4 axis), all of length sqrt(2), chosen
-// by bits of h: no trigonometry, so it's exact everywhere.
-vec2 kit__gradient(uint h) {
-    vec2 g = vec2((h & 1U) == 0U ? 1.0 : -1.0, (h & 2U) == 0U ? 1.0 : -1.0);
-    if ((h & 4U) != 0U) {
-        g = (h & 8U) == 0U ? vec2(g.x * 1.41421356, 0.0) : vec2(0.0, g.y * 1.41421356);
-    }
-    return g;
-}
-
-// kit_gradient_noise(p): smooth noise without value noise's blocky look (Perlin-style).
-//   p   any position, cells 1 unit wide
-//   ->  about -1..1, 0 at every whole-number point
-//   cost: 4 hashes + quintic fade
-//   e.g. float n = 0.5 + 0.5 * kit_gradient_noise(uv * 6.0);
-float kit_gradient_noise(vec2 p) {
-    vec2 i = floor(p), f = fract(p);
-    uvec2 c = uvec2(ivec2(i));
-    vec2 u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
-    float a = dot(kit__gradient(kit_hash_u(c)), f);
-    float b = dot(kit__gradient(kit_hash_u(c + uvec2(1U, 0U))), f - vec2(1.0, 0.0));
-    float d = dot(kit__gradient(kit_hash_u(c + uvec2(0U, 1U))), f - vec2(0.0, 1.0));
-    float e = dot(kit__gradient(kit_hash_u(c + uvec2(1U, 1U))), f - vec2(1.0, 1.0));
-    return mix(mix(a, b, u.x), mix(d, e, u.x), u.y);
 }
 
 // kit_fbm(p, octaves): fractal (layered) value noise: clouds, terrain, smoke.

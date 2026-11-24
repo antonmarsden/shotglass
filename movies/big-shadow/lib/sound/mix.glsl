@@ -1,7 +1,8 @@
 // shotglass-kit/sound: mix.glsl
+// (a copy from shotglass-kit 48313cf, cut down to what Big Shadow uses)
 //
 // Effects for `mainMix`: a multi-tap delay, a reverb made of many short delays, a
-// smoothed level for ducking and limiting. They read the engine's two buses through
+// smoothed level for ducking. They read the engine's two buses through
 // music(samp) and sfx(samp), which exist only in a mix shader, so this file can be
 // included by `[sound] mix` only (music and shot sounds: use sound/master.glsl).
 //
@@ -121,7 +122,7 @@ vec2 kit_mix_reverb(int bus, int samp, int rate, float size, float decay) {
 }
 
 // kit_mix_level(bus, samp, rate, attack, release): how loud a bus is around a sample,
-// for ducking and limiting. The largest peak (either channel) in a window, each
+// for ducking. The largest peak (either channel) in a window, each
 // weighted by how near it is: a peak `attack` seconds ahead counts for nothing, one
 // at samp fully, and one `release` seconds back for nothing again. So the level rises
 // in a straight line before a loud sound arrives and falls in a straight line after
@@ -174,25 +175,4 @@ float kit_mix_level(int bus, int samp, int rate, float attack, float release) {
 //   e.g. vec2 m = music(samp) * kit_mix_duck(samp, int(iSampleRate), 0.12, 0.35, 0.7);
 float kit_mix_duck(int samp, int rate, float lo, float hi, float depth) {
     return kit_duck(kit_mix_level(kit_bus_sfx, samp, rate, 0.01, 0.15), lo, hi, depth);
-}
-
-// kit_mix_limit(bus, samp, rate, gain, ceiling): a look-ahead limiter's gain: how much
-// to turn the output down so that a bus played at `gain` peaks at `ceiling` at most.
-// It starts turning down 5 ms before a loud peak and lets go over 0.2 s, following
-// kit_mix_level, so the gain never steps. It measures the dry bus (and can miss a
-// peak shorter than 3 ms), not your effects: finish with kit_soft_clip for whatever
-// slips past or the echoes and reverb add.
-//   bus      the bus your output mostly is (usually kit_bus_all)
-//   samp     the sample being mixed, as passed to mainMix
-//   rate     sample rate, hertz: int(iSampleRate)
-//   gain     how loud the bus is in your output (the gain you apply to it), > 0
-//   ceiling  the loudest the output may be, linear amplitude (0.9, say)
-//   ->  0..1; 1 while the bus at `gain` stays under the ceiling. Multiply by it
-//   reads: up to 0.2 s back, 5 ms ahead
-//   cost: 128 bus reads for kit_bus_all, 64 for one bus
-//   e.g. vec2 o = kit_soft_clip(2.0 * kit_mix_read(kit_bus_all, samp)
-//            * kit_mix_limit(kit_bus_all, samp, int(iSampleRate), 2.0, 0.8), 0.9);
-float kit_mix_limit(int bus, int samp, int rate, float gain, float ceiling) {
-    float peak = kit_mix_level(bus, samp, rate, 0.005, 0.2) * max(gain, 0.0);
-    return peak > ceiling ? max(ceiling, 0.0) / peak : 1.0;
 }

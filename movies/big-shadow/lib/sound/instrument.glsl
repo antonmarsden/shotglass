@@ -1,6 +1,7 @@
 // shotglass-kit/sound: instrument.glsl
+// (a copy from shotglass-kit 48313cf, cut down to what Big Shadow uses)
 //
-// Pitched instruments: a plucked string, an FM bell, an FM electric piano and a pad.
+// Pitched instruments: a plucked string and an FM bell.
 // Each is one function of the time since the note began (`t`, seconds; negative gives
 // 0), its frequency (`hz`) and a few parameters, and returns a level around +-1 for the
 // caller to scale. They hold no state, so a note is the same whenever and in whatever
@@ -75,60 +76,4 @@ float kit_inst_bell(float t, float hz, float decay, float index) {
     // the sidebands reach about hz * (1 + 1.4 * index): fade the modulation for high notes
     float fm = index * amp * kit__inst_band(hz * (1.0 + 1.4 * index)) * kit__inst_sin(1.4 * hz * t);
     return amp * sin(6.28318531 * fract(hz * t) + fm);
-}
-
-// kit_inst_epiano(t, hz, held, bright): an electric piano, by frequency modulation at
-// 1:1 (a bright attack that mellows as the note sounds) plus a short metallic "tine"
-// at 14 times the pitch. The note fades on its own while held and releases in 0.25 s
-// when the key lets go.
-//   t       seconds since the note began
-//   hz      the note's frequency, hertz
-//   held    seconds the key is held; silent from t = held + 0.25
-//   bright  0..1: how hard the key is struck (0 mellow, 1 a bark with a strong tine)
-//   ->  -1..1; 0 before t = 0 and after the release
-//   cost: 3 sines
-//   e.g. float v = kit_inst_epiano(since, kit_note_hz(60), 0.8, 0.5);
-float kit_inst_epiano(float t, float hz, float held, float bright) {
-    held = max(held, 0.0);
-    if (t < 0.0 || t > held + 0.25) return 0.0;
-    bright = clamp(bright, 0.0, 1.0);
-    float amp = smoothstep(0.0, 0.003, t) * kit_env_adsr(t, held, 0.0, 2.5, 0.15, 0.25);
-    float index = bright * (0.3 + 1.5 * kit_env_ar(t, 0.0, 0.6));
-    float x = 6.28318531 * fract(hz * t);
-    float body = sin(x + index * sin(x));
-    float te = kit__inst_hit(t, 0.002, 0.08);
-    float tine = 0.3 * bright * te * te * kit__inst_sin(14.0 * hz * t) * kit__inst_band(14.0 * hz);
-    return amp * (body + tine) / (1.0 + 0.3 * bright);
-}
-
-// kit_inst_pad(t, hz, held, attack, release): a soft pad: three slightly detuned
-// sawtooth-like voices (6 partials each, 10 cents apart) that drift against each
-// other, with a slow swell. Overlap pad notes to play chords.
-//   t        seconds since the note began
-//   hz       the note's frequency, hertz
-//   held     seconds the key is held; release starts there
-//   attack   seconds to swell to full level, at least 0.005 (0.2..2 suits a pad)
-//   release  seconds to fade after the key lets go, at least 0.005; silent from
-//            t = held + release
-//   ->  -1..1, mostly within +-0.5; 0 before t = 0 and after the release
-//   cost: 18 sines
-//   e.g. float v = kit_inst_pad(since, kit_note_hz(57), 3.0, 0.6, 1.5);
-float kit_inst_pad(float t, float hz, float held, float attack, float release) {
-    held = max(held, 0.0);
-    attack = max(attack, 0.005);
-    release = max(release, 0.005);
-    if (t < 0.0 || t > held + release) return 0.0;
-    float amp = kit_env_adsr(t, held, attack, 0.5, 0.8, release);
-    float s = 0.0, total = 0.0;
-    for (int v = 0; v < 3; v++) {
-        float detune = exp2(float(v - 1) * 10.0 / 1200.0);   // -10, 0, +10 cents
-        float offset = 0.31 * float(v);                       // voices start out of phase
-        for (int i = 1; i <= 6; i++) {
-            float k = float(i);
-            float a = kit__inst_band(k * hz * detune) / k;
-            s += a * kit__inst_sin(k * (hz * detune * t + offset));
-            total += a;
-        }
-    }
-    return amp * s / max(total, 1e-6);
 }
