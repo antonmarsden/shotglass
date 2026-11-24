@@ -35,6 +35,18 @@ pub struct Source {
 /// copy pass, each shot's scene and incoming transition, and the sound shaders
 /// (music, per-shot sounds, mix). Identical sources appear once.
 pub fn movie_sources(m: &Movie, d: Dialect) -> Vec<Source> {
+    let mut sources = movie_sources_with_provenance(m, d);
+    let mut seen = HashSet::new();
+    sources.retain(|s| match &s.src {
+        Ok(a) => seen.insert(a.text.clone()),
+        Err(_) => true,
+    });
+    sources
+}
+
+/// Assemble each shader use so inventories can see every source's file list,
+/// including when different files produce identical GLSL.
+pub(crate) fn movie_sources_with_provenance(m: &Movie, d: Dialect) -> Vec<Source> {
     let cues = m.cue_defines();
     let rel = |p: &std::path::Path| {
         p.strip_prefix(&m.root)
@@ -109,11 +121,6 @@ pub fn movie_sources(m: &Movie, d: Dialect) -> Vec<Source> {
     if let Some(p) = &m.mix {
         frag(format!("mix ({})", rel(p)), mix_source(d, m, &cues, p));
     }
-    let mut seen = HashSet::new();
-    out.retain(|s| match &s.src {
-        Ok(a) => seen.insert(a.text.clone()),
-        Err(_) => true,
-    });
     out
 }
 
