@@ -197,7 +197,115 @@ const CHECKS: &[Check] = &[
         name: "loop films: the soundtrack is seamless at the wrap and matches a long render",
         run: loop_sound,
     },
+    Check {
+        name: "quality metrics: @frame, @reference, GPU mean/max reductions, invalid, limits, heatmaps",
+        run: quality_metrics,
+    },
 ];
+
+/// `shotglass quality` (#96) on a fixture film: an edge at x = 0.5094 (pixel 80 of
+/// 158 is lit at 1×, half lit in the 4×4 reference) and a green ramp of exact 8-bit values. Pins the reduced
+/// numbers exactly, through the 4×4 reduction levels (158×90 → 40×23 → 10×6 → 3×2 → 1×1:
+/// partial blocks at every edge, so an off-by-one bounds test reads past it), the `invalid` count (NaN and Inf left out of the
+/// mean), limits, and a heatmap pixel.
+fn quality_metrics(gl: &Gl, dir: &Path) -> Result<String> {
+    write(
+        dir,
+        &[
+            (
+                "s.glsl",
+                &scene(
+                    "fragColor = vec4(step(0.5094, uv.x), floor(fragCoord.x) / 255.0, 0.0, 1.0);",
+                ),
+            ),
+            (
+                "q/green.glsl",
+                "void mainMetric(out vec4 value, in vec2 fragCoord) {\n  float g = getFrame(fragCoord / iResolution.xy).g * GAIN;\n  value = vec4(vec3(g), g);\n}\n",
+            ),
+            (
+                "q/alias.glsl",
+                "void mainMetric(out vec4 value, in vec2 fragCoord) {\n  vec2 uv = fragCoord / iResolution.xy;\n  float d = abs(getFrame(uv).r - getReference(uv).r);\n  value = vec4(vec3(d), d);\n}\n",
+            ),
+            (
+                "q/bad.glsl",
+                "void mainMetric(out vec4 value, in vec2 fragCoord) {\n  float x = 1.0;\n  if (fragCoord.x < 10.0) x = uintBitsToFloat(0x7fc00000u);\n  if (fragCoord.y > 89.0) x = uintBitsToFloat(0x7f800000u);\n  value = vec4(0.0, 0.0, 0.0, x);\n}\n",
+            ),
+            (
+                "quality.toml",
+                "size = \"158x90\"\nreference = 4\n\
+                 [[metric]]\nuse = \"q/green.glsl\"\nparams = { GAIN = 2 }\nmean = { max = 2.0 }\n\
+                 [[metric]]\nuse = \"q/alias.glsl\"\nmax = { max = 0.4 }\n\
+                 [[metric]]\nuse = \"q/bad.glsl\"\n",
+            ),
+        ],
+    )?;
+    let m = movie(
+        dir,
+        "shotglass = \"0.1.4\"\n[[shot]]\nid=\"a\"\nscene=\"s.glsl\"\nduration=2\n",
+    )?;
+    if crate::validate::AVAILABLE {
+        for d in [Dialect::BASELINE, Dialect::WEB] {
+            let errors = crate::validate::validate_sources(&crate::quality::sources(&m, d)?);
+            if !errors.is_empty() {
+                bail!(
+                    "metric fixtures aren't strictly valid {d}:\n{}",
+                    errors.iter().map(|e| e.to_string()).collect::<String>()
+                );
+            }
+        }
+    }
+    let cfg = crate::quality::Config::of_film(&m)?.ok_or_else(|| anyhow!("no quality.toml"))?;
+    let rep = crate::quality::run(gl.clone(), &m, &cfg, &[1.0], true)?;
+    let close = |what: &str, got: Option<f64>, want: f64| -> Result<()> {
+        match got {
+            Some(g) if (g - want).abs() <= 1e-5 * want.abs().max(1.0) => Ok(()),
+            _ => bail!("{what}: got {got:?}, want {want}"),
+        }
+    };
+    // green: 2 × the ramp x/255 (exact in 8 bits); max at the last column.
+    let ramp = |x: usize| x as f64 / 255.0;
+    let mean = (0..158).map(|x| 2.0 * ramp(x)).sum::<f64>() / 158.0;
+    let g = &rep.metrics[0];
+    close("green mean", g.total.mean, mean)?;
+    close("green max", g.total.max, 2.0 * ramp(157))?;
+    if g.reference || !g.pass || g.total.pixels != 158 * 90 {
+        bail!("green: {g:?}");
+    }
+    // alias: one column differs by 0.5.
+    let a = &rep.metrics[1];
+    close("alias mean", a.total.mean, 0.5 / 158.0)?;
+    close("alias max", a.total.max, 0.5)?;
+    if !a.reference || a.pass || !a.failures.iter().any(|f| f.starts_with("max 0.5")) {
+        bail!(
+            "alias: reference {}, failures {:?}",
+            a.reference,
+            a.failures
+        );
+    }
+    let heat = a.heatmap.as_ref().ok_or_else(|| anyhow!("no heatmap"))?;
+    for (x, want) in [(79, 0u8), (80, 128), (81, 0)] {
+        let px = heat[4 + 45][4 + x];
+        if px[0].abs_diff(want) > 1 {
+            bail!("alias heatmap at x = {x}: {px:?}, want {want}");
+        }
+    }
+    // bad: NaN in 10 columns, Inf in the top row (overlap counted once).
+    let b = &rep.metrics[2];
+    let invalid = 10 * 90 + 148;
+    if b.total.invalid != invalid || b.total.pixels != 158 * 90 - invalid || b.pass {
+        bail!("bad: {:?}, failures {:?}", b.total, b.failures);
+    }
+    close("bad mean (finite only)", b.total.mean, 1.0)?;
+    if rep.pass {
+        bail!("the report passes with failing metrics");
+    }
+    Ok(format!(
+        "alias {:.6}/{:.2}, {} invalid",
+        a.total.mean.unwrap(),
+        a.total.max.unwrap(),
+        b.total.invalid
+    ))
+}
 
 pub fn run(filter: Option<String>) -> Result<()> {
     let dir = std::env::temp_dir().join(format!("shotglass-selftest-{}", std::process::id()));

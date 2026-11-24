@@ -14,6 +14,7 @@ mod headless;
 mod library;
 mod movie;
 mod project;
+mod quality;
 mod selftest;
 mod shader;
 mod sound;
@@ -225,6 +226,24 @@ enum Cmd {
         /// Only run tests whose name contains this text.
         filter: Option<String>,
     },
+    /// Measure the film's quality with the metrics in its quality.toml (library or film
+    /// GLSL): sample frames as `strip` picks them, a report, quality.json and one heatmap
+    /// sheet per metric. Fails when a metric is outside its limits or measures NaN/Inf.
+    Quality {
+        movie: PathBuf,
+        /// How many evenly spaced frames (default: quality.toml's count, else 8).
+        #[arg(long)]
+        count: Option<usize>,
+        /// Explicit times instead of --count.
+        #[arg(long)]
+        at: Option<String>,
+        /// Frame size (default: quality.toml's size, else 384x216).
+        #[arg(long)]
+        size: Option<String>,
+        /// Folder for quality.json and the heatmaps (a project gets one per film).
+        #[arg(long, default_value = "quality")]
+        out: PathBuf,
+    },
     /// Check the renderer and soundtrack on this GPU and driver with built-in test films.
     Selftest {
         /// Only run checks whose name contains this text.
@@ -375,6 +394,23 @@ fn real_main() -> Result<()> {
         Cmd::Freeze { movie } => bundle::run_freeze(&project::film(&movie)?),
         Cmd::Unfreeze { movie } => bundle::run_unfreeze(&project::film(&movie)?),
         Cmd::Test { target, filter } => test_glsl(&target, filter),
+        Cmd::Quality {
+            movie,
+            count,
+            at,
+            size,
+            out,
+        } => {
+            let single = matches!(project::target(&movie)?, project::Target::Film(_));
+            for_each_film(&movie, |f| {
+                let dir = if single {
+                    out.clone()
+                } else {
+                    out.join(f.file_name().unwrap_or_default())
+                };
+                quality_cmd(f, count, at.as_deref(), size.as_deref(), &dir)
+            })
+        }
         Cmd::Selftest { filter } => selftest::run(filter),
     }
 }
@@ -580,7 +616,7 @@ fn fetch_libraries(path: &Path, mode: library::FetchMode, verbose: bool) -> Resu
     Ok(())
 }
 
-fn parse_size(s: &str) -> Result<(i32, i32)> {
+pub(crate) fn parse_size(s: &str) -> Result<(i32, i32)> {
     let (w, h) = s
         .split_once(['x', 'X'])
         .ok_or_else(|| anyhow!("size must look like 1280x720"))?;
@@ -658,6 +694,45 @@ fn still(movie: &Path, at: &str, size: &str, out: &Path) -> Result<()> {
     })
 }
 
+/// A contact sheet's layout: `count` frames of w×h in rows of `cols`, 4 px apart on
+/// dark grey (`strip`, and `quality`'s heatmaps).
+pub(crate) struct Sheet {
+    cols: usize,
+    rows: usize,
+    w: usize,
+    h: usize,
+}
+
+impl Sheet {
+    const GAP: usize = 4;
+
+    pub(crate) fn new(count: usize, cols: usize, w: usize, h: usize) -> Sheet {
+        let cols = cols.clamp(1, count.max(1));
+        Sheet {
+            cols,
+            rows: count.div_ceil(cols).max(1),
+            w,
+            h,
+        }
+    }
+
+    pub(crate) fn blank(&self) -> Frame {
+        Frame::init(
+            self.cols * (self.w + Self::GAP) + Self::GAP,
+            self.rows * (self.h + Self::GAP) + Self::GAP,
+            [24, 24, 24, 255],
+        )
+    }
+
+    /// Top-left corner of frame `i`.
+    pub(crate) fn origin(&self, i: usize) -> (usize, usize) {
+        (
+            (i % self.cols) * (self.w + Self::GAP) + Self::GAP,
+            (i / self.cols) * (self.h + Self::GAP) + Self::GAP,
+        )
+    }
+}
+
 /// `strip --compare`: the reference picture and how close the strip must be.
 struct Golden {
     reference: PathBuf,
@@ -685,27 +760,19 @@ fn strip(
         }
     };
     let (w, h) = parse_size(size)?;
-    let cols = cols.clamp(1, times.len().max(1));
-    let rows = times.len().div_ceil(cols);
-    let gap = 4usize;
+    let layout = Sheet::new(times.len(), cols, w as usize, h as usize);
     let out = out.to_path_buf();
     headless::with_gl(move |gl| {
         let mut r = load_renderer(gl, &m)?;
         r.set_readback(true);
-        let (w, h) = (w as usize, h as usize);
-        let mut sheet = Frame::init(
-            cols * (w + gap) + gap,
-            rows * (h + gap) + gap,
-            [24, 24, 24, 255],
-        );
+        let mut sheet = layout.blank();
         for (i, t) in times.iter().enumerate() {
-            r.render(&m, w as i32, h as i32, &frame_info(&m, *t), true)
+            r.render(&m, w, h, &frame_info(&m, *t), true)
                 .ok_or_else(|| anyhow!("nothing rendered"))?;
             if let Some(e) = r.footage_failure() {
                 bail!("{t:.3}s: {e}");
             }
-            let (x, y) = ((i % cols) * (w + gap) + gap, (i / cols) * (h + gap) + gap);
-            r.read_output_into(&mut sheet, (x, y));
+            r.read_output_into(&mut sheet, layout.origin(i));
             println!("#{i:<3} {:>7.2}s  {}", t, describe(&m, *t));
         }
         save_png(&out, &sheet)?;
@@ -715,6 +782,59 @@ fn strip(
             None => Ok(()),
         }
     })
+}
+
+fn quality_cmd(
+    movie: &Path,
+    count: Option<usize>,
+    at: Option<&str>,
+    size: Option<&str>,
+    out: &Path,
+) -> Result<()> {
+    let m = load_movie(movie)?;
+    let mut cfg = quality::Config::of_film(&m)?.ok_or_else(|| {
+        anyhow!(
+            "{} has no {} (metrics to run: see README, \"Quality metrics\")",
+            m.root.display(),
+            quality::QUALITY_FILE
+        )
+    })?;
+    if let Some(s) = size {
+        cfg.size = parse_size(s)?;
+    }
+    let times = match at {
+        Some(a) => parse_times(a, &m)?,
+        None => {
+            let n = count.unwrap_or(cfg.count).max(1);
+            (0..n)
+                .map(|i| m.duration * (i as f32 + 0.5) / n as f32)
+                .collect()
+        }
+    };
+    let out = out.to_path_buf();
+    headless::with_gl(move |gl| {
+        let report = quality::run(gl, &m, &cfg, &times, true)?;
+        report.print();
+        report.write(&out)?;
+        println!("wrote {}", out.join("quality.json").display());
+        let failed: Vec<&str> = report
+            .metrics
+            .iter()
+            .filter(|x| !x.pass)
+            .map(|x| x.name.as_str())
+            .collect();
+        if !failed.is_empty() {
+            bail!("quality: {} failed", failed.join(", "));
+        }
+        Ok(())
+    })
+}
+
+/// Every shader the film compiles plus its quality metrics, for the strict check.
+fn strict_sources(m: &Movie, d: shader::Dialect) -> Result<Vec<validate::Source>> {
+    let mut s = validate::movie_sources(m, d);
+    s.extend(quality::sources(m, d)?);
+    Ok(s)
 }
 
 fn compare_golden(sheet: &Frame, out: &Path, g: &Golden) -> Result<()> {
@@ -807,7 +927,7 @@ fn strict_check(m: &Movie, web: bool) -> Result<()> {
         );
     }
     let desktop = Dialect::desktop(m.glsl);
-    let sources = validate::movie_sources(m, desktop);
+    let sources = strict_sources(m, desktop)?;
     let errors = validate::validate_sources(&sources);
     if !errors.is_empty() {
         report(&errors);
@@ -823,7 +943,7 @@ fn strict_check(m: &Movie, web: bool) -> Result<()> {
         ),
         Some(_) => {}
         None => {
-            let errors = validate::validate_movie(m, Dialect::WEB);
+            let errors = validate::validate_sources(&strict_sources(m, Dialect::WEB)?);
             if errors.is_empty() {
                 println!("strict GLSL: valid as {} (web)", Dialect::WEB);
             } else if web {

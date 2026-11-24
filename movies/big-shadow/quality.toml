@@ -1,0 +1,16 @@
+# `shotglass quality movies/big-shadow`: see README, "Quality metrics".
+count = 8
+size = "384x216"
+reference = 4
+
+[[metric]]
+use = "metrics/alias.glsl"
+name = "alias"
+params = { GAIN = 4 }
+mean = { max = 0.01 }    # measured 0.0059 (RTX 3060, 2026-11)
+
+[[metric]]
+use = "metrics/clipping.glsl"
+name = "clipping"
+params = { LEVEL = 0.999 }
+mean = { max = 0.001 }   # share of clipped pixels; measured 0.00002
