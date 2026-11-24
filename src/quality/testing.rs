@@ -384,7 +384,12 @@ fn measure_case(
                 let mut given = tex[1..].iter();
                 let inputs: Vec<(&str, glow::Texture)> = std::iter::once(("sg_frame", tex[0]))
                     .chain(VARIANTS.iter().zip(variants).map(|((_, _, s), v)| {
-                        (*s, v.as_ref().and(given.next().copied()).unwrap_or(tex[0]))
+                        (
+                            *s,
+                            v.as_ref()
+                                .and_then(|_| given.next().copied())
+                                .unwrap_or(tex[0]),
+                        )
                     }))
                     .collect();
                 let r = Gpu::with(gl, d, size, |g| unsafe {
