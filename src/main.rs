@@ -21,6 +21,7 @@ mod sound;
 mod text;
 mod texture;
 mod validate;
+mod webm;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
