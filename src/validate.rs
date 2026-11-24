@@ -393,7 +393,7 @@ mod tests {
             errors.is_empty(),
             "{} at {d}:\n{}",
             m.title,
-            errors.iter().map(|e| e.to_string()).collect::<String>()
+            crate::gfx::join_errors(&errors)
         );
     }
 
@@ -570,7 +570,7 @@ mod tests {
         // `return 1;` from a float function: implicit int→float, invalid in GLSL ES.
         let m = film("bad.glsl");
         let errors = validate_movie(&m, Dialect::WEB);
-        let text = errors.iter().map(|e| e.to_string()).collect::<String>();
+        let text = crate::gfx::join_errors(&errors);
         assert!(text.contains("kit/bad.glsl:2"), "{text}");
         // The film defining a function the library already does: the clash comes first,
         // naming both places, ahead of glslang's "redefinition".

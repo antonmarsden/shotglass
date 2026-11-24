@@ -21,9 +21,10 @@
 
 mod config;
 mod gpu;
+mod loudness;
 mod stats;
 
-pub use config::{Config, QUALITY_FILE, tighten};
+pub use config::{Config, QUALITY_FILE, SOUND_MARGIN_DB, tighten};
 pub use stats::Report;
 
 use crate::gfx::{Frame, FrameInfo, Renderer};
@@ -34,7 +35,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use config::Metric;
 use eframe::glow::{self, HasContext};
 use gpu::{Gpu, Texels};
-use stats::{FrameReport, MetricReport, Reduced, Totals};
+use stats::{FrameReport, MetricReport, Reduced, SoundReport, Totals};
 use std::sync::Arc;
 use toodee::{CopyOps, TooDeeOps, TooDeeOpsMut, TranslateOps};
 
@@ -317,8 +318,22 @@ struct Collected {
     sheet: Option<Frame>,
 }
 
-/// Render `times` of `m` and measure them with `cfg`'s metrics. `heatmaps` keeps a
-/// contact sheet per metric (as `strip` lays frames out).
+/// Synthesise the whole soundtrack (one period of a loop film) at
+/// [`loudness::RATE`] and meter it. None: the film has no sound.
+fn measure_sound(r: &mut Renderer, m: &Movie) -> Result<Option<loudness::Loudness>> {
+    if !m.has_sound() {
+        return Ok(None);
+    }
+    let mut st = crate::export::soundtrack(r, m, loudness::RATE)?;
+    let mut meter = loudness::Meter::new();
+    st.render_all(r, |d| meter.push(d))
+        .map_err(|e| anyhow!(e))?;
+    Ok(Some(meter.finish()))
+}
+
+/// Render `times` of `m` and measure them with `cfg`'s metrics, and the soundtrack
+/// if `cfg` has `[sound]`. `heatmaps` keeps a contact sheet per metric (as `strip`
+/// lays frames out).
 pub fn run(
     gl: Arc<glow::Context>,
     m: &Movie,
@@ -329,11 +344,14 @@ pub fn run(
     let mut r = Renderer::new(gl.clone())?;
     r.set_readback(true);
     if let Err(errors) = r.load_all(m) {
-        bail!(
-            "shader errors:\n{}",
-            errors.iter().map(|e| e.to_string()).collect::<String>()
-        );
+        bail!("shader errors:\n{}", crate::gfx::join_errors(&errors));
     }
+    let sound = match &cfg.sound {
+        Some(sc) => Some(SoundReport::judge(sc, measure_sound(&mut r, m)?)),
+        None => None,
+    };
+    // Sound only: no picture to render.
+    let times = if cfg.metrics.is_empty() { &[] } else { times };
     let dialect = r.dialect_for(m).map_err(|e| anyhow!(e))?;
     let size = (cfg.size.0 as usize, cfg.size.1 as usize);
     let n = cfg.reference as usize;
@@ -362,6 +380,9 @@ pub fn run(
                     size.1
                 );
             }
+        }
+        if times.is_empty() {
+            return Ok(());
         }
         let g = unsafe { Gpu::new(&gl, dialect, size.0 as i32, size.1 as i32)? };
         let out = (|| -> Result<()> {
@@ -410,7 +431,7 @@ pub fn run(
     })();
     progs.delete(&gl);
     result?;
-    Ok(report(m, cfg, &progs.reads, collected, frames))
+    Ok(report(m, cfg, &progs.reads, collected, frames, sound))
 }
 
 /// The report: each metric's totals over the frames, judged against its limits.
@@ -420,6 +441,7 @@ fn report(
     reads: &[[bool; 3]],
     collected: Vec<Collected>,
     frames: Vec<FrameReport>,
+    sound: Option<SoundReport>,
 ) -> Report {
     let metrics: Vec<MetricReport> = cfg
         .metrics
@@ -453,7 +475,7 @@ fn report(
         })
         .collect();
     Report {
-        schema: 2,
+        schema: 3,
         engine: env!("CARGO_PKG_VERSION"),
         film: m
             .root
@@ -463,8 +485,9 @@ fn report(
         size: [cfg.size.0 as u32, cfg.size.1 as u32],
         reference: cfg.reference,
         frames,
-        pass: metrics.iter().all(|x| x.pass),
+        pass: metrics.iter().all(|x| x.pass) && sound.as_ref().is_none_or(|s| s.pass),
         metrics,
+        sound,
     }
 }
 

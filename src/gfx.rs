@@ -124,6 +124,11 @@ const TRANSITION_FOOTER: &str = "void main(){\n  vec2 fc = gl_FragCoord.xy;\n  i
 /// An RGBA8 image, one `[r, g, b, a]` cell per pixel, top row first.
 pub type Frame = toodee::TooDee<[u8; 4]>;
 
+/// Error messages one after another (each `Display` ends with its own newline).
+pub fn join_errors<E: std::fmt::Display>(errors: &[E]) -> String {
+    errors.iter().map(|e| e.to_string()).collect()
+}
+
 /// A shader that failed to compile, with messages mapped to file:line.
 #[derive(Clone, Debug)]
 pub struct ShaderError {

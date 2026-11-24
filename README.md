@@ -1193,9 +1193,26 @@ Values outside `range` count in the end bins. Two checks are fixed: **invalid** 
 NaN/Inf measures, which are left out of everything else and always fail the metric;
 **cost** reports the GPU time of each frame (never gated; meaningless on software
 OpenGL). `check` validates metric shaders strictly like every other shader (`check
---web` too). `quality.json` (`schema` 2) records the engine and library versions, the
-size, each frame (with the `@prev`/`@next` frames shown), and each metric's variants,
-per-frame values, totals (with percentiles and the histogram), limits and failures.
+--web` too). `quality.json` (`schema` 3) records the engine and library versions, the
+size, each frame (with the `@prev`/`@next` frames shown), each metric's variants,
+per-frame values, totals (with percentiles and the histogram), limits and failures,
+and the `sound` section.
+
+**Sound.** A `[sound]` table measures the whole soundtrack (one period of a loop film),
+synthesised at 48 kHz, in the engine, not in GLSL:
+
+```toml
+[sound]
+integrated = { min = -24, max = -18 }   # LUFS
+true_peak = { max = -1 }                 # dBTP
+```
+
+The measures are those of ITU-R BS.1770-4 (as in EBU R 128): `integrated` loudness in
+LUFS (K-weighted, 400 ms blocks, gated at -70 LUFS and 10 LU below the ungated
+level), `momentary_max` (400 ms) and `short_term_max` (3 s) in LUFS, `sample_peak` in
+dBFS and `true_peak` in dBTP (4× oversampled). Each takes a `min`/`max`. A limit fails
+if its measure is missing: a film without sound, silence, or one shorter than the
+window. A `quality.toml` may have only `[sound]`; then no frames are rendered.
 
 **The ratchet.** `quality --tighten` runs the metrics and, if every one passes, moves
 each limit in `quality.toml` to the measured value plus `--margin` (default 25%, at
@@ -1203,9 +1220,10 @@ least 1e-6), rounded outward to 3 significant digits. It only ever tightens: a m
 down, a min goes up; comments and layout are kept. Leave room for other renderers: CI's
 software OpenGL and real GPUs differ by several percent on some metrics, so tighten
 with a margin that covers both (or on the renderer CI uses).
+`[sound]` limits move to the measured value ± 0.5 dB, rounded outward to tenths.
 
 The demo (`movies/big-shadow`) has a `quality.toml` with two film metrics in
-`metrics/` (aliasing against `@reference`, clipped highlights) as examples.
+`metrics/` (aliasing against `@reference`, clipped highlights) as examples, and `[sound]` loudness and true-peak limits.
 
 ## Command line
 

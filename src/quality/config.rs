@@ -71,13 +71,14 @@ impl Bound {
         self.min.is_some() || self.max.is_some()
     }
 
-    /// Why `v` is outside, if it is (no value at all fails a set bound).
-    pub fn violation(&self, what: &str, v: Option<f64>) -> Option<String> {
+    /// Why `v` is outside, if it is. No value at all fails a set bound, saying
+    /// `missing` (why there was nothing to measure).
+    pub fn violation(&self, what: &str, v: Option<f64>, missing: &str) -> Option<String> {
         if !self.is_set() {
             return None;
         }
         let Some(v) = v else {
-            return Some(format!("{what}: no finite pixels to measure"));
+            return Some(format!("{what}: {missing}"));
         };
         if let Some(lo) = self.min.filter(|lo| v < *lo) {
             return Some(format!("{what} {v:.6} < min {lo}"));
@@ -97,6 +98,74 @@ struct RawConfig {
     reference: Option<u32>,
     #[serde(default)]
     metric: Vec<toml::Table>,
+    sound: Option<toml::Table>,
+}
+
+/// A sound measurement the engine makes (`loudness.rs`), named in `[sound]`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SoundStat {
+    Integrated,
+    MomentaryMax,
+    ShortTermMax,
+    SamplePeak,
+    TruePeak,
+}
+
+impl SoundStat {
+    pub const ALL: [SoundStat; 5] = [
+        SoundStat::Integrated,
+        SoundStat::MomentaryMax,
+        SoundStat::ShortTermMax,
+        SoundStat::SamplePeak,
+        SoundStat::TruePeak,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            SoundStat::Integrated => "integrated",
+            SoundStat::MomentaryMax => "momentary_max",
+            SoundStat::ShortTermMax => "short_term_max",
+            SoundStat::SamplePeak => "sample_peak",
+            SoundStat::TruePeak => "true_peak",
+        }
+    }
+
+    pub fn parse(key: &str) -> Option<SoundStat> {
+        SoundStat::ALL.into_iter().find(|s| s.name() == key)
+    }
+}
+
+/// `[sound]`: the soundtrack is measured (loudness, peaks) and these limits apply.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SoundConfig {
+    pub limits: Vec<(SoundStat, Bound)>,
+}
+
+/// A `{ min, max }` limit; `ctx` names it in errors (`metric "x": mean`).
+fn parse_bound(v: &toml::Value, ctx: &str) -> Result<Bound> {
+    let b: Bound = v.clone().try_into().context(ctx.to_string())?;
+    if let (Some(lo), Some(hi)) = (b.min, b.max)
+        && lo > hi
+    {
+        bail!("{ctx} has min {lo} > max {hi}");
+    }
+    Ok(b)
+}
+
+fn parse_sound(t: &toml::Table) -> Result<SoundConfig> {
+    let mut limits = vec![];
+    for (k, v) in t {
+        let stat = SoundStat::parse(k).ok_or_else(|| {
+            anyhow!(
+                "[sound]: unknown field `{k}` (expected {})",
+                SoundStat::ALL.map(|s| s.name()).join(", ")
+            )
+        })?;
+        let b = parse_bound(v, &format!("[sound]: {k}"))?;
+        limits.push((stat, b));
+    }
+    limits.sort_by_key(|(s, _)| *s);
+    Ok(SoundConfig { limits })
 }
 
 /// `quality.toml`, resolved.
@@ -107,6 +176,8 @@ pub struct Config {
     /// Supersampling factor N of `@reference` (N×N samples per pixel).
     pub reference: u32,
     pub metrics: Vec<Metric>,
+    /// `[sound]`, if present: measure the soundtrack.
+    pub sound: Option<SoundConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -282,15 +353,7 @@ fn parse_metric(t: &toml::Table, taken: &[Metric]) -> Result<Metric> {
                  threshold, or a limit: mean, min, max, over, p1..p99)"
             )
         })?;
-        let b: Bound = v
-            .clone()
-            .try_into()
-            .with_context(|| format!("metric \"{name}\": {k}"))?;
-        if let (Some(lo), Some(hi)) = (b.min, b.max)
-            && lo > hi
-        {
-            bail!("metric \"{name}\": {k} has min {lo} > max {hi}");
-        }
+        let b = parse_bound(v, &format!("metric \"{name}\": {k}"))?;
         if stat == Stat::Over && threshold.is_none() {
             bail!("metric \"{name}\": an over limit needs threshold = <measure>");
         }
@@ -321,19 +384,21 @@ impl Config {
                 "reference must be 2 to {MAX_REFERENCE} (samples per pixel along each axis), not {reference}"
             );
         }
-        if raw.metric.is_empty() {
-            bail!("no [[metric]] entries");
+        if raw.metric.is_empty() && raw.sound.is_none() {
+            bail!("nothing to measure: no [[metric]] entries and no [sound] table");
         }
         let mut metrics: Vec<Metric> = vec![];
         for t in &raw.metric {
             let m = parse_metric(t, &metrics)?;
             metrics.push(m);
         }
+        let sound = raw.sound.as_ref().map(parse_sound).transpose()?;
         Ok(Config {
             count,
             size,
             reference,
             metrics,
+            sound,
         })
     }
 }
@@ -374,23 +439,79 @@ fn round_sig(x: f64, up: bool) -> f64 {
     format!("{r:.decimals$}").parse().unwrap_or(r)
 }
 
-/// `--tighten`: every limit in `text` moves to the measured value plus `margin`
-/// (a fraction of it, at least `ABS_MARGIN`), rounded outward to 3 significant
-/// digits, but only towards stricter: a max goes down, a min goes up, never back.
-/// `measured(i, stat)` is metric i's value. Comments and layout are kept.
-/// Returns the new text and one line per change.
+/// `--tighten`'s margin for `[sound]` limits, in dB (LU): loudness meters agree to
+/// a few tenths, and synthesis differs slightly between drivers.
+pub const SOUND_MARGIN_DB: f64 = 0.5;
+
+/// `x` rounded outward to tenths (dB values: LUFS, dBTP), as a tidy decimal.
+fn round_tenth(x: f64, up: bool) -> f64 {
+    let r = if up {
+        (x * 10.0 - 1e-9).ceil() / 10.0
+    } else {
+        (x * 10.0 + 1e-9).floor() / 10.0
+    };
+    format!("{r:.1}").parse().unwrap_or(r)
+}
+
+/// Move the `min`/`max` of one limit `bound` towards the measured `v` padded by `pad`
+/// (`round` outward), only if that's stricter. One line per change.
+fn tighten_bound(
+    bound: &mut dyn toml_edit::TableLike,
+    what: &str,
+    v: f64,
+    pad: f64,
+    round: fn(f64, bool) -> f64,
+    changes: &mut Vec<String>,
+) {
+    for (side, up) in [("max", true), ("min", false)] {
+        let old = bound
+            .get(side)
+            .and_then(|x| x.as_float().or_else(|| x.as_integer().map(|i| i as f64)));
+        let Some(old) = old else { continue };
+        let new = round(if up { v + pad } else { v - pad }, up);
+        let stricter = if up { new < old } else { new > old };
+        if stricter {
+            bound.insert(side, toml_edit::value(new));
+            changes.push(format!("{what} {side} {old} → {new} (measured {v:.6})"));
+        }
+    }
+}
+
+/// `--tighten`: every limit in `text` moves to the measured value plus a margin,
+/// rounded outward, but only towards stricter: a max goes down, a min goes up, never
+/// back. Metric limits get `margin` (a fraction of the value, at least `ABS_MARGIN`)
+/// and 3 significant digits; `[sound]` limits (dB) get `sound_margin` dB and tenths.
+/// `metric(i, stat)` is metric i's value, `sound(stat)` the soundtrack's. Comments and
+/// layout are kept. Returns the new text and one line per change.
 pub fn tighten(
     text: &str,
     margin: f64,
-    measured: impl Fn(usize, Stat) -> Option<f64>,
+    sound_margin: f64,
+    metric: impl Fn(usize, Stat) -> Option<f64>,
+    sound: impl Fn(SoundStat) -> Option<f64>,
 ) -> Result<(String, Vec<String>)> {
     let mut doc: toml_edit::DocumentMut = text.parse()?;
     let mut changes = vec![];
+    if let Some(t) = doc.get_mut("sound").and_then(|t| t.as_table_like_mut()) {
+        let keys: Vec<String> = t.iter().map(|(k, _)| k.to_string()).collect();
+        for key in keys {
+            let (Some(stat), Some(bound)) = (
+                SoundStat::parse(&key),
+                t.get_mut(&key).and_then(|b| b.as_table_like_mut()),
+            ) else {
+                continue;
+            };
+            if let Some(v) = sound(stat) {
+                let what = format!("sound: {key}");
+                tighten_bound(bound, &what, v, sound_margin, round_tenth, &mut changes);
+            }
+        }
+    }
     let Some(metrics) = doc
         .get_mut("metric")
         .and_then(|m| m.as_array_of_tables_mut())
     else {
-        return Ok((text.to_string(), changes));
+        return Ok((doc.to_string(), changes));
     };
     for (i, t) in metrics.iter_mut().enumerate() {
         let name = t
@@ -403,25 +524,13 @@ pub fn tighten(
             let Some(stat) = Stat::parse(&key) else {
                 continue;
             };
-            let Some(v) = measured(i, stat) else { continue };
+            let Some(v) = metric(i, stat) else { continue };
             let Some(bound) = t.get_mut(&key).and_then(|b| b.as_table_like_mut()) else {
                 continue;
             };
             let pad = (v.abs() * margin).max(ABS_MARGIN);
-            for (side, up) in [("max", true), ("min", false)] {
-                let old = bound
-                    .get(side)
-                    .and_then(|x| x.as_float().or_else(|| x.as_integer().map(|i| i as f64)));
-                let Some(old) = old else { continue };
-                let new = round_sig(if up { v + pad } else { v - pad }, up);
-                let stricter = if up { new < old } else { new > old };
-                if stricter {
-                    bound.insert(side, toml_edit::value(new));
-                    changes.push(format!(
-                        "{name}: {key} {side} {old} → {new} (measured {v:.6})"
-                    ));
-                }
-            }
+            let what = format!("{name}: {key}");
+            tighten_bound(bound, &what, v, pad, round_sig, &mut changes);
         }
     }
     Ok((doc.to_string(), changes))
@@ -534,7 +643,15 @@ over = { max = 0.01 }
     #[test]
     fn refuses_bad_configs() {
         let bad = [
-            ("", "no [[metric]]"),
+            ("", "nothing to measure"),
+            (
+                "[sound]\nloudness = { max = 1 }\n",
+                "unknown field `loudness`",
+            ),
+            (
+                "[sound]\ntrue_peak = { min = 0, max = -1 }\n",
+                "min 0 > max -1",
+            ),
             ("[[metric]]\nname = \"x\"\n", "no use"),
             ("[[metric]]\nuse = \"alias\"\n", "needs a library"),
             (
@@ -591,6 +708,57 @@ over = { max = 0.01 }
     }
 
     #[test]
+    fn parses_sound_limits() {
+        let c = Config::parse(
+            "[sound]\ntrue_peak = { max = -1 }\nintegrated = { min = -18, max = -14 }\n",
+        )
+        .unwrap();
+        assert!(c.metrics.is_empty());
+        let limits = c.sound.unwrap().limits;
+        assert_eq!(
+            limits,
+            vec![
+                (
+                    SoundStat::Integrated,
+                    Bound {
+                        min: Some(-18.0),
+                        max: Some(-14.0)
+                    }
+                ),
+                (
+                    SoundStat::TruePeak,
+                    Bound {
+                        min: None,
+                        max: Some(-1.0)
+                    }
+                ),
+            ]
+        );
+        // An empty [sound] measures and reports, with no limits.
+        assert_eq!(
+            Config::parse("[sound]\n").unwrap().sound,
+            Some(SoundConfig::default())
+        );
+    }
+
+    #[test]
+    fn tighten_sound_limits_in_tenths_of_a_db() {
+        let text = "[sound]\nintegrated = { min = -20, max = -10 }\ntrue_peak = { max = 0 }\n";
+        let sound = |s: SoundStat| match s {
+            SoundStat::Integrated => Some(-16.04),
+            SoundStat::TruePeak => Some(-1.23),
+            _ => None,
+        };
+        let (out, changes) = tighten(text, 0.25, 0.5, |_, _| None, sound).unwrap();
+        assert_eq!(
+            out,
+            "[sound]\nintegrated = { min = -16.6, max = -15.5 }\ntrue_peak = { max = -0.7 }\n"
+        );
+        assert_eq!(changes.len(), 3, "{changes:?}");
+        assert!(changes[0].starts_with("sound: integrated max -10 → -15.5"));
+    }
+
+    #[test]
     fn rounds_to_three_significant_digits() {
         assert_eq!(round_sig(0.0064505, true), 0.00646);
         assert_eq!(round_sig(0.0064505, false), 0.00645);
@@ -621,7 +789,7 @@ mean = { max = 0.0001 }
             (1, Stat::Mean) => Some(0.000095), // + 10% is above the limit: kept
             _ => None,
         };
-        let (out, changes) = tighten(text, 0.1, measured).unwrap();
+        let (out, changes) = tighten(text, 0.1, 0.5, measured, |_| None).unwrap();
         assert_eq!(
             out,
             "\
@@ -641,7 +809,7 @@ mean = { max = 0.0001 }
         assert_eq!(changes.len(), 4, "{changes:?}");
         assert!(changes[0].starts_with("alias: mean max 0.01 → 0.00649"));
         // A second run changes nothing.
-        let (again, none) = tighten(&out, 0.1, measured).unwrap();
+        let (again, none) = tighten(&out, 0.1, 0.5, measured, |_| None).unwrap();
         assert_eq!(again, out);
         assert!(none.is_empty(), "{none:?}");
     }
