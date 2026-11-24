@@ -178,7 +178,7 @@ const CHECKS: &[Check] = &[
         run: sound_no_clicks,
     },
     Check {
-        name: "sound shader errors point at the right file and line",
+        name: "sound shader errors report the file and line and respect fallback timing",
         run: sound_errors,
     },
     Check {
@@ -2057,12 +2057,19 @@ fn sound_no_clicks(gl: &Gl, dir: &Path) -> Result<String> {
 
 fn sound_errors(gl: &Gl, dir: &Path) -> Result<String> {
     let m = sound_fixture(dir)?;
-    std::fs::write(
-        dir.join("music.glsl"),
-        "// music\n\nvec2 mainSound(int samp, float time) {\n  return vec2(nope);\n}\n",
-    )?;
     let mut r = Renderer::new(gl.clone())?;
     let mut st = Soundtrack::new();
+    st.set_movie(&mut r, &m, 48000)
+        .map_err(|e| anyhow!("{e:?}"))?;
+    let version = st.version();
+    let last = st.total_chunks() - 1;
+    let samples = st.chunk(&mut r, last).map_err(|e| anyhow!(e))?;
+    let music = dir.join("music.glsl");
+    let working = std::fs::read(&music)?;
+    std::fs::write(
+        &music,
+        "// music\n\nvec2 mainSound(int samp, float time) {\n  return vec2(nope);\n}\n",
+    )?;
     match st.set_movie(&mut r, &m, 48000) {
         Ok(()) => bail!("a broken music shader was accepted"),
         Err(e) => {
@@ -2071,6 +2078,31 @@ fn sound_errors(gl: &Gl, dir: &Path) -> Result<String> {
                 bail!("expected an error at music.glsl:4, got:\n{text}");
             }
         }
+    }
+    if st.version() != version
+        || !std::sync::Arc::ptr_eq(&samples, &st.chunk(&mut r, last).map_err(|e| anyhow!(e))?)
+    {
+        bail!("a broken shader discarded timing-compatible fallback audio");
+    }
+    let changed = movie(
+        dir,
+        &SOUND_MOVIE.replace("duration = 1.03", "duration = 2.03"),
+    )?;
+    if changed.sound_samples(48000) <= m.sound_samples(48000) {
+        bail!("the reload fixture did not extend the soundtrack");
+    }
+    if st.set_movie(&mut r, &changed, 48000).is_ok()
+        || st.version().is_some()
+        || st.total_chunks() != 0
+        || st.in_flight() != 0
+    {
+        bail!("a broken reload with a longer film kept stale soundtrack timing");
+    }
+    std::fs::write(music, working)?;
+    st.set_movie(&mut r, &changed, 48000)
+        .map_err(|e| anyhow!("{e:?}"))?;
+    if st.version().is_none() || st.total_samples() != changed.sound_samples(48000) {
+        bail!("fixing the shader did not restore audio at the new film length");
     }
     Ok(String::new())
 }
@@ -2207,7 +2239,31 @@ fn export_lossless(gl: &Gl, dir: &Path) -> Result<String> {
     }
     // FFV1 + FLAC: lossless, so frames and samples must come back exactly.
     let mkv = dir.join("film.mkv");
+    let previous = b"previous export";
+    std::fs::write(&mkv, previous)?;
+    let old_wav_path = dir.join("film.mkv.shotglass-sound.wav");
+    std::fs::write(&old_wav_path, b"unrelated WAV")?;
+    let snapshot = || -> Result<Vec<_>> {
+        let mut names = std::fs::read_dir(dir)?
+            .map(|entry| entry.map(|e| e.file_name()))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        names.sort();
+        Ok(names)
+    };
+    let before = snapshot()?;
+    let bad = Format::Ffmpeg(vec!["-c:v".into(), "shotglass_no_such_encoder".into()]);
+    match run(bad, mkv.clone(), &no_cancel, u64::MAX) {
+        Err(e) if e.to_string().starts_with("ffmpeg failed") => {}
+        Err(e) => bail!("failed video export reported: {e:#}"),
+        Ok(_) => bail!("export accepted an invalid encoder"),
+    }
+    if std::fs::read(&mkv)? != previous || snapshot()? != before {
+        bail!("failed export changed the existing output or left staged files");
+    }
     let s = run(Format::Ffv1, mkv.clone(), &no_cancel, u64::MAX)?;
+    if snapshot()? != before || std::fs::read(&old_wav_path)? != b"unrelated WAV" {
+        bail!("video export changed an unrelated file or left staged files");
+    }
     let video = decode(
         &mkv,
         &["-map", "0:v:0", "-f", "rawvideo", "-pix_fmt", "rgba"],
@@ -2248,8 +2304,19 @@ fn export_lossless(gl: &Gl, dir: &Path) -> Result<String> {
         Err(e) => bail!("cancelled export failed oddly: {e:#}"),
         Ok(_) => bail!("cancelling didn't stop the export"),
     }
-    if cancelled.exists() {
-        bail!("a cancelled export left {}", cancelled.display());
+    if snapshot()? != before {
+        bail!("a cancelled export left files behind");
+    }
+    // A cancellation reported by the final progress callback must also abort.
+    let video_file = std::fs::read(&mkv)?;
+    let stop = AtomicBool::new(false);
+    match run(Format::Ffv1, mkv.clone(), &stop, total) {
+        Err(e) if e.to_string() == "cancelled" => {}
+        Err(e) => bail!("last-frame cancellation failed oddly: {e:#}"),
+        Ok(_) => bail!("last-frame cancellation published a video"),
+    }
+    if std::fs::read(&mkv)? != video_file || snapshot()? != before {
+        bail!("last-frame cancellation changed the existing video or left staged files");
     }
     notes.insert(
         0,

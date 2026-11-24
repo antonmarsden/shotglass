@@ -19,7 +19,8 @@ headless stills. Rust + OpenGL, no browser.
   of sync, and adaptive resolution keeps frames on time.
 - **Live reload.** Save a shader or `movie.toml` and the player reloads in place
   at the same moment. A broken shader shows its errors (with correct file:line)
-  while the last working version keeps playing.
+  while the last working version keeps playing. If a sound shader fails and the
+  film length or loop mode changes, playback is silent until the sound compiles.
 - **Long films too.** Shaders compile just ahead of the playhead and sound is
   synthesised in small chunks, so a long, many-shot episode opens straight away
   and memory doesn't grow with its length (see [Long films](#long-films)).
@@ -1304,7 +1305,11 @@ shotglass export movies/my-film --out frames/                       # PNG sequen
   as rendered (full range, tagged as RGB). VP9 and AV1 store colour at half
   resolution, so the size must be even.
 - **Progress and Ctrl-C.** Progress goes to the terminal. Ctrl-C stops the export
-  and removes the half-written file (a second Ctrl-C quits at once).
+  (a second Ctrl-C quits at once). Video exports replace the destination only
+  after encoding succeeds.
+- **PNG retries.** Export PNGs to a fresh folder for each retry. Frames and
+  `sound.wav` are written directly into the folder, so an interrupted export can
+  leave partial results and a shorter or silent export can leave older files there.
 
 | `--format` | default for | video | audio | use it for |
 |---|---|---|---|---|

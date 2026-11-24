@@ -299,19 +299,8 @@ impl Sink {
     }
 }
 
-/// Removes a file (the temporary WAV, or a half-written export) when dropped.
-struct Cleanup(Option<PathBuf>);
-
-impl Drop for Cleanup {
-    fn drop(&mut self) {
-        if let Some(p) = self.0.take() {
-            let _ = std::fs::remove_file(p);
-        }
-    }
-}
-
 /// Render `m` to `opts.out`. `progress(done, total)` is called after each frame;
-/// setting `cancel` stops the export and removes the partial file.
+/// a cancelled video export discards its staged files.
 pub fn export(
     r: &mut Renderer,
     m: &Movie,
@@ -321,6 +310,12 @@ pub fn export(
 ) -> Result<Summary> {
     let (w, h) = (opts.w, opts.h);
     opts.format.check_size(w, h)?;
+    if opts.loops > 1 && m.loop_frames.is_none() {
+        bail!("--loops needs a film with loop = true");
+    }
+    if cancel.load(Ordering::Relaxed) {
+        bail!("cancelled");
+    }
     let png = opts.format == Format::Png;
     let encoders = if png {
         String::new()
@@ -333,39 +328,46 @@ pub fn export(
     } else {
         codec_args(&opts.format, &encoders, sound)?
     };
-    if png {
+    let staged = if png {
         std::fs::create_dir_all(&opts.out)
             .with_context(|| format!("couldn't create {}", opts.out.display()))?;
-    } else if let Some(dir) = opts.out.parent().filter(|d| !d.as_os_str().is_empty()) {
+        None
+    } else {
+        let dir = opts
+            .out
+            .parent()
+            .filter(|d| !d.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let name = opts
+            .out
+            .file_name()
+            .context("expected an output file name")?;
         std::fs::create_dir_all(dir)?;
-    }
+        // Keep the output name for FFmpeg's muxer selection and stage beside the
+        // destination so publishing only needs a rename.
+        let temp = tempfile::Builder::new()
+            .prefix(".shotglass-export-")
+            .tempdir_in(dir)?;
+        let video_dir = temp.path().join("video");
+        std::fs::create_dir(&video_dir)?;
+        Some((temp, video_dir.join(name)))
+    };
 
     // Sound first: it's quick, and ffmpeg needs the whole file as its second input.
-    let mut wav_tmp = Cleanup(None);
     let mut audio_frames = 0;
-    let wav = if png {
-        opts.out.join("sound.wav")
-    } else {
-        let mut name = opts.out.file_name().unwrap_or_default().to_os_string();
-        name.push(".shotglass-sound.wav");
-        opts.out.with_file_name(name)
-    };
+    let wav = staged
+        .as_ref()
+        .map_or(opts.out.as_path(), |(temp, _)| temp.path())
+        .join("sound.wav");
     if sound {
-        if !png {
-            wav_tmp.0 = Some(wav.clone());
-        }
         audio_frames = write_wav(r, m, opts.rate, &wav, opts.loops)?;
     }
-
-    if opts.loops > 1 && m.loop_frames.is_none() {
-        bail!("--loops needs a film with loop = true");
+    if cancel.load(Ordering::Relaxed) {
+        bail!("cancelled");
     }
     let total = m.frame_count() * opts.loops.max(1);
     let mut child_guard = None;
-    let mut out_guard = Cleanup(None);
-    let sink = if png {
-        Sink::Png(opts.out.clone())
-    } else {
+    let sink = if let Some((_, video)) = &staged {
         let mut cmd = Command::new(ffmpeg_bin());
         cmd.args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y"]);
         cmd.args(["-f", "rawvideo", "-pix_fmt", "rgba"]);
@@ -377,7 +379,7 @@ pub fn export(
             cmd.args(["-map", "0:v:0", "-map", "1:a:0"]);
         }
         cmd.args(&args);
-        cmd.arg(&opts.out);
+        cmd.arg(video);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
@@ -390,7 +392,6 @@ pub fn export(
         let mut child = cmd
             .spawn()
             .with_context(|| format!("couldn't start {}", ffmpeg_bin().display()))?;
-        out_guard.0 = Some(opts.out.clone());
         let stdin = child.stdin.take().unwrap();
         let stderr = child.stderr.take().unwrap();
         let log = std::thread::spawn(move || {
@@ -400,6 +401,8 @@ pub fn export(
         });
         child_guard = Some(KillOnDrop(Some(child), Some(log)));
         Sink::Ffmpeg(stdin)
+    } else {
+        Sink::Png(opts.out.clone())
     };
 
     // Two frames in flight: one being read back while the writer encodes the other.
@@ -417,11 +420,9 @@ pub fn export(
         Ok(())
     });
     let mut allocated = 0;
-    let mut cancelled = false;
     let mut failed = None;
     for n in 0..total {
         if cancel.load(Ordering::Relaxed) {
-            cancelled = true;
             break;
         }
         let t = m.frame_time(n);
@@ -460,13 +461,19 @@ pub fn export(
         progress(n + 1, total);
     }
     drop(to_writer);
+    if (cancel.load(Ordering::Relaxed) || failed.is_some())
+        && let Some(KillOnDrop(Some(child), _)) = &mut child_guard
+    {
+        // Unblock the writer if FFmpeg is still processing queued frames.
+        let _ = child.kill();
+    }
     let written = writer
         .join()
         .map_err(|_| anyhow!("the frame writer panicked"))?;
 
     if let Some(mut g) = child_guard {
-        let (status, log) = g.wait(cancelled || failed.is_some())?;
-        if !cancelled && failed.is_none() && !status.success() {
+        let (status, log) = g.wait(cancel, failed.is_some())?;
+        if !cancel.load(Ordering::Relaxed) && failed.is_none() && !status.success() {
             bail!(
                 "ffmpeg failed ({status}):\n{}",
                 log.trim_end()
@@ -481,14 +488,17 @@ pub fn export(
             );
         }
     }
-    if cancelled {
+    if cancel.load(Ordering::Relaxed) {
         bail!("cancelled");
     }
     if let Some(e) = failed {
         return Err(e);
     }
     written?;
-    out_guard.0 = None; // keep it
+    if let Some((_temp, video)) = staged {
+        std::fs::rename(&video, &opts.out)
+            .with_context(|| format!("couldn't publish {}", opts.out.display()))?;
+    }
     Ok(Summary {
         frames: total,
         audio_frames,
@@ -499,13 +509,24 @@ pub fn export(
 struct KillOnDrop(Option<Child>, Option<std::thread::JoinHandle<String>>);
 
 impl KillOnDrop {
-    /// Wait for ffmpeg to finish (stdin is closed by now); kill it first if `abort`.
-    fn wait(&mut self, abort: bool) -> Result<(std::process::ExitStatus, String)> {
-        let mut child = self.0.take().unwrap();
-        if abort {
-            let _ = child.kill();
-        }
-        let status = child.wait()?;
+    /// Wait for ffmpeg with stdin closed, checking for cancellation during muxing.
+    fn wait(
+        &mut self,
+        cancel: &AtomicBool,
+        abort: bool,
+    ) -> Result<(std::process::ExitStatus, String)> {
+        let child = self.0.as_mut().unwrap();
+        let status = loop {
+            if abort || cancel.load(Ordering::Relaxed) {
+                let _ = child.kill();
+                break child.wait()?;
+            }
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        self.0.take();
         let log = self
             .1
             .take()
