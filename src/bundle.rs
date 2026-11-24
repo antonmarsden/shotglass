@@ -512,7 +512,11 @@ fn check_standalone(dir: &Path, what: &str) -> Result<()> {
     if !project::same_dir(&check.project, dir) {
         bail!("the {what} still belongs to a project (a bug in shotglass {what})");
     }
-    let (_, errors) = used_files(&check);
+    check_frozen_sources(&check, what)
+}
+
+fn check_frozen_sources(movie: &Movie, what: &str) -> Result<()> {
+    let (_, errors) = used_files(movie);
     if !errors.is_empty() {
         bail!(
             "the {what} is missing files (a bug in shotglass {what}):\n{}",
@@ -568,26 +572,106 @@ pub fn freeze(movie: &Path, cache: &Path) -> Result<Bundled> {
         );
     }
     let (m, used) = load_for_freezing(movie, cache)?;
-    if m.root.join(LIBS_DIR).exists() {
-        bail!(
-            "{} already has a {LIBS_DIR}/ folder; move it away first",
-            m.root.display()
-        );
+    for name in [LIBS_DIR, library::LOCK_FILE, project::PROJECT_FILE] {
+        let path = m.root.join(name);
+        match path.symlink_metadata() {
+            Ok(_) => bail!("{} already exists; move it away first", path.display()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("checking {}", path.display())),
+        }
     }
-    let (libraries, _) = write_frozen(&m, &used, &m.root, "freeze")?;
-    if let Err(e) = check_standalone(&m.root, "freeze") {
-        let _ = remove_frozen(&m.root);
-        return Err(e);
-    }
+    let stage = tempfile::Builder::new()
+        .prefix(".shotglass-freeze-")
+        .tempdir_in(&m.root)
+        .context("creating freeze staging directory")?;
+    let (libraries, _) = write_frozen(&m, &used, stage.path(), "freeze")?;
+    check_staged_freeze(stage.path(), &m.root)?;
+    publish_freeze(stage.path(), &m.root)?;
     Ok(Bundled {
         film_files: 0,
         libraries,
     })
 }
 
+fn check_staged_freeze(stage: &Path, film: &Path) -> Result<()> {
+    let mut project = Project::read(stage)?;
+    let lock = Lock::load(stage)?.unwrap_or_default();
+    let film_abs = std::path::absolute(film)?;
+    for spec in &mut project.specs {
+        // Path libraries already inside the film stay there. Copied libraries have a
+        // staged lock entry, whose path is relative to the staged project.
+        if let Some(path) = &mut spec.path
+            && lock.get(&spec.name).is_none()
+        {
+            *path = film_abs.join(&*path).to_string_lossy().into_owned();
+        }
+    }
+    let check = Movie::load_locked_in(film, &project, &stage.join(".no-cache"))
+        .context("the freeze doesn't load on its own (a bug in shotglass freeze)")?;
+    check_frozen_sources(&check, "freeze")
+}
+
+fn publish_freeze(stage: &Path, film: &Path) -> Result<()> {
+    let staged_libs = stage.join(LIBS_DIR);
+    let dest_libs = film.join(LIBS_DIR);
+    let mut reserved_libs = false;
+    let mut moved_libs = Vec::new();
+    let mut installed_files = Vec::new();
+    let result = (|| {
+        if staged_libs.is_dir() {
+            // Reserve the directory without replacing even an empty directory.
+            std::fs::create_dir(&dest_libs)
+                .with_context(|| format!("publishing {}", dest_libs.display()))?;
+            reserved_libs = true;
+            for entry in std::fs::read_dir(&staged_libs)? {
+                let entry = entry?;
+                let source = entry.path();
+                let target = dest_libs.join(entry.file_name());
+                std::fs::rename(&source, &target)
+                    .with_context(|| format!("publishing {}", target.display()))?;
+                moved_libs.push((source, target));
+            }
+        }
+        // A hard link publishes a complete file and fails if the destination exists.
+        // The manifest is last, so discovery only sees it once its dependencies exist.
+        for name in [library::LOCK_FILE, project::PROJECT_FILE] {
+            let source = stage.join(name);
+            if source.is_file() {
+                let dest = film.join(name);
+                std::fs::hard_link(&source, &dest)
+                    .with_context(|| format!("publishing {}", dest.display()))?;
+                installed_files.push(dest);
+            }
+        }
+        Ok(())
+    })();
+    result.map_err(|error: anyhow::Error| {
+        let mut failures = Vec::new();
+        let mut record = |path: &Path, cleanup: std::io::Result<()>| {
+            if let Err(cleanup) = cleanup {
+                failures.push(format!("{}: {cleanup}", path.display()));
+            }
+        };
+        for path in installed_files.iter().rev() {
+            record(path, std::fs::remove_file(path));
+        }
+        for (source, target) in moved_libs.iter().rev() {
+            record(target, std::fs::rename(target, source));
+        }
+        if reserved_libs {
+            record(&dest_libs, std::fs::remove_dir(&dest_libs));
+        }
+        if failures.is_empty() {
+            error
+        } else {
+            error.context(format!("freeze rollback failed: {}", failures.join("; ")))
+        }
+    })
+}
+
 /// Remove what `write_frozen` wrote into a film folder.
 fn remove_frozen(film: &Path) -> Result<()> {
-    for f in [project::PROJECT_FILE, library::LOCK_FILE, NOTICES_FILE] {
+    for f in [project::PROJECT_FILE, library::LOCK_FILE] {
         let p = film.join(f);
         if p.exists() {
             std::fs::remove_file(&p).with_context(|| format!("removing {}", p.display()))?;
@@ -1178,6 +1262,7 @@ mod tests {
     fn a_frozen_film_never_changes_and_unfreezes() {
         let (root, cache) = project_fixture("freeze");
         let a = root.join("a");
+        write(&a, &[(NOTICES_FILE, "user notices")]);
         let m = Movie::load_locked(&a, &cache).unwrap();
         assert!(project::same_dir(&m.project, &root));
         assert_eq!(m.libraries.len(), 3);
@@ -1261,12 +1346,103 @@ mod tests {
         let e = format!("{:#}", unfreeze(&root.join("b")).unwrap_err());
         assert!(e.contains("isn't frozen"), "{e}");
         unfreeze(&a).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(a.join(NOTICES_FILE)).unwrap(),
+            "user notices"
+        );
         for f in [project::PROJECT_FILE, library::LOCK_FILE, LIBS_DIR] {
             assert!(!a.join(f).exists(), "{f} removed");
         }
         let fa = Movie::load_locked(&a, &cache).unwrap();
         assert!(project::same_dir(&fa.project, &root));
         assert!(ring(&fa).contains("0.25"));
+        std::fs::remove_dir_all(root.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn freeze_validates_a_path_library_inside_the_film() {
+        let (root, cache) = project_fixture("freeze-in-film-library");
+        let film = root.join("a");
+        write(
+            &root,
+            &[(
+                project::PROJECT_FILE,
+                "[libraries]\nlocal = { path = \"a/local\" }\n",
+            )],
+        );
+        write(
+            &film,
+            &[
+                (
+                    "local/library.toml",
+                    "name = \"films/local\"\nversion = \"0.1.0\"\n",
+                ),
+                ("local/color.glsl", "vec4 color() { return vec4(1.0); }\n"),
+                (
+                    "scenes/a.glsl",
+                    "#include <local/color.glsl>\nvoid mainImage(out vec4 c, in vec2 p) { c = color(); }\n",
+                ),
+            ],
+        );
+        assert!(freeze(&film, &cache).unwrap().libraries.is_empty());
+        check_standalone(&film, "freeze").unwrap();
+        unfreeze(&film).unwrap();
+        assert!(film.join("local/color.glsl").is_file());
+        std::fs::remove_dir_all(root.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn freeze_refuses_a_preexisting_lock() {
+        let (root, cache) = project_fixture("freeze-lock-collision");
+        let film = root.join("a");
+        write(&film, &[(library::LOCK_FILE, "user lock")]);
+        let error = format!("{:#}", freeze(&film, &cache).unwrap_err());
+        assert!(error.contains("shotglass.lock already exists"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(film.join(library::LOCK_FILE)).unwrap(),
+            "user lock"
+        );
+        assert!(!film.join(project::PROJECT_FILE).exists());
+        assert!(!film.join(LIBS_DIR).exists());
+        std::fs::remove_dir_all(root.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn freeze_validation_and_publication_failures_preserve_live_files() {
+        let (root, cache) = project_fixture("freeze-failures");
+        let film = root.join("a");
+        write(&film, &[(NOTICES_FILE, "user notices")]);
+        let (m, used) = load_for_freezing(&film, &cache).unwrap();
+        let stage = tempfile::tempdir_in(&film).unwrap();
+        let blocked_lock = stage.path().join(library::LOCK_FILE);
+        std::fs::create_dir(&blocked_lock).unwrap();
+        assert!(write_frozen(&m, &used, stage.path(), "freeze").is_err());
+        assert!(stage.path().join(project::PROJECT_FILE).is_file());
+        assert!(!film.join(project::PROJECT_FILE).exists());
+        std::fs::remove_dir(blocked_lock).unwrap();
+        write_frozen(&m, &used, stage.path(), "freeze").unwrap();
+        let shader = stage.path().join(LIBS_DIR).join("kit/noise.glsl");
+        std::fs::remove_file(shader).unwrap();
+        assert!(check_staged_freeze(stage.path(), &film).is_err());
+        for name in [project::PROJECT_FILE, library::LOCK_FILE, LIBS_DIR] {
+            assert!(!film.join(name).exists(), "{name} was published");
+        }
+
+        write_frozen(&m, &used, stage.path(), "freeze").unwrap();
+        check_staged_freeze(stage.path(), &film).unwrap();
+        // Simulate a manifest arriving between the initial collision check and publication.
+        write(&film, &[(project::PROJECT_FILE, "user manifest")]);
+        assert!(publish_freeze(stage.path(), &film).is_err());
+        check_staged_freeze(stage.path(), &film).unwrap();
+        assert!(!film.join(library::LOCK_FILE).exists());
+        assert!(!film.join(LIBS_DIR).exists());
+        for (name, content) in [
+            (project::PROJECT_FILE, "user manifest"),
+            (NOTICES_FILE, "user notices"),
+        ] {
+            assert_eq!(std::fs::read_to_string(film.join(name)).unwrap(), content);
+        }
+        drop(stage);
         std::fs::remove_dir_all(root.parent().unwrap()).ok();
     }
 
