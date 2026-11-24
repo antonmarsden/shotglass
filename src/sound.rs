@@ -259,9 +259,11 @@ impl Soundtrack {
     }
 
     pub fn total_chunks(&self) -> usize {
-        self.plan
-            .as_ref()
-            .map_or(0, |p| p.total.div_ceil(self.chunk_size))
+        self.total_samples().div_ceil(self.chunk_size)
+    }
+
+    pub fn total_samples(&self) -> usize {
+        self.plan.as_ref().map_or(0, |p| p.total)
     }
 
     /// Tracks synthesised since last asked (for status messages).
@@ -273,12 +275,37 @@ impl Soundtrack {
     }
 
     /// Prepare a movie version: assemble and compile its sound shaders. On error the
-    /// previous version stays. Synthesis happens later, chunk by chunk.
+    /// previous version stays if its sample rate, length and loop mode still
+    /// match. Synthesis happens later, chunk by chunk.
     pub fn set_movie(
         &mut self,
         r: &mut Renderer,
         m: &Movie,
         sr: u32,
+    ) -> Result<(), Vec<ShaderError>> {
+        let total = m.sound_samples(sr);
+        let wrap = m.loop_frames.is_some();
+        let result = self.compile_movie(r, m, sr, total, wrap);
+        if result.is_err()
+            && self
+                .plan
+                .as_ref()
+                .is_some_and(|p| (p.sr, p.total, p.wrap) != (sr, total, wrap))
+        {
+            self.cancel_all(r);
+            *self = Self::with_chunk(self.chunk_size);
+            r.retain_audio(&[]);
+        }
+        result
+    }
+
+    fn compile_movie(
+        &mut self,
+        r: &mut Renderer,
+        m: &Movie,
+        sr: u32,
+        total: usize,
+        wrap: bool,
     ) -> Result<(), Vec<ShaderError>> {
         let dialect = r.dialect_for(m).map_err(|e| {
             vec![ShaderError {
@@ -286,8 +313,6 @@ impl Soundtrack {
                 messages: vec![e],
             }]
         })?;
-        let total = m.sound_samples(sr);
-        let wrap = m.loop_frames.is_some();
         let cues = m.cue_defines();
         let mut errors = vec![];
         let mut progs = vec![];

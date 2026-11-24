@@ -178,7 +178,7 @@ const CHECKS: &[Check] = &[
         run: sound_no_clicks,
     },
     Check {
-        name: "sound shader errors point at the right file and line",
+        name: "sound shader errors report the file and line and respect fallback timing",
         run: sound_errors,
     },
     Check {
@@ -2057,12 +2057,19 @@ fn sound_no_clicks(gl: &Gl, dir: &Path) -> Result<String> {
 
 fn sound_errors(gl: &Gl, dir: &Path) -> Result<String> {
     let m = sound_fixture(dir)?;
-    std::fs::write(
-        dir.join("music.glsl"),
-        "// music\n\nvec2 mainSound(int samp, float time) {\n  return vec2(nope);\n}\n",
-    )?;
     let mut r = Renderer::new(gl.clone())?;
     let mut st = Soundtrack::new();
+    st.set_movie(&mut r, &m, 48000)
+        .map_err(|e| anyhow!("{e:?}"))?;
+    let version = st.version();
+    let last = st.total_chunks() - 1;
+    let samples = st.chunk(&mut r, last).map_err(|e| anyhow!(e))?;
+    let music = dir.join("music.glsl");
+    let working = std::fs::read(&music)?;
+    std::fs::write(
+        &music,
+        "// music\n\nvec2 mainSound(int samp, float time) {\n  return vec2(nope);\n}\n",
+    )?;
     match st.set_movie(&mut r, &m, 48000) {
         Ok(()) => bail!("a broken music shader was accepted"),
         Err(e) => {
@@ -2071,6 +2078,31 @@ fn sound_errors(gl: &Gl, dir: &Path) -> Result<String> {
                 bail!("expected an error at music.glsl:4, got:\n{text}");
             }
         }
+    }
+    if st.version() != version
+        || !std::sync::Arc::ptr_eq(&samples, &st.chunk(&mut r, last).map_err(|e| anyhow!(e))?)
+    {
+        bail!("a broken shader discarded timing-compatible fallback audio");
+    }
+    let changed = movie(
+        dir,
+        &SOUND_MOVIE.replace("duration = 1.03", "duration = 2.03"),
+    )?;
+    if changed.sound_samples(48000) <= m.sound_samples(48000) {
+        bail!("the reload fixture did not extend the soundtrack");
+    }
+    if st.set_movie(&mut r, &changed, 48000).is_ok()
+        || st.version().is_some()
+        || st.total_chunks() != 0
+        || st.in_flight() != 0
+    {
+        bail!("a broken reload with a longer film kept stale soundtrack timing");
+    }
+    std::fs::write(music, working)?;
+    st.set_movie(&mut r, &changed, 48000)
+        .map_err(|e| anyhow!("{e:?}"))?;
+    if st.version().is_none() || st.total_samples() != changed.sound_samples(48000) {
+        bail!("fixing the shader did not restore audio at the new film length");
     }
     Ok(String::new())
 }

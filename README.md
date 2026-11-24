@@ -19,7 +19,8 @@ headless stills. Rust + OpenGL, no browser.
   of sync, and adaptive resolution keeps frames on time.
 - **Live reload.** Save a shader or `movie.toml` and the player reloads in place
   at the same moment. A broken shader shows its errors (with correct file:line)
-  while the last working version keeps playing.
+  while the last working version keeps playing. If a sound shader fails and the
+  film length or loop mode changes, playback is silent until the sound compiles.
 - **Long films too.** Shaders compile just ahead of the playhead and sound is
   synthesised in small chunks, so a long, many-shot episode opens straight away
   and memory doesn't grow with its length (see [Long films](#long-films)).

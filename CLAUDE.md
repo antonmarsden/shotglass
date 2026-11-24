@@ -123,6 +123,9 @@ cargo fmt && cargo clippy --all-targets -- -D warnings
 - **A broken edit keeps the last working version on screen** (per shot id fallback, which
   remembers programs and textures). Missing files (assembly errors, a missing texture)
   refuse the whole new version; a broken or half-saved image falls back per texture.
+  Failed sound edits retain the previous soundtrack only when its sample rate, sample
+  count and loop mode match. Otherwise the player clears its audio chunks and plays
+  the new picture timing in silence until the sound compiles.
 - **Sound is identical whatever the chunk size,** and banded vs single draws give the same
   output, and streamed (async) vs blocking synthesis agree bit for bit (the selftest only reports, not fails, a mismatch on
   `INEXACT_SOUND_RENDERERS`: the Apple Software Renderer is ~1e-5 off). The mix may read at most `mix_lookback` back and 50 ms ahead.
