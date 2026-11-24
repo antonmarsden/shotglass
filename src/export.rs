@@ -505,6 +505,48 @@ pub fn export(
     })
 }
 
+/// Render frames `frames` (frame n at `frame_time(n)`, as `still`) through the YUV
+/// pass, pipelined: frame n+1 renders while earlier frames are read back through the
+/// reader's ring, collected oldest first. `sink` gets every frame in order. The only
+/// waits on the GPU are back-pressure (the ring is full) and the final drain.
+pub fn render_yuv(
+    r: &mut Renderer,
+    m: &Movie,
+    (w, h): (usize, usize),
+    frames: std::ops::Range<u64>,
+    reader: &mut crate::yuv::YuvReader,
+    cancel: &AtomicBool,
+    mut sink: impl FnMut(&mut crate::yuv::YuvReader, crate::yuv::YuvFrame) -> Result<()>,
+) -> Result<()> {
+    for n in frames {
+        if cancel.load(Ordering::Relaxed) {
+            bail!("cancelled");
+        }
+        let t = m.frame_time(n);
+        let Some(tex) = r.render(m, w as i32, h as i32, &FrameInfo::frame(m, n), true) else {
+            bail!("frame {n} ({t:.3}s) didn't render");
+        };
+        if let Some(e) = r.footage_failure() {
+            bail!("frame {n} ({t:.3}s): {e}");
+        }
+        if r.context_lost(true, false) {
+            bail!("the GPU driver reset at frame {n} ({t:.3}s); a shader probably ran too long");
+        }
+        while !reader.has_room() {
+            let f = reader.collect(true).expect("a full ring has a frame");
+            sink(reader, f)?;
+        }
+        reader.submit(r, tex, n)?;
+        while let Some(f) = reader.collect(false) {
+            sink(reader, f)?;
+        }
+    }
+    while let Some(f) = reader.collect(true) {
+        sink(reader, f)?;
+    }
+    Ok(())
+}
+
 /// The ffmpeg process and its stderr reader; killed if the export bails early.
 struct KillOnDrop(Option<Child>, Option<std::thread::JoinHandle<String>>);
 

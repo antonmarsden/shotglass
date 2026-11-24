@@ -22,6 +22,7 @@ mod text;
 mod texture;
 mod validate;
 mod webm;
+mod yuv;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};

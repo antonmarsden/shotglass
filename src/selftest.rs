@@ -47,6 +47,10 @@ const CHECKS: &[Check] = &[
         run: readback_into,
     },
     Check {
+        name: "export YUV pass: BT.709 limited range, chroma sited left, read back pipelined",
+        run: yuv_pass,
+    },
+    Check {
         name: "playback doesn't stall on driver error checks",
         run: error_check_rate,
     },
@@ -1413,6 +1417,129 @@ fn dirty_pack_state(gl: &Gl) -> Result<glow::Buffer> {
         }
         Ok(buf)
     }
+}
+
+/// The export's YUV pass (#116) against the CPU reference (`yuv::reference`, itself
+/// pinned to BT.709 limited-range values by unit tests), at 10 and 8 bits, flipped and
+/// plain outputs, through the pipelined loop the export uses: frames come out in
+/// order, and the loop waits on the GPU only when its ring is full (on a fast driver,
+/// never before the final drain).
+fn yuv_pass(gl: &Gl, dir: &Path) -> Result<String> {
+    use crate::yuv::{YuvReader, reference, samples};
+    // Hard colours in the corners (red, blue, white, black), gradients elsewhere, a
+    // one-pixel red column at x = 0 for chroma siting, and a different picture each
+    // frame, so a stale or reordered frame can't pass.
+    write(
+        dir,
+        &[(
+            "a.glsl",
+            &scene(
+                "vec2 p = floor(fragCoord);\n  \
+                 fragColor = vec4(fract(uv.x * 3.0 + float(iFrame) * 0.1), uv.y, fract(p.x * 0.37 + p.y * 0.11), 1.0);\n  \
+                 if (p.x < 8.0 && p.y < 8.0) fragColor = vec4(1.0, 0.0, 0.0, 1.0);\n  \
+                 if (p.x >= iResolution.x - 8.0 && p.y < 8.0) fragColor = vec4(0.0, 0.0, 1.0, 1.0);\n  \
+                 if (p.x < 8.0 && p.y >= iResolution.y - 8.0) fragColor = vec4(1.0);\n  \
+                 if (p.x >= iResolution.x - 8.0 && p.y >= iResolution.y - 8.0) fragColor = vec4(0.0, 0.0, 0.0, 1.0);\n  \
+                 if (p.x == 0.0 && p.y > 20.0 && p.y < 40.0) fragColor = vec4(1.0, 0.0, 0.0, 1.0);",
+            ),
+        )],
+    )?;
+    let m = movie(dir, "[[shot]]\nid=\"a\"\nscene=\"a.glsl\"\nduration=1\n")?;
+    let (w, h) = (W as usize, H as usize);
+    let frames = 12u64;
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    let mut notes = vec![];
+    for (depth, flipped) in [(10u8, true), (8, false)] {
+        let mut r = renderer(gl, &m)?;
+        r.set_readback(flipped);
+        let mut want = vec![];
+        for n in 0..frames {
+            r.render(&m, W, H, &FrameInfo::frame(&m, n), true)
+                .ok_or_else(|| anyhow!("frame {n} didn't render"))?;
+            want.push(reference(&r.read_output().unwrap(), depth));
+        }
+        let mut reader = YuvReader::new(&r, w, h, depth, 4)?;
+        let mut next = 0;
+        let mut off_by_one = 0;
+        crate::export::render_yuv(
+            &mut r,
+            &m,
+            (w, h),
+            0..frames,
+            &mut reader,
+            &cancel,
+            |rd, f| {
+                if f.n != next {
+                    bail!("{depth}-bit: got frame {} when expecting {next}", f.n);
+                }
+                let got = samples(&f.data, depth);
+                let want = &want[f.n as usize];
+                if got.len() != want.len() {
+                    bail!("{depth}-bit: {} samples, want {}", got.len(), want.len());
+                }
+                for (i, (g, e)) in got.iter().zip(want).enumerate() {
+                    let d = g.abs_diff(*e);
+                    if d > 1 {
+                        let plane = if i < w * h { "Y" } else { "CbCr" };
+                        bail!(
+                            "{depth}-bit, {}: frame {}, {plane} sample {i}: {g}, want {e}",
+                            if flipped {
+                                "flipped output"
+                            } else {
+                                "plain output"
+                            },
+                            f.n
+                        );
+                    }
+                    off_by_one += d as usize;
+                }
+                rd.recycle(f.data);
+                next += 1;
+                Ok(())
+            },
+        )?;
+        if next != frames {
+            bail!("{depth}-bit: {next} of {frames} frames came out");
+        }
+        // The corners are exact: no rounding ties there.
+        let got = {
+            let mut reader = YuvReader::new(&r, w, h, depth, 1)?;
+            let tex = r
+                .render(&m, W, H, &FrameInfo::frame(&m, 0), true)
+                .ok_or_else(|| anyhow!("frame 0 didn't render"))?;
+            reader.submit(&r, tex, 0)?;
+            samples(&reader.collect(true).unwrap().data, depth)
+        };
+        let y = |x: usize, yy: usize| got[yy * w + x];
+        let corners = [
+            // fragCoord.y = 0 is the bottom row: red and blue are at the bottom.
+            ("red", y(2, h - 3), if depth == 10 { 250 } else { 63 }),
+            ("blue", y(w - 3, h - 3), if depth == 10 { 127 } else { 32 }),
+            ("white", y(2, 2), if depth == 10 { 940 } else { 235 }),
+            ("black", y(w - 3, 2), if depth == 10 { 64 } else { 16 }),
+        ];
+        for (what, g, e) in corners {
+            if g != e {
+                bail!("{depth}-bit {what} Y = {g}, want {e}");
+            }
+        }
+        // The last chroma row (bottom), Cr, column 1 (centred on luma column 2).
+        let cr_red = got[w * h + (h / 2 - 1) * w + w / 2 + 1];
+        if cr_red != if depth == 10 { 960 } else { 240 } {
+            bail!("{depth}-bit red Cr = {cr_red}");
+        }
+        notes.push(format!(
+            "{depth}-bit: {} waits, {off_by_one} samples off by one",
+            reader.waits
+        ));
+        if reader.waits > 4 {
+            bail!(
+                "{depth}-bit: the loop waited for the GPU {} times in {frames} frames (ring of 4)",
+                reader.waits
+            );
+        }
+    }
+    Ok(notes.join("; "))
 }
 
 fn readback_into(gl: &Gl, dir: &Path) -> Result<String> {
