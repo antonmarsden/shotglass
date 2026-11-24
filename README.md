@@ -34,10 +34,9 @@ cd shotglass
 cargo run --release -- play movies/big-shadow
 ```
 
-The demo carries copies of the [shotglass-kit](https://github.com/antonmarsden/shotglass-kit)
-files it uses in `lib/` (path libraries), so it needs no download. A new film
-(`shotglass new`) uses the kit itself, downloaded with `git` on the first run (see
-[Libraries](#libraries)).
+The demo keeps its shared GLSL in `lib/` (path libraries), so it needs no download. A
+new film (`shotglass new`) uses [shotglass-kit](https://github.com/antonmarsden/shotglass-kit),
+downloaded with `git` on the first run (see [Libraries](#libraries)).
 
 To start your own film:
 
@@ -68,7 +67,7 @@ A movie is a folder:
 movies/big-shadow/
 ├── movie.toml          the edit: shots, timings, uniforms, transitions
 ├── shotglass.toml      the project: engine contract and libraries (see "Projects")
-├── lib/                copies of the kit files it uses: kit/, sound/, transitions/
+├── lib/                its own shared GLSL: base/, sound/, transitions/
 ├── common.glsl         shared helpers (#include "../common.glsl"), built on the kit
 ├── scenes/
 │   ├── shadow.glsl

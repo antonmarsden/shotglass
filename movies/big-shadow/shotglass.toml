@@ -4,6 +4,6 @@ shotglass = "0.1"
 # The film's own shared GLSL, in lib/. Nothing is fetched, so the demo and the golden
 # tests that render it never depend on anything outside this repo.
 [libraries]
-kit = { path = "lib/kit" }
+base = { path = "lib/base" }
 transitions = { path = "lib/transitions" }
 sound = { path = "lib/sound" }

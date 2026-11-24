@@ -1,4 +1,4 @@
-// Big Shadow, lib/kit: color.glsl
+// Big Shadow, lib/base: color.glsl
 #include "noise.glsl"
 
 vec3 kit_aces(vec3 c) {

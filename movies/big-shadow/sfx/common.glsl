@@ -1,6 +1,6 @@
 // Shared audio helpers. Notes, scales and instruments come from lib/sound,
-// random numbers from lib/kit's integer hash.
-#include <kit/noise.glsl>
+// random numbers from lib/base's integer hash.
+#include <base/noise.glsl>
 #include <sound/note.glsl>
 #include <sound/instrument.glsl>
 #include <sound/drum.glsl>

@@ -33,9 +33,9 @@ cargo fmt && cargo clippy --all-targets -- -D warnings
   leaves the actual strip and `<name>.diff.png` (magenta = differs), or the actual WAV
   and `<name>.diff.wav` (with the first differing time in the message), in
   `target/tmp/golden/`; CI uploads them as `golden-image-failures`. Golden films never
-  use kit GLSL: the demo has copies of the kit files it uses in `movies/big-shadow/lib/`
-  (path libraries, no lock, nothing fetched). Keep it that way; the template (which
-  follows kit `main`) has no golden.
+  use kit GLSL: the demo keeps its shared GLSL in `movies/big-shadow/lib/` (`base`,
+  `sound`, `transitions`: path libraries, no lock, nothing fetched). Keep it that way;
+  the template (which follows kit `main`) has no golden.
 - CI (`.github/workflows/ci.yml`) pins Rust in `RUST_TOOLCHAIN` and runs clippy with
   `-D warnings`. Upgrade the toolchain on purpose and fix new lints in the same commit.
   Linux and Windows run the GPU tests on Mesa llvmpipe, macOS on the Apple Software
@@ -77,9 +77,9 @@ cargo fmt && cargo clippy --all-targets -- -D warnings
 | `app.rs` | egui player: transport, timeline, panels, live reload, auto scale, sound streaming |
 | `headless.rs` | hidden-window GL context for CLI commands |
 | `selftest.rs` | GPU/sound checks on fixture films written to a temp dir |
-| `tests/golden.rs`, `tests/golden/` | golden tests: 8-frame 320x180 strips and 8 kHz soundtrack of the demo (self-contained: kit copies in `lib/`), a strip of `tests/films/channels` (textures), a strip of `tests/films/text` (text blocks, distance field, RTL, iChannel6/7), a strip of `tests/films/layers` (spans, fades, fixed scale, `@input`), a strip of `tests/films/blends` (blend passes, `@picture`, `@<layer>`), a strip of `tests/films/footage` (image sequences: 24 in 30, re-timing, `clock = "movie"`, `end = "black"`, `iChannelTime`; tiny CC0 frames), a two-period strip and the soundtrack of `tests/films/loop` (`loop = true`), and the demo's `quality` heatmaps (`tests/golden/quality/big-shadow/<metric>.png`, via `quality --compare`), vs reference PNGs / WAVs |
+| `tests/golden.rs`, `tests/golden/` | golden tests: 8-frame 320x180 strips and 8 kHz soundtrack of the demo (self-contained: its shared GLSL is in `lib/`), a strip of `tests/films/channels` (textures), a strip of `tests/films/text` (text blocks, distance field, RTL, iChannel6/7), a strip of `tests/films/layers` (spans, fades, fixed scale, `@input`), a strip of `tests/films/blends` (blend passes, `@picture`, `@<layer>`), a strip of `tests/films/footage` (image sequences: 24 in 30, re-timing, `clock = "movie"`, `end = "black"`, `iChannelTime`; tiny CC0 frames), a two-period strip and the soundtrack of `tests/films/loop` (`loop = true`), and the demo's `quality` heatmaps (`tests/golden/quality/big-shadow/<metric>.png`, via `quality --compare`), vs reference PNGs / WAVs |
 | `glsl/copy.glsl`, `glsl/over.glsl` | the engine's internal copy pass and layer composite (premultiplied over, × opacity); not transitions films can name |
-| `movies/big-shadow/` | demo film (kit files it uses copied into `lib/`, path libraries); `templates/new/` is what `shotglass new` writes (follows kit `main`, checked by the canary) |
+| `movies/big-shadow/` | demo film (its shared GLSL in `lib/`, path libraries); `templates/new/` is what `shotglass new` writes (follows kit `main`, checked by the canary) |
 
 ## Invariants (each was a real bug; most have a test)
 

@@ -1,4 +1,4 @@
-// Big Shadow, lib/kit: noise.glsl
+// Big Shadow, lib/base: noise.glsl
 uint kit_hash_u(uint x) {
     x ^= x >> 16;
     x *= 0x7feb352dU;

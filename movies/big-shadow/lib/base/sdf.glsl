@@ -1,4 +1,4 @@
-// Big Shadow, lib/kit: sdf.glsl
+// Big Shadow, lib/base: sdf.glsl
 float kit_sd_sphere(vec3 p, float r) { return length(p) - r; }
 
 float kit_sd_capsule(vec3 p, vec3 a, vec3 b, float r) {

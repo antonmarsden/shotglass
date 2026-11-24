@@ -1,9 +1,9 @@
 // Shared helpers for the Big Shadow scenes. Include with:  #include "../common.glsl"
-// Noise, shapes and tonemapping come from lib/kit (see [libraries] in shotglass.toml).
+// Noise, shapes and tonemapping come from lib/base (see [libraries] in shotglass.toml).
 
-#include <kit/noise.glsl>
-#include <kit/sdf.glsl>
-#include <kit/color.glsl>
+#include <base/noise.glsl>
+#include <base/sdf.glsl>
+#include <base/color.glsl>
 
 // 1D smooth noise in 0..1 (flame wobble and flicker).
 float noise1(float x){ return kit_value_noise(vec2(x, 0.0)); }

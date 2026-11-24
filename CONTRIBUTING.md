@@ -126,8 +126,8 @@ None of the machines has a real GPU:
 
 ### Kit canary
 
-The tests above never use shotglass-kit: the demo keeps copies of the kit files it uses
-in `movies/big-shadow/lib/` (path libraries, edited there, not following the kit), and
+The tests above never use shotglass-kit: the demo keeps its own shared GLSL
+in `movies/big-shadow/lib/` (path libraries), and
 the test films have no libraries. So a kit change can't turn CI red, and nothing is
 fetched. `shotglass new`'s template does follow the kit's `main` (a new film gets the
 kit's newest commit), so it has no golden reference; the kit canary
