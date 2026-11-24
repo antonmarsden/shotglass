@@ -864,15 +864,28 @@ impl Movie {
     /// copies), ignoring per-machine overrides (`SHOTGLASS_LIB_*`, `shotglass.local.toml`).
     /// `freeze` and `bundle` use it: they carry the locked files, never a working copy.
     pub fn load_locked(path: &Path, cache: &Path) -> Result<Movie> {
-        let mut m = Movie::read(path)?;
-        m.resolve_libraries_with(&BTreeMap::new(), cache)
-            .with_context(|| format!("in {}", m.root.join("movie.toml").display()))?;
-        m.scan_footage()
-            .with_context(|| format!("in {}", m.root.join("movie.toml").display()))?;
-        m.check_case();
-        m.check_textures()
-            .with_context(|| format!("in {}", m.root.join("movie.toml").display()))?;
-        Ok(m)
+        Movie::read(path)?.finish_locked_load(cache)
+    }
+
+    /// Validate a film against an explicit project, independently of project discovery.
+    pub(crate) fn load_locked_in(root: &Path, project: &Project, cache: &Path) -> Result<Movie> {
+        let file = root.join(crate::project::MOVIE_FILE);
+        let text = std::fs::read_to_string(&file)
+            .with_context(|| format!("reading {}", file.display()))?;
+        Movie::parse_in(&text, root, project)
+            .with_context(|| format!("in {}", file.display()))?
+            .finish_locked_load(cache)
+    }
+
+    fn finish_locked_load(mut self, cache: &Path) -> Result<Movie> {
+        self.resolve_libraries_with(&BTreeMap::new(), cache)
+            .with_context(|| format!("in {}", self.root.join("movie.toml").display()))?;
+        self.scan_footage()
+            .with_context(|| format!("in {}", self.root.join("movie.toml").display()))?;
+        self.check_case();
+        self.check_textures()
+            .with_context(|| format!("in {}", self.root.join("movie.toml").display()))?;
+        Ok(self)
     }
 
     /// Does any shot bind a texture?
