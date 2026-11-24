@@ -14,8 +14,8 @@ Closes #
 - [ ] `cargo fmt && cargo clippy --all-targets -- -D warnings` and `cargo test` pass
 - [ ] `cargo run -- check movies/big-shadow --web --no-gpu` passes, and so does every other shader this PR adds (demo, template, transitions, selftest fixtures)
 - [ ] Golden references: unchanged, or re-blessed in this commit because the change is *meant* to look or sound different (and I looked at the new PNGs / listened to the WAVs)
-- [ ] README.md (user docs) and CLAUDE.md (map, invariants) updated if what they describe changed
-- [ ] A new `movie.toml` field is validated in `Movie::parse`, unit-tested, and in README.md and `templates/new/movie.toml`
+- [ ] README.md + docs/ (user docs) and CLAUDE.md (map, invariants) updated if what they describe changed
+- [ ] A new `movie.toml` field is validated in `Movie::parse`, unit-tested, and in the docs (`docs/movies.md`) and `templates/new/movie.toml`
 - [ ] No new built-in GLSL (reusable GLSL goes in [shotglass-kit](https://github.com/antonmarsden/shotglass-kit))
 
 ## Invariants touched

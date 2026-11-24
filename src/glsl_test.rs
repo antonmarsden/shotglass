@@ -357,7 +357,7 @@ const KIND_FIRST_BITS: u32 = KIND_INTS;
 /// the dispatcher reads back. Only test shaders get it, never films.
 pub fn prelude() -> String {
     let mut s = String::from(
-        "// shotglass test prelude: assertions for *.test.glsl (see README, \"Testing GLSL\").\n\
+        "// shotglass test prelude: assertions for *.test.glsl (see docs/testing-and-quality.md, \"Testing GLSL\").\n\
          int sgtest_count = 0;\n\
          int sgtest_fail = 0;\n\
          int sgtest_kind = 0;\n\

@@ -1,7 +1,7 @@
 # shotglass — notes for Claude
 
 Rust + OpenGL harness for composing short films from GLSL shaders. User docs are in
-README.md; this file is about working on the code.
+README.md (overview, quick start, index) and `docs/` (one page per topic); this file is about working on the code.
 
 ## Strategy and cross-repo work
 
@@ -208,7 +208,7 @@ cargo fmt && cargo clippy --all-targets -- -D warnings
   film is a project of its own. Test films written as one text go through
   `project::write_fixture` / `split_fixture`.
 - **`movie.toml` field:** add it to the serde struct (`deny_unknown_fields`) and the resolved
-  struct, validate it in `Movie::parse`, add a unit test, and update the README and
+  struct, validate it in `Movie::parse`, add a unit test, and update `docs/movies.md` (or the topic page under `docs/`) and
   `templates/new/movie.toml`.
 - **A new demo/template look, or a film-level feature worth guarding visually:** add a
   case to `tests/golden.rs` and bless its reference.
@@ -219,7 +219,8 @@ cargo fmt && cargo clippy --all-targets -- -D warnings
   the check fails.
 - Working in parallel with other sessions: see "Working with AI agents" in CONTRIBUTING.md
   (one issue per branch; `gfx.rs`, `sound.rs`, `audio.rs` take one change at a time).
-- Keep user-facing docs in README.md. Open work is in GitHub issues: #35 roadmap to 1.0,
+- Keep user-facing docs in README.md (overview + index of `docs/`) and the topic pages in
+  `docs/` (`docs/design/` holds design notes); a new page gets a line in the README index. Open work is in GitHub issues: #35 roadmap to 1.0,
   #66 text/layers/footage epic (next: #74 comps and mattes, then #71 glyph runs/subtitles,
   #73 video; later items in #75), #2 web player, #51 live mode (#53–#56), #60 real-time mode.
 
