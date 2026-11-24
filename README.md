@@ -1142,6 +1142,53 @@ test file itself (in a test or in a helper function there): the engine numbers e
 before compiling, which is how a failure names the exact call, even with several on one
 line. Names starting with `sgtest_` are reserved in test files.
 
+## Quality metrics
+
+`shotglass quality <film>` measures sample frames (picked like `strip`'s) with the
+metrics listed in the film's `quality.toml`. It prints a report, writes `quality.json`
+and one heatmap contact sheet per metric (`<name>.png`) into `--out` (a project gets
+one folder per film), and exits non-zero when a metric is outside its limits. What
+counts as good depends on the film, so metrics are GLSL from libraries (the kit's
+`quality/`) or from the film, not built into shotglass.
+
+```toml
+# quality.toml, next to movie.toml
+count = 8            # sample frames (--count / --at override)
+size = "384x216"     # frame size (--size overrides)
+reference = 4        # @reference: N×N samples per pixel (2-8)
+
+[[metric]]
+use = "quality/alias"          # a library metric, or a film file: "fx/mine.glsl"
+name = "alias"                 # optional: names the heatmap; default from use
+params = { GAIN = 4, ink = "#ff8000", palette = ["#000000", "#ffffff"] }
+mean = { max = 0.02 }          # limits on the mean and the max over all frames
+max = { max = 0.5 }
+```
+
+A metric defines `void mainMetric(out vec4 value, in vec2 fragCoord)`: `value.a` is the
+per-pixel measure, `value.rgb` its heatmap colour. It reads render variants of the
+sample frame:
+
+| variant | read with | what |
+|---|---|---|
+| `@frame` | `getFrame(uv)` | the frame at 1× (8-bit, as exported) |
+| `@reference` | `getReference(uv)` | the frame rendered at N×N size and box-filtered to 1× (rendered only for metrics that call it) |
+
+`iResolution`, `iTime` and `iFrame` are those of the sample frame. Params become
+`#define`s: a number is a float, 2–4 numbers a `vecN`, `"#rrggbb"` a `vec3` (0–1, as
+written), and a list of colours `vec3[n](…)` plus `<NAME>_COUNT`.
+
+Measures are reduced on the GPU to a mean and a max per frame, then over frames
+(pixel-weighted mean, largest max). Two checks are fixed: **invalid** counts NaN/Inf
+measures, which are left out of the mean and max and always fail the metric; **cost**
+reports the GPU time of each frame (never gated; meaningless on software OpenGL).
+`check` validates metric shaders strictly like every other shader (`check --web`
+too). `quality.json` (`schema` 1) records the engine and library versions, the size,
+each frame and each metric's per-frame and total values, limits and failures.
+
+The demo (`movies/big-shadow`) has a `quality.toml` with two film metrics in
+`metrics/` (aliasing against `@reference`, clipped highlights) as examples.
+
 ## Command line
 
 ```sh
@@ -1167,6 +1214,8 @@ shotglass bundle <movie> --out <dir>                       # self-contained copy
 shotglass freeze <movie>                                   # copy the library files it includes into the film
 shotglass unfreeze <movie>                                 # follow the project's libraries again
 shotglass test   [file|folder] [filter]                    # GLSL unit and property tests (*.test.glsl) on the GPU
+shotglass quality <movie> [--count 8 | --at ...] [--size 384x216] [--out quality/]
+                 # metrics from quality.toml: report, quality.json, heatmaps; fails outside limits
 shotglass selftest [filter]                                # GPU + sound checks on this machine
 ```
 

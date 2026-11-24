@@ -838,7 +838,7 @@ pub fn run(
     Ok(sum)
 }
 
-unsafe fn compile(
+pub(crate) unsafe fn compile(
     gl: &glow::Context,
     src: &Assembled,
 ) -> std::result::Result<glow::Program, Vec<String>> {

@@ -225,6 +225,30 @@ impl Builder {
         Ok(self)
     }
 
+    /// A pass named by `kind`, as films spell transitions, layer passes, blends and
+    /// metrics: a film file (`fx/iris.glsl`, relative to `root`) or a library's
+    /// (`transitions/iris` → `#include <transitions/iris.glsl>`, shown as
+    /// `<what> "<kind>"`). A bare name is refused with `bare(name)`.
+    pub fn pass(
+        self,
+        root: &Path,
+        what: &str,
+        kind: &str,
+        bare: impl FnOnce(&str) -> anyhow::Error,
+    ) -> Result<Builder> {
+        match crate::movie::transition_kind(kind) {
+            crate::movie::TransitionKind::File(p) => self.file(&root.join(p)),
+            crate::movie::TransitionKind::Library(lib, file) => self.generated(
+                &format!("{what} \"{kind}\""),
+                &format!(
+                    "#include <{lib}/{file}>
+"
+                ),
+            ),
+            crate::movie::TransitionKind::Name(n) => Err(bare(n)),
+        }
+    }
+
     /// Generated code that follows the user's code (e.g. `main()`).
     pub fn footer(mut self, src: &str) -> Builder {
         let idx = self.new_string("<shotglass footer>".into());
@@ -735,6 +759,30 @@ fn parse_location(line: &str) -> Option<(usize, usize, String)> {
     };
     let msg = rest.trim_start_matches([':', ' ']).trim();
     Some((file, line_no, format!("{severity}{msg}")))
+}
+
+/// A param's GLSL value: one number is a float, 2–4 numbers a `vecN`.
+pub fn define_value(v: &[f32]) -> String {
+    use crate::movie::glsl_float;
+    match v {
+        [x] => glsl_float(*x),
+        _ => format!(
+            "vec{}({})",
+            v.len(),
+            v.iter()
+                .map(|x| glsl_float(*x))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+/// Whether `text` uses `name` as a whole identifier (not part of a longer one).
+pub fn mentions_ident(text: &str, name: &str) -> bool {
+    let ident = |c: Option<char>| c.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+    text.match_indices(name).any(|(i, _)| {
+        !ident(text[..i].chars().next_back()) && !ident(text[i + name.len()..].chars().next())
+    })
 }
 
 #[cfg(test)]

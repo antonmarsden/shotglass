@@ -5,8 +5,7 @@
 //! plain copy) draws the result into the output texture at full size.
 
 use crate::anim::Anim;
-use crate::movie::TransitionKind;
-use crate::movie::{At, Layer, LayerScene, Movie, N_CHANNELS, Shot, glsl_float};
+use crate::movie::{At, Layer, LayerScene, Movie, N_CHANNELS, Shot};
 use crate::shader::{Assembled, Builder, Dialect, DriverGlsl, remap_log};
 use crate::texture::{DecodedImage, Filter, Wrap};
 use anyhow::{Result, anyhow};
@@ -3529,33 +3528,18 @@ pub fn layer_source(
         header += &format!("uniform {} {name};\n#define SG_HAS_{name}\n", a.glsl_type());
     }
     for (name, v) in &layer.params {
-        let val = match v.len() {
-            1 => glsl_float(v[0]),
-            n => format!(
-                "vec{n}({})",
-                v.iter()
-                    .map(|x| glsl_float(*x))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-        };
-        header += &format!("#define {name} {val}\n");
+        header += &format!("#define {name} {}\n", crate::shader::define_value(v));
     }
     header += cues;
     let b = Builder::new(dialect, &header, root).libraries(&movie.libraries);
     let b = match &layer.scene {
         LayerScene::File(p) => b.file(p)?,
-        LayerScene::Pass(kind) => match crate::movie::transition_kind(kind) {
-            TransitionKind::File(p) => b.file(&root.join(p))?,
-            TransitionKind::Library(lib, file) => b.generated(
-                &format!("layer pass \"{kind}\""),
-                &format!("#include <{lib}/{file}>\n"),
-            )?,
-            TransitionKind::Name(_) => anyhow::bail!(
+        LayerScene::Pass(kind) => b.pass(root, "layer pass", kind, |_| {
+            anyhow::anyhow!(
                 "layer \"{}\": type \"{kind}\" needs a library or a .glsl file",
                 layer.id
-            ),
-        },
+            )
+        })?,
     };
     Ok(b.footer(LAYER_FOOTER).build())
 }
@@ -3575,31 +3559,16 @@ pub fn blend_source(
     let mut header = TRANSITION_HEADER.to_string();
     header += BLEND_HEADER;
     for (name, v) in &layer.params {
-        let val = match v.len() {
-            1 => glsl_float(v[0]),
-            n => format!(
-                "vec{n}({})",
-                v.iter()
-                    .map(|x| glsl_float(*x))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-        };
-        header += &format!("#define {name} {val}\n");
+        header += &format!("#define {name} {}\n", crate::shader::define_value(v));
     }
     header += cues;
     let b = Builder::new(dialect, &header, root).libraries(&movie.libraries);
-    let b = match crate::movie::transition_kind(kind) {
-        TransitionKind::File(p) => b.file(&root.join(p))?,
-        TransitionKind::Library(lib, file) => b.generated(
-            &format!("blend \"{kind}\""),
-            &format!("#include <{lib}/{file}>\n"),
-        )?,
-        TransitionKind::Name(_) => anyhow::bail!(
+    let b = b.pass(root, "blend", kind, |_| {
+        anyhow::anyhow!(
             "layer \"{}\": blend \"{kind}\" needs a library or a .glsl file",
             layer.id
-        ),
-    };
+        )
+    })?;
     Ok(b.footer(&format!("{BLEND_FOOTER}{TRANSITION_FOOTER}"))
         .build())
 }
@@ -3610,12 +3579,7 @@ pub fn channels_read(src: &Assembled) -> [bool; N_CHANNELS] {
     let text = src.text.replacen(SCENE_HEADER, "", 1);
     let mut out = [false; N_CHANNELS];
     for (n, name) in CHANNEL_UNIFORMS.iter().enumerate() {
-        out[n] = text.match_indices(name).any(|(i, _)| {
-            let before = text[..i].chars().next_back();
-            let after = text[i + name.len()..].chars().next();
-            let ident = |c: Option<char>| c.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
-            !ident(before) && !ident(after)
-        });
+        out[n] = crate::shader::mentions_ident(&text, name);
     }
     out
 }
@@ -3631,32 +3595,19 @@ pub fn transition_source(
     let root = &movie.root;
     let mut header = TRANSITION_HEADER.to_string();
     for (name, v) in params {
-        let val = match v.len() {
-            1 => glsl_float(v[0]),
-            n => format!(
-                "vec{n}({})",
-                v.iter()
-                    .map(|x| glsl_float(*x))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-        };
-        header += &format!("#define {name} {val}\n");
+        header += &format!("#define {name} {}\n", crate::shader::define_value(v));
     }
     header += cues;
     let b = Builder::new(dialect, &header, root).libraries(&movie.libraries);
-    let b = match crate::movie::transition_kind(kind) {
-        TransitionKind::File(p) => b.file(&root.join(p))?,
-        TransitionKind::Library(lib, file) => b.generated(
-            &format!("transition \"{kind}\""),
-            &format!("#include <{lib}/{file}>\n"),
-        )?,
-        TransitionKind::Name("copy") => b.builtin("copy", COPY)?,
-        TransitionKind::Name("over") => b.builtin("over", OVER)?,
-        TransitionKind::Name(_) => anyhow::bail!(
-            "unknown transition \"{kind}\"; use a library's (\"transitions/iris\") or \
+    let b = match kind {
+        "copy" => b.builtin("copy", COPY)?,
+        "over" => b.builtin("over", OVER)?,
+        _ => b.pass(root, "transition", kind, |_| {
+            anyhow::anyhow!(
+                "unknown transition \"{kind}\"; use a library's (\"transitions/iris\") or \
              a file in the film (\"fx/iris.glsl\")"
-        ),
+            )
+        })?,
     };
     Ok(b.footer(TRANSITION_FOOTER).build())
 }
