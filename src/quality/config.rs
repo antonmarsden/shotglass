@@ -300,7 +300,7 @@ fn param_defines(metric: &str, name: &str, v: &toml::Value) -> Result<Vec<(Strin
 
 /// One `[[metric]]` table: the known keys, then limits (`mean`, `min`, `max`, `over`,
 /// `pNN`); anything else is an error, as `deny_unknown_fields` would say.
-fn parse_metric(t: &toml::Table, taken: &[Metric]) -> Result<Metric> {
+pub fn parse_metric(t: &toml::Table, taken: &[Metric]) -> Result<Metric> {
     let str_of = |k: &str| -> Result<Option<String>> {
         match t.get(k) {
             None => Ok(None),

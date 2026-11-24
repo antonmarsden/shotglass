@@ -24,11 +24,13 @@ mod config;
 mod gpu;
 mod loudness;
 mod stats;
+pub mod testing;
 
 pub use config::{Config, Kind, QUALITY_FILE, SOUND_MARGIN_DB, tighten};
 pub use stats::Report;
 
 use crate::gfx::{Frame, FrameInfo, Renderer};
+use crate::library::Library;
 use crate::movie::{Movie, TransitionKind};
 use crate::shader::{Assembled, Builder, Dialect, mentions_ident};
 use crate::validate::{Source, Stage};
@@ -37,6 +39,7 @@ use config::Metric;
 use eframe::glow::{self, HasContext};
 use gpu::{Gpu, Texels};
 use stats::{FrameReport, MetricReport, Reduced, SoundReport, Totals};
+use std::path::Path;
 use std::sync::Arc;
 use toodee::{CopyOps, TooDeeOps, TooDeeOpsMut, TranslateOps};
 
@@ -88,6 +91,14 @@ const SOUND_HALO: usize = loudness::RATE as usize / 10;
 
 const METRIC_FOOTER: &str = "void main(){\n  vec4 v = vec4(0.0);\n  mainMetric(v, gl_FragCoord.xy);\n  shotglass_out = v;\n}";
 
+/// Time 0, frame 0: the uniforms of a sound metric's pass and of a metric test.
+const FRAME_ZERO: FrameInfo = FrameInfo {
+    t: 0.0,
+    dt: 0.0,
+    frame: 0,
+    scale: 1.0,
+};
+
 /// Render variants beyond `@frame`: (name, the function that reads it, its sampler).
 const VARIANTS: [(&str, &str, &str); 3] = [
     ("reference", "getReference", "sg_reference"),
@@ -98,6 +109,17 @@ const VARIANTS: [(&str, &str, &str); 3] = [
 /// The fragment shader for a metric: the metric header, its params as `#define`s,
 /// the metric (a library's or a film file), the footer that calls `mainMetric`.
 pub fn metric_source(d: Dialect, metric: &Metric, m: &Movie, kind: Kind) -> Result<Assembled> {
+    metric_source_in(d, metric, &m.root, &m.libraries, kind)
+}
+
+/// [`metric_source`] with film-relative paths from `root` and these libraries.
+pub fn metric_source_in(
+    d: Dialect,
+    metric: &Metric,
+    root: &Path,
+    libs: &[Library],
+    kind: Kind,
+) -> Result<Assembled> {
     let (header, footer) = match kind {
         Kind::Picture => (METRIC_HEADER, METRIC_FOOTER),
         Kind::Sound => (SOUND_HEADER, SOUND_FOOTER),
@@ -109,8 +131,8 @@ pub fn metric_source(d: Dialect, metric: &Metric, m: &Movie, kind: Kind) -> Resu
     for (k, v) in &metric.defines {
         header += &format!("#define {k} {v}\n");
     }
-    let b = Builder::new(d, &header, &m.root).libraries(&m.libraries);
-    let b = b.pass(&m.root, "metric", &metric.use_, |n| {
+    let b = Builder::new(d, &header, root).libraries(libs);
+    let b = b.pass(root, "metric", &metric.use_, |n| {
         anyhow!("metric \"{n}\" needs a library or a .glsl file")
     })?;
     Ok(b.footer(footer).build())
@@ -215,7 +237,7 @@ impl Programs {
     fn compile(
         gl: &glow::Context,
         d: Dialect,
-        m: &Movie,
+        (root, libs): (&Path, &[Library]),
         metrics: &[Metric],
         kind: Kind,
     ) -> Result<Programs> {
@@ -224,7 +246,7 @@ impl Programs {
             reads: vec![],
         };
         for x in metrics {
-            let built = metric_source(d, x, m, kind)
+            let built = metric_source_in(d, x, root, libs, kind)
                 .with_context(|| format!("metric \"{}\"", x.name))
                 .and_then(|src| {
                     let prog = unsafe { crate::shader::compile(gl, &src) }.map_err(|e| {
@@ -426,19 +448,20 @@ fn largest(map: &Texels, count: usize) -> Option<(f32, usize)> {
 fn run_sound_metrics(
     gl: &glow::Context,
     d: Dialect,
-    m: &Movie,
+    src: (&Path, &[Library]),
     metrics: &[Metric],
     samples: &[f32],
+    wrap: bool,
 ) -> Result<(Vec<Collected>, Vec<Option<f64>>)> {
     let n = samples.len() / 2;
-    let progs = Programs::compile(gl, d, m, metrics, Kind::Sound)?;
+    let progs = Programs::compile(gl, d, src, metrics, Kind::Sound)?;
     let mut collected: Vec<Collected> = metrics.iter().map(|_| Collected::default()).collect();
     let mut worst: Vec<Option<(f32, usize)>> = vec![None; metrics.len()];
     let result = Gpu::with(gl, d, (SOUND_W, SOUND_ROWS), |g| {
-        let info = FrameInfo::at(m, 0.0);
+        let info = FRAME_ZERO;
         for start in (0..n).step_by(SOUND_BLOCK) {
             let count = SOUND_BLOCK.min(n - start);
-            let (texels, first, len) = sound_texels(samples, start, m.loop_frames.is_some());
+            let (texels, first, len) = sound_texels(samples, start, wrap);
             let tex = unsafe { gpu::upload(gl, &texels)? };
             let metric = metrics.iter().zip(&progs.progs);
             for ((x, prog), (c, w)) in metric.zip(collected.iter_mut().zip(&mut worst)) {
@@ -501,7 +524,9 @@ pub fn run(
             if let Some((_, samples)) = &measured
                 && !sc.metrics.is_empty()
             {
-                let (c, at) = run_sound_metrics(&gl, dialect, m, &sc.metrics, samples)?;
+                let src = (m.root.as_path(), m.libraries.as_slice());
+                let wrap = m.loop_frames.is_some();
+                let (c, at) = run_sound_metrics(&gl, dialect, src, &sc.metrics, samples, wrap)?;
                 for ((x, c), at) in sc.metrics.iter().zip(c).zip(at) {
                     let mut rep = metric_report(m, x, c, vec!["sound"]);
                     rep.max_at = at;
@@ -516,7 +541,8 @@ pub fn run(
     let times = if cfg.metrics.is_empty() { &[] } else { times };
     let size = (cfg.size.0 as usize, cfg.size.1 as usize);
     let n = cfg.reference as usize;
-    let progs = Programs::compile(&gl, dialect, m, &cfg.metrics, Kind::Picture)?;
+    let src = (m.root.as_path(), m.libraries.as_slice());
+    let progs = Programs::compile(&gl, dialect, src, &cfg.metrics, Kind::Picture)?;
     let wanted = progs.wanted();
     let layout = crate::Sheet::new(times.len(), 4, size.0, size.1);
     let mut collected: Vec<Collected> = cfg

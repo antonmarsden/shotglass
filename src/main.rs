@@ -217,10 +217,10 @@ enum Cmd {
     Freeze { movie: PathBuf },
     /// Undo freeze: the film follows its project's libraries again.
     Unfreeze { movie: PathBuf },
-    /// Run GLSL unit and property tests (*.test.glsl) on the GPU, with the libraries of
-    /// each file's project. Takes a file or a folder (searched recursively).
+    /// Run GLSL unit and property tests (*.test.glsl) and quality metric tests (*.test.toml)
+    /// on the GPU, with the libraries of each file's project. Takes a file or a folder.
     Test {
-        /// A test file, or a folder to search for *.test.glsl files.
+        /// A test file, or a folder to search for *.test.glsl and *.test.toml files.
         #[arg(default_value = ".")]
         target: PathBuf,
         /// Only run tests whose name contains this text.
@@ -498,7 +498,7 @@ fn test_glsl(target: &Path, filter: Option<String>) -> Result<()> {
     let paths = glsl_test::find_files(target)?;
     if paths.is_empty() {
         bail!(
-            "no test files (*.test.glsl) at or under {}",
+            "no test files (*.test.glsl, *.test.toml) at or under {}",
             target.display()
         );
     }
@@ -529,7 +529,15 @@ fn test_glsl(target: &Path, filter: Option<String>) -> Result<()> {
     let sum = headless::with_gl(move |gl| {
         use eframe::glow::HasContext;
         let renderer = unsafe { gl.get_parameter_string(eframe::glow::RENDERER) };
-        let sum = glsl_test::run(&gl, &files, filter.as_deref(), &mut |l| println!("{l}"))?;
+        let (metric, glsl): (Vec<_>, Vec<_>) = files
+            .into_iter()
+            .partition(|f| quality::testing::is_test_file(&f.path));
+        let mut sum = glsl_test::run(&gl, &glsl, filter.as_deref(), &mut |l| println!("{l}"))?;
+        let m = quality::testing::run(&gl, &metric, filter.as_deref(), &mut |l| println!("{l}"))?;
+        sum.passed += m.passed;
+        sum.failed += m.failed;
+        sum.broken += m.broken;
+        sum.samples += m.samples;
         Ok((sum, renderer))
     })?;
     let (sum, renderer) = sum;

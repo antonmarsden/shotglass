@@ -1138,18 +1138,76 @@ test file itself (in a test or in a helper function there): the engine numbers e
 before compiling, which is how a failure names the exact call, even with several on one
 line. Names starting with `sgtest_` are reserved in test files.
 
+### Metric tests
+
+A [quality metric](#quality-metrics) can be tested on fixed inputs instead of a film:
+`shotglass test` also runs `*.test.toml` files, whose cases each run one metric on
+given pictures or samples and judge it with `quality.toml`'s limits, expecting it to
+pass or to fail. A library keeps its must-pass and must-fail cases next to its unit
+tests:
+
+```toml
+# tests/quality/banding.test.toml
+use = "quality/banding"          # defaults for every case: use, params, range,
+params = { STEP = 4 }            #   threshold, size, samples
+
+[[case]]
+name = "smooth ramp"
+frame = "fixtures/ramp.png"      # @frame: a PNG, or GLSL (mainImage)
+mean = { max = 0.01 }            # limits: mean, min, max, over, p1..p99
+
+[[case]]
+name = "posterised ramp"
+frame = "fixtures/steps.glsl"
+size = "128x32"                  # GLSL pictures' size (default 64x64)
+expect = "fail"                  # some limit must fail (default "pass")
+mean = { max = 0.01 }
+
+[[case]]
+name = "click"
+use = "quality/clicks"
+sound = "fixtures/click.wav"     # a sound metric: a WAV, or GLSL (mainSound)
+max = { max = 0.05 }
+expect = "fail"
+```
+
+```
+$ shotglass test tests/quality
+tests/quality/banding.test.toml
+  ok    smooth ramp  mean 0.000412  max 0.003922  (2048 measured)
+  ok    posterised ramp  mean 0.031250  max 0.062745  (4096 measured); fails as expected: mean 0.031250 > max 0.01
+  ok    click  mean 0.019999  max 0.999969  (100 measured); fails as expected: max 0.999969 > max 0.05
+```
+
+- A picture case sets `frame` and, for each other variant its metric reads, `reference`,
+  `prev`, `next` (a variant the metric reads must be given, and one it doesn't read is
+  refused). PNGs give the size; a `.glsl` input defines `void mainImage(out vec4
+  fragColor, in vec2 fragCoord)` and is drawn at `size` (or the frame's), stored at 8
+  bits like a rendered frame.
+- A sound case sets `sound`: a 48 kHz 16-bit stereo WAV (as `shotglass wav --rate 48000`
+  writes), or a `.glsl` defining `vec2 mainSound(int samp, float time)`, run for
+  `samples` samples (default 48000). Outside the input is silence.
+- `use`, `params`, `range` and `threshold` are those of a `[[metric]]`; `use` is a
+  library metric or a `.glsl` file, and input paths are relative to the test file.
+  Uniforms are those of time 0, frame 0.
+- A case passes when it does what `expect` says; a NaN/+Inf measure is an error either
+  way (a must-fail case must fail by a limit), and so is `expect = "fail"` without
+  limits. Metric and input shaders get the same strict check as test files.
+
 ## Quality metrics
 
 `shotglass quality <film>` measures sample frames (picked like `strip`'s) with the
 metrics listed in the film's `quality.toml`. It prints a report, writes `quality.json`
-and one heatmap contact sheet per metric (`<name>.png`) into `--out` (a project gets
-one folder per film), and exits non-zero when a metric is outside its limits. What
+and one heatmap contact sheet per metric (`<name>.png`) into `--out` (default
+`quality-out/`; a project gets one folder per film; a folder holding GLSL or a
+`library.toml` is refused, so a library's `quality/` is never written into), and exits non-zero when a metric is outside its limits. What
 counts as good depends on the film, so metrics are GLSL from libraries (the kit's
 `quality/`) or from the film, not built into shotglass.
 
 ```toml
 # quality.toml, next to movie.toml
 count = 8            # sample frames (--count / --at override)
+# at = ["intro+0.5", 3.25]   # or explicit times, as --at spells them (not with count)
 size = "384x216"     # frame size (--size overrides)
 reference = 4        # @reference: N×N samples per pixel (2-8)
 
@@ -1178,18 +1236,25 @@ sample frame:
 Each variant other than `@frame` is rendered only for metrics that call its function.
 
 `iResolution`, `iTime` and `iFrame` are those of the sample frame. Params become
-`#define`s: a number is a float, 2–4 numbers a `vecN`, `"#rrggbb"` a `vec3` (0–1, as
-written), and a list of colours `vec3[n](…)` plus `<NAME>_COUNT`.
+`#define`s: a number is a float (an integer too: `STEP = 4` is `4.0`, so write
+`int(STEP)` where GLSL wants an int), 2–4 numbers a `vecN`, `"#rrggbb"` a `vec3` (0–1,
+as written), and a list of colours `vec3[n](…)` plus `<NAME>_COUNT`.
+
+**Not measured.** A metric that applies to some pixels only (outline ink, frames between
+animation steps) sets `value.a = notMeasured()` elsewhere (-Inf): that pixel is left out
+of every reduction (mean, min, max, `over`, histogram) and counted as `unmeasured`, never
+invalid, so the mean covers the measured pixels only. Sound metrics have it too. Test it
+with [metric tests](#metric-tests).
 
 Measures are reduced on the GPU per frame (mean, min, max, `over`) and counted into a
 256-bin histogram over `range`; over frames the mean and `over` are pixel-weighted,
 min and max are the extremes, and the histograms add up. Percentiles (p50, p95, p99
 and any a limit names) come from the histogram, exact to a bin: (range width) / 256.
 Values outside `range` count in the end bins. Two checks are fixed: **invalid** counts
-NaN/Inf measures, which are left out of everything else and always fail the metric;
+NaN/+Inf measures, which are left out of everything else and always fail the metric;
 **cost** reports the GPU time of each frame (never gated; meaningless on software
 OpenGL). `check` validates metric shaders strictly like every other shader (`check
---web` too). `quality.json` (`schema` 3) records the engine and library versions, the
+--web` too). `quality.json` (`schema` 4: adds `unmeasured`) records the engine and library versions, the
 size, each frame (with the `@prev`/`@next` frames shown), each metric's variants,
 per-frame values, totals (with percentiles and the histogram), limits and failures,
 and the `sound` section (with its metrics).
@@ -1208,7 +1273,8 @@ LUFS (K-weighted, 400 ms blocks, gated at -70 LUFS and 10 LU below the ungated
 level), `momentary_max` (400 ms) and `short_term_max` (3 s) in LUFS, `sample_peak` in
 dBFS and `true_peak` in dBTP (4× oversampled). Each takes a `min`/`max`. A limit fails
 if its measure is missing: a film without sound, silence, or one shorter than the
-window. A `quality.toml` may have only `[sound]`; then no frames are rendered.
+window. A `quality.toml` may have only `[sound]`; then no frames are rendered. The
+report's `sound` line judges these limits only; each sound metric has its own line.
 
 **Sound metrics.** `[[sound.metric]]` entries (inside `[sound]`, same fields as
 `[[metric]]`: `use`, `name`, `params`, `range`, `threshold`, limits) are GLSL run over
@@ -1265,8 +1331,8 @@ shotglass fonts add "Family" [..] [--film <dir>]           # Google Fonts famili
 shotglass bundle <movie> --out <dir>                       # self-contained copy with the library files it includes
 shotglass freeze <movie>                                   # copy the library files it includes into the film
 shotglass unfreeze <movie>                                 # follow the project's libraries again
-shotglass test   [file|folder] [filter]                    # GLSL unit and property tests (*.test.glsl) on the GPU
-shotglass quality <movie> [--count 8 | --at ...] [--size 384x216] [--out quality/]
+shotglass test   [file|folder] [filter]                    # GLSL unit and property tests (*.test.glsl), metric tests (*.test.toml)
+shotglass quality <movie> [--count 8 | --at ...] [--size 384x216] [--out quality-out/]
                  [--compare <dir> [--bless] [--budget 0.1%]] # heatmaps vs <dir>/<metric>.png
                  [--tighten [--margin 25%]]    # move limits towards the measured values
                  # metrics from quality.toml: report, quality.json, heatmaps; fails outside limits

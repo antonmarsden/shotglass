@@ -995,7 +995,7 @@ fn bytemuck_slice(px: &mut [[u32; 4]]) -> &mut [u8] {
     unsafe { std::slice::from_raw_parts_mut(px.as_mut_ptr().cast::<u8>(), len) }
 }
 
-/// `*.test.glsl` files at or under `target` (a file is taken as it is), sorted. Hidden
+/// `*.test.glsl` and `*.test.toml` (metric tests) files at or under `target` (a file is taken as it is), sorted. Hidden
 /// folders, `target/` and frozen library copies are skipped.
 pub fn find_files(target: &Path) -> Result<Vec<PathBuf>> {
     if target.is_file() {
@@ -1015,7 +1015,7 @@ pub fn find_files(target: &Path) -> Result<Vec<PathBuf>> {
                 if !(name.starts_with('.') || name == "target" || name == "shotglass-libs") {
                     stack.push(p);
                 }
-            } else if name.ends_with(".test.glsl") {
+            } else if name.ends_with(".test.glsl") || name.ends_with(".test.toml") {
                 out.push(p);
             }
         }
