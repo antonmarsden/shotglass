@@ -3,7 +3,7 @@
 //! counts come back for the numbers (heatmaps are read back for their PNGs).
 
 use super::config::BINS;
-use crate::gfx::FrameInfo;
+use crate::gfx::{FrameInfo, ReadFormat, read_pixels_into};
 use crate::shader::{Assembled, Dialect};
 use anyhow::{Result, anyhow, bail};
 use eframe::glow::{self, HasContext};
@@ -176,24 +176,14 @@ impl Target {
     pub unsafe fn read(&self, gl: &glow::Context, i: u32) -> Texels {
         let (w, h) = self.size;
         let mut px = Texels::init(w as usize, h as usize, [0.0; 4]);
-        unsafe {
-            gl.bind_buffer(glow::PIXEL_PACK_BUFFER, None);
-            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.fbo));
-            gl.read_buffer(glow::COLOR_ATTACHMENT0 + i);
-            gl.pixel_store_i32(glow::PACK_ALIGNMENT, 4);
-            let bytes: &mut [u8] = bytemuck_bytes(px.data_mut());
-            gl.read_pixels(
-                0,
-                0,
-                w,
-                h,
-                glow::RGBA,
-                glow::FLOAT,
-                glow::PixelPackData::Slice(Some(bytes)),
-            );
-            gl.read_buffer(glow::COLOR_ATTACHMENT0);
-            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
-        }
+        read_pixels_into(
+            gl,
+            (self.fbo, glow::COLOR_ATTACHMENT0 + i),
+            [0, 0, w, h],
+            ReadFormat::RgbaF32,
+            bytemuck_bytes(px.data_mut()),
+            (w as usize, (0, 0)),
+        );
         px
     }
 }

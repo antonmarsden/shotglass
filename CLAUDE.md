@@ -142,9 +142,11 @@ cargo fmt && cargo clippy --all-targets -- -D warnings
   row length/skips 0) and unbind `PIXEL_UNPACK_BUFFER` first: the sound path binds it, and a
   client-memory upload with it bound reads a buffer offset. The scene pass unbinds its
   sampler objects after drawing (they'd override the composite pass and egui on units 0–7).
-- **Readbacks restore GL pack state** (`PACK_ROW_LENGTH`/`SKIP_*` to 0, alignment 4) and
-  check bounds first: `glReadPixels` never sees the slice length. Headless renderers call
-  `set_readback(true)` (composite drawn upside down, no CPU flip); the player doesn't.
+- **CPU readbacks use `gfx::read_pixels_into`** to check destination bounds, unbind
+  `PIXEL_PACK_BUFFER`, and restore GL pack defaults (`PACK_ROW_LENGTH`/`SKIP_*` to 0,
+  alignment 4, byte swapping off on desktop GL). `glReadPixels` never sees the slice length.
+  Headless renderers call `set_readback(true)` (composite drawn upside down, no CPU flip);
+  the player doesn't.
 - **Shaders compile as `#version 330 core` (or `300 es`) whatever the driver offers**, unless the
   film sets `glsl = "410"|"430"` (refused on drivers that can't). Selftest checks `__VERSION__`.
   Everything in this repo (demo, template, transitions, selftest fixtures) must pass

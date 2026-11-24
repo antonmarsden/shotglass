@@ -9,6 +9,7 @@ use crate::movie::{At, Movie};
 use crate::shader::Dialect;
 use crate::sound::Soundtrack;
 use anyhow::{Result, anyhow, bail};
+use eframe::glow::{self, HasContext};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -720,10 +721,13 @@ fn glsl_tests(gl: &Gl, dir: &Path) -> Result<String> {
         display: f.into(),
     });
     let mut report = String::new();
+    let junk = dirty_pack_state(gl)?;
     let sum = run(gl, &files, None, &mut |l| {
         report += l;
         report.push('\n');
-    })?;
+    });
+    unsafe { gl.delete_buffer(junk) };
+    let sum = sum?;
     let expected = "\
 unit/fx.test.glsl
   ok    test_pass
@@ -1258,6 +1262,22 @@ duration=2
     Ok(String::new())
 }
 
+fn dirty_pack_state(gl: &Gl) -> Result<glow::Buffer> {
+    unsafe {
+        let buf = gl.create_buffer().map_err(|e| anyhow!(e))?;
+        gl.bind_buffer(glow::PIXEL_PACK_BUFFER, Some(buf));
+        gl.buffer_data_size(glow::PIXEL_PACK_BUFFER, 4096, glow::STREAM_READ);
+        gl.pixel_store_i32(glow::PACK_ALIGNMENT, 8);
+        gl.pixel_store_i32(glow::PACK_ROW_LENGTH, 1);
+        gl.pixel_store_i32(glow::PACK_SKIP_PIXELS, 1);
+        gl.pixel_store_i32(glow::PACK_SKIP_ROWS, 1);
+        if !gl.version().is_embedded {
+            gl.pixel_store_i32(glow::PACK_SWAP_BYTES, 1);
+        }
+        Ok(buf)
+    }
+}
+
 fn readback_into(gl: &Gl, dir: &Path) -> Result<String> {
     // Top and bottom differ, so an upside-down readback can't pass.
     write(
@@ -1280,7 +1300,7 @@ fn readback_into(gl: &Gl, dir: &Path) -> Result<String> {
         "[[shot]]\nid=\"a\"\nscene=\"a.glsl\"\nduration=2\n[[shot]]\nid=\"b\"\nscene=\"b.glsl\"\nduration=2\n\
          transition = { type = \"fx/wipe.glsl\", duration = 1 }\n",
     )?;
-    let defaults = [4, 0, 0, 0];
+    let defaults = [4, 0, 0, 0, 0];
     let mut plain = renderer(gl, &m)?;
     let mut flipped = renderer(gl, &m)?;
     flipped.set_readback(true);
@@ -1304,7 +1324,10 @@ fn readback_into(gl: &Gl, dir: &Path) -> Result<String> {
                 r.render_at(&m, W, H, &info(at_time(&m, at), 1.0), at, true)
                     .ok_or_else(|| anyhow!("nothing rendered"))?;
                 let mut dst = bg.clone();
+                let junk = dirty_pack_state(gl)?;
                 r.read_output_into(&mut dst, (x, y));
+                let state = r.pack_state();
+                unsafe { gl.delete_buffer(junk) };
                 let window = (x, y, x + W as usize, y + H as usize);
                 if dst.view((window.0, window.1), (window.2, window.3)) != want_frame {
                     bail!("{what}, {name}, at ({x}, {y}): the window differs from read_output");
@@ -1312,8 +1335,8 @@ fn readback_into(gl: &Gl, dir: &Path) -> Result<String> {
                 if dst != want {
                     bail!("{what}, {name}, at ({x}, {y}): pixels outside the window changed");
                 }
-                if r.pack_state() != defaults {
-                    bail!("{what}, {name}: pack state left at {:?}", r.pack_state());
+                if state != defaults {
+                    bail!("{what}, {name}: pack state left at {state:?}");
                 }
                 // read_output (used by `still`) agrees as well.
                 expect_same(

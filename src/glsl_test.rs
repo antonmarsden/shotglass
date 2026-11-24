@@ -12,6 +12,7 @@
 //! `expect*(<id>, ` and the engine keeps id → (line, call text), so a failure names the
 //! exact call, even several on one line, without GLSL needing strings.
 
+use crate::gfx::{ReadFormat, read_pixels_into};
 use crate::library::Library;
 use crate::shader::{Assembled, Builder, Dialect, DriverGlsl, compile, top_level_definitions};
 use crate::validate::{Stage, validate};
@@ -956,21 +957,15 @@ impl Gpu {
             }
             gl.use_program(None);
             gl.bind_vertex_array(None);
-            // Readback: pack state at its defaults (alignment 4 fits 16-byte pixels).
-            gl.bind_buffer(glow::PIXEL_PACK_BUFFER, None);
-            gl.pixel_store_i32(glow::PACK_ALIGNMENT, 4);
             let read = |attachment: u32, x: u32, y: u32, w: u32, h: u32| -> Vec<[u32; 4]> {
                 let mut px = vec![[0u32; 4]; (w * h) as usize];
-                let bytes: &mut [u8] = bytemuck_slice(&mut px);
-                gl.read_buffer(glow::COLOR_ATTACHMENT0 + attachment);
-                gl.read_pixels(
-                    x as i32,
-                    y as i32,
-                    w as i32,
-                    h as i32,
-                    glow::RGBA_INTEGER,
-                    glow::UNSIGNED_INT,
-                    glow::PixelPackData::Slice(Some(bytes)),
+                read_pixels_into(
+                    gl,
+                    (self.fbo, glow::COLOR_ATTACHMENT0 + attachment),
+                    [x as i32, y as i32, w as i32, h as i32],
+                    ReadFormat::RgbaU32,
+                    bytemuck_slice(&mut px),
+                    (w as usize, (0, 0)),
                 );
                 px
             };
@@ -981,8 +976,6 @@ impl Gpu {
                 let (x, y) = (i % WIDTH, i / WIDTH);
                 (read(1, x, y, 1, 1)[0], read(2, x, y, 1, 1)[0])
             });
-            gl.read_buffer(glow::COLOR_ATTACHMENT0);
-            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
             Ok(o)
         }
     }
