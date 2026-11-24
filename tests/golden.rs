@@ -185,6 +185,46 @@ fn demo_film() {
     golden("big-shadow", &root().join("movies").join("big-shadow"));
 }
 
+/// `shotglass quality` on the demo (its quality.toml: an `@reference` metric and a
+/// plain one): the heatmaps match tests/golden/quality/big-shadow/<metric>.png, and the
+/// metrics stay within the demo's limits.
+#[test]
+fn demo_quality_heatmaps() {
+    if skip() {
+        return;
+    }
+    let movie = root().join("movies").join("big-shadow");
+    if !fetch_libraries(&movie) {
+        return;
+    }
+    let refs = root()
+        .join("tests")
+        .join("golden")
+        .join("quality")
+        .join("big-shadow");
+    let actual = out_dir().join("quality-big-shadow");
+    let mut args: Vec<&std::ffi::OsStr> = vec![
+        "quality".as_ref(),
+        movie.as_os_str(),
+        "--size".as_ref(),
+        SIZE.as_ref(),
+        "--count".as_ref(),
+        COUNT.as_ref(),
+        "--out".as_ref(),
+        actual.as_os_str(),
+        "--compare".as_ref(),
+        refs.as_os_str(),
+    ];
+    bless(&mut args);
+    let out = shotglass(&args);
+    assert!(
+        out.status.success(),
+        "demo quality: a heatmap differs from tests/golden/quality/big-shadow/ or a metric \
+         failed (see the message above; actual and diff images are in {})",
+        actual.display()
+    );
+}
+
 #[test]
 fn new_template() {
     if skip() {

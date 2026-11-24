@@ -243,6 +243,13 @@ enum Cmd {
         /// Folder for quality.json and the heatmaps (a project gets one per film).
         #[arg(long, default_value = "quality")]
         out: PathBuf,
+        /// Compare each metric's heatmap with <DIR>/<metric>.png (golden images, with
+        /// `strip --compare`'s default tolerance); writes <metric>.diff.png on a mismatch.
+        #[arg(long, value_name = "DIR")]
+        compare: Option<PathBuf>,
+        /// With --compare: write the heatmaps as the new references instead of comparing.
+        #[arg(long, requires = "compare")]
+        bless: bool,
     },
     /// Check the renderer and soundtrack on this GPU and driver with built-in test films.
     Selftest {
@@ -400,6 +407,8 @@ fn real_main() -> Result<()> {
             at,
             size,
             out,
+            compare,
+            bless,
         } => {
             let single = matches!(project::target(&movie)?, project::Target::Film(_));
             for_each_film(&movie, |f| {
@@ -408,7 +417,21 @@ fn real_main() -> Result<()> {
                 } else {
                     out.join(f.file_name().unwrap_or_default())
                 };
-                quality_cmd(f, count, at.as_deref(), size.as_deref(), &dir)
+                let golden = compare.as_ref().map(|c| {
+                    if single {
+                        c.clone()
+                    } else {
+                        c.join(f.file_name().unwrap_or_default())
+                    }
+                });
+                quality_cmd(
+                    f,
+                    count,
+                    at.as_deref(),
+                    size.as_deref(),
+                    &dir,
+                    golden.as_deref().map(|g| (g, bless)),
+                )
             })
         }
         Cmd::Selftest { filter } => selftest::run(filter),
@@ -790,8 +813,10 @@ fn quality_cmd(
     at: Option<&str>,
     size: Option<&str>,
     out: &Path,
+    golden: Option<(&Path, bool)>,
 ) -> Result<()> {
     let m = load_movie(movie)?;
+    let golden = golden.map(|(d, b)| (d.to_path_buf(), b));
     let mut cfg = quality::Config::of_film(&m)?.ok_or_else(|| {
         anyhow!(
             "{} has no {} (metrics to run: see README, \"Quality metrics\")",
@@ -817,6 +842,28 @@ fn quality_cmd(
         report.print();
         report.write(&out)?;
         println!("wrote {}", out.join("quality.json").display());
+        // Heatmaps against golden images first: a limit failure shouldn't hide them.
+        let mut mismatched = vec![];
+        if let Some((dir, bless)) = &golden {
+            for x in &report.metrics {
+                let Some(heat) = &x.heatmap else { continue };
+                let g = Golden {
+                    reference: dir.join(format!("{}.png", x.name)),
+                    bless: *bless,
+                    tol: golden::Tolerance::default(),
+                };
+                if let Err(e) = compare_golden(heat, &out.join(format!("{}.png", x.name)), &g) {
+                    eprintln!("error: {e:#}");
+                    mismatched.push(x.name.as_str());
+                }
+            }
+        }
+        if !mismatched.is_empty() {
+            bail!(
+                "heatmaps differ from the references: {}",
+                mismatched.join(", ")
+            );
+        }
         let failed: Vec<&str> = report
             .metrics
             .iter()
