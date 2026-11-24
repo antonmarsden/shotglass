@@ -13,7 +13,8 @@ use toodee::{TooDee, TooDeeOps};
 pub type Texels = TooDee<[f32; 4]>;
 
 /// One reduction pass: each output texel combines a 4×4 block. The first pass reads
-/// the measure (`.a` of the metric map); later ones read the previous level's two
+/// the measure (`.a` of the metric map) of the first `sg_count` texels in row order
+/// (a sound metric's last block is partly empty); later ones read the previous level's two
 /// targets: (sum, max, finite, non-finite) and (over, min, -, -). Non-finite is
 /// tested on the bits ([`NONFINITE`]).
 const REDUCE: &str = "
@@ -21,6 +22,7 @@ uniform sampler2D sg_src;
 uniform sampler2D sg_src2;
 uniform ivec2 sg_size;
 uniform int sg_first;
+uniform int sg_count;
 uniform float sg_threshold;
 layout(location = 0) out vec4 o0;
 layout(location = 1) out vec4 o1;
@@ -33,6 +35,7 @@ void main() {
       if (p.x >= sg_size.x || p.y >= sg_size.y) continue;
       vec4 v = texelFetch(sg_src, p, 0);
       if (sg_first == 1) {
+        if (p.y * sg_size.x + p.x >= sg_count) continue;
         if (sg_nonfinite(v.a)) {
           bad += 1.0;
         } else {
@@ -283,6 +286,19 @@ impl Gpu {
         }
     }
 
+    /// Run `f` with a `Gpu` for w×h maps, deleted afterwards whatever `f` returns.
+    pub fn with<T>(
+        gl: &glow::Context,
+        d: Dialect,
+        (w, h): (usize, usize),
+        f: impl FnOnce(&Gpu) -> Result<T>,
+    ) -> Result<T> {
+        let g = unsafe { Gpu::new(gl, d, w as i32, h as i32)? };
+        let out = f(&g);
+        unsafe { g.delete(gl) };
+        out
+    }
+
     pub unsafe fn delete(&self, gl: &glow::Context) {
         unsafe {
             gl.delete_vertex_array(self.vao);
@@ -328,11 +344,13 @@ impl Gpu {
         }
     }
 
-    /// Reduce the map down the levels: the last level's two texels.
+    /// Reduce the first `count` texels of the map (row order) down the levels: the
+    /// last level's two texels.
     pub unsafe fn reduce(
         &self,
         gl: &glow::Context,
         threshold: Option<f64>,
+        count: i32,
     ) -> ([f32; 4], [f32; 4]) {
         unsafe {
             let prog = self.reduce;
@@ -343,6 +361,7 @@ impl Gpu {
             let loc = |n: &str| gl.get_uniform_location(prog, n);
             gl.uniform_1_i32(loc("sg_src").as_ref(), 0);
             gl.uniform_1_i32(loc("sg_src2").as_ref(), 1);
+            gl.uniform_1_i32(loc("sg_count").as_ref(), count);
             gl.uniform_1_f32(
                 loc("sg_threshold").as_ref(),
                 threshold.map_or(3.0e38, |t| t as f32),
@@ -376,9 +395,10 @@ impl Gpu {
         }
     }
 
-    /// The map's finite measures counted into `BINS` bins over `range`.
-    pub unsafe fn histogram(&self, gl: &glow::Context, range: (f64, f64)) -> Vec<u64> {
-        let (w, h) = self.map.size;
+    /// The finite measures of the map's first `count` texels counted into `BINS`
+    /// bins over `range`.
+    pub unsafe fn histogram(&self, gl: &glow::Context, range: (f64, f64), count: i32) -> Vec<u64> {
+        let (w, _) = self.map.size;
         unsafe {
             let prog = self.histogram;
             gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.hist.fbo));
@@ -400,7 +420,7 @@ impl Gpu {
             gl.uniform_1_i32(loc("sg_src").as_ref(), 0);
             gl.uniform_1_i32(loc("sg_width").as_ref(), w);
             gl.uniform_2_f32(loc("sg_range").as_ref(), range.0 as f32, range.1 as f32);
-            gl.draw_arrays(glow::POINTS, 0, w * h);
+            gl.draw_arrays(glow::POINTS, 0, count);
             gl.disable(glow::PROGRAM_POINT_SIZE);
             gl.disable(glow::BLEND);
             gl.blend_func(glow::ONE, glow::ZERO); // GL's default

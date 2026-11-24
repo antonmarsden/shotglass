@@ -1,7 +1,7 @@
 //! Reduced values per frame and over frames, percentiles from histograms, limits,
 //! and the report (`quality.json`, heatmaps).
 
-use super::config::{BINS, Bound, Metric, SoundConfig, SoundStat, Stat};
+use super::config::{BINS, Bound, Kind, Metric, SoundConfig, SoundStat, Stat};
 use super::loudness::Loudness;
 use crate::gfx::Frame;
 use anyhow::Result;
@@ -185,6 +185,9 @@ pub struct MetricReport {
     pub limits: BTreeMap<String, Bound>,
     pub failures: Vec<String>,
     pub pass: bool,
+    /// Sound metrics: the time (s) of the largest measure (`frames` are blocks).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_at: Option<f64>,
     #[serde(skip)]
     pub heatmap: Option<Frame>,
 }
@@ -194,6 +197,8 @@ pub struct MetricReport {
 pub struct SoundReport {
     /// None: the film has no sound.
     pub measured: Option<Loudness>,
+    /// `[[sound.metric]]`, over the samples (`frames` are blocks of samples).
+    pub metrics: Vec<MetricReport>,
     /// Limits by name (`integrated`, `true_peak`, …).
     pub limits: BTreeMap<String, Bound>,
     pub failures: Vec<String>,
@@ -201,21 +206,29 @@ pub struct SoundReport {
 }
 
 impl SoundReport {
-    pub fn judge(cfg: &SoundConfig, measured: Option<Loudness>) -> SoundReport {
+    pub fn judge(
+        cfg: &SoundConfig,
+        measured: Option<Loudness>,
+        metrics: Vec<MetricReport>,
+    ) -> SoundReport {
         let mut failures = vec![];
         for (stat, b) in &cfg.limits {
             let v = measured.as_ref().and_then(|l| l.get(*stat));
             let missing = "not measured (no sound, silence, or too short)";
             failures.extend(b.violation(stat.name(), v, missing));
         }
+        if !cfg.metrics.is_empty() && measured.is_none() {
+            failures.push("sound metrics: the film has no sound".into());
+        }
         SoundReport {
+            pass: failures.is_empty() && metrics.iter().all(|x| x.pass),
             measured,
+            metrics,
             limits: cfg
                 .limits
                 .iter()
                 .map(|(s, b)| (s.name().to_string(), *b))
                 .collect(),
-            pass: failures.is_empty(),
             failures,
         }
     }
@@ -243,6 +256,36 @@ impl SoundReport {
             db(l.sample_peak),
             db(l.true_peak),
             l.seconds
+        );
+        for f in &self.failures {
+            println!("      {f}");
+        }
+        self.metrics.iter().for_each(MetricReport::print);
+    }
+}
+
+impl MetricReport {
+    fn print(&self) {
+        let v = self
+            .library_version
+            .as_ref()
+            .map_or(String::new(), |v| format!(" {v}"));
+        let t = &self.total;
+        let over = t
+            .over
+            .map_or(String::new(), |o| format!("  over {:.4}%", o * 100.0));
+        let at = self
+            .max_at
+            .map_or(String::new(), |s| format!(" at {s:.4}s"));
+        println!(
+            "{:<5} {:<16} mean {:>10}  p95 {:>10}  max {:>10}{at}{over}  invalid {}   ({}{v})",
+            if self.pass { "ok" } else { "FAIL" },
+            self.name,
+            fmt_opt(t.mean),
+            fmt_opt(t.get(Stat::P(95))),
+            fmt_opt(t.max),
+            t.invalid,
+            self.use_
         );
         for f in &self.failures {
             println!("      {f}");
@@ -277,29 +320,7 @@ impl Report {
                 f.index, f.time, f.frame
             );
         }
-        for m in &self.metrics {
-            let v = m
-                .library_version
-                .as_ref()
-                .map_or(String::new(), |v| format!(" {v}"));
-            let t = &m.total;
-            let over = t
-                .over
-                .map_or(String::new(), |o| format!("  over {:.4}%", o * 100.0));
-            println!(
-                "{:<5} {:<16} mean {:>10}  p95 {:>10}  max {:>10}{over}  invalid {}   ({}{v})",
-                if m.pass { "ok" } else { "FAIL" },
-                m.name,
-                fmt_opt(t.mean),
-                fmt_opt(t.get(Stat::P(95))),
-                fmt_opt(t.max),
-                t.invalid,
-                m.use_
-            );
-            for f in &m.failures {
-                println!("      {f}");
-            }
-        }
+        self.metrics.iter().for_each(MetricReport::print);
         if let Some(s) = &self.sound {
             s.print();
         }
@@ -329,9 +350,13 @@ impl Report {
         metrics.chain(sound).collect()
     }
 
-    /// Metric `i`'s value of `s`, for `--tighten`.
-    pub fn value(&self, i: usize, s: Stat) -> Option<f64> {
-        self.metrics.get(i)?.total.get(s)
+    /// Metric `i`'s value of `s` (a picture or a sound metric), for `--tighten`.
+    pub fn value(&self, k: Kind, i: usize, s: Stat) -> Option<f64> {
+        let metrics = match k {
+            Kind::Picture => &self.metrics,
+            Kind::Sound => &self.sound.as_ref()?.metrics,
+        };
+        metrics.get(i)?.total.get(s)
     }
 }
 

@@ -1196,7 +1196,7 @@ OpenGL). `check` validates metric shaders strictly like every other shader (`che
 --web` too). `quality.json` (`schema` 3) records the engine and library versions, the
 size, each frame (with the `@prev`/`@next` frames shown), each metric's variants,
 per-frame values, totals (with percentiles and the histogram), limits and failures,
-and the `sound` section.
+and the `sound` section (with its metrics).
 
 **Sound.** A `[sound]` table measures the whole soundtrack (one period of a loop film),
 synthesised at 48 kHz, in the engine, not in GLSL:
@@ -1214,6 +1214,25 @@ dBFS and `true_peak` in dBTP (4× oversampled). Each takes a `min`/`max`. A limi
 if its measure is missing: a film without sound, silence, or one shorter than the
 window. A `quality.toml` may have only `[sound]`; then no frames are rendered.
 
+**Sound metrics.** `[[sound.metric]]` entries (inside `[sound]`, same fields as
+`[[metric]]`: `use`, `name`, `params`, `range`, `threshold`, limits) are GLSL run over
+every sample of the soundtrack at 48 kHz:
+
+```glsl
+// metrics/clicks.glsl (the demo's, abridged)
+void mainSoundMetric(out float value, in int samp) {
+    vec2 d = getSound(samp) - 2.0 * getSound(samp - 1) + getSound(samp - 2);
+    value = max(abs(d.x), abs(d.y));   // the jump in slope
+}
+```
+
+`getSound(samp)` is the stereo sample (silence outside the film, wrapped in a loop
+film); `iSampleRate` and `iSoundSamples` are uniforms. Samples are measured in blocks
+of 2^20, and a metric can read 100 ms (4800 samples) either side of the sample it
+measures; further reads are silent. The measures go through the same reductions as
+pixels (mean, min, max, over, percentiles; "pixels" count samples), and the report
+gives the time of the largest (`max_at`), so a click can be found.
+
 **The ratchet.** `quality --tighten` runs the metrics and, if every one passes, moves
 each limit in `quality.toml` to the measured value plus `--margin` (default 25%, at
 least 1e-6), rounded outward to 3 significant digits. It only ever tightens: a max goes
@@ -1223,7 +1242,8 @@ with a margin that covers both (or on the renderer CI uses).
 `[sound]` limits move to the measured value ± 0.5 dB, rounded outward to tenths.
 
 The demo (`movies/big-shadow`) has a `quality.toml` with two film metrics in
-`metrics/` (aliasing against `@reference`, clipped highlights) as examples, and `[sound]` loudness and true-peak limits.
+`metrics/` (aliasing against `@reference`, clipped highlights) as examples, and `[sound]` loudness and true-peak limits, and a clicks metric (`metrics/clicks.glsl`: the
+second difference against its local level).
 
 ## Command line
 

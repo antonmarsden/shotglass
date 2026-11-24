@@ -139,6 +139,8 @@ impl SoundStat {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SoundConfig {
     pub limits: Vec<(SoundStat, Bound)>,
+    /// `[[sound.metric]]`: GLSL metrics over the samples (`mainSoundMetric`).
+    pub metrics: Vec<Metric>,
 }
 
 /// A `{ min, max }` limit; `ctx` names it in errors (`metric "x": mean`).
@@ -152,12 +154,27 @@ fn parse_bound(v: &toml::Value, ctx: &str) -> Result<Bound> {
     Ok(b)
 }
 
-fn parse_sound(t: &toml::Table) -> Result<SoundConfig> {
+/// `[sound]`; `taken` are the picture metrics (names are unique across both).
+fn parse_sound(t: &toml::Table, taken: &[Metric]) -> Result<SoundConfig> {
     let mut limits = vec![];
+    // Picture metrics, then sound ones: names are checked against all of them.
+    let mut all = taken.to_vec();
     for (k, v) in t {
+        if k == "metric" {
+            let tables = v
+                .as_array()
+                .filter(|a| a.iter().all(|x| x.is_table()))
+                .ok_or_else(|| anyhow!("[sound]: `metric` must be [[sound.metric]] tables"))?;
+            for x in tables {
+                let m = parse_metric(x.as_table().unwrap(), &all)
+                    .map_err(|e| anyhow!("[[sound.metric]]: {e}"))?;
+                all.push(m);
+            }
+            continue;
+        }
         let stat = SoundStat::parse(k).ok_or_else(|| {
             anyhow!(
-                "[sound]: unknown field `{k}` (expected {})",
+                "[sound]: unknown field `{k}` (expected {}, or [[sound.metric]])",
                 SoundStat::ALL.map(|s| s.name()).join(", ")
             )
         })?;
@@ -165,7 +182,8 @@ fn parse_sound(t: &toml::Table) -> Result<SoundConfig> {
         limits.push((stat, b));
     }
     limits.sort_by_key(|(s, _)| *s);
-    Ok(SoundConfig { limits })
+    let metrics = all.split_off(taken.len());
+    Ok(SoundConfig { limits, metrics })
 }
 
 /// `quality.toml`, resolved.
@@ -392,7 +410,11 @@ impl Config {
             let m = parse_metric(t, &metrics)?;
             metrics.push(m);
         }
-        let sound = raw.sound.as_ref().map(parse_sound).transpose()?;
+        let sound = raw
+            .sound
+            .as_ref()
+            .map(|t| parse_sound(t, &metrics))
+            .transpose()?;
         Ok(Config {
             count,
             size,
@@ -404,6 +426,15 @@ impl Config {
 }
 
 impl Config {
+    /// Every metric, picture ones first, with its kind.
+    pub fn all_metrics(&self) -> impl Iterator<Item = (Kind, &Metric)> {
+        let sound = self.sound.iter().flat_map(|s| &s.metrics);
+        self.metrics
+            .iter()
+            .map(|x| (Kind::Picture, x))
+            .chain(sound.map(|x| (Kind::Sound, x)))
+    }
+
     /// The film's `quality.toml`, if it has one.
     pub fn of_film(m: &Movie) -> Result<Option<Config>> {
         let path = m.root.join(QUALITY_FILE);
@@ -487,7 +518,7 @@ pub fn tighten(
     text: &str,
     margin: f64,
     sound_margin: f64,
-    metric: impl Fn(usize, Stat) -> Option<f64>,
+    metric: impl Fn(Kind, usize, Stat) -> Option<f64>,
     sound: impl Fn(SoundStat) -> Option<f64>,
 ) -> Result<(String, Vec<String>)> {
     let mut doc: toml_edit::DocumentMut = text.parse()?;
@@ -507,12 +538,35 @@ pub fn tighten(
             }
         }
     }
-    let Some(metrics) = doc
+    if let Some(a) = doc
+        .get_mut("sound")
+        .and_then(|t| t.get_mut("metric"))
+        .and_then(|m| m.as_array_of_tables_mut())
+    {
+        tighten_metrics(a, margin, |i, s| metric(Kind::Sound, i, s), &mut changes);
+    }
+    if let Some(a) = doc
         .get_mut("metric")
         .and_then(|m| m.as_array_of_tables_mut())
-    else {
-        return Ok((doc.to_string(), changes));
-    };
+    {
+        tighten_metrics(a, margin, |i, s| metric(Kind::Picture, i, s), &mut changes);
+    }
+    Ok((doc.to_string(), changes))
+}
+
+/// Whether a metric measures frames (`[[metric]]`) or samples (`[[sound.metric]]`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    Picture,
+    Sound,
+}
+
+fn tighten_metrics(
+    metrics: &mut toml_edit::ArrayOfTables,
+    margin: f64,
+    metric: impl Fn(usize, Stat) -> Option<f64>,
+    changes: &mut Vec<String>,
+) {
     for (i, t) in metrics.iter_mut().enumerate() {
         let name = t
             .get("name")
@@ -530,10 +584,9 @@ pub fn tighten(
             };
             let pad = (v.abs() * margin).max(ABS_MARGIN);
             let what = format!("{name}: {key}");
-            tighten_bound(bound, &what, v, pad, round_sig, &mut changes);
+            tighten_bound(bound, &what, v, pad, round_sig, changes);
         }
     }
-    Ok((doc.to_string(), changes))
 }
 
 #[cfg(test)]
@@ -742,6 +795,50 @@ over = { max = 0.01 }
     }
 
     #[test]
+    fn parses_sound_metrics() {
+        let c = Config::parse(
+            "[[metric]]
+use = \"a.glsl\"
+[sound]
+true_peak = { max = -1 }
+             [[sound.metric]]
+use = \"q/clicks.glsl\"
+threshold = 8
+over = { max = 0 }
+",
+        )
+        .unwrap();
+        let s = c.sound.unwrap();
+        assert_eq!(s.limits.len(), 1);
+        assert_eq!(s.metrics.len(), 1);
+        assert_eq!(s.metrics[0].name, "clicks");
+        assert_eq!(s.metrics[0].threshold, Some(8.0));
+        // Names are unique across picture and sound metrics.
+        let e = Config::parse(
+            "[[metric]]
+use = \"x/clicks.glsl\"
+[[sound.metric]]
+use = \"q/clicks.glsl\"
+",
+        )
+        .unwrap_err();
+        assert!(format!("{e:#}").contains("[[sound.metric]]"), "{e:#}");
+    }
+
+    #[test]
+    fn tighten_sound_metrics() {
+        let text = "[sound]
+[[sound.metric]]
+use = \"c.glsl\"
+max = { max = 1 }
+";
+        let m = |k: Kind, _, s| (k == Kind::Sound && s == Stat::Max).then_some(0.2);
+        let (out, changes) = tighten(text, 0.25, 0.5, m, |_| None).unwrap();
+        assert!(out.contains("max = { max = 0.25 }"), "{out}");
+        assert_eq!(changes.len(), 1);
+    }
+
+    #[test]
     fn tighten_sound_limits_in_tenths_of_a_db() {
         let text = "[sound]\nintegrated = { min = -20, max = -10 }\ntrue_peak = { max = 0 }\n";
         let sound = |s: SoundStat| match s {
@@ -749,7 +846,7 @@ over = { max = 0.01 }
             SoundStat::TruePeak => Some(-1.23),
             _ => None,
         };
-        let (out, changes) = tighten(text, 0.25, 0.5, |_, _| None, sound).unwrap();
+        let (out, changes) = tighten(text, 0.25, 0.5, |_, _, _| None, sound).unwrap();
         assert_eq!(
             out,
             "[sound]\nintegrated = { min = -16.6, max = -15.5 }\ntrue_peak = { max = -0.7 }\n"
@@ -789,7 +886,7 @@ mean = { max = 0.0001 }
             (1, Stat::Mean) => Some(0.000095), // + 10% is above the limit: kept
             _ => None,
         };
-        let (out, changes) = tighten(text, 0.1, 0.5, measured, |_| None).unwrap();
+        let (out, changes) = tighten(text, 0.1, 0.5, |_, i, s| measured(i, s), |_| None).unwrap();
         assert_eq!(
             out,
             "\
@@ -809,7 +906,7 @@ mean = { max = 0.0001 }
         assert_eq!(changes.len(), 4, "{changes:?}");
         assert!(changes[0].starts_with("alias: mean max 0.01 → 0.00649"));
         // A second run changes nothing.
-        let (again, none) = tighten(&out, 0.1, 0.5, measured, |_| None).unwrap();
+        let (again, none) = tighten(&out, 0.1, 0.5, |_, i, s| measured(i, s), |_| None).unwrap();
         assert_eq!(again, out);
         assert!(none.is_empty(), "{none:?}");
     }
