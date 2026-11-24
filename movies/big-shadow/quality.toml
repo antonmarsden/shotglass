@@ -1,4 +1,6 @@
 # `shotglass quality movies/big-shadow`: see README, "Quality metrics".
+# The metrics in metrics/ are test-only: they exercise `shotglass quality` (the golden
+# heatmaps in tests/golden/quality/big-shadow/), not metrics meant for reuse.
 count = 8
 size = "384x216"
 reference = 4
