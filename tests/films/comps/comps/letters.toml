@@ -1,0 +1,5 @@
+# A comp of white blocks on black: the sky's luma matte.
+[[shot]]
+id = "blocks"
+scene = "scenes/blocks.glsl"
+duration = 1.0

@@ -1,0 +1,2 @@
+# Engine contract: comps and mattes need shotglass 0.1.7.
+shotglass = "0.1.7"

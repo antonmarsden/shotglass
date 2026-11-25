@@ -76,35 +76,59 @@ pub(crate) fn movie_sources_with_provenance(m: &Movie, d: Dialect) -> Vec<Source
         "copy pass".into(),
         transition_source(d, "copy", &[], &cues, m),
     );
-    for shot in &m.shots {
-        if let Some(t) = &shot.transition_in {
+    // The film, then each comp (#74) with its own cues; comp items are named
+    // `comp "intro": shot "a" (…)`.
+    let seqs = std::iter::once((String::new(), m, cues.clone())).chain(m.comps.iter().map(|c| {
+        (
+            format!("comp \"{}\": ", c.name),
+            &*c.movie,
+            crate::gfx::seq_cues(m, Some(&c.movie)),
+        )
+    }));
+    for (pre, s, cues) in seqs {
+        for shot in &s.shots {
+            if let Some(t) = &shot.transition_in {
+                frag(
+                    format!("{pre}transition into \"{}\" ({})", shot.id, t.kind),
+                    transition_source(d, &t.kind, &t.params, &cues, s),
+                );
+            }
+            if shot.comp.is_none() {
+                frag(
+                    format!("{pre}shot \"{}\" ({})", shot.id, rel(&shot.scene)),
+                    scene_source(d, shot, &cues, s),
+                );
+            }
+        }
+        if !s.layers.is_empty() {
             frag(
-                format!("transition into \"{}\" ({})", shot.id, t.kind),
-                transition_source(d, &t.kind, &t.params, &cues, m),
+                format!("{pre}layer composite"),
+                transition_source(d, "over", &[], &cues, s),
             );
         }
-        frag(
-            format!("shot \"{}\" ({})", shot.id, rel(&shot.scene)),
-            scene_source(d, shot, &cues, m),
-        );
-    }
-    if !m.layers.is_empty() {
-        frag(
-            "layer composite".into(),
-            transition_source(d, "over", &[], &cues, m),
-        );
-    }
-    for layer in &m.layers {
-        let what = match &layer.scene {
-            crate::movie::LayerScene::File(p) => format!("layer \"{}\" ({})", layer.id, rel(p)),
-            crate::movie::LayerScene::Pass(k) => format!("layer \"{}\" ({k})", layer.id),
-        };
-        frag(what, layer_source(d, layer, &cues, m));
-        if let Some(b) = &layer.blend {
+        if s.layers.iter().any(|l| l.matte.is_some()) {
             frag(
-                format!("blend of layer \"{}\" ({b})", layer.id),
-                blend_source(d, layer, b, &cues, m),
+                format!("{pre}matted layer composite"),
+                crate::gfx::over_matte_source(d, &cues, s),
             );
+        }
+        for layer in &s.layers {
+            let what = match &layer.scene {
+                crate::movie::LayerScene::File(p) => {
+                    format!("{pre}layer \"{}\" ({})", layer.id, rel(p))
+                }
+                crate::movie::LayerScene::Pass(k) => format!("{pre}layer \"{}\" ({k})", layer.id),
+                crate::movie::LayerScene::Comp(_) => String::new(),
+            };
+            if !what.is_empty() {
+                frag(what, layer_source(d, layer, &cues, s));
+            }
+            if let Some(b) = &layer.blend {
+                frag(
+                    format!("{pre}blend of layer \"{}\" ({b})", layer.id),
+                    blend_source(d, layer, b, &cues, s),
+                );
+            }
         }
     }
     if let Some(p) = &m.music {

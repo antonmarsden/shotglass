@@ -1,0 +1,44 @@
+# Golden-image film for layers phase 3 (tests/golden.rs, #74): a comp as the first
+# shot (its own dissolve and title layer, comp-local cues), a looping comp at its own
+# size read as a channel (a TV screen) and as a matted picture-in-picture layer, and a
+# sky seen through a comp of letters (a luma matte). Everything is film-local GLSL, so
+# the golden only moves when the engine does.
+title = "comps"
+fps = 30
+
+[comps]
+intro = "comps/intro.toml"
+tv = { file = "comps/tv.toml", size = [96, 54], loop = true }
+letters = "comps/letters.toml"
+
+[[shot]]
+id = "open"
+comp = "intro"
+duration = 2.0
+
+[[shot]]
+id = "room"
+scene = "scenes/room.glsl"
+duration = 2.5
+transition = { type = "fx/mix.glsl", duration = 0.5 }
+channels = ["@tv"]
+
+[[layer]]
+id = "frame"
+scene = "scenes/frame.glsl"
+to = 1.5
+opacity = 0.0
+
+[[layer]]
+id = "pip"
+comp = "tv"
+to = 1.5
+time_offset = 0.5
+matte = { source = "@frame" }
+
+[[layer]]
+id = "sky"
+scene = "scenes/sky.glsl"
+from = 2.5
+fade = [0.5, 0.0]
+matte = { source = "@letters", channel = "luma" }

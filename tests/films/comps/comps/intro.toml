@@ -1,0 +1,17 @@
+# A comp: two shots with a dissolve, and a title over the second (comp-local cues).
+[[shot]]
+id = "rings"
+scene = "scenes/rings.glsl"
+duration = 1.25
+
+[[shot]]
+id = "stripes"
+scene = "scenes/stripes.glsl"
+duration = 1.25
+transition = { type = "fx/mix.glsl", duration = 0.5 }
+
+[[layer]]
+id = "title"
+scene = "scenes/title.glsl"
+from = "stripes.settled"
+fade = [0.25, 0.0]

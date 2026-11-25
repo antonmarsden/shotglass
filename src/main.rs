@@ -1151,7 +1151,10 @@ fn check_textures(m: &Movie, web: bool, deep: bool) -> Result<()> {
     for c in m.textures() {
         let mut bytes = None;
         let size = match &c.source {
-            movie::Source::Input | movie::Source::Picture | movie::Source::Layer { .. } => continue,
+            movie::Source::Input
+            | movie::Source::Picture
+            | movie::Source::Layer { .. }
+            | movie::Source::Comp { .. } => continue,
             movie::Source::Frames(seq) => {
                 let label = &seq.pattern.label;
                 let Some(scan) = &seq.scan else {
@@ -1316,6 +1319,9 @@ fn check_textures(m: &Movie, web: bool, deep: bool) -> Result<()> {
         }
         if total > 0 && largest.is_none_or(|(b, _)| total > b) {
             largest = Some((total, &s.id));
+        }
+        if s.comp.is_some() {
+            continue;
         }
         if let Ok(src) = gfx::scene_source(shader::Dialect::BASELINE, s, &cues, m) {
             for (n, reads) in gfx::channels_read(&src).iter().enumerate() {

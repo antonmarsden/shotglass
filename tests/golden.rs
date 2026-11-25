@@ -354,6 +354,22 @@ fn blends_film() {
     );
 }
 
+/// Layers phase 3 (#74): tests/films/comps, comp shots (one with a matted
+/// picture-in-picture of a sized, looping comp), a comp read as a channel with a
+/// time offset, and a layer matted by the luma of a comp.
+#[test]
+fn comps_film() {
+    if skip() {
+        return;
+    }
+    golden_frames(
+        "comps",
+        &root().join("tests").join("films").join("comps"),
+        &["--count", COUNT],
+        &[],
+    );
+}
+
 /// Footage (#70): tests/films/footage, a 24 fps plate (a frame counter and a bar that
 /// moves 2 px a frame) in a 30 fps film under a 12 fps matte on the film's clock;
 /// re-timed (`in`, `speed`), started at a frame and black past its end, with
