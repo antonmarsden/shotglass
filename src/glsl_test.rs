@@ -534,7 +534,11 @@ pub struct TestFile {
 
 impl TestFile {
     /// The newest desktop dialect required by the project's libraries.
-    pub fn desktop_opt_in(&self) -> Option<u32> {
+    pub fn desktop_opt_in(&self, web_checks: WebChecks) -> Option<u32> {
+        if web_checks.web {
+            // Web preflight checks the libraries each assembled shader actually includes.
+            return None;
+        }
         self.libs
             .iter()
             .filter_map(|l| l.glsl)
@@ -543,17 +547,12 @@ impl TestFile {
     }
 }
 
-pub fn test_dialects(opt_in: Option<u32>, web_checks: WebChecks) -> Result<Vec<Dialect>> {
-    if let Some(v) = opt_in.filter(|_| web_checks.web) {
-        anyhow::bail!(
-            "--web: a test library requires desktop GLSL {v}, which is incompatible with GLSL ES 3.00"
-        );
-    }
-    Ok(match opt_in {
+pub fn test_dialects(opt_in: Option<u32>) -> Vec<Dialect> {
+    match opt_in {
         _ if !validate::AVAILABLE => vec![],
         None => vec![Dialect::BASELINE, Dialect::WEB],
         Some(v) => vec![Dialect::desktop(Some(v))],
-    })
+    }
 }
 
 /// Shared preflight for GLSL unit tests and metric tests.
@@ -562,6 +561,14 @@ pub fn check_test_shader(
     web_checks: WebChecks,
     out: &mut dyn FnMut(&str),
 ) -> Result<()> {
+    if let Some(v) = src
+        .library_glsl
+        .filter(|&v| web_checks.web && v > Dialect::BASELINE.version)
+    {
+        bail!(
+            "--web: an included test library requires desktop GLSL {v}, which is incompatible with GLSL ES 3.00"
+        );
+    }
     let (result, warnings) = validate::validate_with_warnings(src, Stage::Fragment);
     if web_checks.web {
         for warning in &warnings {
@@ -793,15 +800,8 @@ pub fn run(
     let mut gpu = unsafe { Gpu::new(gl)? };
     for f in files {
         out(&f.display);
-        let opt_in = f.desktop_opt_in();
-        let strict = match test_dialects(opt_in, web_checks) {
-            Ok(dialects) => dialects,
-            Err(e) => {
-                out(&format!("  {e}"));
-                sum.broken += 1;
-                continue;
-            }
-        };
+        let opt_in = f.desktop_opt_in(web_checks);
+        let strict = test_dialects(opt_in);
         let mut errors = vec![];
         for d in &strict {
             match prepare(f, *d) {
@@ -1353,7 +1353,50 @@ void test_a() {
         web.strict = true;
         let error = check_test_shader(&src, web, &mut |_| {}).unwrap_err();
         assert!(error.to_string().contains("browser compatibility warnings"));
-        assert!(test_dialects(Some(430), web).is_err());
+    }
+
+    #[cfg(feature = "strict-glsl")]
+    #[test]
+    fn web_tests_only_require_portability_of_included_libraries() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let lib = root.join("desktop");
+        std::fs::create_dir(&lib).unwrap();
+        std::fs::write(
+            lib.join("library.toml"),
+            "name = \"local/desktop\"\nversion = \"1.0.0\"\nglsl = 430\n",
+        )
+        .unwrap();
+        std::fs::write(lib.join("helper.glsl"), "float helper() { return 1.0; }").unwrap();
+        let file = TestFile {
+            path: root.join("a.test.glsl"),
+            root: root.into(),
+            libs: vec![Library::read("desktop", &lib, crate::library::Origin::Path).unwrap()],
+            display: "a.test.glsl".into(),
+        };
+        let web = WebChecks {
+            web: true,
+            strict: true,
+        };
+        let portable = "void test_portable() { expect(true); }";
+        std::fs::write(&file.path, portable).unwrap();
+        assert_eq!(file.desktop_opt_in(WebChecks::default()), Some(430));
+        assert_eq!(file.desktop_opt_in(web), None);
+        let src = prepare(&file, Dialect::WEB).unwrap().asm;
+        check_test_shader(&src, web, &mut |_| {}).unwrap();
+
+        std::fs::write(
+            root.join("wrapper.glsl"),
+            "#include <desktop/helper.glsl>\n",
+        )
+        .unwrap();
+        std::fs::write(&file.path, format!("#include \"wrapper.glsl\"\n{portable}")).unwrap();
+        let src = prepare(&file, Dialect::WEB).unwrap().asm;
+        let err = check_test_shader(&src, web, &mut |_| {}).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("included test library requires desktop GLSL 430")
+        );
     }
 
     #[test]

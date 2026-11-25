@@ -709,6 +709,7 @@ mod tests {
         let a = |s: &str| Assembled {
             text: format!("{METRIC_HEADER}{s}"),
             dialect: Dialect::BASELINE,
+            library_glsl: None,
             files: vec![],
             warnings: vec![],
             clashes: vec![],

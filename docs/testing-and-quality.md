@@ -72,6 +72,7 @@ error: 2 passed, 1 failed (266241 samples) on llvmpipe (LLVM 20.1.2, 256 bits)
   with the `strict-glsl` feature. For a Shotglass Kit checkout, run
   `shotglass test /path/to/shotglass-kit --web --strict` to discover its tests
   recursively and validate their assembled shaders, including library includes.
+  A desktop-only library blocks web validation when the shader includes it.
   Assertions and metrics still run on the local GPU.
 - Tests run on the real driver, so they catch driver differences too: run them on your
   GPU as well as in CI (software OpenGL).

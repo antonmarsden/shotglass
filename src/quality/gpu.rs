@@ -246,6 +246,7 @@ impl Gpu {
                 &Assembled {
                     text: format!("{v}{NONFINITE}{REDUCE}"),
                     dialect: d,
+                    library_glsl: None,
                     files: vec!["<shotglass reduction>".into()],
                     warnings: vec![],
                     clashes: vec![],

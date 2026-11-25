@@ -60,6 +60,7 @@ pub(crate) fn movie_sources_with_provenance(m: &Movie, d: Dialect) -> Vec<Source
         src: Ok(Assembled {
             text: vertex_source(d),
             dialect: d,
+            library_glsl: None,
             files: vec!["<shotglass vertex shader>".into()],
             warnings: vec![],
             clashes: vec![],
@@ -202,6 +203,7 @@ fn explain_later_versions(src: &Assembled, stage: Stage, messages: Vec<String>) 
     let newer = Assembled {
         text: format!("{}{}", newest.version_line(), &src.text[old_line.len()..]),
         dialect: newest,
+        library_glsl: src.library_glsl,
         files: src.files.clone(),
         warnings: vec![],
         clashes: vec![],

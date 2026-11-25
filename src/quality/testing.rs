@@ -495,15 +495,8 @@ pub fn run(
                 continue;
             }
         };
-        let opt_in = f.desktop_opt_in();
-        let strict = match test_dialects(opt_in, web_checks) {
-            Ok(dialects) => dialects,
-            Err(e) => {
-                out(&format!("  {e}"));
-                sum.broken += 1;
-                continue;
-            }
-        };
+        let opt_in = f.desktop_opt_in(web_checks);
+        let strict = test_dialects(opt_in);
         let d = match driver.dialect(opt_in) {
             Ok(d) => d,
             Err(e) => {
