@@ -325,8 +325,9 @@ impl YuvReader {
                     );
                 }
             }
-            if !matches!(status, glow::ALREADY_SIGNALED | glow::CONDITION_SATISFIED) {
-                bail!("frame {}: YUV read-back fence wait failed ({status:#x})", slot.n);
+            match status {
+                glow::ALREADY_SIGNALED | glow::CONDITION_SATISFIED => {}
+                _ => bail!("frame {}: YUV fence wait failed ({status:#x})", slot.n),
             }
         }
         let slot = self.in_flight.pop_front().unwrap();

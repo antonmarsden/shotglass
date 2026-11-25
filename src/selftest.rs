@@ -2640,10 +2640,10 @@ fn export_lossless(gl: &Gl, dir: &Path) -> Result<String> {
 
 /// The built-in WebM export (#116): its structure read back with our own EBML reader
 /// (one block per frame within half a millisecond of its time, keyframes cued, Opus
-/// with its delay), a cancelled
-/// export leaves nothing, and, where ffmpeg is installed, the decoded planes are close
-/// to `yuv::reference` of `still`'s frames (much closer than to the neighbouring
-/// frame) and the decoded sound has exactly `wav`'s length and is close to it.
+/// with its delay), and a cancelled export leaves nothing. Where ffmpeg is installed,
+/// the decoded planes are close to `yuv::reference` of `still`'s frames (much closer
+/// than to the neighbouring frame), and the decoded sound has exactly `wav`'s length
+/// and is close to it.
 #[cfg(feature = "webm")]
 #[allow(clippy::type_complexity)]
 fn export_webm(
@@ -2728,7 +2728,7 @@ fn export_webm(
         let expected = i128::from(n) * fps_den * 1_000;
         let error = (i128::from(ms) * fps_num - expected).abs();
         if 2 * error > fps_num {
-            bail!("webm: frame {n} at {ms} ms is more than 0.5 ms from its expected time");
+            bail!("webm: frame {n} at {ms} ms exceeds the 0.5 ms tolerance");
         }
     }
     // Keyframes exactly every KEYINT frames (closed GOPs), and clusters start exactly
