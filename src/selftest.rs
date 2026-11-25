@@ -2542,13 +2542,7 @@ fn export_lossless(gl: &Gl, dir: &Path) -> Result<String> {
         &pcm,
         samples,
         dir,
-        &|f, out, c, stop, depth| {
-            let av1 = export::Av1Options {
-                depth,
-                ..Default::default()
-            };
-            run_with(f, out, c, stop, av1)
-        },
+        &|f, out, c, stop, av1| run_with(f, out, c, stop, av1),
     )?);
 
     if let Err(e) = export::ffmpeg_encoders() {
@@ -2662,7 +2656,7 @@ fn export_webm(
         PathBuf,
         &std::sync::atomic::AtomicBool,
         u64,
-        u8,
+        crate::export::Av1Options,
     ) -> Result<crate::export::Summary>,
 ) -> Result<String> {
     use crate::export::Format;
@@ -2671,12 +2665,19 @@ fn export_webm(
     let total = m.frame_count();
     let (w, h) = (W as usize, H as usize);
     let out = dir.join("film.webm");
+    use crate::export::Av1Options;
+    // A short keyframe interval, so the 1.3 s film has several (the default is ~2 s).
+    const KEYINT: u64 = 8;
+    let short_gops = Av1Options {
+        keyint: Some(KEYINT as u32),
+        ..Default::default()
+    };
     let s = run(
         Format::Webm,
         out.clone(),
         &AtomicBool::new(false),
         u64::MAX,
-        10,
+        short_gops,
     )?;
     if s.frames != total || s.audio_frames != samples {
         bail!(
@@ -2690,9 +2691,12 @@ fn export_webm(
     let seg = read::children(top[1].data, 0)?;
     let mut video_blocks = vec![];
     let mut audio_blocks = 0;
+    // The first video block of each cluster that has one (by index in video_blocks).
+    let mut cluster_firsts = vec![];
     for c in seg.iter().filter(|e| e.id == id::CLUSTER) {
         let kids = read::children(c.data, 0)?;
         let base = read::uint(kids[0].data) as i64;
+        let mut first = true;
         for b in &kids[1..] {
             let data = if b.id == id::BLOCK_GROUP {
                 read::find(&read::children(b.data, 0)?, id::BLOCK)
@@ -2703,6 +2707,10 @@ fn export_webm(
             };
             let t = base + i16::from_be_bytes([data[1], data[2]]) as i64;
             if data[0] & 0x7f == 1 {
+                if first {
+                    cluster_firsts.push(video_blocks.len() as u64);
+                    first = false;
+                }
                 video_blocks.push((t, data[3] & 0x80 != 0));
             } else {
                 audio_blocks += 1;
@@ -2716,10 +2724,32 @@ fn export_webm(
     if times != want {
         bail!("webm: video block times {times:?}, want {want:?}");
     }
-    if !video_blocks[0].1 {
-        bail!("webm: the first frame isn't a keyframe");
+    // Keyframes exactly every KEYINT frames (closed GOPs), and clusters start exactly
+    // at the keyframes (every cluster here is far shorter than the 30 s cap).
+    let keys: Vec<u64> = (0..video_blocks.len())
+        .filter(|&n| video_blocks[n].1)
+        .map(|n| n as u64)
+        .collect();
+    let want_keys: Vec<u64> = (0..total).filter(|n| n % KEYINT == 0).collect();
+    if want_keys.len() < 3 {
+        bail!(
+            "webm: {total} frames give only {} keyframes to check",
+            want_keys.len()
+        );
     }
-    if audio_blocks != (samples + 312).div_ceil(960) {
+    if keys != want_keys {
+        bail!("webm: keyframes at {keys:?}, want {want_keys:?}");
+    }
+    if cluster_firsts != want_keys {
+        bail!(
+            "webm: clusters start at frames {cluster_firsts:?}, want the keyframes {want_keys:?}"
+        );
+    }
+    // libopus's lookahead, as the export's encoder reports it (version-dependent).
+    let pre_skip = usize::from(
+        crate::webm::encode::OpusPackets::new(crate::webm::export::OPUS_KBPS)?.pre_skip,
+    );
+    if audio_blocks != (samples + pre_skip).div_ceil(crate::webm::encode::OPUS_FRAME) {
         bail!("webm: {audio_blocks} Opus packets for {samples} samples");
     }
     if read::find(&seg, id::CUES).is_none() {
@@ -2735,7 +2765,7 @@ fn export_webm(
         cancelled.clone(),
         &AtomicBool::new(false),
         3,
-        10,
+        Av1Options::default(),
     ) {
         Err(e) if e.to_string() == "cancelled" => {}
         Err(e) => bail!("cancelled webm export failed oddly: {e:#}"),
@@ -2779,7 +2809,10 @@ fn export_webm(
                 p.clone(),
                 &AtomicBool::new(false),
                 u64::MAX,
-                8,
+                Av1Options {
+                    depth: 8,
+                    ..Default::default()
+                },
             )?;
             p
         };

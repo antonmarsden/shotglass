@@ -42,7 +42,7 @@ pub fn settings(m: &Movie, w: usize, h: usize, o: &Av1Options) -> Av1Settings {
             None => Rate::Quality(o.quality),
         },
         speed: o.speed,
-        keyint: keyint((m.fps_num, m.fps_den)),
+        keyint: o.keyint.unwrap_or_else(|| keyint((m.fps_num, m.fps_den))),
         grain: o.grain,
     }
 }

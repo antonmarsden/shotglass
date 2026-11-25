@@ -1725,6 +1725,7 @@ impl EncoderFlags {
             speed: self.speed.unwrap_or(d.speed),
             depth: self.depth.unwrap_or(d.depth),
             grain: self.grain.unwrap_or(d.grain),
+            keyint: d.keyint,
         }
     }
 }

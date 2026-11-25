@@ -124,6 +124,10 @@ pub struct Av1Options {
     pub depth: u8,
     /// Film-grain denoising and synthesis, 0 (off) ..= 50.
     pub grain: u8,
+    /// Frames between keyframes; None = about two seconds (`webm::export::keyint`).
+    /// Not on the command line: the selftest sets it to test keyframe spacing on a
+    /// short film.
+    pub keyint: Option<u32>,
 }
 
 impl Default for Av1Options {
@@ -134,6 +138,7 @@ impl Default for Av1Options {
             speed: 6,
             depth: 10,
             grain: 0,
+            keyint: None,
         }
     }
 }
