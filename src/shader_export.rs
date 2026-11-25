@@ -22,7 +22,30 @@ struct Program {
     sources: Vec<String>,
 }
 
-pub fn run(target: &Path, web: bool, out: &Path) -> Result<()> {
+pub fn parse_desktop_version(value: &str) -> Result<u32, String> {
+    let versions = crate::shader::DESKTOP_VERSIONS;
+    value
+        .parse::<u32>()
+        .ok()
+        .filter(|v| versions.contains(v))
+        .ok_or_else(|| {
+            let allowed = versions
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("unsupported desktop GLSL version {value:?}; use {allowed}")
+        })
+}
+
+pub fn run(target: &Path, web: bool, glsl: Option<u32>, out: &Path) -> Result<()> {
+    let dialect_for = |desktop| {
+        if web {
+            Dialect::WEB
+        } else {
+            Dialect::desktop(glsl.or(desktop))
+        }
+    };
     let (dialect, sources) = if target.is_file()
         && target
             .file_name()
@@ -30,11 +53,7 @@ pub fn run(target: &Path, web: bool, out: &Path) -> Result<()> {
     {
         let files = crate::test_files(vec![target.to_path_buf()])?;
         let file = &files[0];
-        let dialect = if web {
-            Dialect::WEB
-        } else {
-            Dialect::desktop(file.desktop_opt_in(Default::default()))
-        };
+        let dialect = dialect_for(file.desktop_opt_in(Default::default()));
         let fragment = crate::glsl_test::prepare(file, dialect)
             .map(|prepared| prepared.asm)
             .map_err(|messages| anyhow::anyhow!("{}", messages.join("\n")));
@@ -57,11 +76,7 @@ pub fn run(target: &Path, web: bool, out: &Path) -> Result<()> {
             );
         }
         let movie = crate::load_movie(target)?;
-        let dialect = if web {
-            Dialect::WEB
-        } else {
-            Dialect::desktop(movie.glsl)
-        };
+        let dialect = dialect_for(movie.glsl);
         (dialect, crate::strict_sources(&movie, dialect)?)
     };
     write(out, dialect, sources)
@@ -133,7 +148,7 @@ mod tests {
             &target,
             "#include \"helper.glsl\"\nvoid test_helper() { expect_eq(helper(), 1.0); }",
         )?;
-        run(&target, true, &out)?;
+        run(&target, true, None, &out)?;
 
         let manifest: serde_json::Value =
             serde_json::from_slice(&std::fs::read(out.join("manifest.json"))?)?;
@@ -153,7 +168,7 @@ mod tests {
                 .iter()
                 .any(|file| file == "helper.glsl")
         );
-        assert!(run(&target, true, &out).is_err());
+        assert!(run(&target, true, None, &out).is_err());
         Ok(())
     }
 }

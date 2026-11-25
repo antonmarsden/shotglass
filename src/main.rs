@@ -238,6 +238,9 @@ enum Cmd {
         /// Assemble for GLSL ES 3.00 (WebGL 2).
         #[arg(long)]
         web: bool,
+        /// Override the desktop GLSL version (for example, 430).
+        #[arg(long, conflicts_with = "web", value_parser = shader_export::parse_desktop_version)]
+        glsl: Option<u32>,
         /// Output folder (new or empty).
         #[arg(long)]
         out: PathBuf,
@@ -460,7 +463,12 @@ fn real_main() -> Result<()> {
             cmd: FontsCmd::Add { families, film },
         } => fonts::run_add(&project::film(&film)?, &families),
         Cmd::Bundle { movie, out } => bundle::run_bundle(&project::film(&movie)?, &out),
-        Cmd::Shaders { target, web, out } => shader_export::run(&target, web, &out),
+        Cmd::Shaders {
+            target,
+            web,
+            glsl,
+            out,
+        } => shader_export::run(&target, web, glsl, &out),
         Cmd::Freeze { movie } => bundle::run_freeze(&project::film(&movie)?),
         Cmd::Unfreeze { movie } => bundle::run_unfreeze(&project::film(&movie)?),
         Cmd::Test {

@@ -27,7 +27,7 @@ shotglass update <movie> [library..]                       # move library pins t
 shotglass licenses <movie>                                 # libraries the film includes, film fonts, and their licences
 shotglass fonts add "Family" [..] [--film <dir>]           # Google Fonts families as libraries, plus [fonts] entries
 shotglass bundle <movie> --out <dir>                       # self-contained copy with the library files it includes
-shotglass shaders <film|file.test.glsl> [--web] --out <dir> # export assembled vertex and fragment GLSL
+shotglass shaders <film|file.test.glsl> [--web | --glsl <version>] --out <dir> # export assembled vertex and fragment GLSL
 shotglass freeze <movie>                                   # copy the library files it includes into the film
 shotglass unfreeze <movie>                                 # follow the project's libraries again
 shotglass test   [file|folder] [filter] [--web [--strict]]                    # GLSL unit and property tests (*.test.glsl), metric tests (*.test.toml)
@@ -158,8 +158,10 @@ Check with `ffmpeg -encoders`: `ffv1` needs `ffv1` and `flac` (built in); withou
 ## Exporting assembled shaders
 
 Run `shotglass shaders <film|file.test.glsl> --web --out <dir>` to export GLSL ES
-3.00 sources for browser compile and link tests. Omit `--web` for the desktop
-dialect. The output folder must be new or empty.
+3.00 sources for browser compile and link tests. With neither flag, the export
+uses the film or test project's desktop dialect. Use `--glsl 330`, `--glsl 410`
+or `--glsl 430` to override it for the export. The output folder must be new or
+empty.
 
 A film export includes the shaders assembled by `check`, including its quality
 metrics. A `*.test.glsl` export resolves the test project's libraries and adds
