@@ -31,6 +31,21 @@ pub struct Source {
     pub src: anyhow::Result<Assembled>,
 }
 
+pub(crate) fn fullscreen_vertex_source(d: Dialect) -> Source {
+    Source {
+        what: "vertex shader".into(),
+        stage: Stage::Vertex,
+        src: Ok(Assembled {
+            text: vertex_source(d),
+            dialect: d,
+            library_glsl: None,
+            files: vec!["<shotglass vertex shader>".into()],
+            warnings: vec![],
+            clashes: vec![],
+        }),
+    }
+}
+
 /// Every shader `m` compiles, assembled in dialect `d`: the shared vertex shader, the
 /// copy pass, each shot's scene and incoming transition, and the sound shaders
 /// (music, per-shot sounds, mix). Identical sources appear once.
@@ -54,18 +69,7 @@ pub(crate) fn movie_sources_with_provenance(m: &Movie, d: Dialect) -> Vec<Source
             .to_string_lossy()
             .replace('\\', "/")
     };
-    let mut out = vec![Source {
-        what: "vertex shader".into(),
-        stage: Stage::Vertex,
-        src: Ok(Assembled {
-            text: vertex_source(d),
-            dialect: d,
-            library_glsl: None,
-            files: vec!["<shotglass vertex shader>".into()],
-            warnings: vec![],
-            clashes: vec![],
-        }),
-    }];
+    let mut out = vec![fullscreen_vertex_source(d)];
     let mut frag = |what: String, src| {
         out.push(Source {
             what,

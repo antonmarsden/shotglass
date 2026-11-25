@@ -17,6 +17,7 @@ mod project;
 mod quality;
 mod selftest;
 mod shader;
+mod shader_export;
 mod sound;
 mod text;
 mod texture;
@@ -228,6 +229,16 @@ enum Cmd {
     Bundle {
         movie: PathBuf,
         /// Output folder (new or empty, outside the film folder).
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Write the assembled GLSL and program pairs for a film or a single *.test.glsl file.
+    Shaders {
+        target: PathBuf,
+        /// Assemble for GLSL ES 3.00 (WebGL 2).
+        #[arg(long)]
+        web: bool,
+        /// Output folder (new or empty).
         #[arg(long)]
         out: PathBuf,
     },
@@ -449,6 +460,7 @@ fn real_main() -> Result<()> {
             cmd: FontsCmd::Add { families, film },
         } => fonts::run_add(&project::film(&film)?, &families),
         Cmd::Bundle { movie, out } => bundle::run_bundle(&project::film(&movie)?, &out),
+        Cmd::Shaders { target, web, out } => shader_export::run(&target, web, &out),
         Cmd::Freeze { movie } => bundle::run_freeze(&project::film(&movie)?),
         Cmd::Unfreeze { movie } => bundle::run_unfreeze(&project::film(&movie)?),
         Cmd::Test {
@@ -584,29 +596,7 @@ fn test_glsl(target: &Path, filter: Option<String>, web_checks: WebChecks) -> Re
             target.display()
         );
     }
-    let mut projects: std::collections::BTreeMap<PathBuf, Vec<library::Library>> =
-        Default::default();
-    let mut files = vec![];
-    for path in paths {
-        // A file in the current folder has the empty path as its parent: use ".".
-        let dir = path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from("."));
-        let root = project::find_root(&dir).unwrap_or(dir);
-        if !projects.contains_key(&root) {
-            let libs = project_libraries(&root)
-                .with_context(|| format!("libraries for {}", path.display()))?;
-            projects.insert(root.clone(), libs);
-        }
-        files.push(glsl_test::TestFile {
-            display: rel_display(&path, &root),
-            libs: projects[&root].clone(),
-            path,
-            root,
-        });
-    }
+    let files = test_files(paths)?;
     let filter_text = filter.clone();
     let sum = headless::with_gl(move |gl| {
         use eframe::glow::HasContext;
@@ -653,6 +643,34 @@ fn test_glsl(target: &Path, filter: Option<String>, web_checks: WebChecks) -> Re
     }
     println!("{summary}");
     Ok(())
+}
+
+/// Resolve the project and libraries once per root for a batch of test files.
+fn test_files(paths: Vec<PathBuf>) -> Result<Vec<glsl_test::TestFile>> {
+    let mut projects: std::collections::BTreeMap<PathBuf, Vec<library::Library>> =
+        Default::default();
+    let mut files = vec![];
+    for path in paths {
+        // A file in the current folder has the empty path as its parent: use ".".
+        let dir = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let root = project::find_root(&dir).unwrap_or(dir);
+        if !projects.contains_key(&root) {
+            let libs = project_libraries(&root)
+                .with_context(|| format!("libraries for {}", path.display()))?;
+            projects.insert(root.clone(), libs);
+        }
+        files.push(glsl_test::TestFile {
+            display: rel_display(&path, &root),
+            libs: projects[&root].clone(),
+            path,
+            root,
+        });
+    }
+    Ok(files)
 }
 
 /// `path` relative to `root` (both made absolute first), with forward slashes.
