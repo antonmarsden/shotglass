@@ -130,6 +130,9 @@ enum Cmd {
         /// Also require every shader to be valid GLSL ES 3.00 (WebGL 2), for the web player.
         #[arg(long)]
         web: bool,
+        /// With --web, fail on browser compatibility warnings as well as GLSL errors.
+        #[arg(long, requires = "web")]
+        strict: bool,
         /// Only validate (movie.toml and the strict GLSL check); no GPU needed.
         #[arg(long)]
         no_gpu: bool,
@@ -377,9 +380,12 @@ fn real_main() -> Result<()> {
             size,
             frames,
             web,
+            strict,
             no_gpu,
             deep,
-        } => for_each_film(&movie, |f| check(f, &size, frames, web, no_gpu, deep)),
+        } => for_each_film(&movie, |f| {
+            check(f, &size, frames, web, strict, no_gpu, deep)
+        }),
         Cmd::Wav {
             movie,
             out,
@@ -1069,7 +1075,7 @@ fn describe(m: &Movie, t: f32) -> String {
 /// The driver-independent part of `check`: every shader through the reference front
 /// end at the film's desktop dialect, and as GLSL ES 3.00 (errors with `web`,
 /// warnings otherwise).
-fn strict_check(m: &Movie, web: bool) -> Result<()> {
+fn strict_check(m: &Movie, web: bool, strict: bool) -> Result<()> {
     use shader::Dialect;
     if !validate::AVAILABLE {
         if web {
@@ -1111,7 +1117,9 @@ fn strict_check(m: &Movie, web: bool) -> Result<()> {
         ),
         Some(_) => {}
         None => {
-            let errors = validate::validate_sources(&strict_sources(m, Dialect::WEB)?);
+            let (errors, warnings) =
+                validate::validate_sources_with_warnings(&strict_sources(m, Dialect::WEB)?);
+            report(&warnings);
             if errors.is_empty() {
                 println!("strict GLSL: valid as {} (web)", Dialect::WEB);
             } else if web {
@@ -1125,6 +1133,12 @@ fn strict_check(m: &Movie, web: bool) -> Result<()> {
                     Dialect::WEB
                 );
                 report(&errors);
+            }
+            if strict && !warnings.is_empty() {
+                bail!(
+                    "{} shader(s) have browser compatibility warnings",
+                    warnings.len()
+                );
             }
         }
     }
@@ -1426,6 +1440,7 @@ fn check(
     size: &str,
     frames: usize,
     web: bool,
+    strict: bool,
     no_gpu: bool,
     deep: bool,
 ) -> Result<()> {
@@ -1463,7 +1478,7 @@ fn check(
             l.root.display()
         );
     }
-    strict_check(&m, web)?;
+    strict_check(&m, web, strict)?;
     check_textures(&m, web, deep)?;
     if no_gpu {
         println!(
