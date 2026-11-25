@@ -3658,14 +3658,17 @@ fn comps_render(gl: &Gl, dir: &Path) -> Result<String> {
             0,
             0.0,
         )?;
-        // At render scale 0.5 too, and drawn in strips.
+        // At render scale 0.5 too, and drawn in strips. The Apple Software
+        // Renderer rounds the comp's extra copy pass 1/255 off on a few pixels
+        // (macOS CI: 0.55%, max 1); everywhere else it must match exactly.
         let got = shot(&mut r, &m, at_shot(0, t), 0.5)?;
         let want = shot(&mut a, &alone, alone.at(t), 0.5)?;
+        let tol = if inexact_sound(gl).is_some() { 1 } else { 0 };
         expect_same(
             &format!("comp shot at {t} s, scale 0.5"),
             &got,
             &want,
-            0,
+            tol,
             0.0,
         )?;
     }
