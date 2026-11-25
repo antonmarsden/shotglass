@@ -198,7 +198,8 @@ shot "moon" (scenes/moon.glsl):
 ```
 
 `check` also tries every shader as GLSL ES 3.00 and warns about anything that
-wouldn't run in a browser. `check --web` turns those warnings into errors.
+wouldn't run in a browser, including identifiers containing two consecutive
+underscores (reserved in WebGL 2). `check --web` turns those warnings into errors.
 `check --no-gpu` runs only these checks, with no OpenGL needed (handy in CI).
 
 Common things that work on one driver and fail on another:

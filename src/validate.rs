@@ -244,6 +244,23 @@ pub fn validate(src: &Assembled, stage: Stage) -> Result<(), Vec<String>> {
     )
     .map_err(|e| vec![format!("glslang: {e}")])?;
     match compiler.create_shader(input) {
+        Ok(shader) if src.dialect == Dialect::WEB => {
+            // glslang permits these in GLSL ES 3.00 with a warning. Chromium WebGL 2
+            // rejects them. Use the compiler's diagnostics to honour preprocessing
+            // and source locations, and leave unrelated warnings alone.
+            let log = shader.get_log();
+            let errors: Vec<_> = log
+                .lines()
+                .filter_map(|line| line.trim().strip_prefix("WARNING: "))
+                .filter(|line| line.contains("identifiers containing consecutive underscores"))
+                .map(|line| format!("ERROR: {line} in WebGL 2"))
+                .collect();
+            if errors.is_empty() {
+                Ok(())
+            } else {
+                Err(remap_log(&errors.join("\n"), &src.files))
+            }
+        }
         Ok(_) => Ok(()),
         Err(glslang::error::GlslangError::ParseError(log))
         | Err(glslang::error::GlslangError::PreprocessError(log)) => {
@@ -379,6 +396,32 @@ mod tests {
             e[0].starts_with("scenes/a.glsl:2: error:") && e[0].contains("cannot convert"),
             "{e:?}"
         );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn web_rejects_reserved_identifiers_in_includes() {
+        let root = dir("web-identifiers");
+        std::fs::write(
+            root.join("noise.glsl"),
+            "// Included helper\nfloat kit__unit() { return 0.5; }\n",
+        )
+        .unwrap();
+        let src = format!("#include \"../noise.glsl\"\n{OK}");
+        assert_eq!(scene(Dialect::BASELINE, &root, &src), Ok(()));
+        let errors = scene(Dialect::WEB, &root, &src).unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.starts_with("noise.glsl:2: error:")
+                && e.contains("kit__unit")
+                && e.contains("WebGL 2")),
+            "{errors:?}"
+        );
+
+        // Chromium permits the preprocessor warning and ignores inactive code.
+        let src = format!(
+            "#define UNUSED__MACRO 1\n#if 0\nfloat unused__helper;\n#endif\n// unused__comment\n{OK}"
+        );
+        assert_eq!(scene(Dialect::WEB, &root, &src), Ok(()));
         std::fs::remove_dir_all(&root).ok();
     }
 
