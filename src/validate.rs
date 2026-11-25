@@ -160,15 +160,27 @@ pub const AVAILABLE: bool = cfg!(feature = "strict-glsl");
 
 /// Validate sources from [`movie_sources`]; one entry per failing shader.
 pub fn validate_sources(sources: &[Source]) -> Vec<ShaderError> {
-    sources
+    validate_sources_with_warnings(sources).0
+}
+
+/// Validate assembled shaders and report browser compatibility warnings separately.
+pub fn validate_sources_with_warnings(sources: &[Source]) -> (Vec<ShaderError>, Vec<ShaderError>) {
+    let mut warnings = Vec::new();
+    let errors = sources
         .iter()
         .filter_map(|s| {
             let messages = match &s.src {
-                Ok(a) => a.explain(explain_later_versions(
-                    a,
-                    s.stage,
-                    validate(a, s.stage).err()?,
-                )),
+                Ok(a) => {
+                    let mut shader_warnings = Vec::new();
+                    let result = validate_shader(a, s.stage, &mut shader_warnings);
+                    if !shader_warnings.is_empty() {
+                        warnings.push(ShaderError {
+                            what: s.what.clone(),
+                            messages: shader_warnings,
+                        });
+                    }
+                    a.explain(explain_later_versions(a, s.stage, result.err()?))
+                }
                 Err(e) => vec![format!("{e:#}")],
             };
             Some(ShaderError {
@@ -176,7 +188,8 @@ pub fn validate_sources(sources: &[Source]) -> Vec<ShaderError> {
                 messages,
             })
         })
-        .collect()
+        .collect();
+    (errors, warnings)
 }
 
 /// Point out errors that go away at the newest desktop version a film may opt in to:
@@ -212,8 +225,16 @@ fn explain_later_versions(src: &Assembled, stage: Stage, messages: Vec<String>) 
 
 /// Run one assembled shader through the reference front end. Err = messages mapped
 /// to file:line through the `#line` markers the assembler wrote.
-#[cfg(feature = "strict-glsl")]
 pub fn validate(src: &Assembled, stage: Stage) -> Result<(), Vec<String>> {
+    validate_shader(src, stage, &mut Vec::new())
+}
+
+#[cfg(feature = "strict-glsl")]
+fn validate_shader(
+    src: &Assembled,
+    stage: Stage,
+    warnings: &mut Vec<String>,
+) -> Result<(), Vec<String>> {
     use glslang::{
         Compiler, CompilerOptions, ShaderInput, ShaderMessage, ShaderSource, ShaderStage,
         SourceLanguage, Target,
@@ -245,12 +266,11 @@ pub fn validate(src: &Assembled, stage: Stage) -> Result<(), Vec<String>> {
     .map_err(|e| vec![format!("glslang: {e}")])?;
     match compiler.create_shader(input) {
         Ok(shader) if src.dialect == Dialect::WEB => {
-            let errors = web_identifier_errors(&shader.get_preprocessed_code(), &src.files);
-            if errors.is_empty() {
-                Ok(())
-            } else {
-                Err(errors)
-            }
+            warnings.extend(web_identifier_warnings(
+                &shader.get_preprocessed_code(),
+                &src.files,
+            ));
+            Ok(())
         }
         Ok(_) => Ok(()),
         Err(glslang::error::GlslangError::ParseError(log))
@@ -266,13 +286,13 @@ pub fn validate(src: &Assembled, stage: Stage) -> Result<(), Vec<String>> {
     }
 }
 
-/// WebGL reserves identifiers containing two consecutive underscores. Scan
+/// Some browser compilers reject identifiers containing two consecutive underscores. Scan
 /// glslang's preprocessed source so comments, inactive branches and macro names
 /// are gone, while expanded tokens and the assembler's source locations remain.
 #[cfg(feature = "strict-glsl")]
-fn web_identifier_errors(source: &str, files: &[String]) -> Vec<String> {
+fn web_identifier_warnings(source: &str, files: &[String]) -> Vec<String> {
     let (mut file, mut line) = (0, 1);
-    let mut errors = Vec::new();
+    let mut warnings = Vec::new();
     for text in source.lines() {
         if let Some(directive) = text.trim_start().strip_prefix('#') {
             let mut args = directive.split_ascii_whitespace();
@@ -288,17 +308,21 @@ fn web_identifier_errors(source: &str, files: &[String]) -> Vec<String> {
             .find(|token| token.contains("__"))
         {
             let diagnostic = format!(
-                "ERROR: {file}:{line}: '{name}': identifiers containing two consecutive underscores are reserved in WebGL 2"
+                "WARNING: {file}:{line}: '{name}': double underscores can fail in browser WebGL compilers (observed in Chromium and Firefox)"
             );
-            errors.extend(remap_log(&diagnostic, files));
+            warnings.extend(remap_log(&diagnostic, files));
         }
         line += 1;
     }
-    errors
+    warnings
 }
 
 #[cfg(not(feature = "strict-glsl"))]
-pub fn validate(_src: &Assembled, _stage: Stage) -> Result<(), Vec<String>> {
+fn validate_shader(
+    _src: &Assembled,
+    _stage: Stage,
+    _warnings: &mut Vec<String>,
+) -> Result<(), Vec<String>> {
     Err(vec![
         "this shotglass was built without the strict-glsl feature, so it can't validate shaders"
             .into(),
@@ -422,28 +446,53 @@ mod tests {
     }
 
     #[test]
-    fn web_rejects_reserved_identifiers_in_includes() {
+    fn web_warns_about_double_underscores_in_includes() {
         let root = dir("web-identifiers");
         std::fs::write(
             root.join("noise.glsl"),
             "// Included helper\nfloat kit__unit() { return 0.5; }\n",
         )
         .unwrap();
+        let validate_scene = |d, source: &str| {
+            let path = root.join("scenes/a.glsl");
+            std::fs::write(&path, source).unwrap();
+            let sources = [Source {
+                what: "scene".into(),
+                stage: Stage::Fragment,
+                src: Ok(
+                    Builder::new(d, "uniform vec3 iResolution;\nout vec4 o;\n", &root)
+                        .file(&path)
+                        .unwrap()
+                        .footer("void main(){ vec4 c; mainImage(c, gl_FragCoord.xy); o = c; }")
+                        .build(),
+                ),
+            }];
+            validate_sources_with_warnings(&sources)
+        };
         let src = format!("#include \"../noise.glsl\"\n{OK}");
-        assert_eq!(scene(Dialect::BASELINE, &root, &src), Ok(()));
-        let errors = scene(Dialect::WEB, &root, &src).unwrap_err();
+        let (errors, warnings) = validate_scene(Dialect::BASELINE, &src);
+        assert!(errors.is_empty() && warnings.is_empty());
+        let (errors, warnings) = validate_scene(Dialect::WEB, &src);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(
-            errors.iter().any(|e| e.starts_with("noise.glsl:2: error:")
-                && e.contains("kit__unit")
-                && e.contains("WebGL 2")),
-            "{errors:?}"
+            warnings[0]
+                .messages
+                .iter()
+                .any(|e| e.starts_with("noise.glsl:2: warning:")
+                    && e.contains("kit__unit")
+                    && e.contains("browser WebGL compilers")),
+            "{warnings:?}"
         );
 
-        // Chromium permits the preprocessor warning and ignores inactive code.
         let src = format!(
             "#define UNUSED__MACRO 1\n#if 0\nfloat unused__helper;\n#endif\n// unused__comment\n{OK}"
         );
-        assert_eq!(scene(Dialect::WEB, &root, &src), Ok(()));
+        let (errors, warnings) = validate_scene(Dialect::WEB, &src);
+        assert!(
+            errors.is_empty() && warnings.is_empty(),
+            "{errors:?} {warnings:?}"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 

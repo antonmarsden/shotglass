@@ -197,9 +197,10 @@ shot "moon" (scenes/moon.glsl):
   scenes/moon.glsl:12: error: 'textureQueryLevels' : no matching overloaded function found (valid in GLSL 430 core: this film compiles as GLSL 330 core, the portable baseline)
 ```
 
-`check` also tries every shader as GLSL ES 3.00 and warns about anything that
-wouldn't run in a browser, including identifiers containing two consecutive
-underscores (reserved in WebGL 2). `check --web` turns those warnings into errors.
+`check` also tries every shader as GLSL ES 3.00. `check --web` requires that
+validation to pass. Browser compatibility warnings, such as identifiers
+containing consecutive underscores that Chromium and Firefox may reject, are
+advisory unless you run `check --web --strict`.
 `check --no-gpu` runs only these checks, with no OpenGL needed (handy in CI).
 
 Common things that work on one driver and fail on another:
