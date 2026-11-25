@@ -1,0 +1,5 @@
+# A looping comp at its own size: a bar sweeping once per period.
+[[shot]]
+id = "sweep"
+scene = "scenes/sweep.glsl"
+duration = 1.0

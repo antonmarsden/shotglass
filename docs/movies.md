@@ -81,6 +81,10 @@ Shots overlap by the length of the transition between them, so a 9 s shot
 followed by a 1.4 s transition hands over at 7.6 s. `shotglass check` reports
 any transition that is longer than its shots allow.
 
+A shot can be a comp instead of a scene (`comp = "intro"`, with the comp declared in
+`[comps]`), and layers can be comps or carry a `matte`: see
+[Layers and blends](layers.md#comps).
+
 Keyframe times are in shot-local seconds. The eases are `linear`, `smooth`
 (default), `smoother`, `in`, `out`, `inout` and `step`.
 

@@ -40,6 +40,13 @@ sound = "sfx/chime.glsl"
 # from = "first"
 # to = "second.settled"
 # fade = [0.5, 0.5]
+# matte = { source = "@letters", channel = "luma" }   # cut out by a comp (0.1.7)
+#
+# Comps, sequences of shots and layers in their own files (shotglass = "0.1.7"; see docs/layers.md):
+# [comps]
+# intro = "comps/intro.toml"
+# tv = { file = "comps/tv.toml", size = [320, 180], loop = true }
+# and a shot `comp = "intro"`, a layer `comp = "tv"` or a channel "@tv".
 #
 # Text, bound to channels like a texture (shotglass = "0.1.3"; see docs/channels.md, "Text"):
 # `shotglass fonts add "Inter"` (in the film folder) adds a Google Fonts family and writes, e.g.:

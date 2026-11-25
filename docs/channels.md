@@ -49,10 +49,12 @@ shotglass tells what an entry is from how it's written, the same way everywhere:
 | `"renders/fog_####.png"` (one run of `#` in the file name) | an image sequence, `#` = frame number (see [Footage](#footage)) |
 | `"footage/surf.mp4"` (`.mp4`, `.m4v`, `.mov`, `.mkv`, `.webm`, `.avi`) | a video (not yet: footage phase 2) |
 | `"@input"`, `"@picture"`, `"@title"` | on a [layer](layers.md#layers): another pass's picture |
+| `"@intro"` (a `[comps]` name) | a [comp](layers.md#comps)'s picture, at the reader's `iTime` |
 | `{ file = "…", … }` | an image with options |
 | `{ frames = "…", … }` | an image sequence with options |
 | `{ texture = "plate", in = 2.0, … }` | a `[textures]` image sequence, re-timed |
 | `{ text = "title", … }` | a `[texts]` entry with sampling options (`filter`, `wrap`, `vflip`) |
+| `{ source = "@intro", time_offset = 1.0, … }` | a comp, shifted in time, with `filter` (no `"mipmap"`) and `wrap` |
 
 Names come from `[textures]` and `[texts]`, which share one namespace. Videos are
 recognised so a film that uses one gets a clear message (they arrive with footage
