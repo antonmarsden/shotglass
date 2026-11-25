@@ -245,20 +245,11 @@ pub fn validate(src: &Assembled, stage: Stage) -> Result<(), Vec<String>> {
     .map_err(|e| vec![format!("glslang: {e}")])?;
     match compiler.create_shader(input) {
         Ok(shader) if src.dialect == Dialect::WEB => {
-            // glslang permits these in GLSL ES 3.00 with a warning. Chromium WebGL 2
-            // rejects them. Use the compiler's diagnostics to honour preprocessing
-            // and source locations, and leave unrelated warnings alone.
-            let log = shader.get_log();
-            let errors: Vec<_> = log
-                .lines()
-                .filter_map(|line| line.trim().strip_prefix("WARNING: "))
-                .filter(|line| line.contains("identifiers containing consecutive underscores"))
-                .map(|line| format!("ERROR: {line} in WebGL 2"))
-                .collect();
+            let errors = web_identifier_errors(&shader.get_preprocessed_code(), &src.files);
             if errors.is_empty() {
                 Ok(())
             } else {
-                Err(remap_log(&errors.join("\n"), &src.files))
+                Err(errors)
             }
         }
         Ok(_) => Ok(()),
@@ -273,6 +264,37 @@ pub fn validate(src: &Assembled, stage: Stage) -> Result<(), Vec<String>> {
         }
         Err(e) => Err(vec![format!("glslang: {e}")]),
     }
+}
+
+/// WebGL reserves identifiers containing two consecutive underscores. Scan
+/// glslang's preprocessed source so comments, inactive branches and macro names
+/// are gone, while expanded tokens and the assembler's source locations remain.
+#[cfg(feature = "strict-glsl")]
+fn web_identifier_errors(source: &str, files: &[String]) -> Vec<String> {
+    let (mut file, mut line) = (0, 1);
+    let mut errors = Vec::new();
+    for text in source.lines() {
+        if let Some(directive) = text.trim_start().strip_prefix('#') {
+            let mut args = directive.split_ascii_whitespace();
+            if args.next() == Some("line")
+                && let Some(next_line) = args.next().and_then(|n| n.parse::<usize>().ok())
+            {
+                line = next_line;
+                file = args.next().and_then(|n| n.parse().ok()).unwrap_or(file);
+                continue;
+            }
+        } else if let Some(name) = text
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .find(|token| token.contains("__"))
+        {
+            let diagnostic = format!(
+                "ERROR: {file}:{line}: '{name}': identifiers containing two consecutive underscores are reserved in WebGL 2"
+            );
+            errors.extend(remap_log(&diagnostic, files));
+        }
+        line += 1;
+    }
+    errors
 }
 
 #[cfg(not(feature = "strict-glsl"))]
