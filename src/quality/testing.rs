@@ -35,9 +35,10 @@ use super::{
     FRAME_ZERO, Kind, Programs, SOUND_W, VARIANTS, frame_texels, loudness, metric_source_in,
     run_sound_metrics,
 };
+use crate::WebChecks;
 use crate::glsl_test::{Summary, TestFile};
+use crate::glsl_test::{check_test_shader, test_dialects};
 use crate::shader::{Builder, Dialect, DriverGlsl};
-use crate::validate::{Stage, validate};
 use anyhow::{Context, Result, anyhow, bail};
 use eframe::glow::{self, HasContext};
 use std::path::{Path, PathBuf};
@@ -465,6 +466,7 @@ pub fn run(
     gl: &glow::Context,
     files: &[TestFile],
     filter: Option<&str>,
+    web_checks: WebChecks,
     out: &mut dyn FnMut(&str),
 ) -> Result<Summary> {
     let driver = unsafe {
@@ -493,16 +495,14 @@ pub fn run(
                 continue;
             }
         };
-        let opt_in = f
-            .libs
-            .iter()
-            .filter_map(|l| l.glsl)
-            .max()
-            .filter(|&v| v > 330);
-        let strict: Vec<Dialect> = match opt_in {
-            _ if !cfg!(feature = "strict-glsl") => vec![],
-            None => vec![Dialect::BASELINE, Dialect::WEB],
-            Some(v) => vec![Dialect::desktop(Some(v))],
+        let opt_in = f.desktop_opt_in();
+        let strict = match test_dialects(opt_in, web_checks) {
+            Ok(dialects) => dialects,
+            Err(e) => {
+                out(&format!("  {e}"));
+                sum.broken += 1;
+                continue;
+            }
         };
         let d = match driver.dialect(opt_in) {
             Ok(d) => d,
@@ -519,16 +519,7 @@ pub fn run(
             let checked = (|| -> Result<()> {
                 for sd in &strict {
                     for src in shaders(*sd, c, f, &dir)? {
-                        if let Err(e) = validate(&src, Stage::Fragment) {
-                            let e: Vec<String> = e
-                                .into_iter()
-                                .filter(|m| !m.contains(": warning:"))
-                                .collect();
-                            bail!(
-                                "strict check ({sd}) failed:\n  {}",
-                                src.explain(e).join("\n  ")
-                            );
-                        }
+                        check_test_shader(&src, web_checks, out)?;
                     }
                 }
                 Ok(())

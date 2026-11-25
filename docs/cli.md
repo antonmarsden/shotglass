@@ -29,7 +29,7 @@ shotglass fonts add "Family" [..] [--film <dir>]           # Google Fonts famili
 shotglass bundle <movie> --out <dir>                       # self-contained copy with the library files it includes
 shotglass freeze <movie>                                   # copy the library files it includes into the film
 shotglass unfreeze <movie>                                 # follow the project's libraries again
-shotglass test   [file|folder] [filter]                    # GLSL unit and property tests (*.test.glsl), metric tests (*.test.toml)
+shotglass test   [file|folder] [filter] [--web [--strict]]                    # GLSL unit and property tests (*.test.glsl), metric tests (*.test.toml)
 shotglass quality <movie> [--count 8 | --at ...] [--size 384x216] [--out quality-out/]
                  [--compare <dir> [--bless] [--budget 0.1%]] # heatmaps vs <dir>/<metric>.png
                  [--tighten [--margin 25%]]    # move limits towards the measured values

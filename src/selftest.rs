@@ -771,7 +771,7 @@ fn glsl_tests(gl: &Gl, dir: &Path) -> Result<String> {
     });
     let mut report = String::new();
     let junk = dirty_pack_state(gl)?;
-    let sum = run(gl, &files, None, &mut |l| {
+    let sum = run(gl, &files, None, Default::default(), &mut |l| {
         report += l;
         report.push('\n');
     });
@@ -919,7 +919,7 @@ fn metric_tests(gl: &Gl, dir: &Path) -> Result<String> {
         display: "t/q.test.toml".into(),
     }];
     let mut report = String::new();
-    let sum = crate::quality::testing::run(gl, &files, None, &mut |l| {
+    let sum = crate::quality::testing::run(gl, &files, None, Default::default(), &mut |l| {
         report += l;
         report.push('\n');
     })?;

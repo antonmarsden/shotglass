@@ -43,7 +43,7 @@ tests/unit/animate.test.glsl
 error: 2 passed, 1 failed (266241 samples) on llvmpipe (LLVM 20.1.2, 256 bits)
 ```
 
-- `shotglass test [file|folder] [filter]` runs every `*.test.glsl` file at or under the
+- `shotglass test [file|folder] [filter]` runs every `*.test.glsl` and `*.test.toml` file at or under the
   folder (default `.`; hidden folders, `target/` and `shotglass-libs/` are skipped), or
   one file. The filter keeps only tests whose name contains it. It exits non-zero if
   anything fails.
@@ -66,6 +66,13 @@ error: 2 passed, 1 failed (266241 samples) on llvmpipe (LLVM 20.1.2, 256 bits)
   3.00, or at the version a library needs) before it runs on the driver. A file that
   doesn't assemble, validate or compile is reported with `file:line`, and the other
   files still run.
+- **Browser compatibility:** `shotglass test --web` requires GLSL ES 3.00
+  validation and reports browser compatibility warnings for both GLSL and metric
+  tests. Add `--strict` to fail on those warnings. These flags require a build
+  with the `strict-glsl` feature. For a Shotglass Kit checkout, run
+  `shotglass test /path/to/shotglass-kit --web --strict` to discover its tests
+  recursively and validate their assembled shaders, including library includes.
+  Assertions and metrics still run on the local GPU.
 - Tests run on the real driver, so they catch driver differences too: run them on your
   GPU as well as in CI (software OpenGL).
 

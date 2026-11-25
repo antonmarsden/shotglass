@@ -171,8 +171,7 @@ pub fn validate_sources_with_warnings(sources: &[Source]) -> (Vec<ShaderError>, 
         .filter_map(|s| {
             let messages = match &s.src {
                 Ok(a) => {
-                    let mut shader_warnings = Vec::new();
-                    let result = validate_shader(a, s.stage, &mut shader_warnings);
+                    let (result, shader_warnings) = validate_with_warnings(a, s.stage);
                     if !shader_warnings.is_empty() {
                         warnings.push(ShaderError {
                             what: s.what.clone(),
@@ -226,7 +225,17 @@ fn explain_later_versions(src: &Assembled, stage: Stage, messages: Vec<String>) 
 /// Run one assembled shader through the reference front end. Err = messages mapped
 /// to file:line through the `#line` markers the assembler wrote.
 pub fn validate(src: &Assembled, stage: Stage) -> Result<(), Vec<String>> {
-    validate_shader(src, stage, &mut Vec::new())
+    validate_with_warnings(src, stage).0
+}
+
+/// Validate one assembled shader, retaining browser compatibility diagnostics.
+pub fn validate_with_warnings(
+    src: &Assembled,
+    stage: Stage,
+) -> (Result<(), Vec<String>>, Vec<String>) {
+    let mut warnings = Vec::new();
+    let result = validate_shader(src, stage, &mut warnings);
+    (result, warnings)
 }
 
 #[cfg(feature = "strict-glsl")]

@@ -12,10 +12,13 @@
 //! `expect*(<id>, ` and the engine keeps id → (line, call text), so a failure names the
 //! exact call, even several on one line, without GLSL needing strings.
 
+use crate::WebChecks;
 use crate::gfx::{ReadFormat, read_pixels_into};
 use crate::library::Library;
 use crate::shader::{Assembled, Builder, Dialect, DriverGlsl, compile, top_level_definitions};
-use crate::validate::{Stage, validate};
+#[cfg(all(test, feature = "strict-glsl"))]
+use crate::validate::validate;
+use crate::validate::{self, Stage};
 use anyhow::{Result, anyhow, bail};
 use eframe::glow::{self, HasContext};
 use std::fmt::Write as _;
@@ -529,6 +532,59 @@ pub struct TestFile {
     pub display: String,
 }
 
+impl TestFile {
+    /// The newest desktop dialect required by the project's libraries.
+    pub fn desktop_opt_in(&self) -> Option<u32> {
+        self.libs
+            .iter()
+            .filter_map(|l| l.glsl)
+            .max()
+            .filter(|&v| v > Dialect::BASELINE.version)
+    }
+}
+
+pub fn test_dialects(opt_in: Option<u32>, web_checks: WebChecks) -> Result<Vec<Dialect>> {
+    if let Some(v) = opt_in.filter(|_| web_checks.web) {
+        anyhow::bail!(
+            "--web: a test library requires desktop GLSL {v}, which is incompatible with GLSL ES 3.00"
+        );
+    }
+    Ok(match opt_in {
+        _ if !validate::AVAILABLE => vec![],
+        None => vec![Dialect::BASELINE, Dialect::WEB],
+        Some(v) => vec![Dialect::desktop(Some(v))],
+    })
+}
+
+/// Shared preflight for GLSL unit tests and metric tests.
+pub fn check_test_shader(
+    src: &Assembled,
+    web_checks: WebChecks,
+    out: &mut dyn FnMut(&str),
+) -> Result<()> {
+    let (result, warnings) = validate::validate_with_warnings(src, Stage::Fragment);
+    if web_checks.web {
+        for warning in &warnings {
+            out(&format!("  {warning}"));
+        }
+    }
+    if let Err(errors) = result {
+        let errors = errors
+            .into_iter()
+            .filter(|m| !m.contains(": warning:"))
+            .collect();
+        anyhow::bail!(
+            "strict check ({}) failed:\n  {}",
+            src.dialect,
+            src.explain(errors).join("\n  ")
+        );
+    }
+    if web_checks.rejects_warnings(&warnings) {
+        anyhow::bail!("shader has browser compatibility warnings");
+    }
+    Ok(())
+}
+
 /// A file assembled for one dialect, with its tests and assertions.
 pub struct Prepared {
     pub tests: Vec<TestFn>,
@@ -723,6 +779,7 @@ pub fn run(
     gl: &glow::Context,
     files: &[TestFile],
     filter: Option<&str>,
+    web_checks: WebChecks,
     out: &mut dyn FnMut(&str),
 ) -> Result<Summary> {
     let (glsl, version) = unsafe {
@@ -736,19 +793,14 @@ pub fn run(
     let mut gpu = unsafe { Gpu::new(gl)? };
     for f in files {
         out(&f.display);
-        let opt_in = f
-            .libs
-            .iter()
-            .filter_map(|l| l.glsl)
-            .max()
-            .filter(|&v| v > 330);
-        // Strict check first, in every dialect the file promises: 330 and ES 3.00, or the
-        // version a library needs.
-        // (Skipped in a build without the strict-glsl feature: the driver still compiles.)
-        let strict: Vec<Dialect> = match opt_in {
-            _ if !cfg!(feature = "strict-glsl") => vec![],
-            None => vec![Dialect::BASELINE, Dialect::WEB],
-            Some(v) => vec![Dialect::desktop(Some(v))],
+        let opt_in = f.desktop_opt_in();
+        let strict = match test_dialects(opt_in, web_checks) {
+            Ok(dialects) => dialects,
+            Err(e) => {
+                out(&format!("  {e}"));
+                sum.broken += 1;
+                continue;
+            }
         };
         let mut errors = vec![];
         for d in &strict {
@@ -758,15 +810,8 @@ pub fn run(
                     break;
                 }
                 Ok(p) => {
-                    if let Err(e) = validate(&p.asm, Stage::Fragment) {
-                        errors.push(format!("strict check ({d}) failed:"));
-                        // Only the errors: warnings (e.g. a library's reserved `__` names)
-                        // would bury them.
-                        let e: Vec<String> = e
-                            .into_iter()
-                            .filter(|m| !m.contains(": warning:"))
-                            .collect();
-                        errors.extend(p.asm.explain(e).into_iter().map(|m| format!("  {m}")));
+                    if let Err(e) = check_test_shader(&p.asm, web_checks, out) {
+                        errors.extend(e.to_string().lines().map(str::to_owned));
                         break;
                     }
                 }
@@ -1265,6 +1310,50 @@ void test_a() {
             }
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "strict-glsl")]
+    #[test]
+    fn web_test_preflight_reports_included_warnings_and_strict_rejects_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.test.glsl");
+        std::fs::write(
+            dir.path().join("helper.glsl"),
+            "float kit__unit() { return 1.0; }",
+        )
+        .unwrap();
+        std::fs::write(
+            &path,
+            "#include \"helper.glsl\"\nvoid test_helper() { expect(kit__unit() == 1.0); }",
+        )
+        .unwrap();
+        let file = TestFile {
+            path,
+            root: dir.path().into(),
+            libs: vec![],
+            display: "a.test.glsl".into(),
+        };
+        let src = prepare(&file, Dialect::WEB).unwrap().asm;
+        let mut messages = Vec::new();
+        check_test_shader(&src, WebChecks::default(), &mut |s| {
+            messages.push(s.to_owned())
+        })
+        .unwrap();
+        assert!(messages.is_empty());
+        let mut web = WebChecks {
+            web: true,
+            strict: false,
+        };
+        check_test_shader(&src, web, &mut |s| messages.push(s.to_owned())).unwrap();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("helper.glsl:1: warning:"))
+        );
+        web.strict = true;
+        let error = check_test_shader(&src, web, &mut |_| {}).unwrap_err();
+        assert!(error.to_string().contains("browser compatibility warnings"));
+        assert!(test_dialects(Some(430), web).is_err());
     }
 
     #[test]
