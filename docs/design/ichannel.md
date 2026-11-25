@@ -3,9 +3,14 @@
 Issue: [#22](https://github.com/antonmarsden/shotglass/issues/22). Status: **implemented**
 (decisions at the end; PR 1 and PR 2 of the plan landed together, see "Implementation notes"). The heavy-assets design (#32) builds on the decisions here.
 
+Channels now also carry text blocks ([text-typography.md](text-typography.md)), `@`
+layer outputs ([layers-compositing.md](layers-compositing.md)) and image-sequence footage
+([video-inputs.md](video-inputs.md)); every entry is classified by
+`movie::ChannelSource::of`, and the scene header declares `iChannelMeta[8]`.
+
 ## Summary
 
-A shot can bind up to four images to `iChannel0..3`, as on Shadertoy. Images are PNG or
+A shot can bind up to eight images to `iChannel0..7` (`movie::N_CHANNELS`), as on Shadertoy. Images are PNG or
 JPEG files from the film folder or from a library, so library images are pinned by the
 sha256 that `shotglass.lock` already records. They are decoded on the CPU by the same Rust
 code on every platform, including the web, and stored as RGBA8, flipped on the decode
@@ -14,7 +19,8 @@ is the fast path, at the price of mip levels that differ slightly between driver
 megabytes per frame, prioritised the same way as compiles. While playing, a shot whose
 textures aren't uploaded yet is handled like a shot that hasn't compiled: the previous
 frame stays up. So every frame you see is the frame `still` and `export` render. The
-scene header doesn't change: `iChannel0..3` and `iChannelResolution` are already declared.
+scene header declares `iChannel0..7`, `iChannelResolution[8]`, `iChannelTime[8]` and
+`iChannelMeta[8]`.
 The engine contract gets a patch bump (0.1.0 → 0.1.1) because `movie.toml` gains a field.
 
 Not in this design: cubemaps, 3D textures, buffers (multipass), video, keyboard and sound
@@ -47,7 +53,7 @@ shotglass = "0.1.1"
 channels = ["noise"]           # film-wide default for every shot (top-level keys go before tables)
 
 [textures]                     # named textures, defined once, used by any shot
-noise = "<kit/textures/noise-rgba-256.png>"      # from the library the film calls "kit"
+noise = "<kit/textures/noise-rgba-256.png>"      # from a library the film calls "kit" (illustrative: the kit ships no textures yet)
 brick = "textures/brick.png"                    # from the film folder
 grid  = { file = "textures/grid.png", filter = "nearest" }
 moon  = { file = "textures/moon.jpg", wrap = "clamp", srgb = true }
@@ -72,7 +78,7 @@ channels = [{ file = "textures/logo.png", wrap = "clamp" }]   # inline, with opt
 # no `channels`: this shot gets the film-wide default; `channels = []` binds nothing
 ```
 
-**`channels`** is an array of at most four entries; entry *n* is `iChannel`*n*. Each entry is:
+**`channels`** is an array of at most eight entries; entry *n* is `iChannel`*n*. Each entry is:
 
 | entry | meaning |
 |---|---|
@@ -111,7 +117,7 @@ New serde fields, all with `deny_unknown_fields`: `MovieFile.channels`,
 
 `parse` checks, with messages in the existing `shot "id": …` style:
 
-- at most four entries: `shot "sky": channels has 5 entries; there are 4 (iChannel0..3)`;
+- at most eight entries: `shot "sky": channels has 9 entries; there are 8 (iChannel0..7)`;
 - a name must be in `[textures]`: `shot "wall": channels[1]: no texture called "noize" in [textures] (there are "brick", "grid", "noise")`;
 - `[textures]` names are identifiers and don't shadow each other;
 - paths follow `library::check_rel_path` (forward slashes, inside the film folder);
@@ -120,7 +126,9 @@ New serde fields, all with `deny_unknown_fields`: `MovieFile.channels`,
 - option values are from the tables above: `[textures] grid: filter "point" isn't one of "mipmap", "linear", "nearest"`;
 - an unused `[textures]` entry is a warning, not an error (handy while editing).
 
-The resolved `Shot` gains `channels: [Option<Channel>; 4]`, where
+The resolved `Shot` has `channels: [Option<Channel>; N_CHANNELS]`. The sketch below is
+the original image-only shape; `Channel` is now `{ source, timing }`, with `source` one of
+`Image`, `Text`, `Frames`, …:
 
 ```rust
 pub struct Channel {
@@ -149,15 +157,15 @@ keeps them unresolved, like library includes). Texture files join `referenced_fi
   error. No change to the lock format.
 
 That makes "an asset pack" for small images just a library: a folder with a
-`library.toml` and some PNGs. The kit will ship MIT or CC0 noise and pattern textures this way
-(see [Decisions](#decisions)). Large assets that don't belong in git
+`library.toml` and some PNGs. The kit was meant to ship MIT or CC0 noise and pattern textures this way
+(see [Decisions](#decisions)), but has none yet: its noise is procedural
+(`core/noise.glsl`). Large assets that don't belong in git
 (video, long samples) are #32's job: it will add content-addressed packs fetched over
 HTTP with their own lock entries, and textures will be able to come from them too, with
 the same `<name/path>` syntax.
 
 Shadertoy's built-in media (its noise, "Organic", "Abstract" textures and so on) aren't
-licensed for redistribution. The README will say so and point to CC0 sources and the
-kit's textures.
+licensed for redistribution. The README will say so and point to CC0 sources.
 
 **Git:** `.gitattributes` in this repo and in the `shotglass new` template get
 `*.png binary` and `*.jpg binary` / `*.jpeg binary`. Git already detects these as binary,
@@ -241,7 +249,7 @@ change to the contract, so it is a **patch bump in 0.x: 0.1.0 → 0.1.1**.
   "unknown field `channels`". `check` warns when a film uses `channels` but its
   `shotglass` field is missing or allows 0.1.0, and `shotglass new` writes the current
   contract anyway.
-- Sampler types are part of the contract from now on: `iChannel0..3` are `sampler2D`.
+- Sampler types are part of the contract from now on: `iChannel0..7` are `sampler2D`.
   A later cubemap or 3D channel would declare `samplerCube`/`sampler3D` for that shot,
   which changes the shot's source (and so its program key). That's fine, but it is a
   contract change of its own.
@@ -599,7 +607,7 @@ for now; any can be revisited during implementation.
    (as `RGBA16F`, which WebGL 2 can filter) waits for a film that needs it.
 6. **Golden case:** a dedicated `tests/films/channels/` film with its own small CC0
    images made for the test. The demo and the template keep their looks.
-7. **Kit textures:** yes. shotglass-kit ships a `textures` library of MIT or CC0 images
+7. **Kit textures:** yes (not done yet: the kit has no `textures` library). shotglass-kit ships a `textures` library of MIT or CC0 images
    (RGBA noise at 64, 256 and 1024, a grey noise, a pattern or two) as the free
    replacement for Shadertoy's built-in media. Each image's source and licence goes in
    the library (`library.toml` `licences`, plus a note per file where they differ). This

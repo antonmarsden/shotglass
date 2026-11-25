@@ -1,8 +1,18 @@
 # Design: text and typography
 
-Status: **proposed** (design only; nothing here is implemented). Builds on
+Status: **phase 1 implemented** (block textures, `iChannelMeta`, kit `text/`). Phase 2,
+glyph runs and subtitles, is #71. Phase 3 is dropped: subtitles, lower thirds and credits
+are `[[layer]]`s binding text channels ([layers-compositing.md](layers-compositing.md)). Builds on
 [iChannel textures](ichannel.md) (#22), whose texture store, decode worker, banded uploads
 and `keys_ready` gating it reuses.
+
+**Where the build differs from this proposal:**
+- There are 8 channels (`iChannel0..7`, `iChannelMeta[8]`), not 4.
+- Fonts come from Google Fonts families declared as libraries (`[libraries] inter = {
+  google = "Inter" }` in `shotglass.toml`, files named `"<inter/Inter-Regular.ttf>"`,
+  added with `shotglass fonts add "Inter"`), or from the film folder. The kit ships no
+  fonts.
+- Wherever this doc says "overlay pass", read "a layer".
 
 ## Summary
 
@@ -239,8 +249,8 @@ the current one) because the file gains fields and the header gains a uniform.
 shotglass = "0.1.3"            # in shotglass.toml: the contract that has [fonts]/[texts]
 
 [fonts]
-body    = "<fonts/inter/Inter-Regular.ttf>"            # from the library the project calls "fonts"
-bold    = { file = "<fonts/inter/Inter-Variable.ttf>", variations = { wght = 700 } }
+body    = "<inter/Inter-Regular.ttf>"                  # from [libraries] inter = { google = "Inter" }
+bold    = { file = "<inter/Inter-Variable.ttf>", variations = { wght = 700 } }
 display = { file = "fonts/Bungee-Regular.ttf", fallback = ["body"] }
 arabic  = "fonts/NotoNaskhArabic-Regular.ttf"
 
@@ -311,8 +321,8 @@ vec3 col = mix(bg, vec3(1.0), edge * uIn);
 word, line, local uv, rect }`; `text/kinetic.glsl` has stagger helpers
 (`stagger(i, n, t, spread)`, per-glyph eased offsets, typewriter reveal by grapheme);
 `text/subtitles.glsl` picks the active entry by `iMovieTime` and draws it with a plate;
-`text/number.glsl` draws a value with a glyph set. Fonts ship in a separate kit library
-(`fonts/`) so a film that brings its own fonts doesn't download them.
+`text/number.glsl` draws a value with a glyph set. Fonts come from Google Fonts libraries, not the
+kit.
 
 Because metrics come in `iChannelMeta` and positions are texel-based, the kit never needs
 the font file; the engine-side layout is the single source of truth.
@@ -424,7 +434,7 @@ phase is one PR, separate from the parsing/layout PR.
     golden).
   - phase 2: table packing/unpacking round trip, lines sorted by x in visual order,
     SRT/WebVTT parsing (times, overlaps, styling tags stripped), glyph-set lookup.
-  - fixture fonts: a small OFL font committed under `tests/fonts/` (with its licence),
+  - fixture fonts: a small OFL font committed under `tests/films/text/fonts/` (with its licence),
     subsetted Latin + Hebrew + Arabic ranges to keep the repo small.
 - **Selftest** ("text textures"; mutation-check each by breaking the code):
   - a text shot played from cold: no blocking loads, frames held until ready, then identical
@@ -452,8 +462,7 @@ phase is one PR, separate from the parsing/layout PR.
    files; README "Text" section; template comment; contract bump.
 3. `gfx.rs` (one PR): `TexSource::Text` on the worker, keys, `iChannelMeta` in the header
    and per draw, watcher extensions; selftest checks; golden `tests/films/text`.
-4. kit: `text/block.glsl` (place, coverage, edge, outline, glow, shadow) and a `fonts`
-   library with two or three OFL families; a title card in the template or demo (re-bless
+4. kit: `text/block.glsl` (place, coverage, edge, outline, glow, shadow); a title card in the template or demo (re-bless
    if the demo changes on purpose).
 
 **Phase 2 — glyph runs**
@@ -462,7 +471,7 @@ phase is one PR, separate from the parsing/layout PR.
 7. kit: `text/runs.glsl`, `text/kinetic.glsl`, `text/subtitles.glsl`, `text/number.glsl`;
    credits-roll example.
 
-**Phase 3 — overlay pass**
+**Phase 3 — overlay pass** *(dropped: use `[[layer]]`s)*
 8. `[[overlay]]` in movie.toml: a film-level scene (own `channels`, uniforms, time window)
    drawn after the cut/transition, before the composite, with the frame as an input
    sampler. Contract change (minor in 0.x terms if it changes the frame pipeline). Lets
@@ -482,14 +491,14 @@ phase is one PR, separate from the parsing/layout PR.
 3. **Sizes in texture pixels vs frame units**: texture pixels keep rasterisation
    independent of output size (determinism); is a `quality`-style option friendlier than
    `size`? Leaning: keep `size`, the kit maps it.
-4. **Two channels per glyph run** uses half of a shot's four. Alternatives: pack atlas and
+4. **Two channels per glyph run** uses a quarter of a shot's eight. Alternatives: pack atlas and
    table in one texture (filtering bleed, mip issues), or raise the channel count (header
    and Shadertoy-compat change). Decide when phase 2 starts, with a real kinetic example.
 5. **MSDF generator**: `fdsm` maturity and determinism vs porting msdfgen's core. Spike
    before phase 2.
 6. **Subtitles as text data vs overlay**: phase 2 subtitles still need every shot's scene to
    include the kit helper. Is that acceptable until phase 3, or should phase 3 come first
-   for subtitle-heavy users?
+   for subtitle-heavy users? *(Resolved: subtitles are a layer.)*
 7. **Web player font size**: CJK fonts are large; should `bundle` warn above a size, or
    should the engine subset to used glyphs at bundle time (a modified font under OFL's
    RFN rule, so only for fonts without reserved names)?
@@ -499,14 +508,14 @@ phase is one PR, separate from the parsing/layout PR.
 - Text is a texture source, bound with `channels`; names share `[textures]`' namespace.
 - Phase 1: one RGBA8 block texture per text: R/A coverage, G signed distance, B reserved;
   text defaults `linear`/`clamp`.
-- Metrics via a new `uniform vec4 iChannelMeta[4]`, set per draw; text edits never
+- Metrics via a new `uniform vec4 iChannelMeta[8]`, set per draw; text edits never
   recompile.
 - Layout on rustybuzz + unicode-bidi + unicode-linebreak, our own greedy layout; RTL and
   complex scripts in scope; no hinting; no system fonts; explicit fallback chains.
 - Rasterise on the decode worker; reuse banded uploads, priorities, LRU budget and
   `keys_ready` unchanged.
-- No GLSL in the engine; the kit's `text` library owns sampling and effects, its `fonts`
-  library owns OFL fonts.
-- Phase 2 glyph runs: MTSDF atlas + RGBA8-packed tables read with `texelFetch`; phase 3
-  overlay pass in its own design.
+- No GLSL in the engine; the kit's `text` library owns sampling and effects, fonts come
+  from Google Fonts libraries.
+- Phase 2 glyph runs: MTSDF atlas + RGBA8-packed tables read with `texelFetch`; no phase 3
+  overlay pass (layers cover it).
 - Contract: patch bump for `[fonts]`/`[texts]` and `iChannelMeta`.

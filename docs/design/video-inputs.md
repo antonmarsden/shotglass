@@ -1,7 +1,15 @@
 # Design: moving-image inputs (footage on iChannels)
 
-Status: **proposal** (nothing implemented). Builds on [ichannel.md](ichannel.md) (#22), which
+Status: **phase 1 (image sequences) implemented**. Phase 2, video, is #73; RGBA16F/EXR
+and other follow-ups are in #75. Builds on [ichannel.md](ichannel.md) (#22), which
 left room for `{ video = "…" }` channels, and touches #32 (heavy assets) and #2 (web player).
+
+**Where the build differs from this proposal:**
+- Video decodes from a cached intra-only conform by default: every clip is transcoded
+  once to an all-intra, constant-rate copy in the cache rather than seeking in camera
+  files. The CFR-only probe and `shotglass conform` as a fallback (below) are superseded.
+- Open questions 1, 2 and 4 are settled as proposed: `end = "hold"`, footage
+  `filter = "linear"`, exact frame or stall (no preview mode).
 
 ## Summary
 
@@ -57,7 +65,7 @@ Footage lives in the same places as images: `[textures]`, the film-wide `channel
 shot's `channels`. Images keep `file`; footage uses `frames` or `video`.
 
 ```toml
-shotglass = "0.1.3"            # whatever patch version ships footage (see Engine contract)
+shotglass = "0.1.6"            # the contract with footage (sequences)
 
 [textures]
 grain = "<kit/textures/grain_##.png>"                     # a library sequence (#: frame number)
@@ -238,7 +246,7 @@ A video's frame `k` must mean the same thing whether reached by decoding from th
 by seeking. Phase 2 accepts **constant-frame-rate** streams only: the probe requires
 `r_frame_rate == avg_frame_rate` and a frame count consistent with duration × rate (±1),
 and frame `k` is the frame at presentation time `start_time + k / rate`. Phone footage is
-often VFR; it gets a clear error pointing to `shotglass conform` (phase 2), which runs
+often VFR; it gets a clear error pointing to `shotglass conform` (phase 2; superseded, see above), which runs
 ffmpeg once to write a CFR, all-intra copy (`-fps_mode cfr`, FFV1 or MJPEG) into the film
 folder. All-intra copies also make seeking, `speed > 2` and (later) reverse playback cheap.
 
@@ -252,7 +260,7 @@ reports the rotated size, which is what `iChannelResolution` shows.
 A sequence frame is an image: `texture::load(path_of(k), label, vflip)` on a worker
 thread, unchanged. Random access, no state, no seeking. What changes is throughput: a
 1080p PNG decodes in roughly 20–40 ms and a JPEG in 5–10 ms, so 30 fps needs several
-workers. The single texture decode thread becomes a small pool (`min(4, cores − 2)`,
+workers. The single texture decode thread becomes a small pool (`gfx::Decoder`) (`min(4, cores − 2)`,
 at least 1) shared by images and footage; jobs carry a priority so the frame under the
 playhead goes first. README guidance: JPEG (quality 95) for plates, PNG for mattes and
 anything with alpha, and smaller frames on slow machines. (QOI, a fast lossless format the

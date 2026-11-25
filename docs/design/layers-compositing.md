@@ -1,9 +1,19 @@
 # Design: layers and compositing
 
-Status: **proposal** (nothing implemented; decisions to confirm are listed under
-[Open questions](#open-questions)). Builds on the iChannel design
+Status: **phases 1 and 2 implemented** (spans, `@input`, scale, source-over; blends,
+`@picture`, `@<layer>`). Phase 3, comps and mattes, is #74; phase 4 items are in #75. Builds on the iChannel design
 ([ichannel.md](ichannel.md)): layers reuse its channel syntax, its texture gating and
 its contract-bump rules.
+
+**Where the build differs from this proposal:**
+- There is no `compose.rs`: the frame plan lives in `gfx.rs` (picture → working target →
+  each layer into a scratch target at its scale, or its own exact-size held target when a
+  later layer reads it → over or blend pass → final copy).
+- Source-over is always its own pass (`glsl/over.glsl`, premultiplied × opacity); there
+  is no GL blend-state path. Opacity is applied by the composite, not the footer, so
+  `@<layer>` sees the layer itself.
+- Open questions 1 and 8 are settled as proposed: authors write straight alpha and the
+  footer premultiplies; `SG_HAS_*` defines, layers only.
 
 ## Summary
 
@@ -34,7 +44,7 @@ This design adds a stack of **layers** above that track, and later **comps**
   layer at `scale = "auto"`; fixed-scale layers are part of the movie, so frames stay
   a function of (movie, t, size, scale). Slow layers draw in viewport strips like
   shots. A broken layer edit falls back per layer id.
-- **Contract:** additive, so a patch bump per phase (0.1.2 → 0.1.3 for the MVP).
+- **Contract:** additive, so a patch bump per phase (0.1.4 for the MVP).
   Films without layers assemble the same sources and render bit for bit as before.
 
 MVP (phase 1): `[[layer]]` with spans, opacity/fades, `@input`, per-layer scale and the
@@ -218,11 +228,11 @@ are kit passes that read the source as an ordinary channel.
 
 ### Syntax
 
-The engine contract stays in `shotglass.toml` (`shotglass = "0.1.3"`); libraries too:
+The engine contract stays in `shotglass.toml` (`shotglass = "0.1.4"`); libraries too:
 
 ```toml
 # shotglass.toml
-shotglass = "0.1.3"
+shotglass = "0.1.4"
 [libraries]
 transitions = { source = "https://github.com/antonmarsden/shotglass-kit", subdir = "transitions" }
 fx          = { source = "https://github.com/antonmarsden/shotglass-kit", subdir = "fx" }
@@ -316,13 +326,13 @@ resolved `Layer` struct, validation in `Movie::parse`, unit tests, README and
 - `@` sources: `@input` only on layers; `@<layer>` only for an earlier layer; `@<comp>`
   names an entry of `[comps]`; mipmap filtering refused; comp references acyclic,
   nesting depth ≤ 4 (each level holds targets);
-- `contract_warning` lists "layers, which need shotglass 0.1.3" (and comps' version).
+- `contract_warning` lists "layers, which need shotglass 0.1.4" (and comps' version).
 
 ## Engine contract
 
-Additive, so a **patch bump in 0.x per phase**: 0.1.2 → 0.1.3 (layers), then 0.1.4
-(blend interface, `@<id>`), 0.1.5 (comps, mattes). Old films keep loading
-(`shotglass = "0.1"`); a film using layers should say `0.1.3` so an older engine says so
+Additive, so a **patch bump in 0.x per phase**: 0.1.4 (layers), 0.1.5
+(blend interface, `@<id>`), then 0.1.7 (comps, mattes). Old films keep loading
+(`shotglass = "0.1"`); a film using layers should say `0.1.4` so an older engine says so
 instead of "unknown field `layer`".
 
 What becomes contract:
@@ -347,11 +357,11 @@ What becomes contract:
    It isn't the transition interface reused because the alpha semantics differ: a
    transition mixes two opaque images, a blend must honour the layer's alpha.
 5. **Source-over** as the default composite and **matte multiply**: plumbing in the
-   layer footer and GL blend state, like the internal `copy` pass. These are the only
+   layer footer and a separate over pass, like the internal `copy` pass. These are the only
    new engine-side GLSL lines; they define what "a layer at opacity o" means, and every
    look is in a library. The kit gets `fx/` (grade, grain, vignette, letterbox, place,
    bloom) and `blend/` (multiply, screen, add, overlay, soft light, difference) with
-   `library.toml` peer requirements `shotglass >= 0.1.3` / `0.1.4`.
+   `library.toml` peer requirements `shotglass >= 0.1.4` / `0.1.5`.
 
 Unchanged: `SCENE_HEADER`, `SCENE_FOOTER` for shots, the transition interface, sound.
 A film without layers assembles exactly today's sources, so program hashes, the on-disk
@@ -359,8 +369,9 @@ program cache and every golden reference stay valid.
 
 ## Renderer
 
-`gfx.rs` takes one change at a time (CONTRIBUTING.md), so the plan is built by a new
-pure module, `src/compose.rs`, and `gfx.rs` only executes it.
+`gfx.rs` takes one change at a time (CONTRIBUTING.md), so the plan was to build it in a
+new pure module, `src/compose.rs`, with `gfx.rs` only executing it (in the end the plan
+stayed in `gfx.rs`).
 
 ### The frame plan (`compose.rs`, no GL)
 
@@ -561,7 +572,7 @@ must pass `check --web` (the kit's CI and the canary).
 
 Each phase is one issue and one branch (CONTRIBUTING.md); `gfx.rs` changes are serialised.
 
-**Phase 1 — MVP: layers with source-over (contract 0.1.3)**
+**Phase 1 — MVP: layers with source-over (contract 0.1.4)**
 1. `movie.rs`: `[[layer]]` (serde + resolved `Layer`), span grammar, `fade`/`opacity`,
    `scale`, `@input` in channels, layer cues, `layers_at`, contract warning, unit tests.
 2. `compose.rs`: the pure plan + unit/property tests.
@@ -573,11 +584,11 @@ Each phase is one issue and one branch (CONTRIBUTING.md); `gfx.rs` changes are s
 5. shotglass-kit (separate PR): `fx/` library — grade, grain, vignette, letterbox, place —
    each passing `check --web`.
 
-**Phase 2 — blend modes and references (0.1.4)**: the blend interface, kit `blend/`,
+**Phase 2 — blend modes and references (0.1.5)**: the blend interface, kit `blend/`,
 `@picture` and `@<layer>`, kit `fx/bloom` as a documented layer recipe, timeline rows and
 mute/solo in the player.
 
-**Phase 3 — comps and mattes (0.1.5)**: `[comps]`, comp files, `[[shot]] comp`,
+**Phase 3 — comps and mattes (0.1.7)**: `[comps]`, comp files, `[[shot]] comp`,
 `[[layer]] comp`, `@<comp>` channels, comp cues, per-frame comp memoisation, `matte`.
 
 **Phase 4 — polish**: layer `transition_in`/`transition_out` (existing interface), opt-in
