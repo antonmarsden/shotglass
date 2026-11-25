@@ -27,6 +27,7 @@ shotglass update <movie> [library..]                       # move library pins t
 shotglass licenses <movie>                                 # libraries the film includes, film fonts, and their licences
 shotglass fonts add "Family" [..] [--film <dir>]           # Google Fonts families as libraries, plus [fonts] entries
 shotglass bundle <movie> --out <dir>                       # self-contained copy with the library files it includes
+shotglass shaders <film|file.test.glsl> [--web | --glsl <version>] --out <dir> # export assembled vertex and fragment GLSL
 shotglass freeze <movie>                                   # copy the library files it includes into the film
 shotglass unfreeze <movie>                                 # follow the project's libraries again
 shotglass test   [file|folder] [filter] [--web [--strict]]                    # GLSL unit and property tests (*.test.glsl), metric tests (*.test.toml)
@@ -153,3 +154,22 @@ and libopus.
 Check with `ffmpeg -encoders`: `ffv1` needs `ffv1` and `flac` (built in); without the
 `webm` feature, `webm` needs `libvpx-vp9` and `libopus`, and `av1` needs `libsvtav1` or
 `libaom-av1`.
+
+## Exporting assembled shaders
+
+Run `shotglass shaders <film|file.test.glsl> --web --out <dir>` to export GLSL ES
+3.00 sources for browser compile and link tests. With neither flag, the export
+uses the film or test project's desktop dialect. Use `--glsl 330`, `--glsl 410`
+or `--glsl 430` to override it for the export. The output folder must be new or
+empty.
+
+A film export includes the shaders assembled by `check`, including its quality
+metrics. A `*.test.glsl` export resolves the test project's libraries and adds
+the same assertion harness and dispatcher as `shotglass test`. Use a test file
+that includes and calls the library function you want to check.
+
+`manifest.json` has `schema` (currently 1), `dialect` and a list of `programs`.
+Each program has a `label`, relative `vertex` and `fragment` filenames, and a
+`sources` array that maps the fragment shader's GLSL source numbers to filenames.
+Load each pair into a WebGL 2 program to compile and link it. The export command
+only assembles the sources, so it can run without a GPU.
