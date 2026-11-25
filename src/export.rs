@@ -4,8 +4,9 @@
 //! Frame n is rendered at exactly `movie.frame_time(n)` at full resolution with
 //! blocking compiles, so it is the same frame `still` renders at that time. Raw RGBA
 //! frames are piped to an external `ffmpeg`; the soundtrack is written first as the
-//! same 16-bit WAV `shotglass wav` writes, and ffmpeg muxes it. Nothing is linked or
-//! bundled: the user's ffmpeg brings the codecs.
+//! same 16-bit WAV `shotglass wav` writes, and ffmpeg muxes it: the user's ffmpeg
+//! brings the codecs. WebM (and AV1 in Matroska) are the exception: with the `webm`
+//! feature they're encoded and muxed in-process (`webm::export`, #116).
 
 use crate::audio;
 use crate::gfx::{Frame, FrameInfo, Renderer};
@@ -21,9 +22,11 @@ use std::sync::mpsc;
 /// What to write.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Format {
-    /// VP9 + Opus in WebM.
+    /// AV1 (SVT-AV1, 10-bit) + Opus in WebM, built in; without the `webm` feature,
+    /// VP9 + Opus through ffmpeg.
     Webm,
-    /// AV1 + Opus (WebM or MKV, by the file extension).
+    /// AV1 + Opus (WebM or MKV, by the file extension): built in like `Webm`, or
+    /// through ffmpeg without the `webm` feature.
     Av1,
     /// FFV1 (lossless RGB) + FLAC in Matroska: archival.
     Ffv1,
@@ -35,6 +38,29 @@ pub enum Format {
 
 impl Format {
     pub const NAMES: &str = "webm, av1, ffv1, png, ffmpeg";
+
+    /// Encoded in-process (SVT-AV1 + libopus + our WebM writer), no ffmpeg.
+    pub fn builtin(&self) -> bool {
+        cfg!(feature = "webm") && matches!(self, Format::Webm | Format::Av1)
+    }
+
+    /// Runs the user's ffmpeg.
+    pub fn needs_ffmpeg(&self) -> bool {
+        !self.builtin() && *self != Format::Png
+    }
+
+    /// The Matroska DocType the built-in encoder writes to `out`.
+    #[cfg_attr(not(feature = "webm"), allow(dead_code))]
+    pub fn doc_type(&self, out: &Path) -> &'static str {
+        let mkv = out
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("mkv"));
+        if *self == Format::Av1 && mkv {
+            "matroska"
+        } else {
+            "webm"
+        }
+    }
 
     /// From `--format`, or from the output's extension when there's no `--format`.
     pub fn choose(name: Option<&str>, out: &Path, ffmpeg_args: Option<&str>) -> Result<Format> {
@@ -66,7 +92,7 @@ impl Format {
             Some("mkv") => Ok(Format::Ffv1),
             None => Ok(Format::Png),
             Some(e) => bail!(
-                "can't tell the format from \".{e}\": use .webm (VP9 + Opus), .mkv (FFV1 + FLAC), \
+                "can't tell the format from \".{e}\": use .webm (AV1 + Opus), .mkv (FFV1 + FLAC), \
                  a folder name (PNG sequence + WAV), or --format ({})",
                 Format::NAMES
             ),
@@ -84,6 +110,39 @@ impl Format {
     }
 }
 
+/// The built-in AV1 encoder's settings (`--quality`, `--bitrate`, `--speed`,
+/// `--depth`, `--grain`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Av1Options {
+    /// SVT-AV1 CRF, 0..=63 (lower is better); ignored with `bitrate`.
+    pub quality: u8,
+    /// Target bitrate in kbit/s instead of constant quality.
+    pub bitrate: Option<u32>,
+    /// SVT-AV1 preset, 0..=13 (higher is faster).
+    pub speed: u8,
+    /// 8 or 10 bits per sample.
+    pub depth: u8,
+    /// Film-grain denoising and synthesis, 0 (off) ..= 50.
+    pub grain: u8,
+    /// Frames between keyframes; None = about two seconds (`webm::export::keyint`).
+    /// Not on the command line: the selftest sets it to test keyframe spacing on a
+    /// short film.
+    pub keyint: Option<u32>,
+}
+
+impl Default for Av1Options {
+    fn default() -> Self {
+        Av1Options {
+            quality: 30,
+            bitrate: None,
+            speed: 6,
+            depth: 10,
+            grain: 0,
+            keyint: None,
+        }
+    }
+}
+
 pub struct Options {
     pub out: PathBuf,
     pub w: usize,
@@ -93,6 +152,9 @@ pub struct Options {
     pub rate: u32,
     /// Periods of a `loop = true` film to write, one after another (1 otherwise).
     pub loops: u64,
+    /// For the built-in encoder.
+    #[cfg_attr(not(feature = "webm"), allow(dead_code))]
+    pub av1: Av1Options,
 }
 
 /// What was written.
@@ -316,6 +378,11 @@ pub fn export(
     if cancel.load(Ordering::Relaxed) {
         bail!("cancelled");
     }
+    #[cfg(feature = "webm")]
+    if opts.format.builtin() {
+        let doc = opts.format.doc_type(&opts.out);
+        return crate::webm::export::export(r, m, opts, &opts.av1, doc, cancel, progress);
+    }
     let png = opts.format == Format::Png;
     let encoders = if png {
         String::new()
@@ -505,6 +572,48 @@ pub fn export(
     })
 }
 
+/// Render frames `frames` (frame n at `frame_time(n)`, as `still`) through the YUV
+/// pass, pipelined: frame n+1 renders while earlier frames are read back through the
+/// reader's ring, collected oldest first. `sink` gets every frame in order. The only
+/// waits on the GPU are back-pressure (the ring is full) and the final drain.
+pub fn render_yuv(
+    r: &mut Renderer,
+    m: &Movie,
+    (w, h): (usize, usize),
+    frames: std::ops::Range<u64>,
+    reader: &mut crate::yuv::YuvReader,
+    cancel: &AtomicBool,
+    mut sink: impl FnMut(&mut crate::yuv::YuvReader, crate::yuv::YuvFrame) -> Result<()>,
+) -> Result<()> {
+    for n in frames {
+        if cancel.load(Ordering::Relaxed) {
+            bail!("cancelled");
+        }
+        let t = m.frame_time(n);
+        let Some(tex) = r.render(m, w as i32, h as i32, &FrameInfo::frame(m, n), true) else {
+            bail!("frame {n} ({t:.3}s) didn't render");
+        };
+        if let Some(e) = r.footage_failure() {
+            bail!("frame {n} ({t:.3}s): {e}");
+        }
+        if r.context_lost(true, false) {
+            bail!("the GPU driver reset at frame {n} ({t:.3}s); a shader probably ran too long");
+        }
+        while !reader.has_room() {
+            let f = reader.collect(true)?.expect("a full ring has a frame");
+            sink(reader, f)?;
+        }
+        reader.submit(r, tex, n)?;
+        while let Some(f) = reader.collect(false)? {
+            sink(reader, f)?;
+        }
+    }
+    while let Some(f) = reader.collect(true)? {
+        sink(reader, f)?;
+    }
+    Ok(())
+}
+
 /// The ffmpeg process and its stderr reader; killed if the export bails early.
 struct KillOnDrop(Option<Child>, Option<std::thread::JoinHandle<String>>);
 
@@ -578,8 +687,22 @@ mod tests {
     }
 
     #[test]
+    fn builtin_formats_and_doc_types() {
+        let built = cfg!(feature = "webm");
+        assert_eq!(Format::Webm.builtin(), built);
+        assert_eq!(Format::Av1.builtin(), built);
+        assert!(!Format::Ffv1.builtin() && Format::Ffv1.needs_ffmpeg());
+        assert!(!Format::Png.needs_ffmpeg());
+        assert_eq!(Format::Webm.needs_ffmpeg(), !built);
+        assert_eq!(Format::Av1.doc_type(Path::new("a.MKV")), "matroska");
+        assert_eq!(Format::Av1.doc_type(Path::new("a.webm")), "webm");
+        assert_eq!(Format::Webm.doc_type(Path::new("a.mkv")), "webm");
+    }
+
+    #[test]
     fn codec_args_need_the_encoders() {
         let list = " V....D libvpx-vp9  libvpx VP9\n A....D libopus  libopus Opus\n V.S..D ffv1 FFmpeg video codec #1\n A....D flac FLAC\n";
+        // Without the webm feature, WebM falls back to ffmpeg's VP9.
         let webm = codec_args(&Format::Webm, list, true).unwrap().join(" ");
         assert!(webm.contains("libvpx-vp9") && webm.contains("libopus"));
         assert!(webm.contains("out_color_matrix=bt709") && webm.contains("-color_range tv"));

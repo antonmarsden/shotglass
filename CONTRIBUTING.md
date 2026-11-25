@@ -4,6 +4,15 @@ Thanks for helping. Notes for working on the code are in [CLAUDE.md](CLAUDE.md)
 (it is written for agents, but it's the most complete map of the code and its
 invariants); user docs are in [README.md](README.md) and [docs/](docs/).
 
+## Building
+
+`git clone --recursive` (or `git submodule update --init` in an existing clone):
+SVT-AV1 is a submodule in `vendor/SVT-AV1`, built by `build.rs` for the `webm`
+feature (built-in WebM export, #116). You need CMake and a C compiler, and nasm
+2.14+ (from nasm.us, `brew install nasm`, `apt install nasm`; or set
+`NASM` to it) for a fast encoder: without nasm the build warns and SVT-AV1 is C-only.
+`SVT_AV1_SRC` builds another source tree, `SVT_AV1_DIR` links an installed SVT-AV1.
+
 ## Before you push
 
 ```sh

@@ -3122,6 +3122,18 @@ impl Renderer {
             .map(|t| (t.alloc.0 as usize, t.alloc.1 as usize))
     }
 
+    /// The GL context, for engine passes that live outside the renderer (export's
+    /// YUV pass, `yuv.rs`).
+    pub(crate) fn gl(&self) -> &Arc<glow::Context> {
+        &self.gl
+    }
+
+    /// Whether the last render's output was drawn upside down (`set_readback`):
+    /// then its texture row 0 is the image's top row.
+    pub(crate) fn output_flipped(&self) -> bool {
+        self.out_flipped
+    }
+
     /// Read the output texture as an RGBA8 frame, top row first.
     pub fn read_output(&self) -> Option<Frame> {
         let (w, h) = self.output_size()?;

@@ -47,6 +47,10 @@ const CHECKS: &[Check] = &[
         run: readback_into,
     },
     Check {
+        name: "export YUV pass: BT.709 limited range, chroma sited left, read back pipelined",
+        run: yuv_pass,
+    },
+    Check {
         name: "playback doesn't stall on driver error checks",
         run: error_check_rate,
     },
@@ -1415,6 +1419,129 @@ fn dirty_pack_state(gl: &Gl) -> Result<glow::Buffer> {
     }
 }
 
+/// The export's YUV pass (#116) against the CPU reference (`yuv::reference`, itself
+/// pinned to BT.709 limited-range values by unit tests), at 10 and 8 bits, flipped and
+/// plain outputs, through the pipelined loop the export uses: frames come out in
+/// order, and the loop waits on the GPU only when its ring is full (on a fast driver,
+/// never before the final drain).
+fn yuv_pass(gl: &Gl, dir: &Path) -> Result<String> {
+    use crate::yuv::{YuvReader, reference, samples};
+    // Hard colours in the corners (red, blue, white, black), gradients elsewhere, a
+    // one-pixel red column at x = 0 for chroma siting, and a different picture each
+    // frame, so a stale or reordered frame can't pass.
+    write(
+        dir,
+        &[(
+            "a.glsl",
+            &scene(
+                "vec2 p = floor(fragCoord);\n  \
+                 fragColor = vec4(fract(uv.x * 3.0 + float(iFrame) * 0.1), uv.y, fract(p.x * 0.37 + p.y * 0.11), 1.0);\n  \
+                 if (p.x < 8.0 && p.y < 8.0) fragColor = vec4(1.0, 0.0, 0.0, 1.0);\n  \
+                 if (p.x >= iResolution.x - 8.0 && p.y < 8.0) fragColor = vec4(0.0, 0.0, 1.0, 1.0);\n  \
+                 if (p.x < 8.0 && p.y >= iResolution.y - 8.0) fragColor = vec4(1.0);\n  \
+                 if (p.x >= iResolution.x - 8.0 && p.y >= iResolution.y - 8.0) fragColor = vec4(0.0, 0.0, 0.0, 1.0);\n  \
+                 if (p.x == 0.0 && p.y > 20.0 && p.y < 40.0) fragColor = vec4(1.0, 0.0, 0.0, 1.0);",
+            ),
+        )],
+    )?;
+    let m = movie(dir, "[[shot]]\nid=\"a\"\nscene=\"a.glsl\"\nduration=1\n")?;
+    let (w, h) = (W as usize, H as usize);
+    let frames = 12u64;
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    let mut notes = vec![];
+    for (depth, flipped) in [(10u8, true), (8, false)] {
+        let mut r = renderer(gl, &m)?;
+        r.set_readback(flipped);
+        let mut want = vec![];
+        for n in 0..frames {
+            r.render(&m, W, H, &FrameInfo::frame(&m, n), true)
+                .ok_or_else(|| anyhow!("frame {n} didn't render"))?;
+            want.push(reference(&r.read_output().unwrap(), depth));
+        }
+        let mut reader = YuvReader::new(&r, w, h, depth, 4)?;
+        let mut next = 0;
+        let mut off_by_one = 0;
+        crate::export::render_yuv(
+            &mut r,
+            &m,
+            (w, h),
+            0..frames,
+            &mut reader,
+            &cancel,
+            |rd, f| {
+                if f.n != next {
+                    bail!("{depth}-bit: got frame {} when expecting {next}", f.n);
+                }
+                let got = samples(&f.data, depth);
+                let want = &want[f.n as usize];
+                if got.len() != want.len() {
+                    bail!("{depth}-bit: {} samples, want {}", got.len(), want.len());
+                }
+                for (i, (g, e)) in got.iter().zip(want).enumerate() {
+                    let d = g.abs_diff(*e);
+                    if d > 1 {
+                        let plane = if i < w * h { "Y" } else { "CbCr" };
+                        bail!(
+                            "{depth}-bit, {}: frame {}, {plane} sample {i}: {g}, want {e}",
+                            if flipped {
+                                "flipped output"
+                            } else {
+                                "plain output"
+                            },
+                            f.n
+                        );
+                    }
+                    off_by_one += d as usize;
+                }
+                rd.recycle(f.data);
+                next += 1;
+                Ok(())
+            },
+        )?;
+        if next != frames {
+            bail!("{depth}-bit: {next} of {frames} frames came out");
+        }
+        // The corners are exact: no rounding ties there.
+        let got = {
+            let mut reader = YuvReader::new(&r, w, h, depth, 1)?;
+            let tex = r
+                .render(&m, W, H, &FrameInfo::frame(&m, 0), true)
+                .ok_or_else(|| anyhow!("frame 0 didn't render"))?;
+            reader.submit(&r, tex, 0)?;
+            samples(&reader.collect(true)?.unwrap().data, depth)
+        };
+        let y = |x: usize, yy: usize| got[yy * w + x];
+        let corners = [
+            // fragCoord.y = 0 is the bottom row: red and blue are at the bottom.
+            ("red", y(2, h - 3), if depth == 10 { 250 } else { 63 }),
+            ("blue", y(w - 3, h - 3), if depth == 10 { 127 } else { 32 }),
+            ("white", y(2, 2), if depth == 10 { 940 } else { 235 }),
+            ("black", y(w - 3, 2), if depth == 10 { 64 } else { 16 }),
+        ];
+        for (what, g, e) in corners {
+            if g != e {
+                bail!("{depth}-bit {what} Y = {g}, want {e}");
+            }
+        }
+        // The last chroma row (bottom), Cr, column 1 (centred on luma column 2).
+        let cr_red = got[w * h + (h / 2 - 1) * w + w / 2 + 1];
+        if cr_red != if depth == 10 { 960 } else { 240 } {
+            bail!("{depth}-bit red Cr = {cr_red}");
+        }
+        notes.push(format!(
+            "{depth}-bit: {} waits, {off_by_one} samples off by one",
+            reader.waits
+        ));
+        if reader.waits > 4 {
+            bail!(
+                "{depth}-bit: the loop waited for the GPU {} times in {frames} frames (ring of 4)",
+                reader.waits
+            );
+        }
+    }
+    Ok(notes.join("; "))
+}
+
 fn readback_into(gl: &Gl, dir: &Path) -> Result<String> {
     // Top and bottom differ, so an upside-down readback can't pass.
     write(
@@ -2351,7 +2478,11 @@ fn export_lossless(gl: &Gl, dir: &Path) -> Result<String> {
     };
     let probes = [0, 1, total / 2, total - 1];
     let no_cancel = AtomicBool::new(false);
-    let run = |format: Format, out: PathBuf, cancel: &AtomicBool, stop_at: u64| {
+    let run_with = |format: Format,
+                    out: PathBuf,
+                    cancel: &AtomicBool,
+                    stop_at: u64,
+                    av1: export::Av1Options| {
         let mut r = renderer(gl, &m)?;
         r.set_readback(true);
         let opts = Options {
@@ -2361,12 +2492,16 @@ fn export_lossless(gl: &Gl, dir: &Path) -> Result<String> {
             format,
             rate: 48000,
             loops: 1,
+            av1,
         };
         export::export(&mut r, &m, &opts, cancel, |done, _| {
             if done == stop_at {
                 cancel.store(true, Ordering::Relaxed);
             }
         })
+    };
+    let run = |format: Format, out: PathBuf, cancel: &AtomicBool, stop_at: u64| {
+        run_with(format, out, cancel, stop_at, export::Av1Options::default())
     };
 
     // PNG sequence + WAV: needs no ffmpeg, so it always runs.
@@ -2399,6 +2534,16 @@ fn export_lossless(gl: &Gl, dir: &Path) -> Result<String> {
         let got = Frame::from_vec(w, h, img.pixels().map(|p| p.0).collect());
         expect_same(&format!("png frame {n}"), &got, &still(n)?, 0, 0.0)?;
     }
+
+    #[cfg(feature = "webm")]
+    notes.push(export_webm(
+        &m,
+        &mut still,
+        &pcm,
+        samples,
+        dir,
+        &|f, out, c, stop, av1| run_with(f, out, c, stop, av1),
+    )?);
 
     if let Err(e) = export::ffmpeg_encoders() {
         let first = e.to_string().lines().next().unwrap_or_default().to_string();
@@ -2491,6 +2636,244 @@ fn export_lossless(gl: &Gl, dir: &Path) -> Result<String> {
         format!("{total} frames, {samples} samples, as PNG + WAV and FFV1 + FLAC"),
     );
     Ok(notes.join("; "))
+}
+
+/// The built-in WebM export (#116): its structure read back with our own EBML reader
+/// (one block per frame at its time, keyframes cued, Opus with its delay), a cancelled
+/// export leaves nothing, and, where ffmpeg is installed, the decoded planes are close
+/// to `yuv::reference` of `still`'s frames (much closer than to the neighbouring
+/// frame) and the decoded sound has exactly `wav`'s length and is close to it.
+#[cfg(feature = "webm")]
+#[allow(clippy::type_complexity)]
+fn export_webm(
+    m: &Movie,
+    still: &mut dyn FnMut(u64) -> Result<Frame>,
+    pcm: &[u8],
+    samples: usize,
+    dir: &Path,
+    run: &dyn Fn(
+        crate::export::Format,
+        PathBuf,
+        &std::sync::atomic::AtomicBool,
+        u64,
+        crate::export::Av1Options,
+    ) -> Result<crate::export::Summary>,
+) -> Result<String> {
+    use crate::export::Format;
+    use crate::webm::mux::{id, read};
+    use std::sync::atomic::AtomicBool;
+    let total = m.frame_count();
+    let (w, h) = (W as usize, H as usize);
+    let out = dir.join("film.webm");
+    use crate::export::Av1Options;
+    // A short keyframe interval, so the 1.3 s film has several (the default is ~2 s).
+    const KEYINT: u64 = 8;
+    let short_gops = Av1Options {
+        keyint: Some(KEYINT as u32),
+        ..Default::default()
+    };
+    let s = run(
+        Format::Webm,
+        out.clone(),
+        &AtomicBool::new(false),
+        u64::MAX,
+        short_gops,
+    )?;
+    if s.frames != total || s.audio_frames != samples {
+        bail!(
+            "webm: {} frames, {} samples reported",
+            s.frames,
+            s.audio_frames
+        );
+    }
+    let file = std::fs::read(&out)?;
+    let top = read::children(&file, 0)?;
+    let seg = read::children(top[1].data, 0)?;
+    let mut video_blocks = vec![];
+    let mut audio_blocks = 0;
+    // The first video block of each cluster that has one (by index in video_blocks).
+    let mut cluster_firsts = vec![];
+    for c in seg.iter().filter(|e| e.id == id::CLUSTER) {
+        let kids = read::children(c.data, 0)?;
+        let base = read::uint(kids[0].data) as i64;
+        let mut first = true;
+        for b in &kids[1..] {
+            let data = if b.id == id::BLOCK_GROUP {
+                read::find(&read::children(b.data, 0)?, id::BLOCK)
+                    .unwrap()
+                    .data
+            } else {
+                b.data
+            };
+            let t = base + i16::from_be_bytes([data[1], data[2]]) as i64;
+            if data[0] & 0x7f == 1 {
+                if first {
+                    cluster_firsts.push(video_blocks.len() as u64);
+                    first = false;
+                }
+                video_blocks.push((t, data[3] & 0x80 != 0));
+            } else {
+                audio_blocks += 1;
+            }
+        }
+    }
+    let want: Vec<i64> = (0..total)
+        .map(|n| ((n as f64 * 1001.0 / 30.0).round()) as i64)
+        .collect();
+    let times: Vec<i64> = video_blocks.iter().map(|b| b.0).collect();
+    if times != want {
+        bail!("webm: video block times {times:?}, want {want:?}");
+    }
+    // Keyframes exactly every KEYINT frames (closed GOPs), and clusters start exactly
+    // at the keyframes (every cluster here is far shorter than the 30 s cap).
+    let keys: Vec<u64> = (0..video_blocks.len())
+        .filter(|&n| video_blocks[n].1)
+        .map(|n| n as u64)
+        .collect();
+    let want_keys: Vec<u64> = (0..total).filter(|n| n % KEYINT == 0).collect();
+    if want_keys.len() < 3 {
+        bail!(
+            "webm: {total} frames give only {} keyframes to check",
+            want_keys.len()
+        );
+    }
+    if keys != want_keys {
+        bail!("webm: keyframes at {keys:?}, want {want_keys:?}");
+    }
+    if cluster_firsts != want_keys {
+        bail!(
+            "webm: clusters start at frames {cluster_firsts:?}, want the keyframes {want_keys:?}"
+        );
+    }
+    // libopus's lookahead, as the export's encoder reports it (version-dependent).
+    let pre_skip = usize::from(
+        crate::webm::encode::OpusPackets::new(crate::webm::export::OPUS_KBPS)?.pre_skip,
+    );
+    if audio_blocks != (samples + pre_skip).div_ceil(crate::webm::encode::OPUS_FRAME) {
+        bail!("webm: {audio_blocks} Opus packets for {samples} samples");
+    }
+    if read::find(&seg, id::CUES).is_none() {
+        bail!("webm: no cues");
+    }
+
+    // Cancelling leaves no file and no staged part.
+    let cancelled = dir.join("cancelled.webm");
+    let names = || -> Result<usize> { Ok(std::fs::read_dir(dir)?.count()) };
+    let before = names()?;
+    match run(
+        Format::Webm,
+        cancelled.clone(),
+        &AtomicBool::new(false),
+        3,
+        Av1Options::default(),
+    ) {
+        Err(e) if e.to_string() == "cancelled" => {}
+        Err(e) => bail!("cancelled webm export failed oddly: {e:#}"),
+        Ok(_) => bail!("cancelling didn't stop the webm export"),
+    }
+    if cancelled.exists() || names()? != before {
+        bail!("a cancelled webm export left files behind");
+    }
+
+    if crate::export::ffmpeg_encoders().is_err() {
+        return Ok(format!("webm: {total} frames (not decoded: no ffmpeg)"));
+    }
+    // Our interleaved-row I420 as planar (ffmpeg's yuv420p / yuv420p10le).
+    let planar = |i420: Vec<u16>| -> Vec<u16> {
+        let (cw, ch) = (w / 2, h / 2);
+        let mut v = i420[..w * h].to_vec();
+        for plane in 0..2 {
+            for row in 0..ch {
+                let at = w * h + row * w + plane * cw;
+                v.extend_from_slice(&i420[at..at + cw]);
+            }
+        }
+        v
+    };
+    let mean_err = |a: &[u16], b: &[u16]| -> f64 {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| x.abs_diff(*y) as f64)
+            .sum::<f64>()
+            / a.len() as f64
+    };
+    // Errors in 10-bit codes at both depths (8-bit errors × 4).
+    let mut worst = [0f64; 2];
+    for (k, depth) in [10u8, 8].into_iter().enumerate() {
+        let path = if depth == 10 {
+            out.clone()
+        } else {
+            let p = dir.join("film-8bit.webm");
+            run(
+                Format::Webm,
+                p.clone(),
+                &AtomicBool::new(false),
+                u64::MAX,
+                Av1Options {
+                    depth: 8,
+                    ..Default::default()
+                },
+            )?;
+            p
+        };
+        let pix_fmt = if depth == 10 {
+            "yuv420p10le"
+        } else {
+            "yuv420p"
+        };
+        let planes = decode(
+            &path,
+            &["-map", "0:v:0", "-f", "rawvideo", "-pix_fmt", pix_fmt],
+        )?;
+        let per = crate::yuv::frame_bytes(w, h, depth);
+        if planes.len() != per * total as usize {
+            bail!(
+                "webm {depth}-bit: decoded {} bytes of video, want {}",
+                planes.len(),
+                per * total as usize
+            );
+        }
+        let unit = f64::from(1u32 << (10 - depth));
+        for n in [0, 1, total / 2, total - 1] {
+            let got = crate::yuv::samples(&planes[n as usize * per..][..per], depth);
+            let want = planar(crate::yuv::reference(&still(n)?, depth));
+            let err = mean_err(&got, &want) * unit;
+            let other = if n == 0 { 1 } else { n - 1 };
+            let neighbour =
+                mean_err(&got, &planar(crate::yuv::reference(&still(other)?, depth))) * unit;
+            if err > 6.0 || err * 2.0 > neighbour {
+                bail!(
+                    "webm {depth}-bit frame {n}: mean error {err:.2} (10-bit codes), {neighbour:.2} against frame {other}"
+                );
+            }
+            worst[k] = worst[k].max(err);
+        }
+    }
+    let audio = decode(&out, &["-map", "0:a:0", "-f", "s16le", "-ar", "48000"])?;
+    if audio.len() != samples * 4 {
+        bail!(
+            "webm: decoded {} stereo samples, want {samples}",
+            audio.len() / 4
+        );
+    }
+    let pcm16 = |b: &[u8]| -> Vec<f64> {
+        b.as_chunks::<2>()
+            .0
+            .iter()
+            .map(|s| i16::from_le_bytes(*s) as f64)
+            .collect()
+    };
+    let (a, b) = (pcm16(&audio), pcm16(pcm));
+    let noise = a.iter().zip(&b).map(|(x, y)| (x - y).powi(2)).sum::<f64>();
+    let signal = b.iter().map(|y| y * y).sum::<f64>();
+    let snr = 10.0 * (signal / noise.max(1.0)).log10();
+    if snr < 20.0 {
+        bail!("webm: the decoded sound is {snr:.1} dB from `wav`");
+    }
+    Ok(format!(
+        "webm: {total} frames, mean error ≤ {:.2} at 10 bits, ≤ {:.2} at 8 (10-bit codes), sound {snr:.0} dB SNR",
+        worst[0], worst[1]
+    ))
 }
 
 // ------------------------------------------------------------------ texture checks
