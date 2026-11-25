@@ -24,7 +24,7 @@ jobs:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@v2
       - name: System packages
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev xvfb libgl1-mesa-dri libegl-mesa0 libxkbcommon-x11-0 ffmpeg nasm
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev xvfb libgl1-mesa-dri libegl-mesa0 libxkbcommon-x11-0 nasm
       - run: cargo build --release
       - name: "The template on kit main: strict check, a frame, strip and soundtrack (software OpenGL)"
         run: xvfb-run -a .github/canary.sh
