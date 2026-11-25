@@ -127,12 +127,8 @@ enum Cmd {
         /// Frames rendered per measurement.
         #[arg(long, default_value_t = 8)]
         frames: usize,
-        /// Also require every shader to be valid GLSL ES 3.00 (WebGL 2), for the web player.
-        #[arg(long)]
-        web: bool,
-        /// With --web, fail on browser compatibility warnings as well as GLSL errors.
-        #[arg(long, requires = "web")]
-        strict: bool,
+        #[command(flatten)]
+        web_checks: WebChecks,
         /// Only validate (movie.toml and the strict GLSL check); no GPU needed.
         #[arg(long)]
         no_gpu: bool,
@@ -248,6 +244,8 @@ enum Cmd {
         target: PathBuf,
         /// Only run tests whose name contains this text.
         filter: Option<String>,
+        #[command(flatten)]
+        web_checks: WebChecks,
     },
     /// Measure the film's quality with the metrics in its quality.toml (library or film
     /// GLSL): sample frames as `strip` picks them, a report, quality.json and one heatmap
@@ -379,12 +377,11 @@ fn real_main() -> Result<()> {
             movie,
             size,
             frames,
-            web,
-            strict,
+            web_checks,
             no_gpu,
             deep,
         } => for_each_film(&movie, |f| {
-            check(f, &size, frames, web, strict, no_gpu, deep)
+            check(f, &size, frames, web_checks, no_gpu, deep)
         }),
         Cmd::Wav {
             movie,
@@ -454,7 +451,11 @@ fn real_main() -> Result<()> {
         Cmd::Bundle { movie, out } => bundle::run_bundle(&project::film(&movie)?, &out),
         Cmd::Freeze { movie } => bundle::run_freeze(&project::film(&movie)?),
         Cmd::Unfreeze { movie } => bundle::run_unfreeze(&project::film(&movie)?),
-        Cmd::Test { target, filter } => test_glsl(&target, filter),
+        Cmd::Test {
+            target,
+            filter,
+            web_checks,
+        } => test_glsl(&target, filter, web_checks),
         Cmd::Quality {
             movie,
             count,
@@ -549,7 +550,33 @@ fn for_each_film(path: &Path, f: impl Fn(&Path) -> Result<()>) -> Result<()> {
 
 /// `shotglass test`: find the test files, resolve each project's libraries (fetching
 /// missing ones, as for films), then run them all in one GL context.
-fn test_glsl(target: &Path, filter: Option<String>) -> Result<()> {
+#[derive(clap::Args, Clone, Copy, Debug, Default)]
+struct WebChecks {
+    /// Require GLSL ES 3.00 validation and report browser compatibility warnings.
+    #[arg(long)]
+    web: bool,
+    /// With --web, fail on browser compatibility warnings as well as GLSL errors.
+    #[arg(long, requires = "web")]
+    strict: bool,
+}
+
+impl WebChecks {
+    fn require_validator(self) -> Result<()> {
+        if self.web && !validate::AVAILABLE {
+            bail!(
+                "--web needs the strict GLSL check, but this build doesn't have it (strict-glsl feature)"
+            );
+        }
+        Ok(())
+    }
+
+    fn rejects_warnings(self, warnings: &[impl Sized]) -> bool {
+        self.strict && !warnings.is_empty()
+    }
+}
+
+fn test_glsl(target: &Path, filter: Option<String>, web_checks: WebChecks) -> Result<()> {
+    web_checks.require_validator()?;
     let paths = glsl_test::find_files(target)?;
     if paths.is_empty() {
         bail!(
@@ -587,8 +614,12 @@ fn test_glsl(target: &Path, filter: Option<String>) -> Result<()> {
         let (metric, glsl): (Vec<_>, Vec<_>) = files
             .into_iter()
             .partition(|f| quality::testing::is_test_file(&f.path));
-        let mut sum = glsl_test::run(&gl, &glsl, filter.as_deref(), &mut |l| println!("{l}"))?;
-        let m = quality::testing::run(&gl, &metric, filter.as_deref(), &mut |l| println!("{l}"))?;
+        let mut sum = glsl_test::run(&gl, &glsl, filter.as_deref(), web_checks, &mut |l| {
+            println!("{l}")
+        })?;
+        let m = quality::testing::run(&gl, &metric, filter.as_deref(), web_checks, &mut |l| {
+            println!("{l}")
+        })?;
         sum.passed += m.passed;
         sum.failed += m.failed;
         sum.broken += m.broken;
@@ -1075,14 +1106,10 @@ fn describe(m: &Movie, t: f32) -> String {
 /// The driver-independent part of `check`: every shader through the reference front
 /// end at the film's desktop dialect, and as GLSL ES 3.00 (errors with `web`,
 /// warnings otherwise).
-fn strict_check(m: &Movie, web: bool, strict: bool) -> Result<()> {
+fn strict_check(m: &Movie, web_checks: WebChecks) -> Result<()> {
     use shader::Dialect;
+    web_checks.require_validator()?;
     if !validate::AVAILABLE {
-        if web {
-            bail!(
-                "--web needs the strict GLSL check, but this build doesn't have it (strict-glsl feature)"
-            );
-        }
         println!("strict GLSL check: skipped (built without the strict-glsl feature)");
         return Ok(());
     }
@@ -1112,7 +1139,7 @@ fn strict_check(m: &Movie, web: bool, strict: bool) -> Result<()> {
     }
     println!("strict GLSL: {} shaders valid as {desktop}", sources.len());
     match opt_in {
-        Some(v) if web => bail!(
+        Some(v) if web_checks.web => bail!(
             "--web: glsl = \"{v}\" films can't run in a browser (GLSL ES 3.00); remove the glsl line"
         ),
         Some(_) => {}
@@ -1122,7 +1149,7 @@ fn strict_check(m: &Movie, web: bool, strict: bool) -> Result<()> {
             report(&warnings);
             if errors.is_empty() {
                 println!("strict GLSL: valid as {} (web)", Dialect::WEB);
-            } else if web {
+            } else if web_checks.web {
                 report(&errors);
                 bail!("{} shader(s) aren't valid {}", errors.len(), Dialect::WEB);
             } else {
@@ -1134,7 +1161,7 @@ fn strict_check(m: &Movie, web: bool, strict: bool) -> Result<()> {
                 );
                 report(&errors);
             }
-            if strict && !warnings.is_empty() {
+            if web_checks.rejects_warnings(&warnings) {
                 bail!(
                     "{} shader(s) have browser compatibility warnings",
                     warnings.len()
@@ -1439,8 +1466,7 @@ fn check(
     movie: &Path,
     size: &str,
     frames: usize,
-    web: bool,
-    strict: bool,
+    web_checks: WebChecks,
     no_gpu: bool,
     deep: bool,
 ) -> Result<()> {
@@ -1478,8 +1504,8 @@ fn check(
             l.root.display()
         );
     }
-    strict_check(&m, web, strict)?;
-    check_textures(&m, web, deep)?;
+    strict_check(&m, web_checks)?;
+    check_textures(&m, web_checks.web, deep)?;
     if no_gpu {
         println!(
             "

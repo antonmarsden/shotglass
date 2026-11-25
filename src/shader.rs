@@ -124,6 +124,8 @@ pub struct Assembled {
     pub text: String,
     /// The language `text` declares in its `#version` line.
     pub dialect: Dialect,
+    /// Highest desktop GLSL version declared by an included library.
+    pub library_glsl: Option<u32>,
     /// Index = GLSL source string number.
     pub files: Vec<String>,
     /// Portability problems that didn't stop the build (e.g. an include that only
@@ -167,6 +169,7 @@ pub struct Builder {
     files: Vec<String>,
     root: PathBuf,
     libs: Vec<Library>,
+    library_glsl: Option<u32>,
     /// Absolute paths already in this shader: each file is included at most once.
     included: HashSet<PathBuf>,
     warnings: Vec<String>,
@@ -187,6 +190,7 @@ impl Builder {
             files: vec!["<shotglass header>".into()],
             root: root.to_path_buf(),
             libs: vec![],
+            library_glsl: None,
             included: HashSet::new(),
             warnings: vec![],
             defs: vec![],
@@ -261,6 +265,7 @@ impl Builder {
         Assembled {
             text: self.text,
             dialect: self.dialect,
+            library_glsl: self.library_glsl,
             files: self.files,
             warnings: self.warnings,
             clashes,
@@ -336,6 +341,9 @@ impl Builder {
         }
         self.included.insert(absolute(path));
         let src = std::fs::read_to_string(path).map_err(|e| anyhow!("{}: {e}", path.display()))?;
+        if let Scope::Lib(i) = scope {
+            self.library_glsl = self.library_glsl.max(self.libs[i].glsl);
+        }
         let idx = self.new_string(self.display(path, scope));
         self.push_text(&src, idx, Some(path), scope, depth)
     }

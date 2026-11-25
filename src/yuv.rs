@@ -434,6 +434,7 @@ mod tests {
             let src = crate::shader::Assembled {
                 text: fragment_source(d),
                 dialect: d,
+                library_glsl: None,
                 files: vec!["yuv.glsl".into()],
                 warnings: vec![],
                 clashes: vec![],
