@@ -151,6 +151,14 @@ const CHECKS: &[Check] = &[
         run: comps_footage,
     },
     Check {
+        name: "comps: a live edit that removes a comp frees its targets",
+        run: comps_removed_free,
+    },
+    Check {
+        name: "comps: a frozen outgoing shot that reads a comp keeps its frame (iFrame)",
+        run: comps_freeze,
+    },
+    Check {
         name: "mattes: alpha, luma, invert, a comp matte, a matted blend, an inactive source",
         run: mattes,
     },
@@ -5023,4 +5031,93 @@ fn loop_sound(gl: &Gl, dir: &Path) -> Result<String> {
         format!("long render within {d:.1e}; seam step {seam:.4} (largest {largest:.4})"),
     );
     Ok(notes.join("; "))
+}
+
+fn comps_removed_free(gl: &Gl, dir: &Path) -> Result<String> {
+    write(
+        dir,
+        &[
+            ("s.glsl", &scene("fragColor = vec4(0.0, 0.0, 1.0, 1.0);")),
+            ("in.glsl", &scene("fragColor = vec4(0.0, 1.0, 0.0, 1.0);")),
+            (
+                "in.toml",
+                "[[shot]]\nid=\"x\"\nscene=\"in.glsl\"\nduration=1\n",
+            ),
+        ],
+    )?;
+    let m = movie(
+        dir,
+        "shotglass = \"0.1.7\"\n[comps]\ninner = \"in.toml\"\n\
+         [[shot]]\nid=\"a\"\ncomp=\"inner\"\nduration=1\n",
+    )?;
+    let mut r = renderer(gl, &m)?;
+    shot(&mut r, &m, at_shot(0, 0.5), 1.0)?;
+    let texs = r.seq_textures(1);
+    if texs.is_empty() {
+        bail!("the comp's sequence allocated no targets");
+    }
+    let m2 = movie(
+        dir,
+        "shotglass = \"0.1.7\"\n[[shot]]\nid=\"a\"\nscene=\"s.glsl\"\nduration=1\n",
+    )?;
+    r.set_movie(&m2).map_err(|e| anyhow!("{e:?}"))?;
+    let live = texs
+        .iter()
+        .filter(|t| unsafe { gl.is_texture(**t) })
+        .count();
+    if live != 0 {
+        bail!(
+            "{live} of {} texture(s) of the removed comp still exist",
+            texs.len()
+        );
+    }
+    Ok(format!("{} textures freed", texs.len()))
+}
+
+fn comps_freeze(gl: &Gl, dir: &Path) -> Result<String> {
+    write(
+        dir,
+        &[
+            ("c.glsl", &scene("fragColor = vec4(0.0, 1.0, 0.0, 1.0);")),
+            (
+                "a.glsl",
+                &scene(
+                    "fragColor = vec4(float(iFrame % 256) / 255.0, texture(iChannel0, uv).g, 0.0, 1.0);",
+                ),
+            ),
+            ("b.glsl", &scene("fragColor = vec4(0.0, 0.0, 1.0, 1.0);")),
+            (
+                "hold.glsl",
+                "vec4 transition(vec2 uv) { return getFromColor(uv); }\n",
+            ),
+            (
+                "c.toml",
+                "[[shot]]\nid=\"x\"\nscene=\"c.glsl\"\nduration=1\n",
+            ),
+        ],
+    )?;
+    let m = movie(
+        dir,
+        "shotglass = \"0.1.7\"\nfps = 30\n[comps]\nc = \"c.toml\"\n\
+         [[shot]]\nid=\"a\"\nscene=\"a.glsl\"\nduration=2\nchannels = [\"@c\"]\n\
+         [[shot]]\nid=\"b\"\nscene=\"b.glsl\"\nduration=2\n\
+         transition = { type = \"hold.glsl\", duration = 1.0, freeze = true }\n",
+    )?;
+    let mut r = renderer(gl, &m)?;
+    r.set_readback(true);
+    let mut got = vec![];
+    for t in [1.2, 1.6] {
+        if r.render(&m, W, H, &info(t, 1.0), true).is_none() {
+            bail!("nothing rendered at {t}");
+        }
+        let f = r.read_output().ok_or_else(|| anyhow!("no output"))?;
+        got.push(px(&f, 80, 45));
+    }
+    // The transition starts at 1.0 s: film frame 30, whatever the frame drawn.
+    for (t, p) in [1.2, 1.6].iter().zip(&got) {
+        if p[0] != 30 || p[1] != 255 {
+            bail!("frozen shot at {t}: {p:?}, wanted iFrame 30 and the comp's green");
+        }
+    }
+    Ok("iFrame 30 at 1.2 s and 1.6 s".into())
 }

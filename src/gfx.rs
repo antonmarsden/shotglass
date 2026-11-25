@@ -1356,6 +1356,21 @@ impl Renderer {
     }
 
     /// Errors of the current version's programs.
+    /// The GL textures of sequence `s`'s scratch targets (selftest: removed comps
+    /// free theirs).
+    pub fn seq_textures(&self, s: usize) -> Vec<glow::Texture> {
+        let Some(q) = self.seqs.get(s) else {
+            return vec![];
+        };
+        [&q.a, &q.b, &q.freeze, &q.layer, &q.picture]
+            .into_iter()
+            .chain(q.work.iter())
+            .chain(q.held.iter())
+            .flatten()
+            .map(|x| x.tex)
+            .collect()
+    }
+
     pub fn errors(&self) -> Vec<ShaderError> {
         let mut seen = std::collections::HashSet::new();
         let mut out = vec![];
