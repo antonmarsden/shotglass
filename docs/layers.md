@@ -143,7 +143,8 @@ to = "room"
 
 A comp file holds `[[shot]]`, `[[layer]]` and `[channels]`-style entries like a film,
 nothing else (no `title`, `fps`, sound, `[comps]`, …: those are the film's). Its paths
-are relative to the comp file. Shaders in a comp see:
+(scenes, channels, `#include`s) are relative to the film folder, like `movie.toml`'s,
+so comps share the film's `scenes/` and textures. Shaders in a comp see:
 
 - **Time:** the comp's own: `iMovieTime` and `iFrame` are comp-local, from 0 at the
   item that uses it (a comp shot or layer starts at its own start; with

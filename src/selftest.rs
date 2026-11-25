@@ -3907,7 +3907,48 @@ fn comps_footage(gl: &Gl, dir: &Path) -> Result<String> {
             r.blocking_footage_loads
         );
     }
-    Ok(format!("45 frames, {waits} waits"))
+    // Nested: the footage comp inside another comp, 0.8 s in (past the window at 0).
+    // Nothing on the film uses it directly, so prefetch must learn its time from the
+    // stalled frame's plan.
+    write(
+        dir,
+        &[(
+            "outer.toml",
+            "[[shot]]\nid=\"o\"\ncomp=\"ft\"\nduration=3\ntime_offset=0.8\n",
+        )],
+    )?;
+    let m = movie(
+        dir,
+        "shotglass = \"0.1.7\"\nfps = 30\n[comps]\nft = \"ft.toml\"\nouter = \"outer.toml\"\n\
+         [[shot]]\nid=\"a\"\ncomp=\"outer\"\nduration=2\n",
+    )?;
+    let cm = &m.comps[0].movie;
+    let mut r = renderer(gl, &m)?;
+    r.set_readback(true);
+    for n in 0..10u64 {
+        let t = m.frame_time(n);
+        let mut tries = 0;
+        loop {
+            r.pump(&m, t, false);
+            if r.render(&m, W, H, &FrameInfo::frame(&m, n), false)
+                .is_some()
+            {
+                let f = r.read_output().ok_or_else(|| anyhow!("no output"))?;
+                let want = cm.source_frame(ItemRef::Shot(0), 0, n + 24);
+                let got = frame_of(px(&f, 80, 45));
+                if got != want {
+                    bail!("nested, film frame {n}: source frame {got:?}, wanted {want:?}");
+                }
+                break;
+            }
+            tries += 1;
+            if tries >= 5000 {
+                bail!("nested, film frame {n} never drew without blocking");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+    Ok(format!("45 frames, {waits} waits; nested 10 frames"))
 }
 
 fn texture_edits(gl: &Gl, dir: &Path) -> Result<String> {

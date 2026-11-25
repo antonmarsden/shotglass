@@ -527,6 +527,9 @@ pub struct Renderer {
     inst: Vec<Option<Target>>,
     /// The comp instances drawn last frame (comp, comp-local time): footage prefetch.
     comp_seen: Vec<(usize, f32)>,
+    /// Comp times asked for by this frame's plan, ready or not: they become `comp_seen`
+    /// even when the frame stalls, so prefetch queues what a stalled frame waits for.
+    comp_req: Vec<(usize, f32)>,
     /// Where each sequence's items start in `wanted` (`[0]` = 0: the film's shots,
     /// then its layers; then each comp's shots and layers).
     seq_base: Vec<usize>,
@@ -837,6 +840,7 @@ impl Renderer {
                 cur: 0,
                 inst: vec![],
                 comp_seen: vec![],
+                comp_req: vec![],
                 seq_base: vec![0],
                 over_matte: None,
                 hidden: Default::default(),
@@ -1283,6 +1287,22 @@ impl Renderer {
         self.fallback.retain(|id, _| ids.contains(id));
         self.wanted_ids = ids;
         self.seq_base = seq_base;
+        // Sequences gone with a removed comp: free their targets, not just the handles.
+        for s in self
+            .seqs
+            .drain(seqs.len().min(self.seqs.len())..)
+            .collect::<Vec<_>>()
+        {
+            let mut all = vec![s.a, s.b, s.freeze, s.layer, s.picture];
+            all.extend(s.work);
+            all.extend(s.held);
+            for x in all.into_iter().flatten() {
+                unsafe {
+                    self.gl.delete_framebuffer(x.fbo);
+                    self.gl.delete_texture(x.tex);
+                }
+            }
+        }
         self.seqs.resize_with(seqs.len(), SeqTargets::default);
         self.over = over;
         self.over_matte = over_matte;
@@ -2727,6 +2747,7 @@ impl Renderer {
         // wouldn't. Films without comps plan exactly the old frame.
         let mut insts: Vec<(InstKey, SeqPlan)> = vec![];
         let n = film_frame(movie, info.t);
+        self.comp_req.clear();
         let root = self.plan_seq(
             movie,
             0,
@@ -2736,7 +2757,9 @@ impl Renderer {
             (sw, sh),
             blocking,
             &mut insts,
-        )?;
+        );
+        self.comp_seen = std::mem::take(&mut self.comp_req);
+        let root = root?;
         let plans: Vec<&SeqPlan> = insts.iter().map(|(_, p)| p).chain([&root]).collect();
         let all_keys: Vec<ShotKeys> = plans
             .iter()
@@ -2777,7 +2800,6 @@ impl Renderer {
         if self.inst.len() < insts.len() {
             self.inst.resize_with(insts.len(), || None);
         }
-        self.comp_seen = insts.iter().map(|(k, p)| (k.comp, p.t)).collect();
         // Comp instances first (each is complete before anything reads it), then the film.
         for (i, (k, p)) in insts.iter().enumerate() {
             ensure_target(&self.gl, &mut self.inst[i], k.dest.0, k.dest.1);
@@ -3010,6 +3032,7 @@ impl Renderer {
         if let Some(i) = insts.iter().position(|(k, _)| *k == key) {
             return Some(i);
         }
+        self.comp_req.push((c, t));
         let m = &comp.movie;
         let scaled = (
             ((full.0 as f32 * scale).round() as i32).clamp(1, full.0),
@@ -3120,7 +3143,13 @@ impl Renderer {
                         let freeze_local = m.shots[to].start - m.shots[from].start;
                         let mut item = Item::shot(&m.shots[from], freeze_local);
                         item.passes = self.inst_passes(&p.chans[0]);
-                        self.draw_scene(k0, &item, freeze_local, Which::Freeze, sw, sh, &info, m);
+                        // The frame at the transition's start, iFrame and iMovieTime too,
+                        // so a redrawn freeze (one that reads a comp) stays still.
+                        let finfo = FrameInfo {
+                            scale: info.scale,
+                            ..FrameInfo::at(m, m.shots[to].start)
+                        };
+                        self.draw_scene(k0, &item, freeze_local, Which::Freeze, sw, sh, &finfo, m);
                         // A frame that reads a comp isn't kept: the comp may move.
                         self.seqs[s].freeze_key = p.chans[0].is_empty().then_some(key);
                     }
