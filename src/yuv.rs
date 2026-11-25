@@ -311,25 +311,23 @@ impl YuvReader {
         };
         let gl = &self.gl;
         unsafe {
-            let ready = matches!(
-                gl.client_wait_sync(slot.fence, 0, 0),
-                glow::ALREADY_SIGNALED | glow::CONDITION_SATISFIED
-            );
-            if !ready {
+            let mut status = gl.client_wait_sync(slot.fence, 0, 0);
+            if status == glow::TIMEOUT_EXPIRED {
                 if !block {
                     return Ok(None);
                 }
                 self.waits += 1;
-                loop {
-                    let s = gl.client_wait_sync(
+                while status == glow::TIMEOUT_EXPIRED {
+                    status = gl.client_wait_sync(
                         slot.fence,
                         glow::SYNC_FLUSH_COMMANDS_BIT,
                         1_000_000_000,
                     );
-                    if s != glow::TIMEOUT_EXPIRED {
-                        break;
-                    }
                 }
+            }
+            match status {
+                glow::ALREADY_SIGNALED | glow::CONDITION_SATISFIED => {}
+                _ => bail!("frame {}: YUV fence wait failed ({status:#x})", slot.n),
             }
         }
         let slot = self.in_flight.pop_front().unwrap();

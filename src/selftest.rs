@@ -2639,10 +2639,11 @@ fn export_lossless(gl: &Gl, dir: &Path) -> Result<String> {
 }
 
 /// The built-in WebM export (#116): its structure read back with our own EBML reader
-/// (one block per frame at its time, keyframes cued, Opus with its delay), a cancelled
-/// export leaves nothing, and, where ffmpeg is installed, the decoded planes are close
-/// to `yuv::reference` of `still`'s frames (much closer than to the neighbouring
-/// frame) and the decoded sound has exactly `wav`'s length and is close to it.
+/// (one block per frame within half a millisecond of its time, keyframes cued, Opus
+/// with its delay), and a cancelled export leaves nothing. Where ffmpeg is installed,
+/// the decoded planes are close to `yuv::reference` of `still`'s frames (much closer
+/// than to the neighbouring frame), and the decoded sound has exactly `wav`'s length
+/// and is close to it.
 #[cfg(feature = "webm")]
 #[allow(clippy::type_complexity)]
 fn export_webm(
@@ -2717,12 +2718,18 @@ fn export_webm(
             }
         }
     }
-    let want: Vec<i64> = (0..total)
-        .map(|n| ((n as f64 * 1001.0 / 30.0).round()) as i64)
-        .collect();
-    let times: Vec<i64> = video_blocks.iter().map(|b| b.0).collect();
-    if times != want {
-        bail!("webm: video block times {times:?}, want {want:?}");
+    if video_blocks.len() as u64 != total {
+        bail!("webm: {} video blocks, want {total}", video_blocks.len());
+    }
+    let fps_num = i128::from(m.fps_num);
+    let fps_den = i128::from(m.fps_den);
+    for (n, &(ms, _)) in (0..total).zip(&video_blocks) {
+        // Compare in units of 1/fps_num milliseconds to avoid rounding the reference.
+        let expected = i128::from(n) * fps_den * 1_000;
+        let error = (i128::from(ms) * fps_num - expected).abs();
+        if 2 * error > fps_num {
+            bail!("webm: frame {n} at {ms} ms exceeds the 0.5 ms tolerance");
+        }
     }
     // Keyframes exactly every KEYINT frames (closed GOPs), and clusters start exactly
     // at the keyframes (every cluster here is far shorter than the 30 s cap).

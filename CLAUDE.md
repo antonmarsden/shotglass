@@ -197,9 +197,10 @@ cargo fmt && cargo clippy --all-targets -- -D warnings
 - **Built-in WebM export never syncs per frame** (#116). Frames go render → YUV pass →
   PBO + fence, collected oldest first (`export::render_yuv`); the loop waits on the GPU
   only when the ring is full and at the final drain (selftest "export YUV pass" pins
-  it). Frame n's block is at exactly n·den/num, the decoded sound has exactly `wav`'s
-  sample count (Opus pre-skip + DiscardPadding), and the YUV values follow
-  `yuv::reference` (selftest "export writes every frame and sample").
+  it). Frame n's block timestamp is n·den/num seconds, rounded to the nearest
+  millisecond. The decoded sound has exactly `wav`'s sample count (Opus pre-skip +
+  DiscardPadding), and the YUV values follow `yuv::reference` (selftest "export writes
+  every frame and sample").
 - **Text blocks are deterministic and laid out off the render thread.** Bytes depend only on
   the font files, the `[texts]` entry and the engine (no system fonts, no hinting, plain
   IEEE maths, exact EDT; `text::tests::raster_is_pinned` pins a sha256: bump it on purpose,
