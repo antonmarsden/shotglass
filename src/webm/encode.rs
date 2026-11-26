@@ -246,6 +246,10 @@ impl Av1Encoder {
 
 impl Drop for Av1Encoder {
     fn drop(&mut self) {
+        // An abandoned encode (cancelled or failed export) never sent the end of the
+        // stream; SVT-AV1 wants it before deinit (else it logs "deinit called without
+        // sending EOS!"). Sending it is cheap: nothing is drained.
+        let _ = self.finish();
         // SAFETY: the handle is ours and freed once.
         unsafe { sg_svt_free(self.s) };
     }
