@@ -13,6 +13,7 @@ mod golden;
 mod headless;
 mod library;
 mod movie;
+mod msdf;
 mod project;
 mod quality;
 mod selftest;

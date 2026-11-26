@@ -139,6 +139,12 @@ cargo fmt && cargo clippy --all-targets -- -D warnings
 - **Deterministic frames:** a frame depends only on (movie, t, size, scale), so playback,
   `still` and `export` agree. Frame n is at `movie.frame_time(n)`; `FrameInfo::at` derives
   iFrame with `frame_at`, never `t * fps` (rounding drops frames at 30000/1001).
+  The scope is **one GPU/CPU stack** (same machine, OS, driver, build): run to run
+  there, output is bit-identical. Across stacks it need not be (drivers, GPUs and
+  platform maths libraries differ); goldens use tolerances and per-renderer
+  baselines for that. Don't pay for cross-platform bit-exactness (custom maths,
+  vendored forks) unless something specific needs it; prefer reference images with
+  a tolerance over cross-platform hashes.
 - **Slow frames are drawn in viewport strips, never scissored ones** (the Apple Software
   Renderer leaves parts of scissored strips undrawn: stale rows from the previous frame).
   Selftest "slow frames drawn in strips" pins the count with `set_tiles(Some(n))`.

@@ -110,6 +110,29 @@ impl Font {
     fn shaper(&self) -> harfrust::ShaperFont<'_, '_> {
         harfrust::ShaperFont::new(&self.face)
     }
+
+    /// The glyph the font maps `c` to (cmap), if any.
+    #[allow(dead_code)] // glyph sets (#71) and the msdf tests
+    pub fn glyph_for(&self, c: char) -> Option<u32> {
+        self.face.charmap().map_unicode(c).map(|g| g.to_u32())
+    }
+
+    pub fn units_per_em(&self) -> f32 {
+        self.face.units_per_em() as f32
+    }
+
+    /// Draws glyph `id`'s outline (font units, y up, no hinting) into `sink`.
+    /// False when the font has no outline for it (or it is broken).
+    pub fn draw_outline(&self, id: u32, sink: &mut impl PathSink) -> bool {
+        let outlines = self.face.outline_glyphs();
+        let Some(outline) = outlines.get(GlyphId::new(id)) else {
+            return false;
+        };
+        let mut memory = vec![0u8; outline.required_memory_size()];
+        outline
+            .draw(&DrawOptions::new(), DrawMemory::from(&mut memory[..]), sink)
+            .is_ok()
+    }
 }
 
 /// Ascender and descender (negative) in font units, as HarfBuzz picks them:
