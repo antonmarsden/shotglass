@@ -151,6 +151,9 @@ proves it). Phase 2 extends the meaning for glyph-run channels (below), still wi
   Generated with a pure-Rust MSDF generator (candidate: `fdsm`; else a small port of
   msdfgen's edge colouring). *Built: `fdsm` as a dependency, `src/msdf.rs`; tested against
   `tests/golden/msdf-atlas.png` with a one-level tolerance.*
+- *Built (tables): the exact format, version 1, is the module doc of `src/glyphrun.rs`
+  (8-texel header, 4-texel line records, 6-texel glyph records, 1024 texels a row);
+  it supersedes the sketch below where they differ.*
 - **Table**: RGBA8 texels, `filter = "nearest"`, read with `texelFetch`. 16-bit values
   packed as hi/lo bytes so RGBA8 stays the only texture format (exact, filter-free, valid
   in GLSL ES 3.00 and WebGL 2 without float-texture extensions). Rows:

@@ -9,6 +9,7 @@ mod fonts;
 mod footage;
 mod gfx;
 mod glsl_test;
+mod glyphrun;
 mod golden;
 mod headless;
 mod library;

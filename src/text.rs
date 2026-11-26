@@ -261,6 +261,11 @@ pub struct PlacedGlyph {
     pub id: u16,
     pub x: f32,
     pub y: f32,
+    /// Visual line, 0 at the top.
+    pub line: u32,
+    /// Byte offset in the whole text of the cluster this glyph belongs to
+    /// (HarfBuzz cluster: logical order, shared by a ligature's glyphs).
+    pub cluster: u32,
 }
 
 /// The result of laying out a text: where every glyph goes and the block's size.
@@ -307,6 +312,14 @@ pub fn layout(text: &str, fonts: &[&Font], style: &TextStyle) -> Result<Layout> 
         range: Range<usize>,
     }
     let paras: Vec<&str> = text.split('\n').collect();
+    let para_starts: Vec<usize> = paras
+        .iter()
+        .scan(0, |at, p| {
+            let s = *at;
+            *at += p.len() + 1;
+            Some(s)
+        })
+        .collect();
     let mut lines: Vec<Line> = vec![];
     let mut bidis = vec![];
     let mut font_of: Vec<Vec<usize>> = vec![];
@@ -427,7 +440,7 @@ pub fn layout(text: &str, fonts: &[&Font], style: &TextStyle) -> Result<Layout> 
 
     // Place each line's visual runs left to right.
     let mut placed: Vec<(Vec<PlacedGlyph>, f32, bool)> = vec![];
-    for line in &lines {
+    for (li, line) in lines.iter().enumerate() {
         let para = paras[line.para];
         let bidi = &bidis[line.para];
         let end = line.range.start + para[line.range.clone()].trim_end().len();
@@ -455,6 +468,9 @@ pub fn layout(text: &str, fonts: &[&Font], style: &TextStyle) -> Result<Layout> 
                             id: info.glyph_id as u16,
                             x: pen + pos.x_offset as f32 * scale,
                             y: -(pos.y_offset as f32) * scale,
+                            line: li as u32,
+                            cluster: (para_starts[line.para] + sub.start + info.cluster as usize)
+                                as u32,
                         });
                         pen += pos.x_advance as f32 * scale;
                     }
