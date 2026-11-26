@@ -1,0 +1,8 @@
+1
+00:00:00,300 --> 00:00:01,700
+Subtitles ride on a layer
+
+2
+00:00:02,000 --> 00:00:03,800
+<i>two lines,</i> one cue &amp;
+{\an8}tags dropped

@@ -6,6 +6,9 @@
 #
 # This tests shotglass's logic, not your GPU driver: for that, run
 # `cargo test` (or `shotglass selftest`) natively on Windows.
+#
+# Built without the `webm` feature (built-in WebM export: CMake, SVT-AV1, libopus):
+# the goldens and the GL checks don't need it, and CI's clippy covers that build.
 FROM rust:1-bookworm
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -22,6 +25,6 @@ COPY src src
 COPY tests tests
 COPY templates templates
 COPY movies movies
-RUN cargo build --release --tests
+RUN cargo build --release --tests --no-default-features --features strict-glsl
 
-CMD ["xvfb-run", "-a", "cargo", "test", "--release"]
+CMD ["xvfb-run", "-a", "cargo", "test", "--release", "--no-default-features", "--features", "strict-glsl"]

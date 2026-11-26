@@ -46,7 +46,7 @@
 //! | 0 | pen x (u16 .4), y offset from the baseline, down positive (s16 .4) |
 //! | 1 | atlas tile x (u16), atlas tile y (u16), in atlas texels |
 //! | 2 | atlas tile width (u16), height (u16); 0 × 0 for a glyph with no ink |
-//! | 3 | tile left (s16 .4), tile top (s16 .4), atlas texels: the tile's top-left corner is at (pen x + left, baseline − top) · layout em / atlas em |
+//! | 3 | tile left (s16 .4), tile top (s16 .4), atlas texels: with k = layout em / atlas em, the tile's top-left corner is at (pen x + x offset + left · k, baseline + y offset − top · k), and it is (width, height) · k big |
 //! | 4 | grapheme index (u16), word index (u16), in logical order |
 //! | 5 | line (u16), x offset from the pen, right positive (s16 .4): the glyph's origin is at pen x + x offset |
 //!

@@ -119,6 +119,10 @@ const CHECKS: &[Check] = &[
         run: text_textures,
     },
     Check {
+        name: "glyph runs: atlas and table reach the shader byte for byte, unflipped, without blocking",
+        run: glyph_runs,
+    },
+    Check {
         name: "layers: source-over with opacity, @input, spans and fades",
         run: layers_compose,
     },
@@ -3290,6 +3294,138 @@ fn text_textures(gl: &Gl, dir: &Path) -> Result<String> {
     let after = shot(&mut r, &m2, at_shot(0, 0.5), 1.0)?;
     expect_same("after a refused text edit", &after, &changed, 0, 0.0)?;
     Ok(format!("ready after {frames} frame(s)"))
+}
+
+fn glyph_runs(gl: &Gl, dir: &Path) -> Result<String> {
+    std::fs::create_dir_all(dir.join("fonts"))?;
+    std::fs::write(dir.join("fonts/sans.ttf"), TEST_FONT)?;
+    // Frame row r (top first) shows texel row r, read with texelFetch: columns 0–79 the
+    // atlas (iChannel0), 80–149 the table (iChannel1, from texel 0). The top half shows
+    // RGB, the bottom half alpha (in red) of texel rows 0–44. Columns 150+ show
+    // iChannelMeta: (atlas em, atlas spread, table header texels) / 255.
+    write(
+        dir,
+        &[(
+            "s.glsl",
+            &scene(
+                "ivec2 p = ivec2(fragCoord);\n  \
+                 int r = int(iResolution.y) - 1 - p.y;\n  \
+                 bool alphaRow = r >= 45;\n  \
+                 int tr = alphaRow ? r - 45 : r;\n  \
+                 bool atlas = p.x < 80;\n  \
+                 ivec2 at = ivec2(atlas ? p.x : p.x - 80, tr);\n  \
+                 ivec2 size = ivec2(atlas ? iChannelResolution[0].xy : iChannelResolution[1].xy);\n  \
+                 vec4 t = atlas ? texelFetch(iChannel0, at, 0) : texelFetch(iChannel1, at, 0);\n  \
+                 if (any(greaterThanEqual(at, size))) t = vec4(0.0);\n  \
+                 fragColor = vec4(alphaRow ? vec3(t.a, 0.0, 0.0) : t.rgb, 1.0);\n  \
+                 if (p.x >= 150) fragColor = vec4(iChannelMeta[0].x, iChannelMeta[0].y, iChannelMeta[1].y, 255.0) / 255.0;",
+            ),
+        )],
+    )?;
+    let toml = |words: &str| {
+        format!(
+            "shotglass = \"0.1.8\"\n[fonts]\nsans = {{ file = \"fonts/sans.ttf\", licence = \"OFL-1.1\" }}\n\
+             [texts]\nrun = {{ text = \"{words}\", font = \"sans\", size = 40, glyphs = true }}\n\
+             [[shot]]\nid=\"a\"\nscene=\"s.glsl\"\nduration=2\n\
+             channels = [\"run\", {{ text = \"run\", part = \"glyphs\" }}]\n"
+        )
+    };
+    let m = movie(dir, &toml("HIx"))?;
+    let run = m.shots[0].channels[0]
+        .as_ref()
+        .and_then(|c| c.text())
+        .ok_or_else(|| anyhow!("iChannel0 isn't the text"))?
+        .glyph_run_shared()?;
+    let (atlas, table) = (&run.atlas.image, &run.table);
+    if atlas.num_rows() < 2 || atlas.cells().all(|p| p[3] == atlas[(0, 0)][3]) {
+        bail!("the fixture atlas is flat; the orientation check would prove nothing");
+    }
+    let texel = |img: &toodee::TooDee<[u8; 4]>, c: usize, r: usize| {
+        if c < img.num_cols() && r < img.num_rows() {
+            img[(c, r)]
+        } else {
+            [0; 4]
+        }
+    };
+    let want_px = |c: usize, r: usize| -> [u8; 3] {
+        if c >= 150 {
+            return [48, 4, crate::glyphrun::HEADER_TEXELS as u8];
+        }
+        let alpha = r >= 45;
+        let tr = if alpha { r - 45 } else { r };
+        let t = if c < 80 {
+            texel(atlas, c, tr)
+        } else {
+            texel(table, c - 80, tr)
+        };
+        if alpha {
+            [t[3], 0, 0]
+        } else {
+            [t[0], t[1], t[2]]
+        }
+    };
+    let check = |what: &str, f: &Frame| -> Result<()> {
+        for r in 0..H as usize {
+            for c in 0..W as usize {
+                let (got, want) = (px(f, c, r), want_px(c, r));
+                if got[..3] != want {
+                    bail!("{what}: pixel ({c}, {r}) is {got:?}, the CPU texel says {want:?}");
+                }
+            }
+        }
+        Ok(())
+    };
+    // Blocking render (as still/export): every byte as built, the right way up.
+    let want = {
+        let mut r = renderer(gl, &m)?;
+        shot(&mut r, &m, at_shot(0, 0.5), 1.0)?
+    };
+    check("blocking render", &want)?;
+    // Playing from cold: held until both parts are ready, nothing loaded on the spot.
+    let mut r = Renderer::new(gl.clone())?;
+    r.set_cache_dir(None);
+    r.set_movie(&m).map_err(|e| anyhow!("{e:?}"))?;
+    let mut frames = 0;
+    let got = loop {
+        if r.render(&m, W, H, &info(0.5, 1.0), false).is_some() {
+            break r.read_output().unwrap();
+        }
+        frames += 1;
+        if frames > 5000 {
+            bail!("the glyph run shot never became ready without blocking");
+        }
+        r.pump(&m, 0.5, false);
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    };
+    if frames == 0 {
+        bail!("a non-blocking render drew before the glyph run was built");
+    }
+    if r.blocking_texture_loads != 0 {
+        bail!(
+            "playback built {} glyph run part(s) on the spot",
+            r.blocking_texture_loads
+        );
+    }
+    check("non-blocking render", &got)?;
+    // New words: new textures, no program compiled.
+    let compiles = r.compiles_started;
+    let m2 = movie(dir, &toml("Hi there"))?;
+    r.set_movie(&m2).map_err(|e| anyhow!("{e:?}"))?;
+    let changed = shot(&mut r, &m2, at_shot(0, 0.5), 1.0)?;
+    if diff(&changed, &want, 0).1 == 0.0 {
+        bail!("editing the glyph run didn't change the picture");
+    }
+    if r.compiles_started != compiles {
+        bail!(
+            "a glyph run edit compiled {} program(s)",
+            r.compiles_started - compiles
+        );
+    }
+    Ok(format!(
+        "ready after {frames} frame(s); atlas {}×{}",
+        atlas.num_cols(),
+        atlas.num_rows()
+    ))
 }
 
 fn layers_compose(gl: &Gl, dir: &Path) -> Result<String> {
