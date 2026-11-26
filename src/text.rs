@@ -18,7 +18,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
-use rustybuzz::ttf_parser;
+use skrifa::font::glyph::outline::{DrawMemory, DrawOptions, PathSink};
+use skrifa::{GlyphId, Tag};
 use unicode_segmentation::UnicodeSegmentation;
 
 /// One font file as a film names it: the file, the face in a collection, and fixed
@@ -34,8 +35,8 @@ pub struct FontSpec {
 
 /// A font file read into memory and checked once.
 pub struct Font {
-    pub spec: FontSpec,
-    data: Arc<Vec<u8>>,
+    /// The face at this font's variation location (cheap to clone, shared).
+    face: Arc<skrifa::Font>,
 }
 
 impl Font {
@@ -58,61 +59,85 @@ impl Font {
                 spec.label
             );
         }
-        let font = Font {
-            spec,
-            data: Arc::new(data),
-        };
-        let face = ttf_parser::Face::parse(&font.data, font.spec.index).map_err(|e| {
+        let base = skrifa::Font::new(data, spec.index).ok_or_else(|| {
             anyhow!(
-                "{}: not a font shotglass can read (TTF, OTF or TTC): {e}",
-                font.spec.label
+                "{}: not a font shotglass can read (TTF, OTF or TTC)",
+                spec.label
             )
         })?;
-        for (tag, _) in &font.spec.variations {
-            let t = tag_of(tag)?;
-            if !face.variation_axes().into_iter().any(|a| a.tag == t) {
+        if !matches!(base.kind(), skrifa::font::Kind::Sfnt(..)) {
+            bail!(
+                "{}: not a font shotglass can read (TTF, OTF or TTC)",
+                spec.label
+            );
+        }
+        // ttf-parser refused these; without them there is no em or line box.
+        let m = base.metrics();
+        for (table, missing) in [
+            ("head", m.raw_units_per_em == 0),
+            ("hhea", m.hhea_line.is_none()),
+        ] {
+            if missing {
                 bail!(
-                    "{}: the font has no \"{tag}\" axis ({})",
-                    font.spec.label,
-                    axis_list(&face)
+                    "{}: not a font shotglass can read: it has no {table} table",
+                    spec.label
                 );
             }
         }
-        Ok(font)
+        let mut vars = vec![];
+        for (tag, v) in &spec.variations {
+            let t = tag_of(tag)?;
+            if base.axes().get_by_tag(t).is_none() {
+                bail!(
+                    "{}: the font has no \"{tag}\" axis ({})",
+                    spec.label,
+                    axis_list(&base)
+                );
+            }
+            vars.push(skrifa::font::Variation::new(t, *v));
+        }
+        let face = if vars.is_empty() {
+            base
+        } else {
+            base.instance_builder().variations(vars).build()
+        };
+        Ok(Font {
+            face: Arc::new(face),
+        })
     }
 
-    /// The shaping face with this font's variations applied.
-    fn face(&self) -> rustybuzz::Face<'_> {
-        let mut face = rustybuzz::Face::from_slice(&self.data, self.spec.index)
-            .expect("checked in Font::from_bytes");
-        let vars: Vec<rustybuzz::Variation> = self
-            .spec
-            .variations
-            .iter()
-            .map(|(t, v)| rustybuzz::Variation {
-                tag: tag_of(t).expect("checked in Font::from_bytes"),
-                value: *v,
-            })
-            .collect();
-        if !vars.is_empty() {
-            face.set_variations(&vars);
-        }
-        face
+    /// The shaping view of this font (its variations applied).
+    fn shaper(&self) -> harfrust::ShaperFont<'_, '_> {
+        harfrust::ShaperFont::new(&self.face)
     }
 }
 
-fn tag_of(s: &str) -> Result<ttf_parser::Tag> {
+/// Ascender and descender (negative) in font units, as HarfBuzz picks them:
+/// OS/2 typo metrics when the font asks for them, else hhea.
+fn line_metrics(face: &skrifa::Font) -> (f32, f32) {
+    let m = face.metrics();
+    let line = if m.use_typo_metrics {
+        m.typo_line.or(m.hhea_line)
+    } else {
+        m.hhea_line.or(m.typo_line)
+    };
+    line.map(|l| (l.ascender.to_f32(), l.descender.to_f32()))
+        .unwrap_or((0.0, 0.0))
+}
+
+fn tag_of(s: &str) -> Result<Tag> {
     if s.len() != 4 || !s.is_ascii() {
         bail!("\"{s}\" isn't a variation axis tag (four letters, like \"wght\")");
     }
-    Ok(ttf_parser::Tag::from_bytes_lossy(s.as_bytes()))
+    let b = s.as_bytes();
+    Ok(Tag::new(&[b[0], b[1], b[2], b[3]]))
 }
 
-fn axis_list(face: &ttf_parser::Face) -> String {
+fn axis_list(face: &skrifa::Font) -> String {
     let axes: Vec<String> = face
-        .variation_axes()
-        .into_iter()
-        .map(|a| format!("\"{}\"", a.tag))
+        .axes()
+        .iter()
+        .map(|a| format!("\"{}\"", a.tag()))
         .collect();
     if axes.is_empty() {
         "it isn't a variable font".to_string()
@@ -237,12 +262,13 @@ pub fn layout(text: &str, fonts: &[&Font], style: &TextStyle) -> Result<Layout> 
     if fonts.is_empty() {
         bail!("a text needs a font");
     }
-    let faces: Vec<rustybuzz::Face> = fonts.iter().map(|f| f.face()).collect();
+    let faces: Vec<harfrust::ShaperFont> = fonts.iter().map(|f| f.shaper()).collect();
     let features = parse_features(&style.features)?;
-    let primary = &faces[0];
+    let primary = &fonts[0].face;
     let scale = style.size / primary.units_per_em() as f32;
-    let ascent = primary.ascender() as f32 * scale;
-    let descent = -(primary.descender() as f32) * scale;
+    let (asc, desc) = line_metrics(primary);
+    let ascent = asc * scale;
+    let descent = -desc * scale;
     let pitch = style.line_height * style.size;
     let half_leading = (pitch - (ascent + descent)) / 2.0;
     let pad = style.spread;
@@ -270,8 +296,9 @@ pub fn layout(text: &str, fonts: &[&Font], style: &TextStyle) -> Result<Layout> 
         // the first that covers its first character, else the primary font (missing).
         let mut fonts_here = vec![0usize; para.len()];
         for (start, g) in para.grapheme_indices(true) {
-            let covers =
-                |f: &rustybuzz::Face, c: char| c.is_whitespace() || f.glyph_index(c).is_some();
+            let covers = |f: &harfrust::ShaperFont, c: char| {
+                c.is_whitespace() || f.nominal_glyph(c as u32).is_some()
+            };
             let pick = faces
                 .iter()
                 .position(|f| g.chars().all(|c| covers(f, c)))
@@ -458,11 +485,11 @@ pub fn layout(text: &str, fonts: &[&Font], style: &TextStyle) -> Result<Layout> 
     })
 }
 
-fn parse_features(names: &[String]) -> Result<Vec<rustybuzz::Feature>> {
+fn parse_features(names: &[String]) -> Result<Vec<harfrust::Feature>> {
     names
         .iter()
         .map(|n| {
-            n.parse::<rustybuzz::Feature>().map_err(|_| {
+            n.parse::<harfrust::Feature>().map_err(|_| {
                 anyhow!("\"{n}\" isn't an OpenType feature (like \"ss01\", \"-liga\" or \"tnum\")")
             })
         })
@@ -470,20 +497,26 @@ fn parse_features(names: &[String]) -> Result<Vec<rustybuzz::Feature>> {
 }
 
 fn shape(
-    face: &rustybuzz::Face,
-    features: &[rustybuzz::Feature],
+    face: &harfrust::ShaperFont,
+    features: &[harfrust::Feature],
     text: &str,
     rtl: bool,
-) -> rustybuzz::GlyphBuffer {
-    let mut buf = rustybuzz::UnicodeBuffer::new();
+) -> harfrust::Buffer {
+    let mut buf = harfrust::Buffer::new();
     buf.push_str(text);
     buf.set_direction(if rtl {
-        rustybuzz::Direction::RightToLeft
+        harfrust::Direction::RightToLeft
     } else {
-        rustybuzz::Direction::LeftToRight
+        harfrust::Direction::LeftToRight
     });
     buf.guess_segment_properties();
-    rustybuzz::shape(face, features, buf)
+    harfrust::shape(
+        face,
+        &mut buf,
+        harfrust::ShapeOptions::new().features(features),
+    )
+    .expect("direction is set");
+    buf
 }
 
 struct Run {
@@ -540,12 +573,13 @@ const DIST: usize = 2;
 
 /// Rasterise `layout` with the same `fonts` it was laid out with.
 pub fn rasterize(layout: &Layout, fonts: &[&Font], spread: f32) -> TextImage {
-    let faces: Vec<rustybuzz::Face> = fonts.iter().map(|f| f.face()).collect();
     let (w, h) = (layout.width, layout.height);
+    let mut memory = vec![];
+    let outlines: Vec<_> = fonts.iter().map(|f| f.face.outline_glyphs()).collect();
     // Outlines as line segments, in coverage-sample units (y down).
     let mut edges = vec![];
     for g in &layout.glyphs {
-        let face = &faces[g.font];
+        let face = &fonts[g.font].face;
         let scale = layout.meta[0] / face.units_per_em() as f32;
         let mut b = Flatten {
             edges: &mut edges,
@@ -556,8 +590,16 @@ pub fn rasterize(layout: &Layout, fonts: &[&Font], spread: f32) -> TextImage {
             start: (0.0, 0.0),
             last: (0.0, 0.0),
         };
-        face.outline_glyph(ttf_parser::GlyphId(g.id), &mut b);
-        b.close();
+        if let Some(outline) = outlines[g.font].get(GlyphId::new(g.id as u32)) {
+            memory.resize(memory.len().max(outline.required_memory_size()), 0u8);
+            // Font units; a failed draw (a broken glyph) leaves what it drew.
+            let _ = outline.draw(
+                &DrawOptions::new(),
+                DrawMemory::from(&mut memory[..]),
+                &mut b,
+            );
+        }
+        Flatten::close(&mut b);
     }
     let mask = fill(&edges, w * COVER, h * COVER);
     let mut rgba = vec![0u8; w * h * 4];
@@ -656,7 +698,7 @@ impl Flatten<'_> {
     }
 }
 
-impl ttf_parser::OutlineBuilder for Flatten<'_> {
+impl PathSink for Flatten<'_> {
     fn move_to(&mut self, x: f32, y: f32) {
         self.close();
         let p = self.pt(x, y);
@@ -948,7 +990,7 @@ mod tests {
         assert!(l.glyphs.iter().all(|g| g.font == 1));
         let max_x = l.glyphs.iter().map(|g| g.x).fold(0.0, f32::max);
         assert!(max_x > 200.0, "right-aligned: {max_x}");
-        let shin = hebrew.face().glyph_index('ש').unwrap().0;
+        let shin = hebrew.face.charmap().map_unicode('ש').unwrap().to_u32() as u16;
         let rightmost = l.glyphs.iter().max_by(|a, b| a.x.total_cmp(&b.x)).unwrap();
         assert_eq!(rightmost.id, shin);
         // Mixed: an LTR paragraph with a Hebrew word keeps the Latin on the left.
@@ -976,10 +1018,10 @@ mod tests {
         assert!(l.missing.is_empty());
         assert!(l.glyphs.iter().all(|g| g.font == 1));
         // Joined forms differ from the isolated letters' nominal glyphs.
-        let face = arabic.face();
+        let face = arabic.face.charmap();
         let nominal: Vec<u16> = "مرحبا"
             .chars()
-            .map(|c| face.glyph_index(c).unwrap().0)
+            .map(|c| face.map_unicode(c).unwrap().to_u32() as u16)
             .collect();
         let shaped: Vec<u16> = l.glyphs.iter().map(|g| g.id).collect();
         assert_ne!(
@@ -1071,6 +1113,13 @@ mod tests {
             .err()
             .unwrap();
         assert!(e.to_string().contains("not a font"));
+        // A font without hhea (renamed in the table directory) is refused, not laid
+        // out with a zero line box.
+        let mut data = std::fs::read(test_font("NotoSans-subset.ttf").file).unwrap();
+        let at = data.windows(4).position(|w| w == b"hhea").unwrap();
+        data[at..at + 4].copy_from_slice(b"xhea");
+        let e = Font::from_bytes(spec("d.ttf"), data).err().unwrap();
+        assert!(e.to_string().contains("no hhea table"), "{e}");
     }
 
     #[test]
@@ -1148,6 +1197,27 @@ mod tests {
             hex, "9850511a0030280f94bb488de7b852a744f9055c6fd49c11e4594b3e929b0eba",
             "{}×{}",
             img.width, img.height
+        );
+        // A variable instance: gvar/HVAR/MVAR as fontations applies them. (#125: vs
+        // ttf-parser, layout was identical and 20 of 8640 bytes differed by one
+        // coverage sample: read-fonts applies gvar deltas in fixed point, not f32.)
+        let mut spec = test_font("NotoSans-subset.ttf");
+        spec.variations = vec![("wght".into(), 650.0)];
+        let semibold = Font::load(&spec).unwrap();
+        let s = TextStyle {
+            size: 24.0,
+            ..TextStyle::default()
+        };
+        let l = layout("Ag", &[&semibold], &s).unwrap();
+        assert_eq!(l.meta, [24.0, 31.712002, 28.800001, 8.0]);
+        let xs: Vec<f32> = l.glyphs.iter().map(|g| g.x).collect();
+        assert_eq!(xs, [8.0, 24.368]);
+        let img = rasterize(&l, &[&semibold], s.spread);
+        let hash = sha2::Sha256::digest(&img.rgba);
+        let hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            hex,
+            "febd8da4d5851eb7829e0b8d9a7a31597e5e9018daa0c9e35d8956da0b5196a1"
         );
     }
 }

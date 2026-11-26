@@ -2752,7 +2752,7 @@ fn text_spec(
                     let f = f
                         .as_str()
                         .ok_or_else(|| anyhow!("{what}: features must be a list of strings"))?;
-                    if f.parse::<rustybuzz::Feature>().is_err() {
+                    if f.parse::<harfrust::Feature>().is_err() {
                         bail!(
                             "{what}: \"{f}\" isn't an OpenType feature (like \"ss01\", \"-liga\" or \"tnum\")"
                         );
