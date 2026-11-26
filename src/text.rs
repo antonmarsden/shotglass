@@ -261,6 +261,9 @@ pub struct PlacedGlyph {
     pub id: u16,
     pub x: f32,
     pub y: f32,
+    /// The shaper's x offset included in `x` (marks, some kerning): `x - x_offset`
+    /// is the pen position, which never decreases along a line.
+    pub x_offset: f32,
     /// Visual line, 0 at the top.
     pub line: u32,
     /// Byte offset in the whole text of the cluster this glyph belongs to
@@ -278,6 +281,8 @@ pub struct Layout {
     /// What reaches the shader as `iChannelMeta`: (em, first baseline from the top,
     /// line pitch, padding), in texels.
     pub meta: [f32; 4],
+    /// Per line, the pen span after alignment: (start, end) x in texels.
+    pub line_spans: Vec<(f32, f32)>,
     /// Characters no font in the chain covers (drawn as the primary font's .notdef).
     pub missing: Vec<char>,
     /// Things worth saying that don't stop the text (a word broken mid-word).
@@ -468,6 +473,7 @@ pub fn layout(text: &str, fonts: &[&Font], style: &TextStyle) -> Result<Layout> 
                             id: info.glyph_id as u16,
                             x: pen + pos.x_offset as f32 * scale,
                             y: -(pos.y_offset as f32) * scale,
+                            x_offset: pos.x_offset as f32 * scale,
                             line: li as u32,
                             cluster: (para_starts[line.para] + sub.start + info.cluster as usize)
                                 as u32,
@@ -500,6 +506,7 @@ pub fn layout(text: &str, fonts: &[&Font], style: &TextStyle) -> Result<Layout> 
     }
     let first_baseline = pad + half_leading + ascent;
     let mut glyphs = vec![];
+    let mut line_spans = vec![];
     for (i, (line, line_w, rtl)) in placed.into_iter().enumerate() {
         let free = content_w - line_w;
         let dx = match (style.align, rtl) {
@@ -508,6 +515,7 @@ pub fn layout(text: &str, fonts: &[&Font], style: &TextStyle) -> Result<Layout> 
             (Align::Center, _) => free / 2.0,
         };
         let baseline = first_baseline + i as f32 * pitch;
+        line_spans.push((pad + dx, pad + dx + line_w));
         glyphs.extend(line.into_iter().map(|g| PlacedGlyph {
             x: g.x + pad + dx,
             y: g.y + baseline,
@@ -520,6 +528,7 @@ pub fn layout(text: &str, fonts: &[&Font], style: &TextStyle) -> Result<Layout> 
         width,
         height,
         lines: lines.len(),
+        line_spans,
         meta: [style.size, first_baseline, pitch, pad],
         missing,
         warnings,

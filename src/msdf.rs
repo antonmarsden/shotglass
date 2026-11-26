@@ -59,10 +59,8 @@ pub struct Tile {
 }
 
 pub struct Atlas {
-    pub width: usize,
-    pub height: usize,
-    /// RGBA8, top row first.
-    pub rgba: Vec<u8>,
+    /// RGBA8 texels, top row first.
+    pub image: TooDee<[u8; 4]>,
     /// Per requested glyph, in order; `None` for a glyph with no outline (a space).
     pub tiles: Vec<Option<Tile>>,
     pub em: f32,
@@ -111,9 +109,7 @@ pub fn build(glyphs: &[GlyphKey], fonts: &[&Font], em: f32, spread: f32) -> Resu
         }));
     }
     Ok(Atlas {
-        width,
-        height,
-        rgba: atlas.into_vec().into_iter().flatten().collect(),
+        image: atlas,
         tiles,
         em,
         spread,
@@ -322,8 +318,7 @@ mod tests {
     }
 
     fn texel(a: &Atlas, x: usize, y: usize) -> [u8; 4] {
-        let i = (y * a.width + x) * 4;
-        a.rgba[i..i + 4].try_into().unwrap()
+        a.image[(x, y)]
     }
 
     fn median(p: [u8; 4]) -> u8 {
@@ -344,7 +339,7 @@ mod tests {
         let a = build(&keys, &[&f], 48.0, 4.0).unwrap();
         let t: Vec<Tile> = a.tiles.iter().map(|t| t.unwrap()).collect();
         for (i, p) in t.iter().enumerate() {
-            assert!(p.x + p.w <= a.width && p.y + p.h <= a.height);
+            assert!(p.x + p.w <= a.image.num_cols() && p.y + p.h <= a.image.num_rows());
             for q in &t[i + 1..] {
                 let apart = p.x + p.w + GUTTER <= q.x
                     || q.x + q.w + GUTTER <= p.x
@@ -439,8 +434,8 @@ mod tests {
             .collect();
         let a = build(&keys, &[&f], 40.0, 4.0).unwrap();
         let b = build(&keys, &[&f], 40.0, 4.0).unwrap();
-        assert_eq!((a.width, a.height), (b.width, b.height));
-        assert!(a.rgba == b.rgba);
+        assert_eq!(a.image.num_cols(), b.image.num_cols());
+        assert!(a.image == b.image);
     }
 
     #[test]
@@ -467,7 +462,9 @@ mod tests {
         let a = build(&keys, &[&f], 48.0, 4.0).unwrap();
         let path =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/msdf-atlas.png");
-        let img = RgbaImage::from_raw(a.width as u32, a.height as u32, a.rgba.clone()).unwrap();
+        let (w, h) = (a.image.num_cols() as u32, a.image.num_rows() as u32);
+        let bytes = a.image.data().iter().flatten().copied().collect();
+        let img = RgbaImage::from_raw(w, h, bytes).unwrap();
         if std::env::var_os("SHOTGLASS_BLESS").is_some() {
             img.save(&path).unwrap();
             return;

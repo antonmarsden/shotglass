@@ -30,12 +30,12 @@
 //! |---|---|
 //! | 0 | baseline y from the top of the block (u32 .8) |
 //! | 1 | first glyph (u16), glyph count (u16) |
-//! | 2 | ink x start (u16 .4), ink x end (u16 .4): the pen span of the line |
+//! | 2 | pen x where the line starts (u16 .4), where it ends (u16 .4), after alignment: the end includes the last glyph's advance |
 //! | 3 | reserved (0) |
 //!
 //! Glyph record (`GLYPH_TEXELS`), per glyph, lines in order and each line's
 //! glyphs in visual order (left to right, after bidi), so pen x never decreases
-//! within a line:
+//! within a line (search on it; the x offset is separate):
 //!
 //! | texel | contents |
 //! |---|---|
@@ -44,7 +44,7 @@
 //! | 2 | atlas tile width (u16), height (u16); 0 × 0 for a glyph with no ink |
 //! | 3 | tile left (s16 .4), tile top (s16 .4), atlas texels: the tile's top-left corner is at (pen x + left, baseline − top) · layout em / atlas em |
 //! | 4 | grapheme index (u16), word index (u16), in logical order |
-//! | 5 | line (u16), reserved (u16, 0) |
+//! | 5 | line (u16), x offset from the pen, right positive (s16 .4): the glyph's origin is at pen x + x offset |
 //!
 //! The glyph's index in the block is its record number. Grapheme and word
 //! indices count from the start of the text (UAX #29), so a stagger follows
@@ -54,6 +54,7 @@
 
 use anyhow::{Context, Result, bail};
 use std::collections::BTreeMap;
+use toodee::TooDee;
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::msdf::{self, GlyphKey};
@@ -70,8 +71,7 @@ pub const MAX_GLYPHS: usize = 65_535;
 pub struct GlyphRun {
     pub atlas: msdf::Atlas,
     /// `TABLE_WIDTH` texels per row, top row first.
-    pub table: Vec<[u8; 4]>,
-    pub table_height: usize,
+    pub table: TooDee<[u8; 4]>,
 }
 
 /// Builds the atlas and table for `layout`, the layout of `text` with `fonts`.
@@ -102,12 +102,12 @@ pub fn build(
     }
     let atlas = msdf::build(&keys, fonts, atlas_em, spread)?;
 
-    let graphemes = boundaries(text.grapheme_indices(true).map(|(i, _)| i));
-    let words = boundaries(
-        text.split_word_bound_indices()
-            .filter(|(_, w)| w.chars().any(char::is_alphanumeric))
-            .map(|(i, _)| i),
-    );
+    let graphemes: Vec<usize> = text.grapheme_indices(true).map(|(i, _)| i).collect();
+    let words: Vec<usize> = text
+        .split_word_bound_indices()
+        .filter(|(_, w)| w.chars().any(char::is_alphanumeric))
+        .map(|(i, _)| i)
+        .collect();
 
     let em = layout.meta[0];
     let pitch = layout.meta[2];
@@ -137,12 +137,8 @@ pub fn build(
             .iter()
             .take_while(|g| g.line as usize == line)
             .count();
-        let glyphs = &layout.glyphs[first..first + count];
         let baseline = first_baseline(layout) + line as f32 * pitch;
-        let (x0, x1) = glyphs
-            .iter()
-            .fold((f32::MAX, f32::MIN), |(a, b), g| (a.min(g.x), b.max(g.x)));
-        let (x0, x1) = if count == 0 { (0.0, 0.0) } else { (x0, x1) };
+        let (x0, x1) = layout.line_spans[line];
         t.u32(fixed32(baseline, 256.0, "a baseline")?);
         t.u16s(first as u16, count as u16);
         t.u16s(
@@ -163,7 +159,7 @@ pub fn build(
             id: g.id as u32,
         }]];
         t.u16s(
-            fixed(g.x, 16.0, "a glyph's x")?,
+            fixed(g.x - g.x_offset, 16.0, "a glyph's x")?,
             sfixed(g.y - line_baseline, "a glyph's y offset")?,
         );
         match tile {
@@ -180,7 +176,7 @@ pub fn build(
         }
         let at = g.cluster as usize;
         t.u16s(index_of(&graphemes, at) as u16, index_of(&words, at) as u16);
-        t.u16s(g.line as u16, 0);
+        t.u16s(g.line as u16, sfixed(g.x_offset, "a glyph's x offset")?);
     }
     let table_height = t.0.len().div_ceil(TABLE_WIDTH).max(1);
     if table_height > crate::msdf::MAX_SIDE {
@@ -189,19 +185,13 @@ pub fn build(
     t.0.resize(table_height * TABLE_WIDTH, [0; 4]);
     Ok(GlyphRun {
         atlas,
-        table: t.0,
-        table_height,
+        table: TooDee::from_vec(TABLE_WIDTH, table_height, t.0),
     })
 }
 
 /// The first baseline from the block's top, in layout texels.
 fn first_baseline(layout: &Layout) -> f32 {
     layout.meta[1]
-}
-
-/// Sorted start offsets.
-fn boundaries(it: impl Iterator<Item = usize>) -> Vec<usize> {
-    it.collect()
 }
 
 /// How many of `starts` are at or before `at`, minus one (0 before the first).
@@ -277,6 +267,7 @@ pub struct DecodedGlyph {
     pub grapheme: u16,
     pub word: u16,
     pub line: u16,
+    pub dx: f32,
 }
 
 pub fn decode(table: &[[u8; 4]]) -> Result<Decoded> {
@@ -329,7 +320,7 @@ pub fn decode(table: &[[u8; 4]]) -> Result<Decoded> {
         let (tw, th) = u16s_at(at + 2)?;
         let (left, top) = u16s_at(at + 3)?;
         let (grapheme, word) = u16s_at(at + 4)?;
-        let (line, _) = u16s_at(at + 5)?;
+        let (line, dx) = u16s_at(at + 5)?;
         out.glyphs.push(DecodedGlyph {
             x: x as f32 / 16.0,
             dy: s(dy),
@@ -339,6 +330,7 @@ pub fn decode(table: &[[u8; 4]]) -> Result<Decoded> {
             grapheme,
             word,
             line,
+            dx: s(dx),
         });
     }
     Ok(out)
@@ -348,6 +340,7 @@ pub fn decode(table: &[[u8; 4]]) -> Result<Decoded> {
 mod tests {
     use super::*;
     use crate::text::{TextStyle, layout, test_font};
+    use toodee::TooDeeOps;
 
     fn font(name: &str) -> Font {
         Font::load(&test_font(name)).unwrap()
@@ -368,13 +361,13 @@ mod tests {
         let text = "Big Shadow\nover the wall";
         let l = layout(text, &[&f], &style(40.0, None)).unwrap();
         let run = build(text, &l, &[&f], 48.0, 4.0).unwrap();
-        assert_eq!(run.table.len(), run.table_height * TABLE_WIDTH);
-        let d = decode(&run.table).unwrap();
+        assert_eq!(run.table.num_cols(), TABLE_WIDTH);
+        let d = decode(run.table.data()).unwrap();
         assert_eq!((d.em, d.atlas_em, d.spread), (40.0, 48.0, 4.0));
         assert_eq!(d.lines.len(), 2);
         assert_eq!(d.glyphs.len(), l.glyphs.len());
         for (g, p) in d.glyphs.iter().zip(&l.glyphs) {
-            assert!((g.x - p.x).abs() <= 1.0 / 32.0, "{} vs {}", g.x, p.x);
+            assert!((g.x + g.dx - p.x).abs() <= 1.0 / 16.0, "{} vs {}", g.x, p.x);
             assert_eq!(g.line as u32, p.line);
             let line = &d.lines[g.line as usize];
             assert!((line.baseline + g.dy - p.y).abs() <= 1.0 / 16.0);
@@ -416,7 +409,7 @@ mod tests {
         let text = "ab שלום cd";
         let l = layout(text, &[&latin, &hebrew], &style(40.0, None)).unwrap();
         let run = build(text, &l, &[&latin, &hebrew], 32.0, 4.0).unwrap();
-        let d = decode(&run.table).unwrap();
+        let d = decode(run.table.data()).unwrap();
         for w in d.glyphs.windows(2) {
             assert!(w[1].x >= w[0].x, "pen x decreases: {w:?}");
         }
@@ -445,7 +438,7 @@ mod tests {
         let l = layout(text, &[&f], &style(40.0, Some(200.0))).unwrap();
         assert!(l.lines > 2);
         let run = build(text, &l, &[&f], 48.0, 4.0).unwrap();
-        let d = decode(&run.table).unwrap();
+        let d = decode(run.table.data()).unwrap();
         assert_eq!(d.lines.len(), l.lines);
         for (i, line) in d.lines.iter().enumerate() {
             assert!(line.count > 0);
@@ -455,6 +448,71 @@ mod tests {
                     .all(|g| g.line as usize == i)
             );
             assert!(line.x0 <= line.x1);
+        }
+    }
+
+    #[test]
+    fn line_spans_include_the_last_glyphs_advance() {
+        let f = font("NotoSans-subset.ttf");
+        let text = "WW";
+        let l = layout(text, &[&f], &style(40.0, None)).unwrap();
+        let run = build(text, &l, &[&f], 48.0, 4.0).unwrap();
+        let d = decode(run.table.data()).unwrap();
+        let line = &d.lines[0];
+        let last = d.glyphs.last().unwrap();
+        // The line ends a W's advance (most of an em) after the last W's pen x,
+        // and the span is the whole content width (no wrap width, left aligned).
+        assert!(line.x1 - last.x > 0.5 * d.em, "{line:?} {last:?}");
+        assert!((line.x0 - 4.0).abs() < 0.1 && (line.x1 - (l.width as f32 - 4.0)).abs() < 1.0);
+    }
+
+    #[test]
+    fn a_mark_keeps_the_pen_order() {
+        let f = font("NotoNaskhArabic-subset.ttf");
+        // Beh + fatha, lam + fatha: each fatha is placed back over its letter.
+        let text = "\u{628}\u{64e}\u{644}\u{64e}\u{645}";
+        let l = layout(text, &[&f], &style(40.0, None)).unwrap();
+        let run = build(text, &l, &[&f], 48.0, 4.0).unwrap();
+        let d = decode(run.table.data()).unwrap();
+        for w in d.glyphs.windows(2) {
+            assert!(w[1].x >= w[0].x, "pen x decreases: {w:?}");
+        }
+        assert!(
+            d.glyphs.iter().any(|g| g.dx != 0.0),
+            "no glyph has an x offset: {:?}",
+            d.glyphs
+        );
+        // A fatha shares its letter's grapheme: beh+fatha, lam+fatha, meem.
+        let mut graphemes: Vec<u16> = d.glyphs.iter().map(|g| g.grapheme).collect();
+        graphemes.sort();
+        // (The font may draw a letter with more than one glyph.)
+        let count = |i| graphemes.iter().filter(|&&g| g == i).count();
+        assert!(
+            count(0) >= 2 && count(1) >= 2 && count(2) >= 1,
+            "{graphemes:?}"
+        );
+        graphemes.dedup();
+        assert_eq!(graphemes, [0, 1, 2]);
+    }
+
+    #[test]
+    fn tight_letter_spacing_and_leading_marks_still_build() {
+        let f = font("NotoNaskhArabic-subset.ttf");
+        // A mark with no letter before it is offset from the pen, and negative
+        // letter spacing pulls pens together; with almost no padding either could
+        // put a glyph's x below 0. The stored pen x must stay valid.
+        let text = "\u{64e}\u{628}\u{644}\u{645}";
+        let st = TextStyle {
+            letter_spacing: -0.2,
+            spread: 0.1,
+            ..style(40.0, None)
+        };
+        let l = layout(text, &[&f], &st).unwrap();
+        let run = build(text, &l, &[&f], 48.0, 4.0).unwrap();
+        let d = decode(run.table.data()).unwrap();
+        assert_eq!(d.glyphs.len(), l.glyphs.len());
+        for (g, p) in d.glyphs.iter().zip(&l.glyphs) {
+            assert!((g.x + g.dx - p.x).abs() <= 1.0 / 16.0);
         }
     }
 
