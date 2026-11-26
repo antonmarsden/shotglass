@@ -117,6 +117,28 @@ impl Font {
         self.face.charmap().map_unicode(c).map(|g| g.to_u32())
     }
 
+    /// `c` shaped alone at `size` px per em: its first glyph and its total advance
+    /// in px, or `None` when this font has no glyph for it. For whitespace, which
+    /// `layout` trims.
+    pub fn shape_alone(
+        &self,
+        c: char,
+        size: f32,
+        features: &[String],
+    ) -> Result<Option<(u16, f32)>> {
+        let face = self.shaper();
+        if face.nominal_glyph(c as u32).is_none() {
+            return Ok(None);
+        }
+        let shaped = shape(&face, &parse_features(features)?, &c.to_string(), false);
+        let scale = size / self.units_per_em();
+        let advance: i32 = shaped.glyph_positions().iter().map(|p| p.x_advance).sum();
+        Ok(shaped
+            .glyph_infos()
+            .first()
+            .map(|g| (g.glyph_id as u16, advance as f32 * scale)))
+    }
+
     pub fn units_per_em(&self) -> f32 {
         self.face.units_per_em() as f32
     }

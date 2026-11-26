@@ -15,7 +15,7 @@
 //!
 //! | texel | contents |
 //! |---|---|
-//! | 0 | format version (u32, `FORMAT`) |
+//! | 0 | format version (u16, `FORMAT`), kind (u16: `KIND_RUN` 0, `KIND_SET` 1) |
 //! | 1 | glyph count (u32) |
 //! | 2 | line count (u32) |
 //! | 3 | first line record texel (u32) |
@@ -49,6 +49,15 @@
 //! The glyph's index in the block is its record number. Grapheme and word
 //! indices count from the start of the text (UAX #29), so a stagger follows
 //! reading order whatever the direction.
+//!
+//! # Glyph sets
+//!
+//! A glyph set (`set = true`) is a table of kind `KIND_SET` with no lines: one
+//! glyph record per character, sorted by code point (binary search from GLSL),
+//! for strings a shader computes (counters, timecode). Each character is shaped
+//! alone (no kerning or ligatures between set glyphs). Texels 0–3 are as above
+//! with pen x 0 and y offset 0; texel 4 is the code point (u32); texel 5 is the
+//! advance (u16 .4) and the x offset (s16 .4).
 
 #![allow(dead_code)] // wired into `[texts]` in the next #71 step
 
@@ -58,9 +67,11 @@ use toodee::TooDee;
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::msdf::{self, GlyphKey};
-use crate::text::{Font, Layout};
+use crate::text::{Font, Layout, PlacedGlyph, TextStyle, layout};
 
-pub const FORMAT: u32 = 1;
+pub const FORMAT: u16 = 1;
+pub const KIND_RUN: u16 = 0;
+pub const KIND_SET: u16 = 1;
 pub const TABLE_WIDTH: usize = 1024;
 pub const HEADER_TEXELS: usize = 8;
 pub const LINE_TEXELS: usize = 4;
@@ -115,7 +126,7 @@ pub fn build(
     let mut t = Table::default();
     let line_at = HEADER_TEXELS;
     let glyph_at = line_at + lines * LINE_TEXELS;
-    t.u32(FORMAT);
+    t.u16s(FORMAT, KIND_RUN);
     t.u32(n as u32);
     t.u32(lines as u32);
     t.u32(line_at as u32);
@@ -162,30 +173,129 @@ pub fn build(
             fixed(g.x - g.x_offset, 16.0, "a glyph's x")?,
             sfixed(g.y - line_baseline, "a glyph's y offset")?,
         );
-        match tile {
-            Some(tile) => {
-                t.u16s(tile.x as u16, tile.y as u16);
-                t.u16s(tile.w as u16, tile.h as u16);
-                t.u16s(sfixed(tile.left, "a tile")?, sfixed(tile.top, "a tile")?);
-            }
-            None => {
-                t.u32(0);
-                t.u32(0);
-                t.u32(0);
-            }
-        }
+        t.tile(tile)?;
         let at = g.cluster as usize;
         t.u16s(index_of(&graphemes, at) as u16, index_of(&words, at) as u16);
         t.u16s(g.line as u16, sfixed(g.x_offset, "a glyph's x offset")?);
     }
-    let table_height = t.0.len().div_ceil(TABLE_WIDTH).max(1);
-    if table_height > crate::msdf::MAX_SIDE {
-        bail!("the glyph table is over {} rows", crate::msdf::MAX_SIDE);
-    }
-    t.0.resize(table_height * TABLE_WIDTH, [0; 4]);
     Ok(GlyphRun {
         atlas,
-        table: TooDee::from_vec(TABLE_WIDTH, table_height, t.0),
+        table: t.finish()?,
+    })
+}
+
+/// Builds a glyph set: each distinct character of `chars` once, laid out alone
+/// with `fonts` and `style` (its size, fallback and letter spacing apply).
+pub fn build_set(
+    chars: &str,
+    fonts: &[&Font],
+    style: &TextStyle,
+    atlas_em: f32,
+    spread: f32,
+) -> Result<GlyphRun> {
+    let mut set: Vec<char> = chars.chars().collect();
+    set.sort();
+    set.dedup();
+    if set.is_empty() {
+        bail!("a glyph set needs at least one character");
+    }
+    if let Some(c) = set.iter().find(|c| c.is_control()) {
+        bail!(
+            "a glyph set can't hold the control character U+{:04X}",
+            *c as u32
+        );
+    }
+    if set.len() > MAX_GLYPHS {
+        bail!("a glyph set has at most {MAX_GLYPHS} characters");
+    }
+    // One layout per character: its glyph, advance and metrics.
+    let mut placed = vec![];
+    let mut meta = [0f32; 4];
+    for &c in &set {
+        let l = layout(&c.to_string(), fonts, style)?;
+        meta = l.meta;
+        if c.is_whitespace() {
+            // Layout trims whitespace: shape it alone with the first font that has it.
+            let mut found = None;
+            for (fi, f) in fonts.iter().enumerate() {
+                if let Some((id, adv)) = f.shape_alone(c, style.size, &style.features)? {
+                    found = Some((fi, id, adv));
+                    break;
+                }
+            }
+            let Some((font, id, adv)) = found else {
+                bail!("no font has U+{:04X} for the glyph set", c as u32);
+            };
+            let g = PlacedGlyph {
+                font,
+                id,
+                x: 0.0,
+                y: 0.0,
+                x_offset: 0.0,
+                line: 0,
+                cluster: 0,
+            };
+            placed.push((c, g, adv + style.letter_spacing * style.size, 0.0));
+            continue;
+        }
+        if let Some(m) = l.missing.first() {
+            bail!("no font has U+{:04X} ({m}) for the glyph set", *m as u32);
+        }
+        let [g] = l.glyphs[..] else {
+            bail!(
+                "'{c}' is {} glyphs in this font; glyph sets take one glyph per character",
+                l.glyphs.len()
+            );
+        };
+        let (x0, x1) = l.line_spans[0];
+        placed.push((c, g, x1 - x0, g.x - x0 - g.x_offset));
+    }
+    let mut index: BTreeMap<GlyphKey, usize> = BTreeMap::new();
+    for (_, g, ..) in &placed {
+        index
+            .entry(GlyphKey {
+                font: g.font,
+                id: g.id as u32,
+            })
+            .or_default();
+    }
+    let keys: Vec<GlyphKey> = index.keys().copied().collect();
+    for (i, v) in index.values_mut().enumerate() {
+        *v = i;
+    }
+    let atlas = msdf::build(&keys, fonts, atlas_em, spread)?;
+
+    let mut t = Table::default();
+    t.u16s(FORMAT, KIND_SET);
+    t.u32(set.len() as u32);
+    t.u32(0);
+    t.u32(HEADER_TEXELS as u32);
+    t.u32(HEADER_TEXELS as u32);
+    t.u16s(
+        fixed(meta[0], 16.0, "the text size")?,
+        fixed(atlas_em, 16.0, "the atlas size")?,
+    );
+    t.u16s(
+        fixed(spread, 256.0, "the spread")?,
+        fixed(meta[2], 16.0, "the line pitch")?,
+    );
+    t.u16s(LINE_TEXELS as u16, GLYPH_TEXELS as u16);
+    for (c, g, advance, _) in &placed {
+        let tile = atlas.tiles[index[&GlyphKey {
+            font: g.font,
+            id: g.id as u32,
+        }]];
+        t.u32(0);
+        t.tile(tile)?;
+        t.u32(*c as u32);
+        t.u16s(
+            fixed(*advance, 16.0, "an advance")?,
+            sfixed(g.x_offset, "a glyph's x offset")?,
+        );
+    }
+    Ok(GlyphRun {
+        atlas,
+        table: t.finish()?,
     })
 }
 
@@ -235,11 +345,37 @@ impl Table {
         let (a, b) = (a.to_be_bytes(), b.to_be_bytes());
         self.0.push([a[0], a[1], b[0], b[1]]);
     }
+    /// Glyph record texels 1–3: the atlas tile and bearing (zeros: no ink).
+    fn tile(&mut self, tile: Option<msdf::Tile>) -> Result<()> {
+        match tile {
+            Some(tile) => {
+                self.u16s(tile.x as u16, tile.y as u16);
+                self.u16s(tile.w as u16, tile.h as u16);
+                self.u16s(sfixed(tile.left, "a tile")?, sfixed(tile.top, "a tile")?);
+            }
+            None => {
+                self.u32(0);
+                self.u32(0);
+                self.u32(0);
+            }
+        }
+        Ok(())
+    }
+    /// Pads to whole rows of `TABLE_WIDTH`.
+    fn finish(mut self) -> Result<TooDee<[u8; 4]>> {
+        let rows = self.0.len().div_ceil(TABLE_WIDTH).max(1);
+        if rows > msdf::MAX_SIDE {
+            bail!("the glyph table is over {} rows", msdf::MAX_SIDE);
+        }
+        self.0.resize(rows * TABLE_WIDTH, [0; 4]);
+        Ok(TooDee::from_vec(TABLE_WIDTH, rows, self.0))
+    }
 }
 
 /// The table read back, as a shader would (tests and `check`).
 #[derive(Debug, PartialEq)]
 pub struct Decoded {
+    pub kind: u16,
     pub em: f32,
     pub atlas_em: f32,
     pub spread: f32,
@@ -268,6 +404,9 @@ pub struct DecodedGlyph {
     pub word: u16,
     pub line: u16,
     pub dx: f32,
+    /// Glyph sets only (else 0): the character and its advance.
+    pub code: u32,
+    pub advance: f32,
 }
 
 pub fn decode(table: &[[u8; 4]]) -> Result<Decoded> {
@@ -284,9 +423,14 @@ pub fn decode(table: &[[u8; 4]]) -> Result<Decoded> {
         ))
     };
     let s = |v: u16| v as i16 as f32 / 16.0;
-    if u32_at(0)? != FORMAT {
-        bail!("glyph table format {} (want {FORMAT})", u32_at(0)?);
+    let (format, kind) = u16s_at(0)?;
+    if format != FORMAT {
+        bail!("glyph table format {format} (want {FORMAT})");
     }
+    if kind != KIND_RUN && kind != KIND_SET {
+        bail!("glyph table kind {kind}");
+    }
+    let set = kind == KIND_SET;
     let (n, lines) = (u32_at(1)? as usize, u32_at(2)? as usize);
     let (line_at, glyph_at) = (u32_at(3)? as usize, u32_at(4)? as usize);
     let (em, atlas_em) = u16s_at(5)?;
@@ -294,6 +438,7 @@ pub fn decode(table: &[[u8; 4]]) -> Result<Decoded> {
     let (lt, gt) = u16s_at(7)?;
     let (lt, gt) = (lt as usize, gt as usize);
     let mut out = Decoded {
+        kind,
         em: em as f32 / 16.0,
         atlas_em: atlas_em as f32 / 16.0,
         spread: spread as f32 / 256.0,
@@ -321,7 +466,7 @@ pub fn decode(table: &[[u8; 4]]) -> Result<Decoded> {
         let (left, top) = u16s_at(at + 3)?;
         let (grapheme, word) = u16s_at(at + 4)?;
         let (line, dx) = u16s_at(at + 5)?;
-        out.glyphs.push(DecodedGlyph {
+        let mut g = DecodedGlyph {
             x: x as f32 / 16.0,
             dy: s(dy),
             tile: [tx, ty, tw, th],
@@ -331,7 +476,15 @@ pub fn decode(table: &[[u8; 4]]) -> Result<Decoded> {
             word,
             line,
             dx: s(dx),
-        });
+            code: 0,
+            advance: 0.0,
+        };
+        if set {
+            g.code = u32_at(at + 4)?;
+            g.advance = line as f32 / 16.0;
+            (g.grapheme, g.word, g.line) = (0, 0, 0);
+        }
+        out.glyphs.push(g);
     }
     Ok(out)
 }
@@ -514,6 +667,60 @@ mod tests {
         for (g, p) in d.glyphs.iter().zip(&l.glyphs) {
             assert!((g.x + g.dx - p.x).abs() <= 1.0 / 16.0);
         }
+    }
+
+    #[test]
+    fn a_glyph_set_is_sorted_by_code_point_with_advances() {
+        let f = font("NotoSans-subset.ttf");
+        // Unsorted, with a duplicate and a space.
+        let run = build_set("9:0 1.0", &[&f], &style(40.0, None), 48.0, 4.0).unwrap();
+        let d = decode(run.table.data()).unwrap();
+        assert_eq!(d.kind, KIND_SET);
+        assert!(d.lines.is_empty());
+        let codes: Vec<u32> = d.glyphs.iter().map(|g| g.code).collect();
+        assert_eq!(codes, [' ', '.', '0', '1', '9', ':'].map(|c| c as u32));
+        // Noto Sans has tabular-width digits: every digit advances the same, and
+        // more than the full stop.
+        let adv = |c: char| {
+            d.glyphs
+                .iter()
+                .find(|g| g.code == c as u32)
+                .unwrap()
+                .advance
+        };
+        assert!(adv('0') > 10.0 && adv('0') == adv('1') && adv('1') == adv('9'));
+        assert!(adv('.') < adv('0'));
+        // A space has an advance and no ink; digits have ink.
+        let space = &d.glyphs[0];
+        assert!(space.advance > 0.0 && space.tile[2] == 0);
+        assert!(d.glyphs[2].tile[2] > 0);
+        // Same tiles as the atlas says.
+        assert_eq!(run.atlas.tiles.len(), 6);
+    }
+
+    #[test]
+    fn a_glyph_set_falls_back_and_refuses_what_no_font_has() {
+        let latin = font("NotoSans-subset.ttf");
+        let hebrew = font("NotoSansHebrew-subset.ttf");
+        let run = build_set("1ש", &[&latin, &hebrew], &style(40.0, None), 48.0, 4.0).unwrap();
+        assert_eq!(decode(run.table.data()).unwrap().glyphs.len(), 2);
+        let err = build_set("1ש", &[&latin], &style(40.0, None), 48.0, 4.0)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("U+05E9"), "{err}");
+        assert!(build_set("", &[&latin], &style(40.0, None), 48.0, 4.0).is_err());
+        assert!(build_set("1\n2", &[&latin], &style(40.0, None), 48.0, 4.0).is_err());
+    }
+
+    #[test]
+    fn a_run_table_is_not_a_set() {
+        let f = font("NotoSans-subset.ttf");
+        let l = layout("12", &[&f], &style(40.0, None)).unwrap();
+        let run = build("12", &l, &[&f], 48.0, 4.0).unwrap();
+        let d = decode(run.table.data()).unwrap();
+        assert_eq!(d.kind, KIND_RUN);
+        assert!(d.glyphs.iter().all(|g| g.code == 0));
     }
 
     #[test]
