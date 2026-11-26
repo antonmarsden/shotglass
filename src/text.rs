@@ -71,6 +71,19 @@ impl Font {
                 spec.label
             );
         }
+        // ttf-parser refused these; without them there is no em or line box.
+        let m = base.metrics();
+        for (table, missing) in [
+            ("head", m.raw_units_per_em == 0),
+            ("hhea", m.hhea_line.is_none()),
+        ] {
+            if missing {
+                bail!(
+                    "{}: not a font shotglass can read: it has no {table} table",
+                    spec.label
+                );
+            }
+        }
         let mut vars = vec![];
         for (tag, v) in &spec.variations {
             let t = tag_of(tag)?;
@@ -562,6 +575,7 @@ const DIST: usize = 2;
 pub fn rasterize(layout: &Layout, fonts: &[&Font], spread: f32) -> TextImage {
     let (w, h) = (layout.width, layout.height);
     let mut memory = vec![];
+    let outlines: Vec<_> = fonts.iter().map(|f| f.face.outline_glyphs()).collect();
     // Outlines as line segments, in coverage-sample units (y down).
     let mut edges = vec![];
     for g in &layout.glyphs {
@@ -576,7 +590,7 @@ pub fn rasterize(layout: &Layout, fonts: &[&Font], spread: f32) -> TextImage {
             start: (0.0, 0.0),
             last: (0.0, 0.0),
         };
-        if let Some(outline) = face.outline_glyphs().get(GlyphId::new(g.id as u32)) {
+        if let Some(outline) = outlines[g.font].get(GlyphId::new(g.id as u32)) {
             memory.resize(memory.len().max(outline.required_memory_size()), 0u8);
             // Font units; a failed draw (a broken glyph) leaves what it drew.
             let _ = outline.draw(
@@ -1099,6 +1113,13 @@ mod tests {
             .err()
             .unwrap();
         assert!(e.to_string().contains("not a font"));
+        // A font without hhea (renamed in the table directory) is refused, not laid
+        // out with a zero line box.
+        let mut data = std::fs::read(test_font("NotoSans-subset.ttf").file).unwrap();
+        let at = data.windows(4).position(|w| w == b"hhea").unwrap();
+        data[at..at + 4].copy_from_slice(b"xhea");
+        let e = Font::from_bytes(spec("d.ttf"), data).err().unwrap();
+        assert!(e.to_string().contains("no hhea table"), "{e}");
     }
 
     #[test]
@@ -1176,6 +1197,27 @@ mod tests {
             hex, "9850511a0030280f94bb488de7b852a744f9055c6fd49c11e4594b3e929b0eba",
             "{}×{}",
             img.width, img.height
+        );
+        // A variable instance: gvar/HVAR/MVAR as fontations applies them. (#125: vs
+        // ttf-parser, layout was identical and 20 of 8640 bytes differed by one
+        // coverage sample: read-fonts applies gvar deltas in fixed point, not f32.)
+        let mut spec = test_font("NotoSans-subset.ttf");
+        spec.variations = vec![("wght".into(), 650.0)];
+        let semibold = Font::load(&spec).unwrap();
+        let s = TextStyle {
+            size: 24.0,
+            ..TextStyle::default()
+        };
+        let l = layout("Ag", &[&semibold], &s).unwrap();
+        assert_eq!(l.meta, [24.0, 31.712002, 28.800001, 8.0]);
+        let xs: Vec<f32> = l.glyphs.iter().map(|g| g.x).collect();
+        assert_eq!(xs, [8.0, 24.368]);
+        let img = rasterize(&l, &[&semibold], s.spread);
+        let hash = sha2::Sha256::digest(&img.rgba);
+        let hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            hex,
+            "febd8da4d5851eb7829e0b8d9a7a31597e5e9018daa0c9e35d8956da0b5196a1"
         );
     }
 }
