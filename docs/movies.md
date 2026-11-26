@@ -200,7 +200,9 @@ shot "moon" (scenes/moon.glsl):
 `check` also tries every shader as GLSL ES 3.00. `check --web` requires that
 validation to pass. Browser compatibility warnings, such as identifiers
 containing consecutive underscores that Chromium and Firefox may reject, are
-advisory unless you run `check --web --strict`.
+advisory unless you run `check --web --strict`. `check --strict` fails on every
+warning `check` prints, not only those: a missing font licence, footage that runs out,
+subtitle styling a glyph run drops, a click at a loop film's seam, and so on.
 `check --no-gpu` runs only these checks, with no OpenGL needed (handy in CI).
 
 Common things that work on one driver and fail on another:

@@ -15,6 +15,7 @@ shotglass strip  <movie> [--count 12 | --at ...] [--size 384x216] [--cols 4] [--
 shotglass check  <movie> [--web] [--strict] [--no-gpu] [--deep] [--size 1280x720] [--frames 8]
                  # validate movie.toml and the GLSL (strictly), compile, synth, time
                  # --deep: also decode every frame of every image sequence
+                 # --strict: fail if it printed any warning (with --web: browser ones too)
 shotglass wav    <movie> [--out sound.wav] [--rate 48000] [--allow-silence]
                  [--compare ref.wav [--bless] [--max-rms 0.0015] [--max-peak 0.01]]
                  # --compare: fail if the sound differs from ref.wav (writes sound.diff.wav)

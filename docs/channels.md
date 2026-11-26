@@ -268,8 +268,8 @@ channels = ["subs", { text = "subs", part = "glyphs" }]
   entities decoded. Cues that overlap, or end after the film (one period in a loop
   film), are errors. Show them on a film-wide `[[layer]]`. A glyph run draws plain
   text, so `shotglass check` warns when a file loses styling (which tags, overrides,
-  cue settings, `STYLE`/`REGION` blocks, in how many cues); `check --strict` makes
-  that an error.
+  cue settings, `STYLE`/`REGION` blocks, in how many cues); `check --strict` fails on
+  it, as on any warning.
 
 ### Getting fonts
 
