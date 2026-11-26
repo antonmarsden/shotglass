@@ -122,16 +122,18 @@ impl Font {
     }
 
     /// Draws glyph `id`'s outline (font units, y up, no hinting) into `sink`.
-    /// False when the font has no outline for it (or it is broken).
-    pub fn draw_outline(&self, id: u32, sink: &mut impl PathSink) -> bool {
+    /// `Ok(false)` when the font has no outline for it; an error when the outline
+    /// is broken (what was drawn before the error is in `sink`).
+    pub fn draw_outline(&self, id: u32, sink: &mut impl PathSink) -> Result<bool> {
         let outlines = self.face.outline_glyphs();
         let Some(outline) = outlines.get(GlyphId::new(id)) else {
-            return false;
+            return Ok(false);
         };
         let mut memory = vec![0u8; outline.required_memory_size()];
         outline
             .draw(&DrawOptions::new(), DrawMemory::from(&mut memory[..]), sink)
-            .is_ok()
+            .map_err(|e| anyhow::anyhow!("glyph {id}: broken outline ({e})"))?;
+        Ok(true)
     }
 }
 

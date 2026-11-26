@@ -3,8 +3,10 @@
 //! RGBA8 image.
 //!
 //! Tile format: RGB = multi-channel distance (the median is the distance; corners
-//! stay sharp), A = true distance. 0.5 (128) is the outline, inside is above;
-//! one unit is `2 · spread` pixels, so values saturate `spread` px from the edge.
+//! stay sharp), A = true distance. A signed distance d px (inside positive) is
+//! stored as ⌊255 · (d / (2 · spread) + 0.5)⌋ (fdsm truncates), so the outline
+//! lies between 127 and 128: threshold at 127.5 / 255. Values saturate `spread`
+//! px from the edge.
 //! Rows are top first, glyphs upright (y down), like every texture we decode.
 //!
 //! Generated with the `fdsm` crate. Output is the same on every run on one
@@ -14,7 +16,7 @@
 // Not wired into `[texts]` yet (the next #71 step); the tests use all of it.
 #![allow(dead_code)]
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use fdsm::bezier::scanline::FillRule;
 use fdsm::bezier::{Point, Segment};
 use fdsm::generate::generate_mtsdf;
@@ -22,13 +24,14 @@ use fdsm::render::correct_sign_mtsdf;
 use fdsm::shape::{Contour, Shape};
 use image::RgbaImage;
 use skrifa::font::glyph::outline::PathSink;
+use toodee::{CopyOps, TooDee, TooDeeOps, TooDeeOpsMut};
 
 use crate::text::Font;
 
 /// Largest atlas side, as for any texture.
 pub const MAX_SIDE: usize = 4096;
-/// Empty texels between tiles, so linear filtering at a tile's edge never reads
-/// its neighbour.
+/// Empty texels around every tile (atlas edges included), so linear filtering
+/// at a tile's edge never reads a neighbour, whatever the wrap mode.
 const GUTTER: usize = 1;
 /// Corner threshold for edge colouring (sine of the angle), fdsm's default.
 const CORNER_SIN: f64 = 0.03;
@@ -68,7 +71,7 @@ pub struct Atlas {
 
 /// A glyph's distance field, before packing.
 struct Field {
-    image: RgbaImage,
+    image: TooDee<[u8; 4]>,
     left: f32,
     top: f32,
 }
@@ -78,31 +81,26 @@ pub fn build(glyphs: &[GlyphKey], fonts: &[&Font], em: f32, spread: f32) -> Resu
     if !(em > 0.0 && spread > 0.0) {
         bail!("atlas em size and spread must be positive");
     }
-    let fields: Vec<Option<Field>> = glyphs
+    let fields = glyphs
         .iter()
         .map(|g| field(fonts[g.font], g.id, em as f64, spread as f64))
-        .collect();
+        .collect::<Result<Vec<Option<Field>>>>()?;
     let sizes: Vec<Option<(usize, usize)>> = fields
         .iter()
-        .map(|f| {
-            f.as_ref()
-                .map(|f| (f.image.width() as usize, f.image.height() as usize))
-        })
+        .map(|f| f.as_ref().map(|f| (f.image.num_cols(), f.image.num_rows())))
         .collect();
     let (width, height, places) = pack(&sizes)?;
-    let mut rgba = vec![0u8; width * height * 4];
+    let mut atlas = TooDee::init(width, height, [0u8; 4]);
     let mut tiles = Vec::with_capacity(glyphs.len());
     for (f, place) in fields.iter().zip(&places) {
         let (Some(f), Some((x, y))) = (f, place) else {
             tiles.push(None);
             continue;
         };
-        let (w, h) = (f.image.width() as usize, f.image.height() as usize);
-        for row in 0..h {
-            let src = &f.image.as_raw()[row * w * 4..(row + 1) * w * 4];
-            let at = ((y + row) * width + x) * 4;
-            rgba[at..at + w * 4].copy_from_slice(src);
-        }
+        let (w, h) = (f.image.num_cols(), f.image.num_rows());
+        atlas
+            .view_mut((*x, *y), (x + w, y + h))
+            .copy_from_toodee(&f.image);
         tiles.push(Some(Tile {
             x: *x,
             y: *y,
@@ -115,7 +113,7 @@ pub fn build(glyphs: &[GlyphKey], fonts: &[&Font], em: f32, spread: f32) -> Resu
     Ok(Atlas {
         width,
         height,
-        rgba,
+        rgba: atlas.into_vec().into_iter().flatten().collect(),
         tiles,
         em,
         spread,
@@ -139,23 +137,26 @@ fn pack(sizes: &[Option<(usize, usize)>]) -> Result<(usize, usize, Vec<Option<(u
             (w + GUTTER) * (h + GUTTER)
         })
         .sum();
+    // Every tile carries a gutter on its right and bottom; one more column and
+    // row on the left and top.
     let widest = order
         .iter()
         .map(|&i| sizes[i].unwrap().0 + GUTTER)
         .max()
-        .unwrap_or(1);
-    let width = ((area as f64).sqrt().ceil() as usize)
+        .unwrap_or(1)
+        + GUTTER;
+    let width = ((area as f64).sqrt().ceil() as usize + GUTTER)
         .max(widest)
         .min(MAX_SIDE);
     if widest > MAX_SIDE {
         bail!("a glyph is wider than {MAX_SIDE} px at this atlas size");
     }
     let mut places = vec![None; sizes.len()];
-    let (mut x, mut y, mut shelf) = (0, 0, 0);
+    let (mut x, mut y, mut shelf) = (GUTTER, GUTTER, 0);
     for i in order {
         let (w, h) = sizes[i].unwrap();
         if x + w + GUTTER > width {
-            x = 0;
+            x = GUTTER;
             y += shelf;
             shelf = 0;
         }
@@ -172,15 +173,21 @@ fn pack(sizes: &[Option<(usize, usize)>]) -> Result<(usize, usize, Vec<Option<(u
     Ok((width, height, places))
 }
 
-/// The MTSDF of one glyph, or `None` when it has no outline.
-fn field(font: &Font, id: u32, em: f64, spread: f64) -> Option<Field> {
+/// The MTSDF of one glyph, `None` when it has no outline (a space), an error
+/// when its outline is broken.
+fn field(font: &Font, id: u32, em: f64, spread: f64) -> Result<Option<Field>> {
     let scale = em / font.units_per_em() as f64;
     let mut pen = Pen::default();
-    if !font.draw_outline(id, &mut pen) {
-        return None;
+    if !font
+        .draw_outline(id, &mut pen)
+        .context("can't build the glyph atlas")?
+    {
+        return Ok(None);
     }
     pen.finish();
-    let (x0, y0, x1, y1) = pen.bounds?;
+    let Some((x0, y0, x1, y1)) = pen.bounds else {
+        return Ok(None);
+    };
     // Tile: the control-point box (which contains the outline), plus `spread`.
     let w = ((x1 - x0) * scale + 2.0 * spread).ceil() as u32;
     let h = ((y1 - y0) * scale + 2.0 * spread).ceil() as u32;
@@ -209,11 +216,12 @@ fn field(font: &Font, id: u32, em: f64, spread: f64) -> Option<Field> {
     let mut image = RgbaImage::new(w, h);
     generate_mtsdf(&prepared, 2.0 * spread, &mut image);
     correct_sign_mtsdf(&mut image, &prepared, FillRule::Nonzero);
-    Some(Field {
-        image,
+    let px = image.pixels().map(|p| p.0).collect();
+    Ok(Some(Field {
+        image: TooDee::from_vec(w as usize, h as usize, px),
         left: left as f32,
         top: top as f32,
-    })
+    }))
 }
 
 #[derive(Clone, Copy)]
@@ -271,6 +279,11 @@ impl PathSink for Pen {
     }
     fn quad_to(&mut self, x1: f32, y1: f32, x: f32, y: f32) {
         let (c, p) = ((x1 as f64, y1 as f64), (x as f64, y as f64));
+        // Degenerate curves (a control point on an end point) are lines, or
+        // nothing: fdsm can't take a zero-length segment.
+        if c == self.last || c == p {
+            return self.line_to(x, y);
+        }
         self.grow(c);
         self.grow(p);
         self.push(Seg::Quad(self.last, c, p), p);
@@ -281,6 +294,9 @@ impl PathSink for Pen {
             (x2 as f64, y2 as f64),
             (x as f64, y as f64),
         );
+        if (c1 == self.last || c1 == p) && (c2 == self.last || c2 == p) {
+            return self.line_to(x, y);
+        }
         self.grow(c1);
         self.grow(c2);
         self.grow(p);
@@ -340,6 +356,35 @@ mod tests {
     }
 
     #[test]
+    fn tiles_keep_a_gutter_from_the_atlas_edges() {
+        let sizes = vec![Some((5, 7)), Some((3, 3)), None, Some((6, 2))];
+        let (w, h, places) = pack(&sizes).unwrap();
+        for (s, p) in sizes.iter().zip(&places) {
+            let (Some((sw, sh)), Some((x, y))) = (s, p) else {
+                assert!(s.is_none() && p.is_none());
+                continue;
+            };
+            assert!(*x >= GUTTER && *y >= GUTTER, "{x},{y}");
+            assert!(x + sw + GUTTER <= w && y + sh + GUTTER <= h);
+        }
+    }
+
+    #[test]
+    fn degenerate_curves_become_lines_or_nothing() {
+        let mut pen = Pen::default();
+        pen.move_to(0.0, 0.0);
+        pen.quad_to(0.0, 0.0, 0.0, 0.0); // a point: nothing
+        pen.quad_to(0.0, 0.0, 10.0, 0.0); // control on the start: a line
+        pen.quad_to(10.0, 10.0, 10.0, 10.0); // control on the end: a line
+        pen.curve_to(10.0, 10.0, 0.0, 10.0, 0.0, 10.0); // controls on the ends
+        pen.curve_to(0.0, 10.0, 0.0, 10.0, 0.0, 10.0); // a point: nothing
+        pen.close();
+        let c = &pen.contours[0];
+        assert_eq!(c.len(), 4, "three lines plus the closing one");
+        assert!(c.iter().all(|s| matches!(s, Seg::Line(a, b) if a != b)));
+    }
+
+    #[test]
     fn a_space_has_no_tile() {
         let f = latin();
         let keys = [
@@ -375,8 +420,8 @@ mod tests {
         // padding) is outside.
         let mid = texel(&a, t.x + t.w / 2, t.y + t.h / 2);
         let corner = texel(&a, t.x, t.y);
-        assert!(median(mid) > 128 && mid[3] > 128, "{mid:?}");
-        assert!(median(corner) < 128 && corner[3] < 128, "{corner:?}");
+        assert!(median(mid) >= 128 && mid[3] >= 128, "{mid:?}");
+        assert!(median(corner) <= 127 && corner[3] <= 127, "{corner:?}");
         // Upright: an I's tile sits on the baseline, so its top is about the cap
         // height plus the spread above it.
         assert!(t.top > 30.0 && t.top < 40.0, "top {}", t.top);
