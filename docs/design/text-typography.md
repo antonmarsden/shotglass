@@ -184,6 +184,7 @@ a neighbourhood; wilder effects use one block texture per word, or the overlay p
 - TTF, OTF (CFF and CFF2), TTC (with `index`), variable fonts (`variations = { wght = 700 }`).
   WOFF/WOFF2 are refused with a message ("convert to TTF/OTF"); they add a decompressor
   for no gain in an offline tool.
+- (Since #125: fonts are read with fontations (`skrifa` / `read-fonts`) and shaped with HarfRust, rustybuzz's successor; the notes below are the original design.)
 - Parsed with `ttf-parser` (the parser rustybuzz uses). Loaded on the decode worker,
   cached by file sha256 for the life of the renderer, so ten blocks in one font parse it
   once.

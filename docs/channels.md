@@ -264,7 +264,7 @@ inter_italic = "<inter/Inter-Italic[opsz,wght].ttf>"
 
 - Fonts come only from the film or its libraries, never from the system, and are not
   hinted, so text looks the same on every machine and in `export`.
-- Shaping (kerning, ligatures, Arabic joining, marks) is HarfBuzz's, via rustybuzz;
+- Shaping (kerning, ligatures, Arabic joining, marks) is HarfBuzz's, via HarfRust;
   mixed left-to-right and right-to-left text is ordered per line (Unicode bidi).
 - Each letter uses the first font in the fallback chain that has it. A letter no font
   has is an error that names it (`check` and the player refuse the edit), as are a text

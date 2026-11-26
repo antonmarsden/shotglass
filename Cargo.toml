@@ -34,7 +34,8 @@ notify = "8.2.2"
 opus = { version = "0.4.0", optional = true }
 raw-window-handle = "0.6"
 # Text (#68): font parsing and shaping (pure-Rust HarfBuzz port), bidi, line breaking.
-rustybuzz = "0.20.1"
+harfrust = "0.16.1"
+skrifa = "0.50.0"
 semver = "1.0.28"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.140"
@@ -44,7 +45,6 @@ toml = "1.2.1"
 # `shotglass fonts add` edits movie.toml in place, keeping comments and order.
 toml_edit = "0.25.19"
 toodee = "0.8"
-ttf-parser = "0.25.1"
 unicode-bidi = "0.3.18"
 unicode-linebreak = "0.1.5"
 unicode-segmentation = "1.13.3"
