@@ -9,16 +9,19 @@ mod fonts;
 mod footage;
 mod gfx;
 mod glsl_test;
+mod glyphrun;
 mod golden;
 mod headless;
 mod library;
 mod movie;
+mod msdf;
 mod project;
 mod quality;
 mod selftest;
 mod shader;
 mod shader_export;
 mod sound;
+mod subtitles;
 mod text;
 mod texture;
 mod validate;
@@ -575,8 +578,10 @@ struct WebChecks {
     /// Require GLSL ES 3.00 validation and report browser compatibility warnings.
     #[arg(long)]
     web: bool,
-    /// With --web, fail on browser compatibility warnings as well as GLSL errors.
-    #[arg(long, requires = "web")]
+    /// Fail on warnings: on check, every warning it prints (a dropped subtitle style,
+    /// a missing font licence, footage past its end...); with --web, browser
+    /// compatibility warnings too (check and test).
+    #[arg(long)]
     strict: bool,
 }
 
@@ -725,6 +730,7 @@ fn load_movie(path: &Path) -> Result<Movie> {
     }
     let m = Movie::load(path)?;
     for w in &m.warnings {
+        WARNINGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         eprintln!("warning: {w}");
     }
     Ok(m)
@@ -1061,6 +1067,17 @@ fn quality_cmd(
     })
 }
 
+/// Warnings printed since `check` started (`check --strict` fails on any).
+static WARNINGS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Prints `warning: …` and counts it for `check --strict`.
+macro_rules! warning {
+    ($($arg:tt)*) => {{
+        WARNINGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        println!("warning: {}", format!($($arg)*));
+    }};
+}
+
 /// Every shader the film compiles plus its quality metrics, for the strict check.
 fn strict_sources(m: &Movie, d: shader::Dialect) -> Result<Vec<validate::Source>> {
     let mut s = validate::movie_sources(m, d);
@@ -1146,8 +1163,8 @@ fn strict_check(m: &Movie, web_checks: WebChecks) -> Result<()> {
     };
     let opt_in = m.glsl.filter(|v| *v != Dialect::BASELINE.version);
     if let Some(v) = opt_in {
-        println!(
-            "warning: glsl = \"{v}\" narrows where this film runs: it needs an OpenGL {}.{} \
+        warning!(
+            "glsl = \"{v}\" narrows where this film runs: it needs an OpenGL {}.{} \
              driver (macOS stops at 4.1, Windows on ARM at 3.3) and can't run in a browser",
             v / 100,
             v % 100 / 10
@@ -1179,8 +1196,8 @@ fn strict_check(m: &Movie, web_checks: WebChecks) -> Result<()> {
                 report(&errors);
                 bail!("{} shader(s) aren't valid {}", errors.len(), Dialect::WEB);
             } else {
-                println!(
-                    "warning: {} shader(s) aren't valid {}, so they won't run in a browser \
+                warning!(
+                    "{} shader(s) aren't valid {}, so they won't run in a browser \
                      (`check --web` makes this an error):",
                     errors.len(),
                     Dialect::WEB
@@ -1203,7 +1220,7 @@ fn strict_check(m: &Movie, web_checks: WebChecks) -> Result<()> {
 /// and each shot's memory, and point out channels a scene reads but nothing is bound to.
 fn check_textures(m: &Movie, web: bool, deep: bool) -> Result<()> {
     if let Some(w) = m.contract_warning() {
-        println!("warning: {w}");
+        warning!("{w}");
     }
     // (source, size, GPU bytes it needs at once)
     let mut sizes: Vec<(&movie::Source, (usize, usize), usize)> = vec![];
@@ -1266,11 +1283,11 @@ fn check_textures(m: &Movie, web: bool, deep: bool) -> Result<()> {
                             if deep { ", every frame decoded" } else { "" }
                         );
                         for warning in &img.warnings {
-                            println!("warning: {warning}");
+                            warning!("{warning}");
                         }
                         if w * h > 1920 * 1080 {
-                            println!(
-                                "warning: {label}: {w}×{h} frames are over 1920×1080; footage \
+                            warning!(
+                                "{label}: {w}×{h} frames are over 1920×1080; footage \
                                  this large may not play in real time (and is heavy for the web)"
                             );
                         }
@@ -1290,7 +1307,7 @@ fn check_textures(m: &Movie, web: bool, deep: bool) -> Result<()> {
                         flags(c)
                     );
                     for warning in &img.warnings {
-                        println!("warning: {warning}");
+                        warning!("{warning}");
                     }
                     Some((w, h))
                 }
@@ -1318,14 +1335,15 @@ fn check_textures(m: &Movie, web: bool, deep: bool) -> Result<()> {
                         flags(c)
                     );
                     for warning in &l.warnings {
-                        println!("warning: text \"{}\": {warning}", t.name);
+                        warning!("text \"{}\": {warning}", t.name);
                     }
                     for f in t.fonts.iter().filter(|f| f.file.library.is_none()) {
                         if f.licence.is_none() {
-                            println!(
-                                "warning: font \"{}\" ({}) has no licence = \"…\"; say which \
+                            warning!(
+                                "font \"{}\" ({}) has no licence = \"…\"; say which \
                                  (e.g. \"OFL-1.1\") so `shotglass licenses` can list it",
-                                f.name, f.file.label
+                                f.name,
+                                f.file.label
                             );
                         }
                     }
@@ -1343,8 +1361,8 @@ fn check_textures(m: &Movie, web: bool, deep: bool) -> Result<()> {
         };
         if w.max(h) > texture::WEB_MAX_SIZE {
             let max = texture::WEB_MAX_SIZE;
-            println!(
-                "warning: {}: {w}×{h} is over {max}×{max}, the most some phones' browsers \
+            warning!(
+                "{}: {w}×{h} is over {max}×{max}, the most some phones' browsers \
                  support{}",
                 c.label(),
                 if web {
@@ -1360,8 +1378,8 @@ fn check_textures(m: &Movie, web: bool, deep: bool) -> Result<()> {
         bail!("{failed} texture(s) can't be used");
     }
     if web_footage_bytes > 200 << 20 {
-        println!(
-            "warning: the film's image sequences are {} on disk; the web player preloads \
+        warning!(
+            "the film's image sequences are {} on disk; the web player preloads \
              footage, so keep it under about 200 MB (smaller frames, JPEG)",
             texture::describe_bytes(web_footage_bytes as usize)
         );
@@ -1393,8 +1411,8 @@ fn check_textures(m: &Movie, web: bool, deep: bool) -> Result<()> {
         if let Ok(src) = gfx::scene_source(shader::Dialect::BASELINE, s, &cues, m) {
             for (n, reads) in gfx::channels_read(&src).iter().enumerate() {
                 if *reads && s.channels[n].is_none() {
-                    println!(
-                        "warning: shot \"{}\" ({}): reads iChannel{n}, but channels has nothing \
+                    warning!(
+                        "shot \"{}\" ({}): reads iChannel{n}, but channels has nothing \
                          at {n} (it reads black)",
                         s.id,
                         s.scene
@@ -1414,6 +1432,26 @@ fn check_textures(m: &Movie, web: bool, deep: bool) -> Result<()> {
             texture::describe_bytes(b),
             texture::describe_bytes(texture::BUDGET)
         );
+    }
+    Ok(())
+}
+
+/// `check`: styling each subtitle file loses (a glyph run draws plain text).
+fn subtitle_styling(m: &Movie) -> Result<()> {
+    let mut seen = std::collections::BTreeSet::new();
+    for t in m.channels().filter_map(|c| c.text()) {
+        if !seen.insert(t.name.as_str()) {
+            continue;
+        }
+        let label = match &t.body {
+            movie::TextBody::Subtitles(f) => &f.label,
+            _ => continue,
+        };
+        if let Some((cues, dropped)) = t.subtitles_reporting()?
+            && let Some(s) = dropped.summary(cues.len())
+        {
+            warning!("text \"{}\": {label}: {s}", t.name);
+        }
     }
     Ok(())
 }
@@ -1462,8 +1500,8 @@ fn footage_warnings(m: &Movie) {
                     ..map
                 };
                 if open.source_frame(last).is_none() {
-                    println!(
-                        "warning: {who} ({:.2} s) runs past the end of {label} ({} frames); \
+                    warning!(
+                        "{who} ({:.2} s) runs past the end of {label} ({} frames); \
                          end = \"hold\" freezes its last frame",
                         end - start,
                         map.count
@@ -1477,8 +1515,8 @@ fn footage_warnings(m: &Movie) {
                 let frames = period * map.timing.speed * map.src.0 as f64 / map.src.1 as f64;
                 let laps = frames / map.count as f64;
                 if (laps - laps.round()).abs() > 1e-6 {
-                    println!(
-                        "warning: {who}: {label} ({} frames) doesn't fit the loop period \
+                    warning!(
+                        "{who}: {label} ({} frames) doesn't fit the loop period \
                          ({period:.2} s) a whole number of times: a visible jump at the seam",
                         map.count
                     );
@@ -1489,6 +1527,34 @@ fn footage_warnings(m: &Movie) {
 }
 
 fn check(
+    movie: &Path,
+    size: &str,
+    frames: usize,
+    web_checks: WebChecks,
+    no_gpu: bool,
+    deep: bool,
+) -> Result<()> {
+    WARNINGS.store(0, std::sync::atomic::Ordering::Relaxed);
+    run_checks(movie, size, frames, web_checks, no_gpu, deep)?;
+    strict_verdict(
+        web_checks.strict,
+        WARNINGS.load(std::sync::atomic::Ordering::Relaxed),
+    )?;
+    println!("\nok");
+    Ok(())
+}
+
+/// `check --strict` fails on any warning, naming how many.
+fn strict_verdict(strict: bool, warnings: usize) -> Result<()> {
+    if strict && warnings > 0 {
+        bail!(
+            "{warnings} warning(s), and --strict makes warnings errors; fix them, or drop --strict"
+        );
+    }
+    Ok(())
+}
+
+fn run_checks(
     movie: &Path,
     size: &str,
     frames: usize,
@@ -1532,11 +1598,8 @@ fn check(
     }
     strict_check(&m, web_checks)?;
     check_textures(&m, web_checks.web, deep)?;
+    subtitle_styling(&m)?;
     if no_gpu {
-        println!(
-            "
-ok"
-        );
         return Ok(());
     }
     headless::with_gl(move |gl| {
@@ -1565,7 +1628,7 @@ ok"
             t0.elapsed().as_secs_f32() * 1000.0
         );
         for w in &r.warnings {
-            println!("warning: {w}");
+            warning!("{w}");
         }
         if m.has_sound() {
             let t = Instant::now();
@@ -1591,7 +1654,7 @@ ok"
             if m.loop_frames.is_some()
                 && let Some(w) = seam.warning()
             {
-                println!("warning: {w}");
+                warning!("{w}");
             }
             println!("sound tracks: {}", st.take_rendered().join(", "));
             let rms = (sum_sq / n.max(1) as f64).sqrt();
@@ -1636,7 +1699,6 @@ ok"
             };
             println!("{name} {ms:8.2} ms{flag}");
         }
-        println!("\nok");
         Ok(())
     })
 }
@@ -2021,6 +2083,13 @@ fn new_movie(dir: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn strict_fails_on_any_warning() {
+        assert!(strict_verdict(false, 3).is_ok());
+        assert!(strict_verdict(true, 0).is_ok());
+        let e = strict_verdict(true, 2).unwrap_err().to_string();
+        assert!(e.contains("2 warning(s)") && e.contains("--strict"), "{e}");
+    }
     #[test]
     fn silent_wav_can_be_blessed_and_compared() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("shotglass-silent-wav-{}", std::process::id()));

@@ -110,6 +110,53 @@ impl Font {
     fn shaper(&self) -> harfrust::ShaperFont<'_, '_> {
         harfrust::ShaperFont::new(&self.face)
     }
+
+    /// The glyph the font maps `c` to (cmap), if any.
+    #[cfg(test)]
+    pub fn glyph_for(&self, c: char) -> Option<u32> {
+        self.face.charmap().map_unicode(c).map(|g| g.to_u32())
+    }
+
+    /// `c` shaped alone at `size` px per em: its first glyph and its total advance
+    /// in px, or `None` when this font has no glyph for it. For whitespace, which
+    /// `layout` trims.
+    pub fn shape_alone(
+        &self,
+        c: char,
+        size: f32,
+        features: &[String],
+    ) -> Result<Option<(u16, f32)>> {
+        let face = self.shaper();
+        if face.nominal_glyph(c as u32).is_none() {
+            return Ok(None);
+        }
+        let shaped = shape(&face, &parse_features(features)?, &c.to_string(), false);
+        let scale = size / self.units_per_em();
+        let advance: i32 = shaped.glyph_positions().iter().map(|p| p.x_advance).sum();
+        Ok(shaped
+            .glyph_infos()
+            .first()
+            .map(|g| (g.glyph_id as u16, advance as f32 * scale)))
+    }
+
+    pub fn units_per_em(&self) -> f32 {
+        self.face.units_per_em() as f32
+    }
+
+    /// Draws glyph `id`'s outline (font units, y up, no hinting) into `sink`.
+    /// `Ok(false)` when the font has no outline for it; an error when the outline
+    /// is broken (what was drawn before the error is in `sink`).
+    pub fn draw_outline(&self, id: u32, sink: &mut impl PathSink) -> Result<bool> {
+        let outlines = self.face.outline_glyphs();
+        let Some(outline) = outlines.get(GlyphId::new(id)) else {
+            return Ok(false);
+        };
+        let mut memory = vec![0u8; outline.required_memory_size()];
+        outline
+            .draw(&DrawOptions::new(), DrawMemory::from(&mut memory[..]), sink)
+            .map_err(|e| anyhow::anyhow!("glyph {id}: broken outline ({e})"))?;
+        Ok(true)
+    }
 }
 
 /// Ascender and descender (negative) in font units, as HarfBuzz picks them:
@@ -209,6 +256,9 @@ pub struct TextStyle {
     pub features: Vec<String>,
     /// Distance-field spread in pixels, also the padding on every side.
     pub spread: f32,
+    /// A glyph run's layout: never a texture itself, so its height isn't limited
+    /// to `MAX_SIZE` (long credits, subtitles). Width still is.
+    pub tall: bool,
 }
 
 impl Default for TextStyle {
@@ -223,6 +273,7 @@ impl Default for TextStyle {
             direction: Direction::Auto,
             features: vec![],
             spread: 8.0,
+            tall: false,
         }
     }
 }
@@ -236,6 +287,14 @@ pub struct PlacedGlyph {
     pub id: u16,
     pub x: f32,
     pub y: f32,
+    /// The shaper's x offset included in `x` (marks, some kerning): `x - x_offset`
+    /// is the pen position, which never decreases along a line.
+    pub x_offset: f32,
+    /// Visual line, 0 at the top.
+    pub line: u32,
+    /// Byte offset in the whole text of the cluster this glyph belongs to
+    /// (HarfBuzz cluster: logical order, shared by a ligature's glyphs).
+    pub cluster: u32,
 }
 
 /// The result of laying out a text: where every glyph goes and the block's size.
@@ -248,6 +307,8 @@ pub struct Layout {
     /// What reaches the shader as `iChannelMeta`: (em, first baseline from the top,
     /// line pitch, padding), in texels.
     pub meta: [f32; 4],
+    /// Per line, the pen span after alignment: (start, end) x in texels.
+    pub line_spans: Vec<(f32, f32)>,
     /// Characters no font in the chain covers (drawn as the primary font's .notdef).
     pub missing: Vec<char>,
     /// Things worth saying that don't stop the text (a word broken mid-word).
@@ -282,6 +343,14 @@ pub fn layout(text: &str, fonts: &[&Font], style: &TextStyle) -> Result<Layout> 
         range: Range<usize>,
     }
     let paras: Vec<&str> = text.split('\n').collect();
+    let para_starts: Vec<usize> = paras
+        .iter()
+        .scan(0, |at, p| {
+            let s = *at;
+            *at += p.len() + 1;
+            Some(s)
+        })
+        .collect();
     let mut lines: Vec<Line> = vec![];
     let mut bidis = vec![];
     let mut font_of: Vec<Vec<usize>> = vec![];
@@ -402,7 +471,7 @@ pub fn layout(text: &str, fonts: &[&Font], style: &TextStyle) -> Result<Layout> 
 
     // Place each line's visual runs left to right.
     let mut placed: Vec<(Vec<PlacedGlyph>, f32, bool)> = vec![];
-    for line in &lines {
+    for (li, line) in lines.iter().enumerate() {
         let para = paras[line.para];
         let bidi = &bidis[line.para];
         let end = line.range.start + para[line.range.clone()].trim_end().len();
@@ -430,6 +499,10 @@ pub fn layout(text: &str, fonts: &[&Font], style: &TextStyle) -> Result<Layout> 
                             id: info.glyph_id as u16,
                             x: pen + pos.x_offset as f32 * scale,
                             y: -(pos.y_offset as f32) * scale,
+                            x_offset: pos.x_offset as f32 * scale,
+                            line: li as u32,
+                            cluster: (para_starts[line.para] + sub.start + info.cluster as usize)
+                                as u32,
                         });
                         pen += pos.x_advance as f32 * scale;
                     }
@@ -451,7 +524,7 @@ pub fn layout(text: &str, fonts: &[&Font], style: &TextStyle) -> Result<Layout> 
     let content_h = (pitch * lines.len() as f32).max(1.0);
     let width = (content_w + 2.0 * pad).ceil() as usize;
     let height = (content_h + 2.0 * pad).ceil() as usize;
-    if width > MAX_SIZE || height > MAX_SIZE {
+    if width > MAX_SIZE || (height > MAX_SIZE && !style.tall) {
         bail!(
             "the text block is {width}×{height}, larger than {MAX_SIZE} on a side; use a \
              smaller size or a narrower width"
@@ -459,6 +532,7 @@ pub fn layout(text: &str, fonts: &[&Font], style: &TextStyle) -> Result<Layout> 
     }
     let first_baseline = pad + half_leading + ascent;
     let mut glyphs = vec![];
+    let mut line_spans = vec![];
     for (i, (line, line_w, rtl)) in placed.into_iter().enumerate() {
         let free = content_w - line_w;
         let dx = match (style.align, rtl) {
@@ -467,6 +541,7 @@ pub fn layout(text: &str, fonts: &[&Font], style: &TextStyle) -> Result<Layout> 
             (Align::Center, _) => free / 2.0,
         };
         let baseline = first_baseline + i as f32 * pitch;
+        line_spans.push((pad + dx, pad + dx + line_w));
         glyphs.extend(line.into_iter().map(|g| PlacedGlyph {
             x: g.x + pad + dx,
             y: g.y + baseline,
@@ -479,6 +554,7 @@ pub fn layout(text: &str, fonts: &[&Font], style: &TextStyle) -> Result<Layout> 
         width,
         height,
         lines: lines.len(),
+        line_spans,
         meta: [style.size, first_baseline, pitch, pad],
         missing,
         warnings,

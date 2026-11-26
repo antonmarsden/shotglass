@@ -1,7 +1,8 @@
 //! Golden regression tests: renders a contact sheet and the soundtrack of the demo film
 //! (and contact sheets of tests/films/channels, the
 //! iChannel textures film, tests/films/text, the text film, tests/films/layers and
-//! tests/films/blends, the layer films, tests/films/footage, image sequences, and both
+//! tests/films/blends, the layer films, tests/films/footage, image sequences, tests/films/glyphs, glyph runs and
+//! subtitles, and both
 //! of tests/films/loop, a `loop = true` film) and compares them with reference PNGs and WAVs in tests/golden/, so "compiles but looks (or sounds) wrong" fails `cargo test` (and
 //! CI, on software OpenGL).
 //!
@@ -382,6 +383,24 @@ fn footage_film() {
     golden_frames(
         "footage",
         &root().join("tests").join("films").join("footage"),
+        &["--count", COUNT],
+        &[],
+    );
+}
+
+/// Glyph runs (#71): tests/films/glyphs, a two-line glyph run staggered by grapheme
+/// and tinted by word, drawn from the MTSDF atlas through the glyph table; SRT
+/// subtitles on a film-wide layer (a two-line cue, tags dropped, an entity decoded);
+/// a clock drawn from a glyph set. Film-local GLSL reads the table, so a change to
+/// the table format, the atlas or the layout shows here.
+#[test]
+fn glyphs_film() {
+    if skip() {
+        return;
+    }
+    golden_frames(
+        "glyphs",
+        &root().join("tests").join("films").join("glyphs"),
         &["--count", COUNT],
         &[],
     );

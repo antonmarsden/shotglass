@@ -1,0 +1,28 @@
+# Golden-image film for glyph runs (tests/golden.rs, #71): a two-line glyph run whose
+# glyphs rise in one grapheme after another, tinted by word, drawn from the MTSDF atlas
+# and the glyph table; a film-wide layer showing SRT subtitles (two cues, one of two
+# lines) on a box sized from the line records, and a clock drawn from a glyph set.
+# Shaders are film-local (scenes/glyphs.glsl reads the table), so the golden only
+# moves when the engine does.
+title = "glyphs"
+fps = 30
+
+[fonts]
+sans = { file = "fonts/NotoSans-subset.ttf", licence = "OFL-1.1" }
+bold = { file = "fonts/NotoSans-subset.ttf", variations = { wght = 800 }, licence = "OFL-1.1" }
+
+[texts]
+run = { text = "each glyph\non its own", font = "bold", size = 96, align = "center", line_height = 1.1, glyphs = true }
+subs = { subtitles = "subs.srt", font = "sans", size = 36, width = 900, align = "center", glyphs = true }
+digits = { glyphs = "0123456789.s", set = true, font = "sans", size = 28 }
+
+[[shot]]
+id = "run"
+scene = "scenes/run.glsl"
+duration = 4.0
+channels = ["run", { text = "run", part = "glyphs" }]
+
+[[layer]]
+id = "subtitles"
+scene = "layers/subtitles.glsl"
+channels = ["subs", { text = "subs", part = "glyphs" }, "digits", { text = "digits", part = "glyphs" }]

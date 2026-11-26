@@ -215,6 +215,61 @@ Changing the words or the style makes a new texture and never recompiles a shade
 | `features` | OpenType features: `["ss01", "-liga", "tnum"]` | none |
 | `sdf_spread` | distance-field reach in pixels, also the padding around the text | 8 |
 | `filter`, `wrap`, `vflip` | as for images | `"linear"`, `"clamp"`, `true` |
+| `glyphs`, `set`, `subtitles`, `atlas_size` | glyph runs, glyph sets and subtitles: see below | – |
+
+### Glyph runs, glyph sets and subtitles
+
+A block texture is one picture. For type that moves letter by letter, rolls for
+hundreds of lines, or shows timed subtitles, make the text a **glyph run** with
+`glyphs = true` (needs `shotglass = "0.1.8"`). It becomes two textures:
+
+- **the atlas** (bind the text's name, or `{ text = "credits", part = "atlas" }`): every
+  distinct glyph once, as a multi-channel signed distance field (MTSDF). The median of
+  red, green and blue is the distance, with corners that stay sharp at any scale, and
+  alpha is the true distance. 127.5/255 is the outline, larger values are inside,
+  and the values saturate 4 atlas pixels from the edge.
+- **the glyph table** (`{ text = "credits", part = "glyphs" }`): where each glyph goes.
+  Each entry has its pen position, its atlas tile, and its grapheme, word and line
+  numbers for staggering. Read it with `texelFetch`. It is always `nearest` and
+  `clamp`, and `filter`, `wrap` and `vflip` don't apply.
+
+The table's exact layout is the engine's contract (format 1, the module doc of
+`src/glyphrun.rs`): an RGBA8 texture 1024 texels wide with 16-bit values in byte pairs.
+It has a header, then a record per line (baseline, glyph range, x span), then one per
+glyph, in visual order (pen x never decreases along a line), and for subtitles one per
+cue. Both textures are stored top row first and are never flipped.
+`iChannelMeta[n]` is (atlas em, atlas spread, text em, 0) for the atlas and (1024,
+header texels, text em, atlas spread) for the table. Drawing from them is shader
+work: shotglass-kit's `text/runs.glsl` finds the glyph under a pixel.
+
+```toml
+[texts]
+credits = { file = "credits.txt", font = "body", size = 48, align = "center", glyphs = true }
+digits = { glyphs = "0123456789:.", set = true, font = "body" }
+subs = { subtitles = "subs.vtt", font = "body", size = 56, width = 1600, glyphs = true }
+
+[[layer]]
+id = "subtitles"
+scene = "fx/subtitles.glsl"
+channels = ["subs", { text = "subs", part = "glyphs" }]
+```
+
+- `atlas_size`: the atlas's pixels per em, 8–256, default 48. Raise it if glyphs
+  are magnified a lot. A glyph run's layout has no 4096 px height limit (long credits),
+  but its width does.
+- **Glyph sets** (`glyphs = "…"` with `set = true`, and no `text`): those characters
+  sorted by code point, each with its advance, so a shader can draw strings it
+  computes (a counter, timecode). Each character is shaped on its own, with no
+  kerning or ligatures between them.
+- **Subtitles** (`subtitles = "subs.srt"` for SRT, or `"subs.vtt"` for WebVTT, with
+  `glyphs = true`; the format follows the extension): the table
+  gets a record per cue (start and end in film milliseconds, its lines). Styling tags,
+  position overrides, cue settings, `NOTE`/`STYLE`/`REGION` blocks are dropped and
+  entities decoded. Cues that overlap, or end after the film (one period in a loop
+  film), are errors. Show them on a film-wide `[[layer]]`. A glyph run draws plain
+  text, so `shotglass check` warns when a file loses styling (which tags, overrides,
+  cue settings, `STYLE`/`REGION` blocks, in how many cues); `check --strict` fails on
+  it, as on any warning.
 
 ### Getting fonts
 

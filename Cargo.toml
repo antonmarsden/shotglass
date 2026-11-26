@@ -1,6 +1,6 @@
 [package]
 name = "shotglass"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2024"
 description = "Compose short films and cartoons from GLSL shaders: shots, transitions and GPU-synthesised sound on one scrubbable timeline."
 license = "MIT OR Apache-2.0"
@@ -50,6 +50,7 @@ unicode-linebreak = "0.1.5"
 unicode-segmentation = "1.13.3"
 ctrlc = "3.5"
 winit = "0.30"
+fdsm = "0.8.0"
 
 # Dependencies are slow unoptimised; this keeps `cargo run` snappy.
 [profile.dev.package."*"]

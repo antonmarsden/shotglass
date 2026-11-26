@@ -344,10 +344,40 @@ pub struct FontRef {
 /// What a text block says.
 #[derive(Clone, Debug, PartialEq)]
 pub enum TextBody {
+    /// The words (for a glyph set: its characters).
     Inline(String),
     /// A UTF-8 file, read when the block is laid out (live-reloaded like an image).
     File(FileRef),
+    /// An SRT or WebVTT file (a glyph run with an entry per cue).
+    Subtitles(FileRef),
 }
+
+/// How a text is drawn (#71).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum GlyphMode {
+    /// One texture: coverage + SDF of the whole block (phase 1).
+    Block,
+    /// `glyphs = true`: an MTSDF atlas plus a glyph table.
+    Run,
+    /// `glyphs = "0123…"` with `set = true`: those characters, by code point.
+    Set,
+}
+
+/// Which texture of a text a channel binds.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum TextPart {
+    /// The block texture (`GlyphMode::Block`), or a glyph run's atlas.
+    Main,
+    /// A glyph run's table: `{ text = "credits", part = "glyphs" }`.
+    Table,
+}
+
+/// Default `atlas_size` (px per em in a glyph run's atlas) and its range.
+pub const ATLAS_SIZE: f32 = 48.0;
+const ATLAS_SIZES: std::ops::RangeInclusive<f32> = 8.0..=256.0;
+/// A glyph run atlas's distance-field spread (px each side), fixed: the kit's
+/// effects are written for it, and `iChannelMeta` carries it.
+pub const ATLAS_SPREAD: f32 = 4.0;
 
 /// A `[texts]` entry: words, fonts (primary first, then the fallback chain) and layout.
 #[derive(Clone, Debug, PartialEq)]
@@ -356,13 +386,48 @@ pub struct TextSource {
     pub body: TextBody,
     pub fonts: Vec<FontRef>,
     pub style: crate::text::TextStyle,
+    pub glyphs: GlyphMode,
+    /// Glyph runs and sets: the atlas's px per em.
+    pub atlas_size: f32,
+    /// What the channel binding this source reads.
+    pub part: TextPart,
 }
 
 impl TextSource {
-    /// The words, read from the file if the text has one.
+    /// Subtitle cues, for a `subtitles` text.
+    pub fn subtitles(&self) -> Result<Option<Vec<crate::subtitles::Entry>>> {
+        Ok(self.subtitles_reporting()?.map(|(e, _)| e))
+    }
+
+    /// Subtitle cues and the styling parsing dropped (`check` reports it), for a
+    /// `subtitles` text.
+    pub fn subtitles_reporting(
+        &self,
+    ) -> Result<Option<(Vec<crate::subtitles::Entry>, crate::subtitles::Dropped)>> {
+        let TextBody::Subtitles(f) = &self.body else {
+            return Ok(None);
+        };
+        let bytes = std::fs::read(&f.file)
+            .with_context(|| format!("text \"{}\": can't read {}", self.name, f.label))?;
+        let s = String::from_utf8(bytes)
+            .map_err(|_| anyhow!("text \"{}\": {} isn't UTF-8", self.name, f.label))?;
+        let format = crate::subtitles::Format::of(&f.file)
+            .ok_or_else(|| anyhow!("text \"{}\": {} isn't .srt or .vtt", self.name, f.label))?;
+        crate::subtitles::parse_reporting(&s, format, &f.label).map(Some)
+    }
+
+    /// The words, read from the file if the text has one (subtitles: the cues'
+    /// texts, one after another).
     pub fn read_text(&self) -> Result<String> {
         match &self.body {
             TextBody::Inline(s) => Ok(s.clone()),
+            TextBody::Subtitles(_) => Ok(self
+                .subtitles()?
+                .unwrap_or_default()
+                .iter()
+                .map(|e| e.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n")),
             TextBody::File(f) => {
                 let bytes = std::fs::read(&f.file)
                     .with_context(|| format!("text \"{}\": can't read {}", self.name, f.label))?;
@@ -411,6 +476,93 @@ impl TextSource {
             );
         }
         Ok((layout, fonts))
+    }
+
+    /// A glyph run's or set's atlas and table, built once for both parts: the
+    /// atlas and table channels of one text version share it (the decode worker
+    /// asks for each). Keyed by the source (part aside) and the size and mtime of
+    /// every file it reads, so an edit rebuilds it.
+    pub fn glyph_run_shared(&self) -> Result<std::sync::Arc<crate::glyphrun::GlyphRun>> {
+        use std::sync::{Arc, Mutex};
+        type Cached = (String, Arc<crate::glyphrun::GlyphRun>);
+        static CACHE: Mutex<Vec<Cached>> = Mutex::new(vec![]);
+        const KEEP: usize = 8;
+        let mut key_src = self.clone();
+        key_src.part = TextPart::Main;
+        let mut key = format!("{key_src:?}");
+        let mut files: Vec<&FileRef> = self.fonts.iter().map(|f| &f.file).collect();
+        if let TextBody::File(f) | TextBody::Subtitles(f) = &self.body {
+            files.push(f);
+        }
+        for f in files {
+            let m = std::fs::metadata(&f.file).ok();
+            key += &format!(
+                "|{:?}{:?}",
+                m.as_ref().map(|m| m.len()),
+                m.and_then(|m| m.modified().ok())
+            );
+        }
+        if let Some((_, run)) = CACHE.lock().unwrap().iter().find(|(k, _)| *k == key) {
+            return Ok(run.clone());
+        }
+        let run = Arc::new(self.glyph_run()?);
+        let mut cache = CACHE.lock().unwrap();
+        cache.retain(|(k, _)| *k != key);
+        cache.push((key, run.clone()));
+        if cache.len() > KEEP {
+            cache.remove(0);
+        }
+        Ok(run)
+    }
+
+    /// A glyph run's or set's atlas and table (on the decode worker).
+    pub fn glyph_run(&self) -> Result<crate::glyphrun::GlyphRun> {
+        let (layout, fonts) = self.layout()?;
+        let refs: Vec<&crate::text::Font> = fonts.iter().collect();
+        let what = || format!("text \"{}\"", self.name);
+        match self.glyphs {
+            GlyphMode::Block => bail!("{}: not a glyph run (engine bug)", what()),
+            GlyphMode::Set => crate::glyphrun::build_set(
+                &self.read_text()?,
+                &refs,
+                &self.style,
+                self.atlas_size,
+                ATLAS_SPREAD,
+            ),
+            GlyphMode::Run => match self.subtitles()? {
+                Some(cues) => crate::glyphrun::build_subtitles(
+                    &cues,
+                    &refs,
+                    &self.style,
+                    self.atlas_size,
+                    ATLAS_SPREAD,
+                )
+                .map(|(run, _)| run),
+                None => crate::glyphrun::build(
+                    &self.read_text()?,
+                    &layout,
+                    &refs,
+                    self.atlas_size,
+                    ATLAS_SPREAD,
+                ),
+            },
+        }
+        .with_context(what)
+    }
+
+    /// `iChannelMeta` for a glyph run's atlas: (atlas em, atlas spread, layout em,
+    /// 0); its table: (table width, header texels, layout em, atlas spread). A
+    /// block's is its layout's `meta`.
+    pub fn glyph_meta(&self) -> [f32; 4] {
+        match self.part {
+            TextPart::Main => [self.atlas_size, ATLAS_SPREAD, self.style.size, 0.0],
+            TextPart::Table => [
+                crate::glyphrun::TABLE_WIDTH as f32,
+                crate::glyphrun::HEADER_TEXELS as f32,
+                self.style.size,
+                ATLAS_SPREAD,
+            ],
+        }
     }
 }
 
@@ -631,7 +783,7 @@ impl Channel {
             Source::Image(f) => vec![f],
             Source::Text(t) => {
                 let mut v: Vec<&FileRef> = vec![];
-                if let TextBody::File(f) = &t.body {
+                if let TextBody::File(f) | TextBody::Subtitles(f) = &t.body {
                     v.push(f);
                 }
                 v.extend(t.fonts.iter().map(|f| &f.file));
@@ -659,7 +811,7 @@ impl Channel {
             Source::Text(t) => {
                 let t = &mut **t;
                 let mut v: Vec<&mut FileRef> = vec![];
-                if let TextBody::File(f) = &mut t.body {
+                if let TextBody::File(f) | TextBody::Subtitles(f) = &mut t.body {
                     v.push(f);
                 }
                 v.extend(t.fonts.iter_mut().map(|f| &mut f.file));
@@ -1069,6 +1221,13 @@ impl Movie {
             features.push("comps or mattes, which need shotglass 0.1.7");
             need = semver::Version::new(0, 1, 7);
         }
+        if self
+            .channels()
+            .any(|c| c.text().is_some_and(|t| t.glyphs != GlyphMode::Block))
+        {
+            features.push("glyph runs, glyph sets or subtitles, which need shotglass 0.1.8");
+            need = semver::Version::new(0, 1, 8);
+        }
         if features.is_empty() {
             return None;
         }
@@ -1081,6 +1240,7 @@ impl Movie {
             semver::Version::new(0, 1, 4),
             semver::Version::new(0, 1, 5),
             semver::Version::new(0, 1, 6),
+            semver::Version::new(0, 1, 7),
         ];
         let allows_old = match &self.shotglass {
             None => true,
@@ -1221,6 +1381,24 @@ impl Movie {
             for c in channels.iter().flatten() {
                 if let Some(t) = c.text() {
                     t.layout().with_context(|| who.clone())?;
+                    if let Some(cues) = t.subtitles().with_context(|| who.clone())? {
+                        let limit = (self.duration * 1000.0).round() as u64;
+                        if let Some(e) = cues.iter().find(|e| e.end as u64 > limit) {
+                            bail!(
+                                "{who}: text \"{}\": the cue at {} ends at {}, after the film's \
+                                 {}{}",
+                                t.name,
+                                crate::subtitles::stamp(e.start),
+                                crate::subtitles::stamp(e.end),
+                                crate::subtitles::stamp(limit as u32),
+                                if self.loop_frames.is_some() {
+                                    " (one loop period)"
+                                } else {
+                                    ""
+                                }
+                            );
+                        }
+                    }
                 }
             }
             let (total, parts) = crate::texture::shot_memory(channels);
@@ -1981,8 +2159,10 @@ fn build_sequence(
             {
                 used.insert(name.to_string());
             }
-            if let Some(name) = v.get("texture").and_then(toml::Value::as_str) {
-                used.insert(name.to_string());
+            for key in ["texture", "text"] {
+                if let Some(name) = v.get(key).and_then(toml::Value::as_str) {
+                    used.insert(name.to_string());
+                }
             }
             out[n] = texture_spec(
                 &ctx,
@@ -2619,8 +2799,9 @@ fn font_chain(start: &str, fonts: &BTreeMap<String, (FontRef, Vec<String>)>) -> 
     out
 }
 
-/// One `[texts]` value: `{ text | file, font, size, width, align, line_height,
-/// letter_spacing, max_lines, direction, features, sdf_spread, filter, wrap, vflip }`.
+/// One `[texts]` value: `{ text | file | subtitles, font, size, width, align,
+/// line_height, letter_spacing, max_lines, direction, features, sdf_spread, glyphs,
+/// set, atlas_size, filter, wrap, vflip }`.
 fn text_spec(
     what: &str,
     name: &str,
@@ -2633,17 +2814,64 @@ fn text_spec(
     let Some(t) = v.as_table() else {
         bail!("{what}: a text is a table like {{ text = \"Hello\", font = \"body\", size = 96 }}");
     };
-    for later in ["glyphs", "subtitles", "set"] {
-        if t.contains_key(later) {
-            bail!("{what}: {later} is for glyph runs, which arrive with text phase 2");
+    let set = match t.get("set") {
+        None => false,
+        Some(toml::Value::Boolean(b)) => *b,
+        Some(_) => bail!("{what}: set must be true or false"),
+    };
+    let glyphs = match (t.get("glyphs"), set) {
+        (None | Some(toml::Value::Boolean(false)), false) => GlyphMode::Block,
+        (Some(toml::Value::Boolean(true)), false) => GlyphMode::Run,
+        (Some(toml::Value::String(_)), true) => GlyphMode::Set,
+        (Some(toml::Value::String(_)), false) => bail!(
+            "{what}: glyphs = \"…\" lists a glyph set's characters; add set = true (or use \
+             glyphs = true for a glyph run of the text)"
+        ),
+        (_, true) => bail!("{what}: set = true needs the characters as glyphs = \"0123456789:.\""),
+        (Some(_), false) => {
+            bail!("{what}: glyphs must be true, false or (with set = true) a string")
         }
-    }
-    let body = match (t.get("text"), t.get("file")) {
-        (Some(_), Some(_)) => bail!("{what}: give text = \"…\" or file = \"…\", not both"),
-        (Some(toml::Value::String(s)), None) => TextBody::Inline(s.clone()),
-        (None, Some(toml::Value::String(s))) => TextBody::File(file_ref(what, s, specs, root)?),
-        (Some(_), None) | (None, Some(_)) => bail!("{what}: text and file must be strings"),
-        (None, None) => bail!("{what}: a text needs text = \"…\" or file = \"…\" (UTF-8)"),
+    };
+    let sources: Vec<&str> = ["text", "file", "subtitles"]
+        .into_iter()
+        .filter(|k| t.contains_key(*k))
+        .collect();
+    let body = if glyphs == GlyphMode::Set {
+        if let Some(k) = sources.first() {
+            bail!(
+                "{what}: a glyph set's characters are glyphs = \"…\"; {k} doesn't go with set = true"
+            );
+        }
+        let chars = t["glyphs"].as_str().unwrap_or_default();
+        if chars.is_empty() {
+            bail!("{what}: glyphs = \"\" has no characters");
+        }
+        TextBody::Inline(chars.to_string())
+    } else {
+        if sources.len() > 1 {
+            bail!(
+                "{what}: give one of text, file or subtitles (this one has {})",
+                sources.join(" and ")
+            );
+        }
+        let path = |s: &str| file_ref(what, s, specs, root);
+        match sources.first().map(|k| (*k, &t[*k])) {
+            Some(("text", toml::Value::String(s))) => TextBody::Inline(s.clone()),
+            Some(("file", toml::Value::String(s))) => TextBody::File(path(s)?),
+            Some(("subtitles", toml::Value::String(s))) => {
+                if crate::subtitles::Format::of(Path::new(s)).is_none() {
+                    bail!("{what}: subtitles = \"{s}\" must be a .srt or .vtt file");
+                }
+                if glyphs != GlyphMode::Run {
+                    bail!("{what}: subtitles are drawn as a glyph run; add glyphs = true");
+                }
+                TextBody::Subtitles(path(s)?)
+            }
+            Some((k, _)) => bail!("{what}: {k} must be a string"),
+            None => bail!(
+                "{what}: a text needs text = \"…\", file = \"…\" (UTF-8) or subtitles = \"…\" (.srt/.vtt)"
+            ),
+        }
     };
     let font = match t.get("font") {
         Some(toml::Value::String(f)) => f.clone(),
@@ -2699,9 +2927,19 @@ fn text_spec(
                 .join(", ")
         )
     };
+    let mut atlas_size = ATLAS_SIZE;
     for (k, val) in t {
         match k.as_str() {
-            "text" | "file" | "font" => {}
+            "text" | "file" | "subtitles" | "font" | "glyphs" | "set" => {}
+            "atlas_size" => {
+                if glyphs == GlyphMode::Block {
+                    bail!("{what}: atlas_size is for glyph runs (glyphs = true) and glyph sets");
+                }
+                atlas_size = number(k, val)?;
+                if !ATLAS_SIZES.contains(&atlas_size) {
+                    bail!("{what}: atlas_size must be 8–256 (atlas pixels per em)");
+                }
+            }
             "size" => {
                 style.size = number(k, val)?;
                 if !(4.0..=1024.0).contains(&style.size) {
@@ -2775,16 +3013,34 @@ fn text_spec(
                 channel.wrap = Wrap::parse(&s).ok_or_else(|| one_of(k, &s, Wrap::NAMES))?;
             }
             "vflip" => {
+                if glyphs != GlyphMode::Block {
+                    bail!(
+                        "{what}: vflip isn't for glyph runs: their atlas and table are read \
+                         with texelFetch, top row first (the kit maps it)"
+                    );
+                }
                 channel.vflip = val
                     .as_bool()
                     .ok_or_else(|| anyhow!("{what}: vflip must be true or false"))?
             }
             "srgb" => bail!("{what}: srgb is for images; a text's channels are data"),
             other => bail!(
-                "{what}: unknown option `{other}` (a text has text or file, font, size, width, \
-                 align, line_height, letter_spacing, max_lines, direction, features, sdf_spread, \
-                 filter, wrap and vflip)"
+                "{what}: unknown option `{other}` (a text has text, file or subtitles, font, \
+                 size, width, align, line_height, letter_spacing, max_lines, direction, \
+                 features, sdf_spread, glyphs, set, atlas_size, filter, wrap and vflip)"
             ),
+        }
+    }
+    if glyphs != GlyphMode::Block {
+        if channel.filter == Filter::Mipmap {
+            bail!(
+                "{what}: a glyph atlas isn't mipmapped (MSDF doesn't mip); use filter = \"linear\""
+            );
+        }
+        channel.vflip = false;
+        style.tall = true;
+        if glyphs == GlyphMode::Set && (style.width.is_some() || style.max_lines.is_some()) {
+            bail!("{what}: width and max_lines are for laid-out text, not a glyph set");
         }
     }
     channel.source = Source::Text(Box::new(TextSource {
@@ -2792,6 +3048,9 @@ fn text_spec(
         body,
         fonts: font_chain(&font, fonts),
         style,
+        glyphs,
+        atlas_size,
+        part: TextPart::Main,
     }));
     Ok(channel)
 }
@@ -3109,12 +3368,8 @@ fn texture_spec(
             if sources.first() == Some(&"video") {
                 return Err(not_yet(what, &shown("video"), "video"));
             }
-            if t.contains_key("part") {
-                bail!(
-                    "{what}: part = {} is a glyph run's table; glyph runs arrive with text \
-                     phase 2",
-                    t["part"]
-                );
+            if t.contains_key("part") && !t.contains_key("text") {
+                bail!("{what}: part picks a glyph run's texture; it goes with text = \"…\"");
             }
             // `texture = "name"`: a [textures] footage entry, re-timed.
             let retimed = sources.first() == Some(&"texture");
@@ -3122,13 +3377,42 @@ fn texture_spec(
                 let Some(name) = v.as_str() else {
                     bail!("{what}: text must be the name of a [texts] entry");
                 };
-                match names.and_then(|n| n.get(name)) {
+                let mut c = match names.and_then(|n| n.get(name)) {
                     Some(c) if c.text().is_some() => c.clone(),
                     _ if names.is_none() => {
                         bail!("{what}: text = \"{name}\": [textures] entries are images")
                     }
                     _ => bail!("{what}: text = \"{name}\": no [texts] entry called \"{name}\""),
+                };
+                if let Some(p) = t.get("part") {
+                    let run = c.text().is_some_and(|x| x.glyphs != GlyphMode::Block);
+                    let part = match p.as_str() {
+                        Some("atlas") => TextPart::Main,
+                        Some("glyphs") => TextPart::Table,
+                        _ => bail!("{what}: part must be \"atlas\" or \"glyphs\""),
+                    };
+                    if !run {
+                        bail!(
+                            "{what}: part = {p} is for glyph runs; text \"{name}\" is a block \
+                             (add glyphs = true to its [texts] entry)"
+                        );
+                    }
+                    if part == TextPart::Table {
+                        for k in ["filter", "wrap", "vflip"] {
+                            if t.contains_key(k) {
+                                bail!(
+                                    "{what}: a glyph table is read with texelFetch; {k} doesn't apply"
+                                );
+                            }
+                        }
+                        c.filter = Filter::Nearest;
+                        c.wrap = Wrap::Clamp;
+                    }
+                    if let Source::Text(x) = &mut c.source {
+                        x.part = part;
+                    }
                 }
+                c
             } else if retimed {
                 let Some(name) = t["texture"].as_str() else {
                     bail!("{what}: texture must be the name of a [textures] entry");
@@ -3248,7 +3532,7 @@ fn texture_spec(
                     );
                 }
                 match k.as_str() {
-                    "file" | "text" | "frames" | "texture" => {}
+                    "file" | "text" | "frames" | "texture" | "part" => {}
                     "filter" => {
                         let s = word(Filter::NAMES)?;
                         c.filter =
@@ -4482,10 +4766,6 @@ glsl = 450
                 r#"{ video = "a.mov", in = 2.0 }"#,
                 "is a video; video files arrive",
             ),
-            (
-                r#"{ text = "credits", part = "glyphs" }"#,
-                "part = \"glyphs\" is a glyph run's table; glyph runs arrive with text phase 2",
-            ),
             (r#"{ file = "a.mp4" }"#, "is a video; video files arrive"),
         ] {
             let e = shot(entry);
@@ -5216,6 +5496,18 @@ glsl = 450
             w.contains("comps or mattes, which need shotglass 0.1.7"),
             "{w}"
         );
+        // Glyph runs need 0.1.8.
+        let runs = texts_film(
+            "body = \"fonts/Body.ttf\"\n",
+            "run = { text = \"a\", font = \"body\", glyphs = true }\n",
+            &["channels = [\"run\"]"],
+        )
+        .unwrap();
+        let w = runs.contract_warning().unwrap();
+        assert!(
+            w.contains("glyph runs, glyph sets or subtitles, which need shotglass 0.1.8"),
+            "{w}"
+        );
     }
 
     #[test]
@@ -5587,11 +5879,11 @@ glsl = 450
         for (texts, says) in [
             (
                 "t = { font = \"body\" }\n",
-                "a text needs text = \"…\" or file = \"…\"",
+                "a text needs text = \"…\", file = \"…\" (UTF-8) or subtitles",
             ),
             (
                 "t = { text = \"a\", file = \"a.txt\", font = \"body\" }\n",
-                "not both",
+                "give one of text, file or subtitles (this one has text and file)",
             ),
             ("t = { text = \"a\" }\n", "a text needs font = \"…\""),
             (
@@ -5631,8 +5923,56 @@ glsl = 450
                 "unknown option `colour`",
             ),
             (
-                "t = { text = \"a\", font = \"body\", glyphs = true }\n",
-                "glyph runs, which arrive with text phase 2",
+                "t = { text = \"a\", font = \"body\", glyphs = \"0123\" }\n",
+                "add set = true",
+            ),
+            (
+                "t = { font = \"body\", set = true }\n",
+                "set = true needs the characters as glyphs = \"0123456789:.\"",
+            ),
+            (
+                "t = { text = \"a\", font = \"body\", glyphs = \"01\", set = true }\n",
+                "text doesn't go with set = true",
+            ),
+            (
+                "t = { font = \"body\", glyphs = \"\", set = true }\n",
+                "has no characters",
+            ),
+            (
+                "t = { font = \"body\", glyphs = 3 }\n",
+                "glyphs must be true, false or",
+            ),
+            (
+                "t = { subtitles = \"subs.srt\", font = \"body\" }\n",
+                "subtitles are drawn as a glyph run; add glyphs = true",
+            ),
+            (
+                "t = { subtitles = \"subs.txt\", font = \"body\", glyphs = true }\n",
+                "must be a .srt or .vtt file",
+            ),
+            (
+                "t = { text = \"a\", subtitles = \"s.srt\", font = \"body\", glyphs = true }\n",
+                "give one of text, file or subtitles (this one has text and subtitles)",
+            ),
+            (
+                "t = { text = \"a\", font = \"body\", atlas_size = 64 }\n",
+                "atlas_size is for glyph runs",
+            ),
+            (
+                "t = { text = \"a\", font = \"body\", glyphs = true, atlas_size = 4 }\n",
+                "atlas_size must be 8–256",
+            ),
+            (
+                "t = { text = \"a\", font = \"body\", glyphs = true, filter = \"mipmap\" }\n",
+                "a glyph atlas isn't mipmapped",
+            ),
+            (
+                "t = { text = \"a\", font = \"body\", glyphs = true, vflip = false }\n",
+                "vflip isn't for glyph runs",
+            ),
+            (
+                "t = { font = \"body\", glyphs = \"01\", set = true, width = 100 }\n",
+                "width and max_lines are for laid-out text, not a glyph set",
             ),
             ("t = \"Hello\"\n", "a text is a table"),
             (
@@ -5786,6 +6126,179 @@ glsl = 450
             );
         }
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn glyph_runs_bind_their_atlas_and_table() {
+        let m = texts_film(
+            "body = \"fonts/Body.ttf\"\n",
+            "credits = { file = \"credits.txt\", font = \"body\", glyphs = true, atlas_size = 64 }\n\
+             digits = { glyphs = \"0123456789:\", set = true, font = \"body\" }\n\
+             subs = { subtitles = \"subs.vtt\", font = \"body\", width = 900, glyphs = true }\n\
+             title = { text = \"t\", font = \"body\" }\n",
+            &["channels = [\"credits\", { text = \"credits\", part = \"glyphs\" }, \"digits\", \
+               { text = \"digits\", part = \"glyphs\" }, { text = \"subs\", part = \"atlas\" }, \
+               { text = \"subs\", part = \"glyphs\" }, \"title\"]"],
+        )
+        .unwrap();
+        let c = &m.shots[0].channels;
+        let t = |i: usize| c[i].as_ref().unwrap().text().unwrap();
+        assert_eq!(
+            (t(0).glyphs, t(0).part, t(0).atlas_size),
+            (GlyphMode::Run, TextPart::Main, 64.0)
+        );
+        assert_eq!((t(1).glyphs, t(1).part), (GlyphMode::Run, TextPart::Table));
+        assert_eq!((t(2).glyphs, t(3).part), (GlyphMode::Set, TextPart::Table));
+        assert_eq!(t(2).body, TextBody::Inline("0123456789:".into()));
+        assert_eq!(t(2).atlas_size, ATLAS_SIZE);
+        assert!(matches!(&t(4).body, TextBody::Subtitles(f) if f.label == "subs.vtt"));
+        assert_eq!((t(6).glyphs, t(6).part), (GlyphMode::Block, TextPart::Main));
+        // Atlases filter linearly; tables are nearest + clamp; glyph runs never flip;
+        // their layout isn't limited to one texture's height.
+        let ch = |i: usize| c[i].as_ref().unwrap();
+        assert_eq!((ch(0).filter, ch(0).vflip), (Filter::Linear, false));
+        assert_eq!(
+            (ch(1).filter, ch(1).wrap, ch(1).vflip),
+            (Filter::Nearest, Wrap::Clamp, false)
+        );
+        assert!(t(0).style.tall && !t(6).style.tall);
+        assert!(ch(6).vflip);
+        // The subtitle file is one of the channel's files (watched, bundled).
+        assert!(ch(4).files().iter().any(|f| f.label == "subs.vtt"));
+
+        let bind_err = |entry: &str| {
+            err(texts_film(
+                "body = \"fonts/Body.ttf\"\n",
+                "run = { text = \"a\", font = \"body\", glyphs = true }\nblock = { text = \"a\", font = \"body\" }\n",
+                &[&format!("channels = [{entry}]")],
+            ))
+        };
+        for (entry, says) in [
+            (
+                r#"{ text = "block", part = "glyphs" }"#,
+                "part = \"glyphs\" is for glyph runs; text \"block\" is a block",
+            ),
+            (
+                r#"{ text = "run", part = "table" }"#,
+                "part must be \"atlas\" or \"glyphs\"",
+            ),
+            (
+                r#"{ text = "run", part = "glyphs", filter = "linear" }"#,
+                "filter doesn't apply",
+            ),
+            (
+                r#"{ file = "a.png", part = "glyphs" }"#,
+                "it goes with text = \"…\"",
+            ),
+        ] {
+            let e = bind_err(entry);
+            assert!(e.contains(says), "{entry}: {e}");
+        }
+    }
+
+    #[test]
+    fn glyph_runs_load_lay_out_and_check_subtitle_times() {
+        use crate::glyphrun::{HEADER_TEXELS, KIND_RUN, KIND_SET, TABLE_WIDTH, decode};
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path();
+        std::fs::create_dir_all(dir.join("fonts")).unwrap();
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/films/text/fonts/NotoSans-subset.ttf"),
+            dir.join("fonts/sans.ttf"),
+        )
+        .unwrap();
+        std::fs::write(dir.join("a.glsl"), "").unwrap();
+        std::fs::write(
+            dir.join("subs.srt"),
+            "1\n00:00:00,500 --> 00:00:01,000\nBig Shadow\n\n2\n00:00:01,000 --> 00:00:01,900\nthe wall\n",
+        )
+        .unwrap();
+        let film = |duration: f32| {
+            crate::project::write_fixture(
+                dir,
+                &format!(
+                    "[fonts]\nsans = \"fonts/sans.ttf\"\n[texts]\n\
+                     run = {{ text = \"Big Shadow\\nover the wall\", font = \"sans\", size = 40, glyphs = true }}\n\
+                     digits = {{ glyphs = \"0123456789\", set = true, font = \"sans\" }}\n\
+                     subs = {{ subtitles = \"subs.srt\", font = \"sans\", glyphs = true }}\n\
+                     [[shot]]\nid = \"s\"\nscene = \"a.glsl\"\nduration = {duration}\n\
+                     channels = [\"run\", {{ text = \"run\", part = \"glyphs\" }}, \"digits\", \
+                     {{ text = \"digits\", part = \"glyphs\" }}, {{ text = \"subs\", part = \"glyphs\" }}]\n"
+                ),
+            )
+            .unwrap();
+            Movie::load(dir)
+        };
+        let m = film(2.0).unwrap();
+        let text = |i: usize| {
+            m.shots[0].channels[i]
+                .as_ref()
+                .unwrap()
+                .text()
+                .unwrap()
+                .clone()
+        };
+        // The decode worker's output: the atlas, and a table a shader can read.
+        let atlas = crate::texture::load_text(&text(0), true).unwrap();
+        assert_eq!(atlas.meta, [ATLAS_SIZE, ATLAS_SPREAD, 40.0, 0.0]);
+        assert!(atlas.width > 0 && atlas.rgba.len() == atlas.width * atlas.height * 4);
+        let table = crate::texture::load_text(&text(1), true).unwrap();
+        assert_eq!(table.width, TABLE_WIDTH);
+        assert_eq!(
+            table.meta,
+            [TABLE_WIDTH as f32, HEADER_TEXELS as f32, 40.0, ATLAS_SPREAD]
+        );
+        let texels: Vec<[u8; 4]> = table
+            .rgba
+            .chunks(4)
+            .map(|c| c.try_into().unwrap())
+            .collect();
+        let d = decode(&texels).unwrap();
+        assert_eq!((d.kind, d.lines.len(), d.glyphs.len()), (KIND_RUN, 2, 23));
+        let set: Vec<[u8; 4]> = crate::texture::load_text(&text(3), true)
+            .unwrap()
+            .rgba
+            .chunks(4)
+            .map(|c| c.try_into().unwrap())
+            .collect();
+        assert_eq!(decode(&set).unwrap().kind, KIND_SET);
+        let subs: Vec<[u8; 4]> = crate::texture::load_text(&text(4), true)
+            .unwrap()
+            .rgba
+            .chunks(4)
+            .map(|c| c.try_into().unwrap())
+            .collect();
+        assert_eq!(
+            decode(&subs).unwrap().entries,
+            [(500, 1000, 0, 1), (1000, 1900, 1, 1)]
+        );
+        // The atlas and table of one text share one build; editing a file it
+        // reads makes a new one.
+        let a = text(0).glyph_run_shared().unwrap();
+        let b = text(1).glyph_run_shared().unwrap();
+        assert!(std::sync::Arc::ptr_eq(&a, &b));
+        let before = text(4).glyph_run_shared().unwrap();
+        std::fs::write(
+            dir.join("subs.srt"),
+            "1\n00:00:00,500 --> 00:00:01,000\nBig Shadows\n\n\
+             2\n00:00:01,000 --> 00:00:01,900\nthe walls\n",
+        )
+        .unwrap();
+        let after = text(4).glyph_run_shared().unwrap();
+        assert!(!std::sync::Arc::ptr_eq(&before, &after));
+        assert_eq!(decode(after.table.data()).unwrap().entries.len(), 2);
+        // Bound only through a channel table, the texts still count as used.
+        assert!(m.warnings.is_empty(), "{:?}", m.warnings);
+        // Memory accounting sees every part.
+        let (bytes, parts) = crate::texture::shot_memory(&m.shots[0].channels);
+        assert!(bytes > 0 && parts.len() == 5, "{parts:?}");
+        // A cue past the end of the film refuses the version.
+        let e = format!("{:#}", film(1.5).unwrap_err());
+        assert!(
+            e.contains("the cue at 0:00:01.000 ends at 0:00:01.900, after the film's 0:00:01.500"),
+            "{e}"
+        );
     }
 
     #[test]

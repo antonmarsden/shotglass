@@ -1,0 +1,2 @@
+# Engine contract: glyph runs, glyph sets and subtitles need shotglass 0.1.8.
+shotglass = "0.1.8"

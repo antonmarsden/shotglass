@@ -54,6 +54,12 @@ sound = "sfx/chime.glsl"
 # inter = "<inter/Inter[opsz,wght].ttf>"
 # [texts]
 # title = { text = "My Film", font = "inter", size = 128 }
+# Glyph runs (each glyph on its own, for per-letter animation), glyph sets and subtitles
+# (shotglass = "0.1.8"; see docs/channels.md, "Glyph runs"):
+# credits = { file = "credits.txt", font = "inter", size = 48, align = "center", glyphs = true }
+# digits = { glyphs = "0123456789:.", set = true, font = "inter" }
+# subs = { subtitles = "subs.vtt", font = "inter", size = 56, width = 1600, glyphs = true }
+# ...and in a shot or layer: channels = ["credits", { text = "credits", part = "glyphs" }]
 #
 # Named textures, for images several shots use or that have options:
 # [textures]

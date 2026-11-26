@@ -149,7 +149,11 @@ proves it). Phase 2 extends the meaning for glyph-run channels (below), still wi
   distance (for soft effects). Each distinct (font, glyph id) once, rasterised at an atlas
   em size (`atlas_size`, default 48 px) with 4 px spread, shelf-packed, power-of-two-free.
   Generated with a pure-Rust MSDF generator (candidate: `fdsm`; else a small port of
-  msdfgen's edge colouring); determinism is pinned by a golden hash test.
+  msdfgen's edge colouring). *Built: `fdsm` as a dependency, `src/msdf.rs`; tested against
+  `tests/golden/msdf-atlas.png` with a one-level tolerance.*
+- *Built (tables): the exact format, version 1, is the module doc of `src/glyphrun.rs`
+  (8-texel header, 4-texel line records, 6-texel glyph records, 1024 texels a row);
+  it supersedes the sketch below where they differ.*
 - **Table**: RGBA8 texels, `filter = "nearest"`, read with `texelFetch`. 16-bit values
   packed as hi/lo bytes so RGBA8 stays the only texture format (exact, filter-free, valid
   in GLSL ES 3.00 and WebGL 2 without float-texture extensions). Rows:
@@ -387,6 +391,10 @@ phase is one PR, separate from the parsing/layout PR.
   hinting, no time, locale or thread-count dependence; integer EDT; f32 maths in layout is
   plain IEEE (Rust doesn't contract to FMA), and a unit test pins a sha256 of rasterised
   output, run on Linux, Windows and macOS CI. Same frame in `play`, `still`, `export`.
+  Phase 1's integer EDT makes block bytes identical on every platform, but that is a
+  bonus: the requirement is determinism on one GPU/CPU stack (CLAUDE.md). The glyph
+  atlas (`src/msdf.rs`, the `fdsm` crate) uses platform `acos`/`cbrt`, so its test
+  compares against a reference atlas with a one-level tolerance instead of a hash.
 - **`check --web`**: the engine adds no GLSL; `iChannelMeta` is a plain `vec4` array
   (fine in ES 3.00); tables are RGBA8 + `texelFetch` (no float textures). The kit `text`
   library and the test film's GLSL must pass `check --web`. `check --web` warns above
@@ -495,7 +503,8 @@ phase is one PR, separate from the parsing/layout PR.
 4. **Two channels per glyph run** uses a quarter of a shot's eight. Alternatives: pack atlas and
    table in one texture (filtering bleed, mip issues), or raise the channel count (header
    and Shadertoy-compat change). Decide when phase 2 starts, with a real kinetic example.
-5. **MSDF generator**: `fdsm` maturity and determinism vs porting msdfgen's core. Spike
+5. **MSDF generator** *(resolved: `fdsm` as a crate; msdfgen would add a C++ toolchain
+   to the default build and wasm; determinism is per stack)*: `fdsm` maturity and determinism vs porting msdfgen's core. Spike
    before phase 2.
 6. **Subtitles as text data vs overlay**: phase 2 subtitles still need every shot's scene to
    include the kit helper. Is that acceptable until phase 3, or should phase 3 come first
