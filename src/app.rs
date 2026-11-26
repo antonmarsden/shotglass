@@ -247,6 +247,10 @@ impl LiveReload {
                                     | "OTF"
                                     | "TTC"
                                     | "txt"
+                                    | "srt"
+                                    | "vtt"
+                                    | "SRT"
+                                    | "VTT"
                             )
                         )
                     });

@@ -112,7 +112,7 @@ impl Font {
     }
 
     /// The glyph the font maps `c` to (cmap), if any.
-    #[allow(dead_code)] // glyph sets (#71) and the msdf tests
+    #[cfg(test)]
     pub fn glyph_for(&self, c: char) -> Option<u32> {
         self.face.charmap().map_unicode(c).map(|g| g.to_u32())
     }
@@ -256,6 +256,9 @@ pub struct TextStyle {
     pub features: Vec<String>,
     /// Distance-field spread in pixels, also the padding on every side.
     pub spread: f32,
+    /// A glyph run's layout: never a texture itself, so its height isn't limited
+    /// to `MAX_SIZE` (long credits, subtitles). Width still is.
+    pub tall: bool,
 }
 
 impl Default for TextStyle {
@@ -270,6 +273,7 @@ impl Default for TextStyle {
             direction: Direction::Auto,
             features: vec![],
             spread: 8.0,
+            tall: false,
         }
     }
 }
@@ -520,7 +524,7 @@ pub fn layout(text: &str, fonts: &[&Font], style: &TextStyle) -> Result<Layout> 
     let content_h = (pitch * lines.len() as f32).max(1.0);
     let width = (content_w + 2.0 * pad).ceil() as usize;
     let height = (content_h + 2.0 * pad).ceil() as usize;
-    if width > MAX_SIZE || height > MAX_SIZE {
+    if width > MAX_SIZE || (height > MAX_SIZE && !style.tall) {
         bail!(
             "the text block is {width}×{height}, larger than {MAX_SIZE} on a side; use a \
              smaller size or a narrower width"

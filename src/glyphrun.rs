@@ -75,9 +75,7 @@
 //! with pen x 0 and y offset 0; texel 4 is the code point (u32); texel 5 is the
 //! advance (u16 .4) and the x offset (s16 .4).
 
-#![allow(dead_code)] // wired into `[texts]` in the next #71 step
-
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use std::collections::BTreeMap;
 use toodee::TooDee;
 use unicode_segmentation::UnicodeSegmentation;
@@ -475,7 +473,8 @@ impl Table {
     }
 }
 
-/// The table read back, as a shader would (tests and `check`).
+/// The table read back, as a shader would (tests).
+#[cfg(test)]
 #[derive(Debug, PartialEq)]
 pub struct Decoded {
     pub kind: u16,
@@ -489,6 +488,7 @@ pub struct Decoded {
     pub entries: Vec<(u32, u32, usize, usize)>,
 }
 
+#[cfg(test)]
 #[derive(Debug, PartialEq)]
 pub struct DecodedLine {
     pub baseline: f32,
@@ -498,6 +498,7 @@ pub struct DecodedLine {
     pub x1: f32,
 }
 
+#[cfg(test)]
 #[derive(Debug, PartialEq)]
 pub struct DecodedGlyph {
     pub x: f32,
@@ -514,7 +515,9 @@ pub struct DecodedGlyph {
     pub advance: f32,
 }
 
+#[cfg(test)]
 pub fn decode(table: &[[u8; 4]]) -> Result<Decoded> {
+    use anyhow::Context;
     let u32_at = |i: usize| -> Result<u32> {
         Ok(u32::from_be_bytes(
             *table.get(i).context("glyph table too short")?,
@@ -866,10 +869,7 @@ mod tests {
             .iter()
             .filter(|g| g.line == 1 || g.line == 2)
             .count();
-        assert_eq!(
-            wanted,
-            second.chars().filter(|&c| c != '\n').count()
-        );
+        assert_eq!(wanted, second.chars().filter(|&c| c != '\n').count());
         // Overlaps are refused here too.
         let bad = [
             Entry {

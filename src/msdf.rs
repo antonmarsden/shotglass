@@ -13,9 +13,6 @@
 //! machine; across platforms its cubic solver uses the platform's `acos`/`cbrt`,
 //! so tests compare against a reference with a one-level tolerance, not a hash.
 
-// Not wired into `[texts]` yet (the next #71 step); the tests use all of it.
-#![allow(dead_code)]
-
 use anyhow::{Context, Result, bail};
 use fdsm::bezier::scanline::FillRule;
 use fdsm::bezier::{Point, Segment};
@@ -63,8 +60,6 @@ pub struct Atlas {
     pub image: TooDee<[u8; 4]>,
     /// Per requested glyph, in order; `None` for a glyph with no outline (a space).
     pub tiles: Vec<Option<Tile>>,
-    pub em: f32,
-    pub spread: f32,
 }
 
 /// A glyph's distance field, before packing.
@@ -111,8 +106,6 @@ pub fn build(glyphs: &[GlyphKey], fonts: &[&Font], em: f32, spread: f32) -> Resu
     Ok(Atlas {
         image: atlas,
         tiles,
-        em,
-        spread,
     })
 }
 

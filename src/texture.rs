@@ -194,6 +194,30 @@ fn flip_rows(data: &mut [u8], w: usize, h: usize) {
 /// top line at v = 1, upright with `fragCoord / iResolution.xy`). Runs on the decode
 /// worker: tens of milliseconds for a large block.
 pub fn load_text(t: &crate::movie::TextSource, vflip: bool) -> Result<DecodedImage, String> {
+    use crate::movie::{GlyphMode, TextPart};
+    use toodee::TooDeeOps;
+    if t.glyphs != GlyphMode::Block {
+        // A glyph run's atlas or table (#71): built whole, top row first, never
+        // flipped (read with texelFetch / tile rectangles).
+        let (layout, _) = t.layout().map_err(|e| format!("{e:#}"))?;
+        let run = t.glyph_run().map_err(|e| format!("{e:#}"))?;
+        let image = match t.part {
+            TextPart::Main => run.atlas.image,
+            TextPart::Table => run.table,
+        };
+        let (width, height) = (image.num_cols(), image.num_rows());
+        return Ok(DecodedImage {
+            width,
+            height,
+            rgba: image.into_vec().into_iter().flatten().collect(),
+            warnings: layout
+                .warnings
+                .iter()
+                .map(|w| format!("text \"{}\": {w}", t.name))
+                .collect(),
+            meta: t.meta(&layout),
+        });
+    }
     let (layout, fonts) = t.layout().map_err(|e| format!("{e:#}"))?;
     let refs: Vec<&crate::text::Font> = fonts.iter().collect();
     let img = crate::text::rasterize(&layout, &refs, t.style.spread);
@@ -212,6 +236,38 @@ pub fn load_text(t: &crate::movie::TextSource, vflip: bool) -> Result<DecodedIma
             .collect(),
         meta: layout.meta,
     })
+}
+
+/// A text texture's size for memory accounting, from its layout: a block's
+/// exact size; a glyph table's exact size; a glyph atlas estimated from its
+/// distinct glyphs (each at most about an em and a half square plus spread).
+fn text_size(t: &crate::movie::TextSource, l: &crate::text::Layout) -> (usize, usize) {
+    use crate::glyphrun::{ENTRY_TEXELS, GLYPH_TEXELS, HEADER_TEXELS, LINE_TEXELS, TABLE_WIDTH};
+    use crate::movie::{ATLAS_SPREAD, GlyphMode, TextPart};
+    if t.glyphs == GlyphMode::Block {
+        return (l.width, l.height);
+    }
+    let glyphs = l.glyphs.len();
+    match t.part {
+        TextPart::Table => {
+            // Entries: at most one per line.
+            let texels = HEADER_TEXELS
+                + l.lines * (LINE_TEXELS + ENTRY_TEXELS)
+                + glyphs.max(t.read_text().map_or(0, |s| s.chars().count())) * GLYPH_TEXELS;
+            (TABLE_WIDTH, texels.div_ceil(TABLE_WIDTH).max(1))
+        }
+        TextPart::Main => {
+            let mut distinct: Vec<(usize, u16)> = l.glyphs.iter().map(|g| (g.font, g.id)).collect();
+            distinct.sort();
+            distinct.dedup();
+            let n = distinct
+                .len()
+                .max(t.read_text().map_or(0, |s| s.chars().count()).min(4096));
+            let side = (1.5 * t.atlas_size + 2.0 * ATLAS_SPREAD + 1.0).ceil() as usize;
+            let w = ((n as f64).sqrt().ceil() as usize * side).clamp(1, 4096);
+            (w, (n * side * side).div_ceil(w).clamp(1, 4096))
+        }
+    }
 }
 
 /// Width and height from the file's header, without decoding the pixels.
@@ -254,7 +310,7 @@ pub fn shot_memory(
         }
         let size = match &c.source {
             crate::movie::Source::Image(f) => dimensions(&f.file),
-            crate::movie::Source::Text(t) => t.layout().ok().map(|(l, _)| (l.width, l.height)),
+            crate::movie::Source::Text(t) => t.layout().ok().map(|(l, _)| text_size(t, &l)),
             _ => None, // another pass's picture, not a texture
         };
         if let Some((w, h)) = size {

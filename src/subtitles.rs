@@ -7,8 +7,6 @@
 //! `REGION` blocks. Entities `&amp; &lt; &gt; &quot; &apos; &nbsp; &lrm; &rlm;`
 //! are decoded. Times are exact milliseconds.
 
-#![allow(dead_code)] // wired into `[texts]` in the next #71 step
-
 use anyhow::{Result, bail};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
