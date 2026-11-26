@@ -1,0 +1,39 @@
+name: SVT-AV1 (cached)
+description: >
+  Builds vendor/SVT-AV1 once per submodule commit and runner OS, caches the install
+  and sets SVT_AV1_DIR so build.rs links it instead of rebuilding it with CMake.
+  (rust-cache leaves out the workspace crate's build-script output, so without this
+  every run rebuilds SVT-AV1.) Run after checkout (with submodules) and after nasm
+  is installed (the NASM env var is used when set).
+runs:
+  using: composite
+  steps:
+    - id: key
+      shell: bash
+      run: |
+        echo "rev=$(git rev-parse HEAD:vendor/SVT-AV1)" >> "$GITHUB_OUTPUT"
+        echo "dir=$(cygpath -m "$RUNNER_TEMP" 2>/dev/null || echo "$RUNNER_TEMP")/svt-av1" >> "$GITHUB_OUTPUT"
+    - id: cache
+      uses: actions/cache@v4
+      with:
+        path: ${{ steps.key.outputs.dir }}
+        key: svt-av1-${{ runner.os }}-${{ runner.arch }}-${{ steps.key.outputs.rev }}-${{ hashFiles('.github/actions/svt-av1/action.yml') }}
+    # The same settings as build.rs's build_svt: static, no apps or tests, no LTO,
+    # Release, nasm SIMD on x86.
+    - if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        nasm_flag=()
+        if [ -n "${NASM:-}" ]; then nasm_flag=(-DCMAKE_ASM_NASM_COMPILER="$NASM"); fi
+        cmake -S vendor/SVT-AV1 -B "$RUNNER_TEMP/svt-av1-build" \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_INSTALL_PREFIX="${{ steps.key.outputs.dir }}" \
+          -DCMAKE_INSTALL_LIBDIR=lib \
+          -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+          -DBUILD_SHARED_LIBS=OFF -DBUILD_APPS=OFF -DBUILD_TESTING=OFF \
+          -DSVT_AV1_LTO=OFF -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+          "${nasm_flag[@]}"
+        cmake --build "$RUNNER_TEMP/svt-av1-build" --config Release --parallel
+        cmake --install "$RUNNER_TEMP/svt-av1-build" --config Release
+    - shell: bash
+      run: echo "SVT_AV1_DIR=${{ steps.key.outputs.dir }}" >> "$GITHUB_ENV"

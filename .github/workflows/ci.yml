@@ -34,6 +34,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: System packages
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev xvfb libgl1-mesa-dri libegl-mesa0 libxkbcommon-x11-0 ffmpeg nasm
+      - uses: ./.github/actions/svt-av1
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - name: Clippy without the strict GLSL checker (glslang)
@@ -99,6 +100,7 @@ jobs:
         run: |
           choco install -y --no-progress nasm
           echo 'NASM=C:/Program Files/NASM/nasm.exe' >> "$GITHUB_ENV"
+      - uses: ./.github/actions/svt-av1
       - run: cargo clippy --all-targets -- -D warnings
       - name: Unit tests, GPU selftest, golden images and soundtracks (software OpenGL)
         run: cargo test
@@ -132,6 +134,7 @@ jobs:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
       - run: brew install nasm
+      - uses: ./.github/actions/svt-av1
       - run: cargo clippy --all-targets -- -D warnings
       # macOS runners have Apple's OpenGL 4.1 (on Metal), so the GPU selftest and the
       # golden tests run here, against the same llvmpipe references.
