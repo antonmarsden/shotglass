@@ -23,6 +23,10 @@
 //! | 5 | layout em (u16 .4), atlas em (u16 .4) |
 //! | 6 | atlas spread (u16 .8), line pitch (u16 .4) |
 //! | 7 | line record texels (u16), glyph record texels (u16) |
+//! | 8 | entry count (u32; 0 unless the text is subtitles) |
+//! | 9 | first entry record texel (u32) |
+//! | 10 | entry record texels (u16), reserved (u16, 0) |
+//! | 11 | reserved (0) |
 //!
 //! Line record (`LINE_TEXELS`), one per visual line, top to bottom:
 //!
@@ -45,6 +49,18 @@
 //! | 3 | tile left (s16 .4), tile top (s16 .4), atlas texels: the tile's top-left corner is at (pen x + left, baseline − top) · layout em / atlas em |
 //! | 4 | grapheme index (u16), word index (u16), in logical order |
 //! | 5 | line (u16), x offset from the pen, right positive (s16 .4): the glyph's origin is at pen x + x offset |
+//!
+//! Entry record (`ENTRY_TEXELS`), subtitles only, one per cue in time order:
+//!
+//! | texel | contents |
+//! |---|---|
+//! | 0 | start (u32, milliseconds of film time) |
+//! | 1 | end (u32, milliseconds; shown while start ≤ t < end) |
+//! | 2 | first line (u16), line count (u16) |
+//! | 3 | reserved (0) |
+//!
+//! Every cue is laid out as its own paragraph(s) of one block, so a cue's lines
+//! follow each other; to place a cue, offset by its first line's baseline.
 //!
 //! The glyph's index in the block is its record number. Grapheme and word
 //! indices count from the start of the text (UAX #29), so a stagger follows
@@ -73,7 +89,8 @@ pub const FORMAT: u16 = 1;
 pub const KIND_RUN: u16 = 0;
 pub const KIND_SET: u16 = 1;
 pub const TABLE_WIDTH: usize = 1024;
-pub const HEADER_TEXELS: usize = 8;
+pub const HEADER_TEXELS: usize = 12;
+pub const ENTRY_TEXELS: usize = 4;
 pub const LINE_TEXELS: usize = 4;
 pub const GLYPH_TEXELS: usize = 6;
 /// Indices are 16-bit.
@@ -92,6 +109,73 @@ pub fn build(
     fonts: &[&Font],
     atlas_em: f32,
     spread: f32,
+) -> Result<GlyphRun> {
+    build_with(text, layout, fonts, atlas_em, spread, &[])
+}
+
+/// A subtitle cue placed in the block: its time and its lines.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct EntryLines {
+    start: u32,
+    end: u32,
+    first_line: usize,
+    lines: usize,
+}
+
+/// Builds a subtitle glyph run: the cues' texts laid out as one block, one cue
+/// after another, plus the entry table. `entries` must be in time order.
+pub fn build_subtitles(
+    entries: &[crate::subtitles::Entry],
+    fonts: &[&Font],
+    style: &TextStyle,
+    atlas_em: f32,
+    spread: f32,
+) -> Result<(GlyphRun, Layout)> {
+    if entries.windows(2).any(|w| w[1].start < w[0].end) {
+        bail!("subtitle cues must be in time order without overlaps");
+    }
+    let text = entries
+        .iter()
+        .map(|e| e.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let l = layout(&text, fonts, style)?;
+    // Which lines each cue took: by the byte ranges of the cues in `text`.
+    let mut placed = vec![];
+    let mut at = 0usize;
+    for e in entries {
+        let range = at..at + e.text.len();
+        at = range.end + 1;
+        let lines: Vec<u32> = l
+            .glyphs
+            .iter()
+            .filter(|g| range.contains(&(g.cluster as usize)))
+            .map(|g| g.line)
+            .collect();
+        let (Some(&a), Some(&b)) = (lines.iter().min(), lines.iter().max()) else {
+            bail!(
+                "the subtitle at {} has nothing to draw",
+                crate::subtitles::stamp(e.start)
+            );
+        };
+        placed.push(EntryLines {
+            start: e.start,
+            end: e.end,
+            first_line: a as usize,
+            lines: (b - a + 1) as usize,
+        });
+    }
+    let run = build_with(&text, &l, fonts, atlas_em, spread, &placed)?;
+    Ok((run, l))
+}
+
+fn build_with(
+    text: &str,
+    layout: &Layout,
+    fonts: &[&Font],
+    atlas_em: f32,
+    spread: f32,
+    entries: &[EntryLines],
 ) -> Result<GlyphRun> {
     let n = layout.glyphs.len();
     if n > MAX_GLYPHS {
@@ -126,6 +210,7 @@ pub fn build(
     let mut t = Table::default();
     let line_at = HEADER_TEXELS;
     let glyph_at = line_at + lines * LINE_TEXELS;
+    let entry_at = glyph_at + n * GLYPH_TEXELS;
     t.u16s(FORMAT, KIND_RUN);
     t.u32(n as u32);
     t.u32(lines as u32);
@@ -140,6 +225,14 @@ pub fn build(
         fixed(pitch, 16.0, "the line pitch")?,
     );
     t.u16s(LINE_TEXELS as u16, GLYPH_TEXELS as u16);
+    t.u32(entries.len() as u32);
+    t.u32(if entries.is_empty() {
+        0
+    } else {
+        entry_at as u32
+    });
+    t.u16s(ENTRY_TEXELS as u16, 0);
+    t.u32(0);
 
     // Lines: glyphs are grouped by line, in order, already.
     let mut first = 0usize;
@@ -177,6 +270,12 @@ pub fn build(
         let at = g.cluster as usize;
         t.u16s(index_of(&graphemes, at) as u16, index_of(&words, at) as u16);
         t.u16s(g.line as u16, sfixed(g.x_offset, "a glyph's x offset")?);
+    }
+    for e in entries {
+        t.u32(e.start);
+        t.u32(e.end);
+        t.u16s(e.first_line as u16, e.lines as u16);
+        t.u32(0);
     }
     Ok(GlyphRun {
         atlas,
@@ -280,6 +379,10 @@ pub fn build_set(
         fixed(meta[2], 16.0, "the line pitch")?,
     );
     t.u16s(LINE_TEXELS as u16, GLYPH_TEXELS as u16);
+    t.u32(0);
+    t.u32(0);
+    t.u16s(ENTRY_TEXELS as u16, 0);
+    t.u32(0);
     for (c, g, advance, _) in &placed {
         let tile = atlas.tiles[index[&GlyphKey {
             font: g.font,
@@ -382,6 +485,8 @@ pub struct Decoded {
     pub pitch: f32,
     pub lines: Vec<DecodedLine>,
     pub glyphs: Vec<DecodedGlyph>,
+    /// (start ms, end ms, first line, line count)
+    pub entries: Vec<(u32, u32, usize, usize)>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -445,7 +550,16 @@ pub fn decode(table: &[[u8; 4]]) -> Result<Decoded> {
         pitch: pitch as f32 / 16.0,
         lines: vec![],
         glyphs: vec![],
+        entries: vec![],
     };
+    let (entries, entry_at) = (u32_at(8)? as usize, u32_at(9)? as usize);
+    let (et, _) = u16s_at(10)?;
+    for e in 0..entries {
+        let at = entry_at + e * et as usize;
+        let (first, count) = u16s_at(at + 2)?;
+        out.entries
+            .push((u32_at(at)?, u32_at(at + 1)?, first as usize, count as usize));
+    }
     for l in 0..lines {
         let at = line_at + l * lt;
         let (first, count) = u16s_at(at + 1)?;
@@ -721,6 +835,63 @@ mod tests {
         let d = decode(run.table.data()).unwrap();
         assert_eq!(d.kind, KIND_RUN);
         assert!(d.glyphs.iter().all(|g| g.code == 0));
+    }
+
+    #[test]
+    fn subtitles_get_an_entry_per_cue_with_its_lines() {
+        use crate::subtitles::{Entry, Format, parse};
+        let f = font("NotoSans-subset.ttf");
+        let cues = parse(
+            "1\n00:00:01,000 --> 00:00:02,500\nBig Shadow\n\n\
+             2\n00:00:03,000 --> 00:00:04,000\nover the\nwall\n\n\
+             3\n00:00:04,000 --> 00:00:05,000\none two three four five six seven\n",
+            Format::Srt,
+            "subs.srt",
+        )
+        .unwrap();
+        let (run, l) = build_subtitles(&cues, &[&f], &style(40.0, Some(300.0)), 48.0, 4.0).unwrap();
+        let d = decode(run.table.data()).unwrap();
+        assert_eq!(d.entries.len(), 3);
+        assert_eq!(d.entries[0], (1000, 2500, 0, 1));
+        assert_eq!((d.entries[1].0, d.entries[1].1), (3000, 4000));
+        assert_eq!((d.entries[1].2, d.entries[1].3), (1, 2));
+        // The third cue wraps at 300 px into several lines, after the second's.
+        assert_eq!(d.entries[2].2, 3);
+        assert!(d.entries[2].3 >= 2);
+        assert_eq!(d.entries[2].2 + d.entries[2].3, l.lines);
+        // Lines of a cue hold only that cue's glyphs.
+        let second: String = "over the\nwall".into();
+        let wanted = l
+            .glyphs
+            .iter()
+            .filter(|g| g.line == 1 || g.line == 2)
+            .count();
+        assert_eq!(
+            wanted,
+            second.chars().filter(|&c| c != '\n').count()
+        );
+        // Overlaps are refused here too.
+        let bad = [
+            Entry {
+                start: 0,
+                end: 2000,
+                text: "a".into(),
+            },
+            Entry {
+                start: 1000,
+                end: 3000,
+                text: "b".into(),
+            },
+        ];
+        assert!(build_subtitles(&bad, &[&f], &style(40.0, None), 48.0, 4.0).is_err());
+    }
+
+    #[test]
+    fn a_plain_run_has_no_entries() {
+        let f = font("NotoSans-subset.ttf");
+        let l = layout("hi", &[&f], &style(40.0, None)).unwrap();
+        let d = decode(build("hi", &l, &[&f], 48.0, 4.0).unwrap().table.data()).unwrap();
+        assert!(d.entries.is_empty());
     }
 
     #[test]

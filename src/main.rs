@@ -21,6 +21,7 @@ mod selftest;
 mod shader;
 mod shader_export;
 mod sound;
+mod subtitles;
 mod text;
 mod texture;
 mod validate;
