@@ -470,6 +470,43 @@ impl TextSource {
         Ok((layout, fonts))
     }
 
+    /// A glyph run's or set's atlas and table, built once for both parts: the
+    /// atlas and table channels of one text version share it (the decode worker
+    /// asks for each). Keyed by the source (part aside) and the size and mtime of
+    /// every file it reads, so an edit rebuilds it.
+    pub fn glyph_run_shared(&self) -> Result<std::sync::Arc<crate::glyphrun::GlyphRun>> {
+        use std::sync::{Arc, Mutex};
+        type Cached = (String, Arc<crate::glyphrun::GlyphRun>);
+        static CACHE: Mutex<Vec<Cached>> = Mutex::new(vec![]);
+        const KEEP: usize = 8;
+        let mut key_src = self.clone();
+        key_src.part = TextPart::Main;
+        let mut key = format!("{key_src:?}");
+        let mut files: Vec<&FileRef> = self.fonts.iter().map(|f| &f.file).collect();
+        if let TextBody::File(f) | TextBody::Subtitles(f) = &self.body {
+            files.push(f);
+        }
+        for f in files {
+            let m = std::fs::metadata(&f.file).ok();
+            key += &format!(
+                "|{:?}{:?}",
+                m.as_ref().map(|m| m.len()),
+                m.and_then(|m| m.modified().ok())
+            );
+        }
+        if let Some((_, run)) = CACHE.lock().unwrap().iter().find(|(k, _)| *k == key) {
+            return Ok(run.clone());
+        }
+        let run = Arc::new(self.glyph_run()?);
+        let mut cache = CACHE.lock().unwrap();
+        cache.retain(|(k, _)| *k != key);
+        cache.push((key, run.clone()));
+        if cache.len() > KEEP {
+            cache.remove(0);
+        }
+        Ok(run)
+    }
+
     /// A glyph run's or set's atlas and table (on the decode worker).
     pub fn glyph_run(&self) -> Result<crate::glyphrun::GlyphRun> {
         let (layout, fonts) = self.layout()?;
@@ -2115,8 +2152,10 @@ fn build_sequence(
             {
                 used.insert(name.to_string());
             }
-            if let Some(name) = v.get("texture").and_then(toml::Value::as_str) {
-                used.insert(name.to_string());
+            for key in ["texture", "text"] {
+                if let Some(name) = v.get(key).and_then(toml::Value::as_str) {
+                    used.insert(name.to_string());
+                }
             }
             out[n] = texture_spec(
                 &ctx,
@@ -6227,6 +6266,23 @@ glsl = 450
             decode(&subs).unwrap().entries,
             [(500, 1000, 0, 1), (1000, 1900, 1, 1)]
         );
+        // The atlas and table of one text share one build; editing a file it
+        // reads makes a new one.
+        let a = text(0).glyph_run_shared().unwrap();
+        let b = text(1).glyph_run_shared().unwrap();
+        assert!(std::sync::Arc::ptr_eq(&a, &b));
+        let before = text(4).glyph_run_shared().unwrap();
+        std::fs::write(
+            dir.join("subs.srt"),
+            "1\n00:00:00,500 --> 00:00:01,000\nBig Shadows\n\n\
+             2\n00:00:01,000 --> 00:00:01,900\nthe walls\n",
+        )
+        .unwrap();
+        let after = text(4).glyph_run_shared().unwrap();
+        assert!(!std::sync::Arc::ptr_eq(&before, &after));
+        assert_eq!(decode(after.table.data()).unwrap().entries.len(), 2);
+        // Bound only through a channel table, the texts still count as used.
+        assert!(m.warnings.is_empty(), "{:?}", m.warnings);
         // Memory accounting sees every part.
         let (bytes, parts) = crate::texture::shot_memory(&m.shots[0].channels);
         assert!(bytes > 0 && parts.len() == 5, "{parts:?}");

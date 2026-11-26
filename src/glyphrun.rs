@@ -344,8 +344,16 @@ pub fn build_set(
                 l.glyphs.len()
             );
         };
+        // Layout leaves the spacing off after the last letter; a set character is
+        // followed by another, so it gets it back (as whitespace does above).
         let (x0, x1) = l.line_spans[0];
-        placed.push((c, g, x1 - x0, g.x - x0 - g.x_offset));
+        let baseline = l.meta[1];
+        placed.push((
+            c,
+            g,
+            x1 - x0 + style.letter_spacing * style.size,
+            g.y - baseline,
+        ));
     }
     let mut index: BTreeMap<GlyphKey, usize> = BTreeMap::new();
     for (_, g, ..) in &placed {
@@ -381,12 +389,12 @@ pub fn build_set(
     t.u32(0);
     t.u16s(ENTRY_TEXELS as u16, 0);
     t.u32(0);
-    for (c, g, advance, _) in &placed {
+    for (c, g, advance, dy) in &placed {
         let tile = atlas.tiles[index[&GlyphKey {
             font: g.font,
             id: g.id as u32,
         }]];
-        t.u32(0);
+        t.u16s(0, sfixed(*dy, "a glyph's y offset")?);
         t.tile(tile)?;
         t.u32(*c as u32);
         t.u16s(
@@ -813,6 +821,27 @@ mod tests {
         assert!(d.glyphs[2].tile[2] > 0);
         // Same tiles as the atlas says.
         assert_eq!(run.atlas.tiles.len(), 6);
+    }
+
+    #[test]
+    fn a_glyph_set_advance_includes_letter_spacing_for_every_character() {
+        let f = font("NotoSans-subset.ttf");
+        let plain = decode(
+            build_set("0 ", &[&f], &style(40.0, None), 48.0, 4.0)
+                .unwrap()
+                .table
+                .data(),
+        )
+        .unwrap();
+        let st = TextStyle {
+            letter_spacing: 0.25,
+            ..style(40.0, None)
+        };
+        let spaced = decode(build_set("0 ", &[&f], &st, 48.0, 4.0).unwrap().table.data()).unwrap();
+        // Both the space and the digit gain 0.25 em = 10 px.
+        for (a, b) in plain.glyphs.iter().zip(&spaced.glyphs) {
+            assert!((b.advance - a.advance - 10.0).abs() < 0.1, "{a:?} {b:?}");
+        }
     }
 
     #[test]

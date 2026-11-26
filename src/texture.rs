@@ -200,10 +200,10 @@ pub fn load_text(t: &crate::movie::TextSource, vflip: bool) -> Result<DecodedIma
         // A glyph run's atlas or table (#71): built whole, top row first, never
         // flipped (read with texelFetch / tile rectangles).
         let (layout, _) = t.layout().map_err(|e| format!("{e:#}"))?;
-        let run = t.glyph_run().map_err(|e| format!("{e:#}"))?;
+        let run = t.glyph_run_shared().map_err(|e| format!("{e:#}"))?;
         let image = match t.part {
-            TextPart::Main => run.atlas.image,
-            TextPart::Table => run.table,
+            TextPart::Main => run.atlas.image.clone(),
+            TextPart::Table => run.table.clone(),
         };
         let (width, height) = (image.num_cols(), image.num_rows());
         return Ok(DecodedImage {

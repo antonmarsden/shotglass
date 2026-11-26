@@ -185,7 +185,13 @@ fn clean(line: &str) -> String {
     let mut out = String::with_capacity(line.len());
     let mut rest = line;
     while let Some(c) = rest.chars().next() {
-        if c == '<' {
+        // A tag starts with a letter, `/` or a digit (a karaoke timestamp); a bare
+        // '<' in plain SRT text ("x < 5") is text.
+        let tag_start = rest[1..]
+            .chars()
+            .next()
+            .is_some_and(|n| n.is_ascii_alphanumeric() || n == '/');
+        if c == '<' && tag_start {
             if let Some(end) = rest.find('>') {
                 rest = &rest[end + 1..];
                 continue;
@@ -305,6 +311,12 @@ mod tests {
             srt("1\n00:00:01,000 --> 00:00:02,000\na\n\n2\n00:00:02,000 --> 00:00:03,000\nb\n")
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn a_bare_less_than_is_text() {
+        let e = srt("1\n00:00:01,000 --> 00:00:02,000\nx < 5 and y > 3, <i>z</i>\n").unwrap();
+        assert_eq!(e[0].text, "x < 5 and y > 3, z");
     }
 
     #[test]
