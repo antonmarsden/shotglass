@@ -261,7 +261,8 @@ channels = ["subs", { text = "subs", part = "glyphs" }]
   sorted by code point, each with its advance, so a shader can draw strings it
   computes (a counter, timecode). Each character is shaped on its own, with no
   kerning or ligatures between them.
-- **Subtitles** (`subtitles = "subs.srt"` or `.vtt`, with `glyphs = true`): the table
+- **Subtitles** (`subtitles = "subs.srt"` for SRT, or `"subs.vtt"` for WebVTT, with
+  `glyphs = true`; the format follows the extension): the table
   gets a record per cue (start and end in film milliseconds, its lines). Styling tags,
   position overrides, cue settings, `NOTE`/`STYLE`/`REGION` blocks are dropped and
   entities decoded. Cues that overlap, or end after the film (one period in a loop

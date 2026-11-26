@@ -98,6 +98,9 @@ pub struct GlyphRun {
     pub atlas: msdf::Atlas,
     /// `TABLE_WIDTH` texels per row, top row first.
     pub table: TooDee<[u8; 4]>,
+    /// The layout's warnings (a set has none), so the texture loader needn't lay
+    /// the text out again for them.
+    pub warnings: Vec<String>,
 }
 
 /// Builds the atlas and table for `layout`, the layout of `text` with `fonts`.
@@ -278,6 +281,7 @@ fn build_with(
     Ok(GlyphRun {
         atlas,
         table: t.finish()?,
+        warnings: layout.warnings.clone(),
     })
 }
 
@@ -405,6 +409,7 @@ pub fn build_set(
     Ok(GlyphRun {
         atlas,
         table: t.finish()?,
+        warnings: vec![],
     })
 }
 
@@ -821,6 +826,17 @@ mod tests {
         assert!(d.glyphs[2].tile[2] > 0);
         // Same tiles as the atlas says.
         assert_eq!(run.atlas.tiles.len(), 6);
+    }
+
+    #[test]
+    fn a_run_carries_its_layouts_warnings() {
+        // The texture loader takes them from the run instead of laying out again.
+        let f = font("NotoSans-subset.ttf");
+        let st = style(40.0, Some(60.0));
+        let l = layout("unbreakable", &[&f], &st).unwrap();
+        assert!(!l.warnings.is_empty(), "the fixture should warn");
+        let run = build("unbreakable", &l, &[&f], 48.0, 4.0).unwrap();
+        assert_eq!(run.warnings, l.warnings);
     }
 
     #[test]

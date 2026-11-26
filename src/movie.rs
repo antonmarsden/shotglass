@@ -542,14 +542,13 @@ impl TextSource {
         .with_context(what)
     }
 
-    /// `iChannelMeta` for this source's texture: a block's metrics (from its
-    /// layout); a glyph run's atlas: (atlas em, atlas spread, layout em, 0); its
-    /// table: (table width, header texels, layout em, atlas spread).
-    pub fn meta(&self, layout: &crate::text::Layout) -> [f32; 4] {
-        match (self.glyphs, self.part) {
-            (GlyphMode::Block, _) => layout.meta,
-            (_, TextPart::Main) => [self.atlas_size, ATLAS_SPREAD, self.style.size, 0.0],
-            (_, TextPart::Table) => [
+    /// `iChannelMeta` for a glyph run's atlas: (atlas em, atlas spread, layout em,
+    /// 0); its table: (table width, header texels, layout em, atlas spread). A
+    /// block's is its layout's `meta`.
+    pub fn glyph_meta(&self) -> [f32; 4] {
+        match self.part {
+            TextPart::Main => [self.atlas_size, ATLAS_SPREAD, self.style.size, 0.0],
+            TextPart::Table => [
                 crate::glyphrun::TABLE_WIDTH as f32,
                 crate::glyphrun::HEADER_TEXELS as f32,
                 self.style.size,

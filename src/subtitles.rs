@@ -320,6 +320,15 @@ mod tests {
     }
 
     #[test]
+    fn escaped_markup_is_text() {
+        // Entities decode in the same pass that strips tags: a decoded '<' is never
+        // read as the start of one.
+        let e = srt("1\n00:00:01,000 --> 00:00:02,000\n&lt;i&gt;not italic&lt;/i&gt; &amp;lt;\n")
+            .unwrap();
+        assert_eq!(e[0].text, "<i>not italic</i> &lt;");
+    }
+
+    #[test]
     fn format_by_extension() {
         assert_eq!(Format::of("a/b.SRT".as_ref()), Some(Format::Srt));
         assert_eq!(Format::of("b.vtt".as_ref()), Some(Format::Vtt));

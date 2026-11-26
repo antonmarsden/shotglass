@@ -198,8 +198,8 @@ pub fn load_text(t: &crate::movie::TextSource, vflip: bool) -> Result<DecodedIma
     use toodee::TooDeeOps;
     if t.glyphs != GlyphMode::Block {
         // A glyph run's atlas or table (#71): built whole, top row first, never
-        // flipped (read with texelFetch / tile rectangles).
-        let (layout, _) = t.layout().map_err(|e| format!("{e:#}"))?;
+        // flipped (read with texelFetch / tile rectangles). The atlas and table of
+        // one version share the build, layout warnings included.
         let run = t.glyph_run_shared().map_err(|e| format!("{e:#}"))?;
         let image = match t.part {
             TextPart::Main => run.atlas.image.clone(),
@@ -210,12 +210,12 @@ pub fn load_text(t: &crate::movie::TextSource, vflip: bool) -> Result<DecodedIma
             width,
             height,
             rgba: image.into_vec().into_iter().flatten().collect(),
-            warnings: layout
+            warnings: run
                 .warnings
                 .iter()
                 .map(|w| format!("text \"{}\": {w}", t.name))
                 .collect(),
-            meta: t.meta(&layout),
+            meta: t.glyph_meta(),
         });
     }
     let (layout, fonts) = t.layout().map_err(|e| format!("{e:#}"))?;

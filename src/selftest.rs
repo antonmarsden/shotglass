@@ -1048,6 +1048,23 @@ fn shot(r: &mut Renderer, m: &Movie, at: At, scale: f32) -> Result<Frame> {
     r.read_output().ok_or_else(|| anyhow!("no output"))
 }
 
+/// Plays from where `r` is, not blocking, at film time `t` (pumping between frames)
+/// until a frame draws; returns it and how many frames were held before it.
+fn play_until_ready(r: &mut Renderer, m: &Movie, t: f32, what: &str) -> Result<(Frame, usize)> {
+    let mut frames = 0;
+    loop {
+        if r.render(m, W, H, &info(t, 1.0), false).is_some() {
+            return Ok((r.read_output().unwrap(), frames));
+        }
+        frames += 1;
+        if frames > 5000 {
+            bail!("the {what} never became ready without blocking");
+        }
+        r.pump(m, t, false);
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
 /// (largest channel difference, fraction of pixels differing by more than `tol`).
 fn diff(a: &Frame, b: &Frame, tol: u8) -> (u8, f32) {
     let mut max = 0u8;
@@ -3246,18 +3263,7 @@ fn text_textures(gl: &Gl, dir: &Path) -> Result<String> {
     let mut r = Renderer::new(gl.clone())?;
     r.set_cache_dir(None);
     r.set_movie(&m).map_err(|e| anyhow!("{e:?}"))?;
-    let mut frames = 0;
-    let got = loop {
-        if r.render(&m, W, H, &info(0.5, 1.0), false).is_some() {
-            break r.read_output().unwrap();
-        }
-        frames += 1;
-        if frames > 5000 {
-            bail!("the text shot never became ready without blocking");
-        }
-        r.pump(&m, 0.5, false);
-        std::thread::sleep(std::time::Duration::from_millis(1));
-    };
+    let (got, frames) = play_until_ready(&mut r, &m, 0.5, "text shot")?;
     if frames == 0 {
         bail!("a non-blocking render drew before the text was rasterised");
     }
@@ -3385,18 +3391,7 @@ fn glyph_runs(gl: &Gl, dir: &Path) -> Result<String> {
     let mut r = Renderer::new(gl.clone())?;
     r.set_cache_dir(None);
     r.set_movie(&m).map_err(|e| anyhow!("{e:?}"))?;
-    let mut frames = 0;
-    let got = loop {
-        if r.render(&m, W, H, &info(0.5, 1.0), false).is_some() {
-            break r.read_output().unwrap();
-        }
-        frames += 1;
-        if frames > 5000 {
-            bail!("the glyph run shot never became ready without blocking");
-        }
-        r.pump(&m, 0.5, false);
-        std::thread::sleep(std::time::Duration::from_millis(1));
-    };
+    let (got, frames) = play_until_ready(&mut r, &m, 0.5, "glyph run shot")?;
     if frames == 0 {
         bail!("a non-blocking render drew before the glyph run was built");
     }
@@ -3516,18 +3511,7 @@ fn layers_ready_and_fallback(gl: &Gl, dir: &Path) -> Result<String> {
     if r.render(&m, W, H, &info(1.0, 1.0), false).is_some() {
         bail!("playback drew the shot before its new layer was compiled");
     }
-    let mut frames = 0;
-    let got = loop {
-        if r.render(&m, W, H, &info(1.0, 1.0), false).is_some() {
-            break r.read_output().unwrap();
-        }
-        frames += 1;
-        if frames > 5000 {
-            bail!("the layered shot never became ready without blocking");
-        }
-        r.pump(&m, 1.0, false);
-        std::thread::sleep(std::time::Duration::from_millis(1));
-    };
+    let (got, frames) = play_until_ready(&mut r, &m, 1.0, "layered shot")?;
     expect_same("non-blocking render with a layer", &got, &want, 0, 0.0)?;
     // A compile error in the layer: the last working layer stays on screen.
     write(dir, &[("l.glsl", &scene("fragColor = vec4(oops);"))])?;
@@ -3956,18 +3940,7 @@ fn comps_ready_and_fallback(gl: &Gl, dir: &Path) -> Result<String> {
     if r.render(&m, W, H, &info(1.5, 1.0), false).is_some() {
         bail!("playback drew a comp shot before the comp's programs were compiled");
     }
-    let mut frames = 0;
-    let got = loop {
-        if r.render(&m, W, H, &info(1.5, 1.0), false).is_some() {
-            break r.read_output().unwrap();
-        }
-        frames += 1;
-        if frames > 5000 {
-            bail!("the comp shot never became ready without blocking");
-        }
-        r.pump(&m, 1.5, false);
-        std::thread::sleep(std::time::Duration::from_millis(1));
-    };
+    let (got, frames) = play_until_ready(&mut r, &m, 1.5, "comp shot")?;
     expect_same("non-blocking comp shot", &got, &want, 0, 0.0)?;
     if r.blocking_texture_loads != 0 || r.blocking_footage_loads != 0 {
         bail!("playback loaded on the spot");

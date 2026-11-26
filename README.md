@@ -71,7 +71,7 @@ strict-glsl` leaves the encoders out (WebM then goes through ffmpeg).
 - **Movie:** a folder with a `movie.toml` (the edit: shots, timings, uniforms,
   transitions) and its shaders. See [Movies](docs/movies.md).
 - **Shot:** a Shadertoy-style `mainImage` shader over a span of the timeline, with its
-  own clock (`iShotTime`) and optional `channels` (images, footage, text).
+  own clock (`iShotTime`) and optional `channels` (images, footage, text, subtitles).
 - **Transition:** a GLSL pass that combines the outgoing and incoming shots.
 - **Layer:** a pass drawn over a span of the film and composited over the picture.
 - **Sound:** music, per-shot sound and a mix pass, synthesised on the GPU in GLSL.
@@ -85,7 +85,7 @@ strict-glsl` leaves the encoders out (WebM then goes through ffmpeg).
 The detailed user documentation lives in [`docs/`](docs/):
 
 - [Movies: `movie.toml`, shaders and transitions](docs/movies.md): How a film is laid out on disk, every `movie.toml` field, scene shaders and their uniforms, transitions, and writing portable GLSL.
-- [Channels: textures, footage and text](docs/channels.md): What a shot can bind to `iChannel0..7`: images, image sequences (footage) and laid-out text, plus getting fonts.
+- [Channels: textures, footage and text](docs/channels.md): What a shot can bind to `iChannel0..7`: images, image sequences (footage), laid-out text, glyph runs, and SRT or WebVTT subtitles, plus getting fonts.
 - [Layers and blends](docs/layers.md): Layers over spans of the film, their opacity and scale, blend modes and reading other layers.
 - [Sound](docs/sound.md): Music, per-shot sound and the mix pass, all synthesised on the GPU in GLSL.
 - [Loop films](docs/loop-films.md): Films that play forever (`loop = true`), Shadertoy-style, with a seamless picture and sound.
