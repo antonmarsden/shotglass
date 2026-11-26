@@ -8,6 +8,7 @@
 //! are decoded. Times are exact milliseconds.
 
 use anyhow::{Result, bail};
+use std::collections::BTreeSet;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Entry {
@@ -35,10 +36,86 @@ impl Format {
     }
 }
 
+/// What parsing left out that a reader might expect to see: styling a glyph run
+/// can't carry (it draws plain text; looks are the shader's). `shotglass check`
+/// reports it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Dropped {
+    /// Cues that lost a tag, an override or cue settings.
+    pub cues: usize,
+    /// Tag names as written (`i`, `v`, `c`, `font`; `timestamp` for karaoke times).
+    pub tags: BTreeSet<String>,
+    /// `{\an8}`-style overrides.
+    pub overrides: bool,
+    /// WebVTT cue settings (`align:start line:0`).
+    pub settings: bool,
+    /// WebVTT `STYLE` / `REGION` blocks (`NOTE` is a comment, not counted).
+    pub blocks: BTreeSet<&'static str>,
+}
+
+impl Dropped {
+    pub fn is_empty(&self) -> bool {
+        *self == Dropped::default()
+    }
+
+    /// One line for `check`, None when nothing was dropped.
+    pub fn summary(&self, total: usize) -> Option<String> {
+        if self.is_empty() {
+            return None;
+        }
+        let mut what = vec![];
+        if !self.tags.is_empty() {
+            let tags: Vec<String> = self
+                .tags
+                .iter()
+                .map(|t| {
+                    if t == "timestamp" {
+                        "karaoke timestamps".to_string()
+                    } else {
+                        format!("<{t}>")
+                    }
+                })
+                .collect();
+            what.push(format!("tags {}", tags.join(" ")));
+        }
+        if self.overrides {
+            what.push("{\\…} overrides".to_string());
+        }
+        if self.settings {
+            what.push("cue settings".to_string());
+        }
+        let mut s = String::new();
+        if !what.is_empty() {
+            s = format!(
+                "{} dropped in {} of {total} cues",
+                what.join(", "),
+                self.cues
+            );
+        }
+        if !self.blocks.is_empty() {
+            let b: Vec<&str> = self.blocks.iter().copied().collect();
+            if !s.is_empty() {
+                s += "; ";
+            }
+            s += &format!("{} blocks skipped", b.join("/"));
+        }
+        Some(format!(
+            "{s}: a glyph run draws plain text (style it in the shader)"
+        ))
+    }
+}
+
 /// Parses a subtitle file. `label` names it in errors. Entries come back in
 /// file order; they must have start < end and must not overlap (a subtitle
 /// layer shows one entry at a time).
+#[cfg(test)]
 pub fn parse(src: &str, format: Format, label: &str) -> Result<Vec<Entry>> {
+    parse_reporting(src, format, label).map(|(e, _)| e)
+}
+
+/// `parse`, also saying what styling it dropped.
+pub fn parse_reporting(src: &str, format: Format, label: &str) -> Result<(Vec<Entry>, Dropped)> {
+    let mut dropped = Dropped::default();
     let src = src.strip_prefix('\u{feff}').unwrap_or(src);
     let src = src.replace("\r\n", "\n").replace('\r', "\n");
     let mut blocks = blocks(&src);
@@ -55,12 +132,15 @@ pub fn parse(src: &str, format: Format, label: &str) -> Result<Vec<Entry>> {
     let mut out = vec![];
     for (line, block) in blocks {
         if format == Format::Vtt
-            && block.first().is_some_and(|l| {
-                ["NOTE", "STYLE", "REGION"].iter().any(|k| {
+            && let Some(k) = block.first().and_then(|l| {
+                ["NOTE", "STYLE", "REGION"].into_iter().find(|k| {
                     *l == *k || l.starts_with(&format!("{k} ")) || l.starts_with(&format!("{k}\t"))
                 })
             })
         {
+            if k != "NOTE" {
+                dropped.blocks.insert(k);
+            }
             continue;
         }
         // The timing line: the first line with "-->" (an identifier may precede it).
@@ -73,7 +153,9 @@ pub fn parse(src: &str, format: Format, label: &str) -> Result<Vec<Entry>> {
         let tline = line + ti;
         let (a, rest) = block[ti].split_once("-->").unwrap();
         // WebVTT cue settings (and anything else) follow the end time.
-        let b = rest.split_whitespace().next().unwrap_or("");
+        let mut after = rest.split_whitespace();
+        let b = after.next().unwrap_or("");
+        let settings = format == Format::Vtt && after.next().is_some();
         let start = time(a.trim(), format).ok_or_else(|| {
             anyhow::anyhow!(
                 "{label}:{tline}: can't read the start time \"{}\"",
@@ -85,11 +167,21 @@ pub fn parse(src: &str, format: Format, label: &str) -> Result<Vec<Entry>> {
         if end <= start {
             bail!("{label}:{tline}: the cue ends before it starts");
         }
+        let mut cue = Dropped {
+            settings,
+            ..Dropped::default()
+        };
         let text: Vec<String> = block[ti + 1..]
             .iter()
-            .map(|l| clean(l))
+            .map(|l| clean(l, &mut cue))
             .filter(|l| !l.trim().is_empty())
             .collect();
+        if !cue.is_empty() {
+            dropped.cues += 1;
+            dropped.tags.append(&mut cue.tags);
+            dropped.overrides |= cue.overrides;
+            dropped.settings |= cue.settings;
+        }
         if text.is_empty() {
             bail!("{label}:{tline}: the cue has no text");
         }
@@ -115,7 +207,7 @@ pub fn parse(src: &str, format: Format, label: &str) -> Result<Vec<Entry>> {
             );
         }
     }
-    Ok(out)
+    Ok((out, dropped))
 }
 
 fn first_line(s: &str) -> &str {
@@ -180,8 +272,8 @@ fn time(s: &str, format: Format) -> Option<u32> {
     u32::try_from(ms).ok()
 }
 
-/// A cue line without tags, overrides and entities.
-fn clean(line: &str) -> String {
+/// A cue line without tags, overrides and entities; what it dropped goes in `dropped`.
+fn clean(line: &str, dropped: &mut Dropped) -> String {
     let mut out = String::with_capacity(line.len());
     let mut rest = line;
     while let Some(c) = rest.chars().next() {
@@ -193,11 +285,24 @@ fn clean(line: &str) -> String {
             .is_some_and(|n| n.is_ascii_alphanumeric() || n == '/');
         if c == '<' && tag_start {
             if let Some(end) = rest.find('>') {
+                let tag = rest[1..end].trim_start_matches('/');
+                let name: String = tag
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric())
+                    .collect();
+                dropped
+                    .tags
+                    .insert(if name.starts_with(|c: char| c.is_ascii_digit()) {
+                        "timestamp".to_string()
+                    } else {
+                        name.to_ascii_lowercase()
+                    });
                 rest = &rest[end + 1..];
                 continue;
             }
         } else if c == '{' && rest.starts_with("{\\") {
             if let Some(end) = rest.find('}') {
+                dropped.overrides = true;
                 rest = &rest[end + 1..];
                 continue;
             }
@@ -326,6 +431,48 @@ mod tests {
         let e = srt("1\n00:00:01,000 --> 00:00:02,000\n&lt;i&gt;not italic&lt;/i&gt; &amp;lt;\n")
             .unwrap();
         assert_eq!(e[0].text, "<i>not italic</i> &lt;");
+    }
+
+    #[test]
+    fn dropped_styling_is_reported() {
+        let (_, d) = parse_reporting(
+            "WEBVTT\n\nSTYLE\n::cue { color: red }\n\nNOTE hi\n\n\
+             00:01.000 --> 00:02.000 align:start\n<v Anna>Hi <00:01.500>there</v>\n\n\
+             00:03.000 --> 00:04.000\nplain\n\n00:05.000 --> 00:06.000\n<I>loud</I>\n",
+            Format::Vtt,
+            "subs.vtt",
+        )
+        .unwrap();
+        assert_eq!(d.cues, 2);
+        assert_eq!(
+            d.tags.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["i", "timestamp", "v"]
+        );
+        assert!(d.settings && !d.overrides);
+        assert_eq!(d.blocks.iter().copied().collect::<Vec<_>>(), ["STYLE"]);
+        assert_eq!(
+            d.summary(3).unwrap(),
+            "tags <i> karaoke timestamps <v>, cue settings dropped in 2 of 3 cues; STYLE blocks \
+             skipped: a glyph run draws plain text (style it in the shader)"
+        );
+        let (_, d) = parse_reporting(
+            "1\n00:00:01,000 --> 00:00:02,000\n{\\an8}top & x < 5\n",
+            Format::Srt,
+            "subs.srt",
+        )
+        .unwrap();
+        assert_eq!(
+            d.summary(1).unwrap(),
+            "{\\…} overrides dropped in 1 of 1 cues: a glyph run draws plain text (style it in the shader)"
+        );
+        // Plain text, entities and comments drop nothing.
+        let (_, d) = parse_reporting(
+            "WEBVTT\n\nNOTE x\n\n00:01.000 --> 00:02.000\n&lt;b&gt; a < b\n",
+            Format::Vtt,
+            "subs.vtt",
+        )
+        .unwrap();
+        assert!(d.is_empty() && d.summary(1).is_none(), "{d:?}");
     }
 
     #[test]

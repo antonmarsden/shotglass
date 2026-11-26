@@ -12,7 +12,7 @@ shotglass still  <movie> --at 3.5,moon,closeup+2 [--size 1280x720] [--out stills
 shotglass strip  <movie> [--count 12 | --at ...] [--size 384x216] [--cols 4] [--out strip.png]
                  [--compare ref.png [--bless] [--tolerance 8] [--budget 0.1%] [--max-mean 0.25]]
                  # --compare: fail if the strip differs from ref.png (writes strip.diff.png)
-shotglass check  <movie> [--web [--strict]] [--no-gpu] [--deep] [--size 1280x720] [--frames 8]
+shotglass check  <movie> [--web] [--strict] [--no-gpu] [--deep] [--size 1280x720] [--frames 8]
                  # validate movie.toml and the GLSL (strictly), compile, synth, time
                  # --deep: also decode every frame of every image sequence
 shotglass wav    <movie> [--out sound.wav] [--rate 48000] [--allow-silence]

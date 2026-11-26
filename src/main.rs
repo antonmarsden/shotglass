@@ -578,8 +578,9 @@ struct WebChecks {
     /// Require GLSL ES 3.00 validation and report browser compatibility warnings.
     #[arg(long)]
     web: bool,
-    /// With --web, fail on browser compatibility warnings as well as GLSL errors.
-    #[arg(long, requires = "web")]
+    /// Fail on warnings that mean the film won't look as written: subtitle styling a
+    /// glyph run drops (check), and with --web browser compatibility warnings.
+    #[arg(long)]
     strict: bool,
 }
 
@@ -1421,6 +1422,37 @@ fn check_textures(m: &Movie, web: bool, deep: bool) -> Result<()> {
     Ok(())
 }
 
+/// `check`: styling each subtitle file loses (a glyph run draws plain text): a
+/// warning, or with --strict an error.
+fn subtitle_styling(m: &Movie, strict: bool) -> Result<()> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut lines = vec![];
+    for t in m.channels().filter_map(|c| c.text()) {
+        if !seen.insert(t.name.as_str()) {
+            continue;
+        }
+        let label = match &t.body {
+            movie::TextBody::Subtitles(f) => &f.label,
+            _ => continue,
+        };
+        if let Some((cues, dropped)) = t.subtitles_reporting()?
+            && let Some(s) = dropped.summary(cues.len())
+        {
+            lines.push(format!("text \"{}\": {label}: {s}", t.name));
+        }
+    }
+    for l in &lines {
+        println!("{}: {l}", if strict { "error" } else { "warning" });
+    }
+    if strict && !lines.is_empty() {
+        bail!(
+            "{} subtitle file(s) lose styling (--strict); remove the markup or drop --strict",
+            lines.len()
+        );
+    }
+    Ok(())
+}
+
 /// `check`'s footage warnings: a shot or layer that runs past the end of its sequence
 /// (`end = "hold"` freezes the last frame), and a loop film's `end = "loop"` channel
 /// whose clip doesn't fit the period a whole number of times (a jump at the seam).
@@ -1535,6 +1567,7 @@ fn check(
     }
     strict_check(&m, web_checks)?;
     check_textures(&m, web_checks.web, deep)?;
+    subtitle_styling(&m, web_checks.strict)?;
     if no_gpu {
         println!(
             "

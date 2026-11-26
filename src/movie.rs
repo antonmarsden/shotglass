@@ -396,6 +396,14 @@ pub struct TextSource {
 impl TextSource {
     /// Subtitle cues, for a `subtitles` text.
     pub fn subtitles(&self) -> Result<Option<Vec<crate::subtitles::Entry>>> {
+        Ok(self.subtitles_reporting()?.map(|(e, _)| e))
+    }
+
+    /// Subtitle cues and the styling parsing dropped (`check` reports it), for a
+    /// `subtitles` text.
+    pub fn subtitles_reporting(
+        &self,
+    ) -> Result<Option<(Vec<crate::subtitles::Entry>, crate::subtitles::Dropped)>> {
         let TextBody::Subtitles(f) = &self.body else {
             return Ok(None);
         };
@@ -405,7 +413,7 @@ impl TextSource {
             .map_err(|_| anyhow!("text \"{}\": {} isn't UTF-8", self.name, f.label))?;
         let format = crate::subtitles::Format::of(&f.file)
             .ok_or_else(|| anyhow!("text \"{}\": {} isn't .srt or .vtt", self.name, f.label))?;
-        crate::subtitles::parse(&s, format, &f.label).map(Some)
+        crate::subtitles::parse_reporting(&s, format, &f.label).map(Some)
     }
 
     /// The words, read from the file if the text has one (subtitles: the cues'
