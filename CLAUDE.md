@@ -248,8 +248,8 @@ cargo fmt && cargo clippy --all-targets -- -D warnings
   (one issue per branch; `gfx.rs`, `sound.rs`, `audio.rs` take one change at a time).
 - Keep user-facing docs in README.md (overview + index of `docs/`) and the topic pages in
   `docs/` (`docs/design/` holds design notes); a new page gets a line in the README index. Open work is in GitHub issues: #35 roadmap to 1.0,
-  #66 text/layers/footage epic (next: #71 glyph runs/subtitles,
-  #73 video; later items in #75), #2 web player, #51 live mode (#53–#56), #60 real-time mode.
+  #66 text/layers/footage epic (next: #71's kit libraries in shotglass-kit,
+  #73 video; #127 WOFF/WOFF2; later items in #75), #2 web player, #51 live mode (#53–#56), #60 real-time mode.
 
 ## Conventions
 
