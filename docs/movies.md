@@ -39,6 +39,7 @@ aspect = [16, 9]
 fps = 30                      # or 29.97, or "30000/1001"; frame stepping, iFrame and export
 # glsl = "430"                # opt in to a later GLSL; see "Portable shaders" (default 330)
 # loop = true                 # play forever, Shadertoy-style; see "Loop films"
+# loop = "warm"               # ... and feedback buffers carry their state over the seam (0.1.10)
 
 [sound]
 music = "music.glsl"          # optional

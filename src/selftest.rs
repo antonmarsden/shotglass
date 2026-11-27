@@ -239,6 +239,10 @@ const CHECKS: &[Check] = &[
         run: buffers_in_comps,
     },
     Check {
+        name: "buffers: loop = \"warm\" carries state over the seam (= an unlooped second period); paths agree; a wrap restores the seam",
+        run: buffers_warm_loop,
+    },
+    Check {
         name: "chunked sound matches a single-pass render",
         run: sound_chunk_equivalence,
     },
@@ -2319,6 +2323,166 @@ fn half(f: &Frame, left: bool) -> Frame {
         }
     }
     out
+}
+
+/// `buffers_warm_loop`'s buffers and layer (#138): a float accumulator with an init pass
+/// over the whole film, and a 4-deep pure history read 3 frames back.
+const WARM_BODY: &str = "[[buffer]]\nid=\"acc\"\nscene=\"acc.glsl\"\ninit=\"seed.glsl\"\nsize=[40, 24]\n\
+     format=\"rgba32f\"\nchannels=[\"@prev\", \"@picture\", \"t.png\"]\n\
+     [[buffer]]\nid=\"hist\"\nscene=\"copy.glsl\"\ninit=\"hinit.glsl\"\nscale=0.5\n\
+     format=\"rgba8\"\nhistory=4\nchannels=[\"@picture\"]\n\
+     [[layer]]\nid=\"show\"\nscene=\"show.glsl\"\nscale=1\n\
+     channels=[\"@acc\", { source = \"@hist\", frame = -3 }]\n";
+
+fn buffers_warm_loop(gl: &Gl, dir: &Path) -> Result<String> {
+    const P: u64 = 30;
+    let film = |sub: &str, head: &str, shots: &str| -> Result<Movie> {
+        let d = dir.join(sub);
+        buffer_film(&d, HIST3)?;
+        // 24 fps: the seam (frame 30) isn't on the once-a-second checkpoint grid.
+        movie(
+            &d,
+            &format!("shotglass = \"0.1.10\"\nfps = 24\n{head}\n{shots}{WARM_BODY}"),
+        )
+    };
+    let one = "[[shot]]\nid=\"a\"\nscene=\"s.glsl\"\nduration=1.25\n";
+    let warm = film("warm", "loop = \"warm\"", one)?;
+    if warm.loop_frames != Some(P) || !warm.warm {
+        bail!("the fixture isn't a warm 30-frame loop");
+    }
+    // The reference: the period played twice, unlooped, with no reset between (shot-
+    // local time repeats; the buffers don't read film time).
+    let twice = film(
+        "twice",
+        "",
+        "[[shot]]\nid=\"a\"\nscene=\"s.glsl\"\nduration=1.25\n\
+         [[shot]]\nid=\"b\"\nscene=\"s.glsl\"\nduration=1.25\n",
+    )?;
+    let plain = film("plain", "loop = true", one)?;
+    let mut u = renderer(gl, &twice)?;
+    let want: Vec<Frame> = (0..2 * P)
+        .map(|n| buf_frame(&mut u, &twice, n, 1.0))
+        .collect::<Result<_>>()?;
+    let mut r = renderer(gl, &warm)?;
+    let mut fwd = vec![];
+    for n in 0..P {
+        let f = buf_frame(&mut r, &warm, n, 1.0)?;
+        expect_fold(
+            gl,
+            &format!(
+                "warm frame {n} vs the unlooped second period's frame {}",
+                P + n
+            ),
+            &f,
+            &want[(P + n) as usize],
+            0,
+            0.0,
+        )?;
+        fwd.push(f);
+    }
+    let mut pl = renderer(gl, &plain)?;
+    let cold0 = buf_frame(&mut pl, &plain, 0, 1.0)?;
+    if cold0 == fwd[0] {
+        bail!("frame 0 of the warm loop equals the plain loop's (a reset)");
+    }
+    expect_fold(
+        gl,
+        "plain loop frame 0 vs the first period",
+        &cold0,
+        &want[0],
+        0,
+        0.0,
+    )?;
+    // Every path agrees: seeks, cold stills, folds without checkpoints.
+    for n in [20u64, 0, 29, 3, 15, 1] {
+        expect_fold(
+            gl,
+            &format!("warm frame {n} after seeking"),
+            &buf_frame(&mut r, &warm, n, 1.0)?,
+            &fwd[n as usize],
+            0,
+            0.0,
+        )?;
+    }
+    for n in [0u64, 2, 29] {
+        let mut c = renderer(gl, &warm)?;
+        c.set_buffer_checkpoints(false);
+        expect_fold(
+            gl,
+            &format!("warm frame {n}, cold, no checkpoints"),
+            &buf_frame(&mut c, &warm, n, 1.0)?,
+            &fwd[n as usize],
+            0,
+            0.0,
+        )?;
+    }
+    // Playing over the wrap: never blocks, and the wrap restores the seam's checkpoint
+    // instead of stepping a whole period of pre-roll again.
+    let mut p = renderer(gl, &warm)?;
+    for n in 0..P {
+        let (f, _) = buf_play(&mut p, &warm, n)?;
+        expect_fold(
+            gl,
+            &format!("warm frame {n} played"),
+            &f,
+            &fwd[n as usize],
+            0,
+            0.0,
+        )?;
+    }
+    let (steps, restores) = (p.buffer_steps, p.buffer_restores);
+    let mut wrap_steps = 0;
+    for n in 0..4 {
+        let (f, _) = buf_play(&mut p, &warm, n)?;
+        expect_fold(
+            gl,
+            &format!("warm frame {n} after the wrap"),
+            &f,
+            &fwd[n as usize],
+            0,
+            0.0,
+        )?;
+        if n == 0 {
+            wrap_steps = p.buffer_steps - steps;
+        }
+    }
+    // The seam restored, then only the pure history's frames before it.
+    if p.buffer_restores == restores || wrap_steps > 5 {
+        bail!(
+            "the wrap stepped {wrap_steps} buffer steps and restored {} checkpoints (want the \
+             seam restored, a few steps)",
+            p.buffer_restores - restores
+        );
+    }
+    if p.blocking_catchups != 0 {
+        bail!("playback caught up blocking {} times", p.blocking_catchups);
+    }
+    // With room for only two checkpoints (acc: 40×24 rgba32f, one state each), the
+    // seam's survives the play-through: eviction keeps it, and the wrap restores it.
+    let mut t = renderer(gl, &warm)?;
+    t.set_buffer_cache_budget(2 * 40 * 24 * 16);
+    for n in 0..P {
+        buf_play(&mut t, &warm, n)?;
+    }
+    let steps = t.buffer_steps;
+    let (f, _) = buf_play(&mut t, &warm, 0)?;
+    expect_fold(
+        gl,
+        "frame 0 after the wrap, small budget",
+        &f,
+        &fwd[0],
+        0,
+        0.0,
+    )?;
+    if t.buffer_steps - steps > 5 {
+        bail!(
+            "with a two-checkpoint budget the wrap stepped {} (the seam's checkpoint was evicted)",
+            t.buffer_steps - steps
+        );
+    }
+    Ok(format!(
+        "30 warm frames = the unlooped second period; paths agree; the wrap frame took {wrap_steps} steps"
+    ))
 }
 
 /// The comp of `buffers_in_comps` (#138): a moving picture, a float accumulator with

@@ -150,7 +150,8 @@ so comps share the film's `scenes/` and textures. Shaders in a comp see:
   item that uses it (a comp shot or layer starts at its own start; with
   `time_offset`/`time_scale` as usual). A channel `@<comp>` follows the reading shot's
   `iTime` plus the entry's `time_offset`; a matte follows its layer. Past the comp's
-  end it holds its last frame (before 0, its first), or wraps with `loop = true`.
+  end it holds its last frame (before 0, its first), or wraps with `loop = true`
+  (`loop = "warm"`: its [buffers](buffers.md#seamless-loops-loop--warm) carry state over the wrap).
 - **Cues:** the film's cue defines, plus `COMP_DURATION` and `COMP_CUE_<SHOT>_START` /
   `_END` (and its layers') for the comp's own items.
 - **Size:** `size = [w, h]` renders the comp at that size (scale 1, whatever the

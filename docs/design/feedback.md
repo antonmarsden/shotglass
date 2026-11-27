@@ -3,8 +3,8 @@
 Status: **phase 1 built** (#134): `[[buffer]]`, history, resets, checkpoints; **phase 2
 built** (#137): background fill, progressive scrub, `preview_lookback`, adaptive spacing,
 `cache = "dense"`, slow-seek hints, per-frame invalidation; user docs in
-[buffers.md](../buffers.md). Phase 3 (#138): **buffers in comps built**; warm loops and
-`after` are still a proposal. Builds on the iChannel design
+[buffers.md](../buffers.md). Phase 3 (#138): **buffers in comps and `loop = "warm"` built**;
+`after` is still a proposal. Builds on the iChannel design
 ([ichannel.md](ichannel.md), which deferred `{ buffer = "A" }` to its own design) and on
 layers and comps ([layers-compositing.md](layers-compositing.md), which ruled
 previous-frame inputs out of layers).
@@ -217,10 +217,22 @@ relative order of `[[buffer]]` and `[[layer]]` entries. It's additive: buffers w
 The period's first frame (frame 0) is always a reset, so loop k equals loop 0 and the
 "shaders only see time within one period" invariant holds. That means a buffer is
 visibly empty at the seam. A seamless loop needs the state at frame 0 to equal the state
-after a whole period: phase 3 adds `loop = "warm"`, which defines state(0) as the fold
-from frame 0 of a *previous* period (one period of pre-roll, computed once and
-checkpointed). That's exact for effects that forget and a fixed point only by luck for
-simulations, so it stays opt-in.
+after a whole period: phase 3 (#138, built) adds `loop = "warm"` (films, and comps'
+`[comps]` entries), which defines state(0) as the fold from frame 0 of a *previous*
+period (one period of pre-roll). That's exact for effects that forget and a fixed point
+only by luck for simulations, so it stays opt-in.
+
+- **Virtual frames:** a warm sequence's fold runs over v in 0..2p: period −1 (cold
+  pre-roll) then period 0, real frame v − p. A buffer active from frame 0 to the end
+  (spanning the seam) has no reset at v = p, so it continues from period −1's last
+  frame; every other span and reset repeats per period, and a step reads its inputs at
+  frame v mod p. Cursor, plans, rings, checkpoints and the playhead are virtual, so the
+  history ring reads the previous period's states across the seam for free.
+- **iFrame** of a spanning buffer is v − its reset, counting on over the seam (up to
+  2p − 1); the other uniforms stay within one period.
+- **The seam is checkpointed and kept** (its own eviction exemption): each wrap of the
+  loop restores it, a blit, instead of stepping p frames.
+- `check` warns when no buffer spans the seam.
 
 ### Comps
 

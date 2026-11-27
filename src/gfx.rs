@@ -1401,11 +1401,12 @@ impl Renderer {
             let f = &mut self.folds[q];
             f.reads_film = reads_film;
             f.decl = hash(&format!(
-                "{:?}\0{}/{}\0{:?}\0{}\0{:?}\0{}",
+                "{:?}\0{}/{}\0{:?}/{}\0{}\0{:?}\0{}",
                 seq.buffers,
                 seq.fps_num,
                 seq.fps_den,
                 seq.loop_frames,
+                seq.warm,
                 seq.duration,
                 size,
                 if reads_film {

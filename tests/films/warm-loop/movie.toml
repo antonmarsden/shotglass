@@ -1,0 +1,39 @@
+# Golden-image film for warm loops (tests/golden.rs, #138): loop = "warm". A dot runs a
+# closed path once per period (1.5 s, 45 frames), drawn on transparent into "dot".
+# "trail" (orange, the whole film) spans the seam, so frame 0 continues from the end of
+# the period before: its trail is already there. "late" (blue, from 0.2 s) doesn't
+# span it, so it starts empty every period. The strip's first frames show the
+# difference; the last shows the period's end that frame 0 follows. Shaders are
+# film-local, so the golden only moves when the engine does.
+title = "warm-loop"
+fps = 30
+loop = "warm"
+
+[[shot]]
+id = "a"
+scene = "scenes/plate.glsl"
+duration = 1.5
+
+[[buffer]]
+id = "dot"
+scene = "buffers/dot.glsl"
+size = [160, 90]
+format = "rgba8"
+
+[[buffer]]
+id = "trail"
+scene = "buffers/trail.glsl"
+size = [160, 90]
+channels = ["@prev", "@dot"]
+
+[[buffer]]
+id = "late"
+scene = "buffers/trail.glsl"
+from = 0.2
+size = [160, 90]
+channels = ["@prev", "@dot"]
+
+[[layer]]
+id = "show"
+scene = "layers/show.glsl"
+channels = ["@input", "@trail", "@late"]

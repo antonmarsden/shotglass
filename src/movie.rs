@@ -73,8 +73,9 @@ struct MovieFile {
     glsl: Option<String>,
     /// Play forever: the film repeats with its duration (a whole number of frames) as
     /// the period, and shaders only ever see time within one period.
+    /// `"warm"` (#138): also a seamless loop for feedback buffers.
     #[serde(rename = "loop")]
-    looping: Option<bool>,
+    looping: Option<LoopFile>,
     sound: Option<SoundFile>,
     #[serde(rename = "shot", default)]
     shots: Vec<ShotFile>,
@@ -117,6 +118,28 @@ struct CompFile {
     /// Feedback buffers (#138): they fold over comp-local frames.
     #[serde(rename = "buffer", default)]
     buffers: Vec<BufferFile>,
+}
+
+/// `loop = true | false | "warm"`.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum LoopFile {
+    Bool(bool),
+    Mode(String),
+}
+
+/// `loop`: (looping, warm). "warm" (#138) is a loop whose buffers carry their state over
+/// the seam: frame 0 continues from a whole period of pre-roll instead of a reset.
+fn loop_mode(what: &str, v: Option<&LoopFile>) -> Result<(bool, bool)> {
+    match v {
+        None | Some(LoopFile::Bool(false)) => Ok((false, false)),
+        Some(LoopFile::Bool(true)) => Ok((true, false)),
+        Some(LoopFile::Mode(m)) if m == "warm" => Ok((true, true)),
+        Some(LoopFile::Mode(m)) => bail!(
+            "{what}loop = \"{m}\": use true, false or \"warm\" (a loop whose feedback buffers \
+             carry their state over the seam)"
+        ),
+    }
 }
 
 #[derive(Deserialize)]
@@ -1239,6 +1262,11 @@ pub struct Movie {
     /// `loop = true`: the film repeats every `n` frames (its whole duration). See
     /// `loop_period`, `wrap`, `sound_samples`.
     pub loop_frames: Option<u64>,
+    /// `loop = "warm"` (#138): a loop film's (or comp's) buffers carry their state over
+    /// the seam. Their fold runs over two periods (the first is pre-roll): frame n's
+    /// state is the fold from the start of the period before, so frame 0 follows a
+    /// whole period instead of a reset (`gfx::fold`). Always false without a loop.
+    pub warm: bool,
     /// Movie-level music/ambience (`mainSound`, movie time).
     pub music: Option<PathBuf>,
     /// Final mix pass (`mainMix`).
@@ -1432,6 +1460,10 @@ impl Movie {
         }
         if self.comps.iter().any(|c| !c.movie.buffers.is_empty()) {
             features.push("buffers in comps, which need shotglass 0.1.10");
+            need = semver::Version::new(0, 1, 10);
+        }
+        if self.warm || self.comps.iter().any(|c| c.movie.warm) {
+            features.push("loop = \"warm\", which needs shotglass 0.1.10");
             need = semver::Version::new(0, 1, 10);
         }
         if features.is_empty() {
@@ -1934,6 +1966,7 @@ impl Movie {
         };
         let buffer_decls = buffer_decls(&f.buffers)?;
         // [comps] (#74): names first; shots, layers and comps refer to them by index.
+        let film_loop = loop_mode("", f.looping.as_ref())?;
         let decls = comp_decls(&f.comps)?;
         let comp_names: Vec<String> = decls.iter().map(|d| d.name.clone()).collect();
         let comp_rels: Vec<String> = decls.iter().map(|d| d.rel.clone()).collect();
@@ -1956,7 +1989,7 @@ impl Movie {
             f.layers,
             f.buffers,
             f.channels.as_deref(),
-            f.looping == Some(true),
+            film_loop.0,
         )?;
         if loop_frames.is_some() {
             let first = &shots[0];
@@ -2019,6 +2052,7 @@ impl Movie {
                     fps_den,
                     glsl,
                     loop_frames,
+                    warm: d.warm,
                     music: None,
                     mix: None,
                     mix_lookback: 1.0,
@@ -2051,6 +2085,7 @@ impl Movie {
             fps_den,
             glsl,
             loop_frames,
+            warm: film_loop.1,
             volume: f.sound.as_ref().and_then(|s| s.volume).unwrap_or(1.0),
             music: f
                 .sound
@@ -2095,6 +2130,23 @@ impl Movie {
         check_comp_graph(&movie)?;
         check_comp_buffers(&movie, &movie.comps)?;
         check_buffer_memory(&movie)?;
+        let mut movie = movie;
+        let cold: Vec<String> = std::iter::once(("the film".to_string(), &movie))
+            .chain(
+                movie
+                    .comps
+                    .iter()
+                    .map(|c| (format!("comp \"{}\"", c.name), &*c.movie)),
+            )
+            .filter(|(_, m)| m.warm && warm_buffers(m).next().is_none())
+            .map(|(w, _)| w)
+            .collect();
+        for w in cold {
+            movie.warnings.push(format!(
+                "{w}: loop = \"warm\" has no effect: no feedback buffer runs from frame 0 to the \
+                 end of the period, so none carries state over the seam (use loop = true)"
+            ));
+        }
         Ok(movie)
     }
 
@@ -3058,6 +3110,15 @@ fn build_buffers(
         }
     }
     Ok(out)
+}
+
+/// The buffers of a warm loop sequence (#138) that carry state over its seam: active
+/// from frame 0 to the end of the period.
+pub fn warm_buffers(m: &Movie) -> impl Iterator<Item = &Buffer> {
+    let p = m.loop_frames.filter(|_| m.warm);
+    m.buffers
+        .iter()
+        .filter(move |b| p.is_some_and(|p| b.start_frame == 0 && b.end_frame >= p))
 }
 
 /// Required buffer memory across the film and its comps (#138): each sequence's worst
@@ -4298,6 +4359,8 @@ struct CompDecl {
     rel: String,
     size: Option<(u32, u32)>,
     looping: bool,
+    /// `loop = "warm"` (#138).
+    warm: bool,
 }
 
 /// Deepest comp nesting (each level holds its own targets).
@@ -4314,12 +4377,13 @@ fn comp_decls(t: &BTreeMap<String, toml::Value>) -> Result<Vec<CompDecl>> {
                  picture)"
             );
         }
-        let (rel, size, looping) = match v {
-            toml::Value::String(s) => (s.clone(), None, false),
+        let (rel, size, looping, warm) = match v {
+            toml::Value::String(s) => (s.clone(), None, false, false),
             toml::Value::Table(t) => {
                 let mut file = None;
                 let mut size = None;
                 let mut looping = false;
+                let mut warm = false;
                 for (k, val) in t {
                     match k.as_str() {
                         "file" => {
@@ -4342,9 +4406,11 @@ fn comp_decls(t: &BTreeMap<String, toml::Value>) -> Result<Vec<CompDecl>> {
                             }
                         }
                         "loop" => {
-                            looping = val
-                                .as_bool()
-                                .ok_or_else(|| anyhow!("{what}: loop must be true or false"))?
+                            (looping, warm) = match val {
+                                toml::Value::Boolean(b) => (*b, false),
+                                toml::Value::String(m) if m == "warm" => (true, true),
+                                _ => bail!("{what}: loop must be true, false or \"warm\""),
+                            }
                         }
                         other => bail!(
                             "{what}: unknown option `{other}` (a comp has file, size and loop)"
@@ -4354,7 +4420,7 @@ fn comp_decls(t: &BTreeMap<String, toml::Value>) -> Result<Vec<CompDecl>> {
                 let Some(file) = file else {
                     bail!("{what}: a comp table needs file = \"comps/….toml\"");
                 };
-                (file, size, looping)
+                (file, size, looping, warm)
             }
             _ => bail!("{what}: a comp is \"comps/….toml\" or {{ file = \"…\", size, loop }}"),
         };
@@ -4367,6 +4433,7 @@ fn comp_decls(t: &BTreeMap<String, toml::Value>) -> Result<Vec<CompDecl>> {
             rel,
             size,
             looping,
+            warm,
         });
     }
     Ok(out)
@@ -7079,6 +7146,58 @@ glsl = 450
         assert_eq!(m.loop_frames, Some(300));
         assert!((m.loop_period().unwrap() - 10.01).abs() < 1e-12);
         assert_eq!(m.sound_samples(48000), 480480);
+    }
+
+    /// `loop = "warm"` (#138): a loop film (or comp) whose seam-spanning buffers carry
+    /// their state over the seam.
+    #[test]
+    fn loop_warm() {
+        let one = "[[shot]]\nid = \"a\"\nscene = \"a.glsl\"\nduration = 2\n";
+        let buf = "[[buffer]]\nid = \"t\"\nscene = \"b.glsl\"\nchannels = [\"@prev\"]\n";
+        let m = fixture(
+            &format!("shotglass = \"0.1.10\"\nloop = \"warm\"\n{one}{buf}"),
+            Path::new("."),
+        )
+        .unwrap();
+        assert_eq!((m.loop_frames, m.warm), (Some(60), true));
+        assert_eq!(warm_buffers(&m).count(), 1);
+        assert!(m.warnings.is_empty(), "{:?}", m.warnings);
+        assert_eq!(m.contract_warning(), None);
+        let m = fixture(
+            &format!("shotglass = \"0.1.9\"\nloop = \"warm\"\n{one}{buf}"),
+            Path::new("."),
+        )
+        .unwrap();
+        assert!(m.contract_warning().unwrap().contains("loop = \"warm\""));
+        // A plain loop isn't warm.
+        let m = loop_film("", one).unwrap();
+        assert!(!m.warm);
+        // No buffer spans the seam: a warning, not an error.
+        let late = "[[buffer]]\nid = \"t\"\nscene = \"b.glsl\"\nfrom = 1\n";
+        let m = fixture(&format!("loop = \"warm\"\n{one}{late}"), Path::new(".")).unwrap();
+        assert!(
+            m.warnings.iter().any(|w| w.contains("has no effect")),
+            "{:?}",
+            m.warnings
+        );
+        assert_eq!(warm_buffers(&m).count(), 0);
+        // Anything else is refused.
+        let e = err(fixture(&format!("loop = \"hot\"\n{one}"), Path::new(".")));
+        assert!(e.contains("\"warm\""), "{e}");
+        // Comps too.
+        let (_d, m) = comps_film(
+            "[comps]\nc = { file = \"c.toml\", loop = \"warm\" }\n\
+             [[shot]]\nid = \"s\"\ncomp = \"c\"\nduration = 1\n",
+            &[("c.toml", &format!("{one}{buf}"))],
+        );
+        let m = m.unwrap();
+        assert!(m.comps[0].looping && m.comps[0].movie.warm && !m.warm);
+        let (_d, m) = comps_film(
+            "[comps]\nc = { file = \"c.toml\", loop = \"hot\" }\n\
+             [[shot]]\nid = \"s\"\ncomp = \"c\"\nduration = 1\n",
+            &[("c.toml", one)],
+        );
+        assert!(err(m).contains("loop must be true, false or \"warm\""));
     }
 
     #[test]

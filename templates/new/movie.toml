@@ -6,6 +6,7 @@ fps = 30                  # or 29.97, or "30000/1001"
 # Shaders compile as GLSL 3.30 everywhere, so the film runs on any OpenGL 3.3 machine.
 # glsl = "430"           # opt in to a later GLSL ("410" or "430"); fewer machines run it
 # loop = true             # play forever (shotglass = "0.1.2" in shotglass.toml); see docs/loop-films.md
+# loop = "warm"           # ... with feedback buffers carried over the seam (0.1.10; docs/buffers.md)
 
 [sound]
 music = "music.glsl"      # vec2 mainSound(int samp, float time); time = movie time

@@ -53,7 +53,8 @@ names.
 - **Resets:** a buffer starts over at the start of its span, and at every `reset`
   point: shot or layer ids (their start), span-style points (`"moon + 2"`) or film
   seconds. `reset = "cuts"` starts over at every shot start in the span (temporal
-  smoothing that mustn't smear across a cut). A loop film's frame 0 is always a reset.
+  smoothing that mustn't smear across a cut). A loop film's frame 0 is a reset, unless
+  the film says `loop = "warm"` ([seamless loops](#seamless-loops-loop--warm)).
 - **Init:** at a reset the previous state is black, unless `init = "buffers/seed.glsl"`
   names a pass drawn once instead (it sees the frame's uniforms and channels, but no
   `@prev`).
@@ -203,7 +204,8 @@ channels = ["@input", "@trail"]
   from its last reset to c, whoever shows the comp and whenever: exactly what the comp
   would show as a film of its own. A comp shown from 0.5 s in (`time_offset = 0.5`) starts
   at comp frame 15 (at 30 fps), with the state of 15 steps; a comp that holds its last
-  frame holds its state too; a `loop = true` comp resets at its frame 0, like a loop film.
+  frame holds its state too; a `loop = true` comp resets at its frame 0, like a loop film
+  (`loop = "warm"` carries it over, [as for films](#seamless-loops-loop--warm)).
 - **Shown in one place.** A comp with buffers (or that shows one) may be used once in
   the film and its comps: one shot, layer, matte or channel (a film buffer's included).
   Two uses could ask for two comp frames at once. For a second use, make a second comp
@@ -216,8 +218,38 @@ channels = ["@input", "@trail"]
 - Memory: `shotglass check` adds the worst frame of the film's buffers and of every
   comp's, and refuses more than 1 GB in all.
 
+## Seamless loops: `loop = "warm"`
+
+In a [loop film](loop-films.md) frame 0 is a reset, so a trail is empty at the seam and
+the loop shows a jump. `loop = "warm"` (needs `shotglass = "0.1.10"`) carries the state
+over the seam instead:
+
+```toml
+loop = "warm"
+```
+
+- **What frame n shows:** the fold from the start of the *period before* (one period of
+  pre-roll from a cold start), so frame 0 follows a whole period, as if the film had
+  already played once. It's the same every loop, and `still`, `strip`, `export` and the
+  player agree, as for any buffer.
+- **Which buffers:** those that run from frame 0 to the end of the period (spanning the
+  seam). For them the seam isn't a reset (not even one at frame 0 from `reset`). Other
+  resets, and buffers that start later or end earlier, behave as in a plain loop.
+  `shotglass check` warns when no buffer spans the seam (then warm changes nothing).
+- **Seamless for effects that forget** (trails, smoothing, echo): after a period the
+  pre-roll has gone, so frame 0 is exactly what the frame after the last would be. A
+  simulation that never settles is only seamless by luck: frame 0 is its state after
+  one period, not after many.
+- **`iFrame`** of a spanning buffer counts on over the seam, from its last reset in the
+  period before (so up to two periods' frames). Every other uniform stays within one
+  period.
+- **Cost:** reaching a frame from nothing folds up to two periods instead of one. The
+  state at the seam is checkpointed and kept, so each wrap of the loop restores it
+  instead of stepping a period again.
+- A comp can be warm too: `loop = "warm"` on its `[comps]` entry.
+
 ## Not yet
 
-Seamless loop films (`loop = "warm"`) and buffers inside the layer stack
-(`after = "<layer>"`) come later (#138); see [the design](design/feedback.md).
+Buffers inside the layer stack (`after = "<layer>"`) come later (#138); see
+[the design](design/feedback.md).
 `check --deep` doesn't yet look for NaN/Inf in float state.

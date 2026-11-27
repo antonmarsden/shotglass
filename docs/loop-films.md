@@ -26,6 +26,9 @@ duration = 8.0                  # the period: a whole number of frames (240 at 3
   shot can't have a `transition`. For a seam you can't see, end on the image you
   start with. `iMovieTime / MOVIE_DURATION` runs from 0 to 1 once per loop, which
   makes that easy.
+- **Feedback buffers** start over at frame 0, so a trail is empty at the seam.
+  `loop = "warm"` (0.1.10) carries their state over it: see
+  [Feedback buffers](buffers.md#seamless-loops-loop--warm).
 - **Time stays within one period.** `iTime`, `iMovieTime`, `iShotTime`, `iFrame` and
   the sound shaders' `time` and `samp` are exactly what the first loop gets, however
   long the film has played. So frame *n* of loop 1000 is frame *n* of loop 1, and

@@ -106,6 +106,8 @@ pub(super) struct Fold {
     lookback: bool,
     /// Seconds per catch-up step (wall time, smoothed), for the slow-seek hint.
     step_secs: f64,
+    /// A warm sequence's seam (v = p, #138): its checkpoint is never evicted.
+    seam: Option<u64>,
 }
 
 impl Fold {
@@ -135,6 +137,7 @@ impl Fold {
             approximate: false,
             lookback: false,
             step_secs: 0.0,
+            seam: None,
         }
     }
 
@@ -165,6 +168,7 @@ impl Fold {
             approximate: false,
             lookback: false,
             step_secs: 0.0,
+            seam: None,
         }
     }
 
@@ -308,10 +312,77 @@ fn blit(gl: &glow::Context, src: &Target, dst: &Target) {
     }
 }
 
+// Warm loop films and comps (#138, `loop = "warm"`): the fold runs over *virtual*
+// frames v in 0..2p, two periods of p frames: period −1 (v < p) is pre-roll from a cold
+// start, period 0 (v ≥ p) is what's shown, real frame v − p. A buffer that spans the
+// seam (active from frame 0 to the end) doesn't reset at v = p: frame 0 continues from
+// period −1's last frame, so its state at real frame n is the fold from the start of
+// the period before. Everything else (other buffers' spans and resets, the inputs a
+// step reads at frame v mod p) repeats per period. Without warm, v is the real frame.
+// The cursor, plans, rings, checkpoints and the playhead are all in virtual frames.
+
+/// A warm sequence's period.
+fn warm(movie: &Movie) -> Option<u64> {
+    movie.loop_frames.filter(|_| movie.warm)
+}
+
+/// The real frame of virtual frame `v`.
+fn real(movie: &Movie, v: u64) -> u64 {
+    warm(movie).map_or(v, |p| v % p)
+}
+
+/// The virtual frame the fold shows for real frame `n`.
+fn virt(movie: &Movie, n: u64) -> u64 {
+    warm(movie).map_or(n, |p| p + n % p)
+}
+
+/// Does buffer `b` carry state over a warm seam?
+fn spans_seam(b: &Buffer, p: u64) -> bool {
+    b.start_frame == 0 && b.end_frame >= p
+}
+
+fn act(movie: &Movie, b: &Buffer, v: u64) -> bool {
+    b.active(real(movie, v))
+}
+
+/// The last reset at or before virtual frame `v`.
+fn reset_v(movie: &Movie, b: &Buffer, v: u64) -> Option<u64> {
+    match warm(movie) {
+        Some(p) if v >= p => match b.reset_at(v - p) {
+            // The seam isn't a reset: the fold goes on from period −1's.
+            Some(0) if spans_seam(b, p) => b.reset_at(p - 1),
+            r => r.map(|r| r + p),
+        },
+        _ => b.reset_at(v),
+    }
+}
+
+/// The first frame of `b`'s run of active frames containing (or after) `v`.
+fn run_start(movie: &Movie, b: &Buffer, v: u64) -> u64 {
+    match warm(movie) {
+        Some(p) if v >= p && !spans_seam(b, p) => p + b.start_frame,
+        _ => b.start_frame,
+    }
+}
+
+/// The first frame ≥ `s` where `b` is active.
+fn next_active(movie: &Movie, b: &Buffer, s: u64) -> Option<u64> {
+    let mut runs = vec![(b.start_frame, b.end_frame)];
+    if let Some(p) = warm(movie) {
+        runs[0].1 = runs[0].1.min(p);
+        runs.push((p + b.start_frame, p + b.end_frame.min(p)));
+    }
+    runs.into_iter().find_map(|(a, e)| {
+        let f = s.max(a);
+        (f < e).then_some(f)
+    })
+}
+
 /// Where a pure history buffer must start so every state readers can ask for from
 /// frame `from` on (`from - history` and later) is there.
-fn pure_start(b: &Buffer, from: u64) -> u64 {
-    from.saturating_sub(b.history as u64).max(b.start_frame)
+fn pure_start(movie: &Movie, b: &Buffer, from: u64) -> u64 {
+    from.saturating_sub(b.history as u64)
+        .max(run_start(movie, b, from))
 }
 
 /// The earliest frame a fold reaching `n` from nothing must start at: every non-pure
@@ -323,8 +394,8 @@ fn cold_start(movie: &Movie, n: u64) -> u64 {
         let s2 = movie
             .buffers
             .iter()
-            .filter(|b| !b.is_pure() && b.active(s))
-            .filter_map(|b| b.reset_at(s))
+            .filter(|b| !b.is_pure() && act(movie, b, s))
+            .filter_map(|b| reset_v(movie, b, s))
             .fold(s, u64::min);
         if s2 == s {
             return s;
@@ -339,10 +410,7 @@ fn first_step(movie: &Movie, starts: &[u64], n: u64) -> u64 {
         .buffers
         .iter()
         .zip(starts)
-        .filter_map(|(b, &s)| {
-            let f = s.max(b.start_frame);
-            (f <= n && f < b.end_frame).then_some(f)
-        })
+        .filter_map(|(b, &s)| next_active(movie, b, s).filter(|&f| f <= n))
         .min()
         .unwrap_or(n + 1)
 }
@@ -467,7 +535,7 @@ impl Renderer {
         if used + each > f.budget {
             return false;
         }
-        let end = movie.frame_count();
+        let end = warm(movie).map_or(movie.frame_count(), |p| 2 * p);
         let target = match &f.plan {
             Some(p) if p.key == f.key && p.target > f.playhead => p.target,
             _ => {
@@ -481,7 +549,10 @@ impl Renderer {
                     }
                     let k = checkpoint_interval(movie, g);
                     if g.is_multiple_of(k)
-                        && movie.buffers.iter().any(|b| !b.is_pure() && b.active(g))
+                        && movie
+                            .buffers
+                            .iter()
+                            .any(|b| !b.is_pure() && act(movie, b, g))
                         && !f.checkpoints.iter().any(|x| x.key == f.key && x.frame == g)
                     {
                         break g;
@@ -637,11 +708,13 @@ impl Renderer {
         out: (i32, i32),
         blocking: bool,
     ) -> bool {
-        self.folds[q].playhead = n;
-        self.advance_buffers(film, q, n, out, blocking)
+        // A warm loop's frame n is virtual frame p + n (#138).
+        let v = virt(super::seq_movie(film, q), n);
+        self.folds[q].playhead = v;
+        self.advance_buffers(film, q, v, out, blocking)
     }
 
-    /// Bring every buffer to film frame `n` (#134) before the frame is planned. False
+    /// Bring every buffer to (virtual) frame `n` (#134) before the frame is planned. False
     /// while that isn't done: a stall (something not ready without `blocking`), or a
     /// catch-up sliced over several renders.
     pub(super) fn advance_buffers(
@@ -653,6 +726,7 @@ impl Renderer {
         blocking: bool,
     ) -> bool {
         let movie = super::seq_movie(film, q);
+        self.folds[q].seam = warm(movie);
         // A comp's buffers (#138) are sized against the comp's own size, if it has one.
         let out = super::seq_out(film, q, out);
         self.folds[q].n = n;
@@ -777,7 +851,7 @@ impl Renderer {
         let live: Vec<&Buffer> = movie
             .buffers
             .iter()
-            .filter(|b| !b.is_pure() && b.active(n))
+            .filter(|b| !b.is_pure() && act(movie, b, n))
             .collect();
         if live.is_empty() || live.iter().any(|b| b.preview_lookback.is_none()) {
             return None;
@@ -801,8 +875,8 @@ impl Renderer {
             .buffers
             .iter()
             .map(|b| match b.preview_lookback {
-                _ if b.is_pure() => pure_start(b, n),
-                Some(l) => n.saturating_sub(l).max(b.reset_at(n).unwrap_or(0)),
+                _ if b.is_pure() => pure_start(movie, b, n),
+                Some(l) => n.saturating_sub(l).max(reset_v(movie, b, n).unwrap_or(0)),
                 None => n + 1,
             })
             .collect();
@@ -844,13 +918,14 @@ impl Renderer {
     /// stepped to `c` with all the states it (and its readers) need.
     fn cursor_valid(&self, movie: &Movie, q: usize, c: u64) -> bool {
         movie.buffers.iter().enumerate().all(|(i, b)| {
-            if !b.active(c) {
+            if !act(movie, b, c) {
                 return true;
             }
             let Some(r) = self.folds[q].rings.get(i).and_then(Option::as_ref) else {
                 return false;
             };
-            r.last == Some(c) && (Some(r.since) == b.reset_at(c) || r.since + b.history as u64 <= c)
+            r.last == Some(c)
+                && (Some(r.since) == reset_v(movie, b, c) || r.since + b.history as u64 <= c)
         })
     }
 
@@ -862,7 +937,13 @@ impl Renderer {
         let cold: Vec<u64> = {
             let s = cold_start(movie, n);
             bufs.iter()
-                .map(|b| if b.is_pure() { pure_start(b, s) } else { s })
+                .map(|b| {
+                    if b.is_pure() {
+                        pure_start(movie, b, s)
+                    } else {
+                        s
+                    }
+                })
                 .collect()
         };
         let mut best = (first_step(movie, &cold, n), cold, None::<usize>, false);
@@ -887,7 +968,7 @@ impl Renderer {
                 .iter()
                 .map(|b| {
                     if b.is_pure() {
-                        pure_start(b, c + 1)
+                        pure_start(movie, b, c + 1)
                     } else {
                         c + 1
                     }
@@ -991,7 +1072,7 @@ impl Renderer {
     /// Rings of buffers not active at `n` hold nothing anyone reads: free them.
     fn free_idle_rings(&mut self, movie: &Movie, q: usize, n: u64) {
         for (b, buf) in movie.buffers.iter().enumerate() {
-            if !buf.active(n)
+            if !act(movie, buf, n)
                 && let Some(r) = self.folds[q].rings[b].take()
             {
                 for (t, _) in r.slots {
@@ -1012,7 +1093,7 @@ impl Renderer {
         back: u32,
         m: u64,
     ) -> Option<(glow::Texture, usize, usize)> {
-        if !movie.buffers.get(b)?.active(m) {
+        if !act(movie, movie.buffers.get(b)?, m) {
             return None;
         }
         // An approximate frame reads the states of the frame the rings are at.
@@ -1065,7 +1146,7 @@ impl Renderer {
         let movie = super::seq_movie(film, q);
         let bufs = &movie.buffers;
         let todo: Vec<usize> = (0..bufs.len())
-            .filter(|&b| bufs[b].active(m) && m >= starts[b])
+            .filter(|&b| act(movie, &bufs[b], m) && m >= starts[b])
             .collect();
         if todo.is_empty() {
             return true;
@@ -1073,12 +1154,15 @@ impl Renderer {
         let Some(copy) = self.copy else { return false };
         let mut keys = vec![];
         for &b in &todo {
-            match self.usable(self.buf_base[q] + b, blocking, m) {
+            match self.usable(self.buf_base[q] + b, blocking, real(movie, m)) {
                 Some(k) => keys.push(k),
                 None => return false,
             }
         }
-        let t = movie.frame_time(m);
+        // Inputs are read at the real frame (a warm sequence's pre-roll repeats the
+        // period); state, resets and iFrame count virtual frames.
+        let rm = real(movie, m);
+        let t = movie.frame_time(rm);
         let at = movie.at(t);
         let mut insts = vec![];
         let reads_picture = |b: usize| {
@@ -1099,7 +1183,7 @@ impl Renderer {
                     film,
                     q,
                     at,
-                    (t, m.min(i32::MAX as u64) as i32, m),
+                    (t, rm.min(i32::MAX as u64) as i32, rm),
                     size,
                     size,
                     blocking,
@@ -1162,7 +1246,7 @@ impl Renderer {
         let mut init = vec![false; todo.len()];
         for (i, &b) in todo.iter().enumerate() {
             let buf = &bufs[b];
-            let fresh = buf.resets.binary_search(&m).is_ok()
+            let fresh = reset_v(movie, buf, m) == Some(m)
                 || self.folds[q].rings[b]
                     .as_ref()
                     .is_none_or(|r| m == 0 || r.last != Some(m - 1));
@@ -1172,7 +1256,7 @@ impl Renderer {
                 for s in &mut r.slots {
                     s.1 = None;
                 }
-                r.reset = buf.reset_at(m).unwrap_or(m);
+                r.reset = reset_v(movie, buf, m).unwrap_or(m);
                 r.since = m;
                 r.last = None;
                 init[i] = r.reset == m;
@@ -1291,7 +1375,10 @@ impl Renderer {
         if !self.folds[q].checkpoints_on || self.folds[q].lookback {
             return;
         }
-        if !m.is_multiple_of(checkpoint_interval(movie, m)) {
+        // A warm sequence always keeps the state at its seam (v = p, real frame 0), so
+        // each wrap of the loop restores it instead of stepping a period again.
+        let seam = warm(movie) == Some(m);
+        if !m.is_multiple_of(checkpoint_interval(movie, m)) && !seam {
             return;
         }
         let key = self.folds[q].key;
@@ -1303,7 +1390,7 @@ impl Renderer {
             return;
         }
         let live: Vec<usize> = (0..movie.buffers.len())
-            .filter(|&b| !movie.buffers[b].is_pure() && movie.buffers[b].active(m))
+            .filter(|&b| !movie.buffers[b].is_pure() && act(movie, &movie.buffers[b], m))
             .collect();
         // A pure buffer can step ahead of the others (it starts `history` back): their
         // rings then hold another frame's state, or none. Only a whole fold at m is saved.
@@ -1340,11 +1427,11 @@ impl Renderer {
                     let k = self.keep_frame(p, f.playhead);
                     f.checkpoints
                         .iter()
-                        .map(move |c| evict_score(c.key == f.key, c.frame, f.playhead, k))
+                        .map(move |c| evict_score(c.key == f.key, c.frame, f.playhead, k, f.seam))
                 })
                 .fold(f64::NEG_INFINITY, f64::max);
             let keep_new = keep.max(Some(m).filter(|&m| m <= playhead));
-            if evict_score(true, m, playhead, keep_new) >= worst {
+            if evict_score(true, m, playhead, keep_new, self.folds[q].seam) >= worst {
                 return;
             }
         }
@@ -1428,7 +1515,7 @@ impl Renderer {
                 let f = &self.folds[q];
                 let keep = self.keep_frame(q, f.playhead);
                 for (i, c) in f.checkpoints.iter().enumerate() {
-                    let sc = evict_score(c.key == f.key, c.frame, f.playhead, keep);
+                    let sc = evict_score(c.key == f.key, c.frame, f.playhead, keep, f.seam);
                     if worst.is_none_or(|w| sc > w.0) {
                         worst = Some((sc, q, i));
                     }
@@ -1444,12 +1531,19 @@ impl Renderer {
 /// Eviction order (higher goes first): stale checkpoints (another fold key), then the
 /// farthest from the playhead, where a frame on a coarser grid (divisible by a higher
 /// power of two) counts as nearer, so far from the playhead the spacing doubles
-/// instead of thrashing (#137). The one just before the playhead (`keep`) stays.
-fn evict_score(current: bool, frame: u64, playhead: u64, keep: Option<u64>) -> f64 {
+/// instead of thrashing (#137). The one just before the playhead (`keep`) stays, and a
+/// warm loop's seam (#138).
+fn evict_score(
+    current: bool,
+    frame: u64,
+    playhead: u64,
+    keep: Option<u64>,
+    seam: Option<u64>,
+) -> f64 {
     if !current {
         return f64::INFINITY;
     }
-    if Some(frame) == keep {
+    if Some(frame) == keep || Some(frame) == seam {
         return -1.0;
     }
     let d = frame.abs_diff(playhead) as f64;
@@ -1460,7 +1554,7 @@ fn evict_score(current: bool, frame: u64, playhead: u64, keep: Option<u64>) -> f
 /// Checkpoint spacing at frame `m`: one second of frames, or every frame while a
 /// buffer active there has `cache = "dense"` (#137).
 fn checkpoint_interval(movie: &Movie, m: u64) -> u64 {
-    if movie.buffers.iter().any(|b| b.dense && b.active(m)) {
+    if movie.buffers.iter().any(|b| b.dense && act(movie, b, m)) {
         1
     } else {
         (movie.fps.round() as u64).max(1)
