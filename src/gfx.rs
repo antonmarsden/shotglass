@@ -15,6 +15,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use toodee::{TooDeeOps, TooDeeOpsMut, TranslateOps};
 
+mod fold;
+
 /// The engine's own pass that shows one shot unchanged (`transition_source(.., "copy", ..)`).
 /// Not a transition films can name: their transitions come from libraries or files.
 const COPY: &str = include_str!("glsl/copy.glsl");
@@ -111,6 +113,9 @@ const CHANNEL_UNIFORMS: [&str; N_CHANNELS] = [
 ];
 
 const SCENE_FOOTER: &str = "void main(){\n  vec4 c = vec4(0.0, 0.0, 0.0, 1.0);\n  mainImage(c, gl_FragCoord.xy);\n  shotglass_out = vec4(c.rgb, 1.0);\n}";
+
+/// A buffer's footer (#134): the raw state, any values (no premultiply, no clamp).
+const BUFFER_FOOTER: &str = "void main(){\n  vec4 c = vec4(0.0, 0.0, 0.0, 1.0);\n  mainImage(c, gl_FragCoord.xy);\n  shotglass_out = c;\n}";
 
 const TRANSITION_HEADER: &str = "\
 uniform sampler2D uFrom;
@@ -576,6 +581,19 @@ pub struct Renderer {
     footage_failure: Option<String>,
     /// Evicted textures kept for reuse: ((w, h, srgb, mipmap), texture).
     spare: Vec<((usize, usize, bool, bool), glow::Texture)>,
+    /// Feedback buffers (#134): rings, cursor, checkpoints (`fold.rs`).
+    fold: fold::Fold,
+    /// Where the film's buffers start in `wanted` (after every sequence's items).
+    buf_base: usize,
+    /// Plan the film's picture track without its layers (a buffer's `@picture`).
+    plan_no_layers: bool,
+    /// Buffer steps drawn (tests).
+    pub buffer_steps: usize,
+    /// Blocking renders that had to catch a buffer up (more than one step): playback
+    /// must do none.
+    pub blocking_catchups: usize,
+    /// Checkpoints restored (tests).
+    pub buffer_restores: usize,
 }
 
 /// A sound block submitted with `Renderer::submit_audio`, not yet collected.
@@ -797,6 +815,7 @@ impl Renderer {
             } else {
                 None
             };
+            let fold_state = fold::Fold::new(&gl, ext);
             Ok(Renderer {
                 warnings: vec![],
                 gl_info,
@@ -864,6 +883,12 @@ impl Renderer {
                 footage_failure: None,
                 spare: vec![],
                 texture_ms: 0.0,
+                fold: fold_state,
+                buf_base: 0,
+                plan_no_layers: false,
+                buffer_steps: 0,
+                blocking_catchups: 0,
+                buffer_restores: 0,
             })
         }
     }
@@ -991,6 +1016,9 @@ impl Renderer {
                 crate::movie::Source::Picture => Some(PICTURE_TEX),
                 crate::movie::Source::Layer { index, .. } => Some(LAYER_TEX - *index as u64),
                 crate::movie::Source::Comp { .. } => Some(COMP_TEX - n as u64),
+                crate::movie::Source::Buffer { index, back, .. } => {
+                    Some(fold::buf_key(*index, *back))
+                }
                 _ => None,
             };
             if let Some(tex) = pass {
@@ -1251,6 +1279,40 @@ impl Renderer {
                 }
             }
         }
+        // Buffers (#134) after every sequence's items: the scene, its init pass in
+        // `trans` (keys_ready needs both), its channels.
+        let buf_base = wanted.len();
+        for (b, buf) in movie.buffers.iter().enumerate() {
+            let what = format!("buffer \"{}\"", buf.id);
+            let scene = add(
+                self,
+                format!("{what} ({})", rel(&buf.scene, &movie.root)),
+                buffer_source(dialect, buf, &buf.scene, &cues, movie),
+            );
+            let init = match &buf.init {
+                Some(p) => add(
+                    self,
+                    format!("init of {what} ({})", rel(p, &movie.root)),
+                    buffer_source(dialect, buf, p, &cues, movie),
+                )
+                .map(Some),
+                None => Some(None),
+            };
+            let channels = self.channel_keys(
+                &what,
+                crate::movie::ItemRef::Buffer(b),
+                movie,
+                &mut tex_errors,
+            );
+            if let (Some(scene), Some(init)) = (scene, init) {
+                wanted.push(ShotKeys {
+                    scene,
+                    trans: init,
+                    channels,
+                });
+                ids.push(format!("[buffer]{}", buf.id));
+            }
+        }
         let over = if seqs.iter().all(|(_, s, _)| s.layers.is_empty()) {
             None
         } else {
@@ -1284,6 +1346,30 @@ impl Renderer {
         self.fallback.retain(|id, _| ids.contains(id));
         self.wanted_ids = ids;
         self.seq_base = seq_base;
+        self.buf_base = buf_base;
+        // What a fold reads besides program and texture keys (#134, "Invalidation").
+        let reads_film = movie.buffers.iter().any(|b| {
+            b.channels.iter().flatten().any(|c| {
+                matches!(
+                    c.source,
+                    crate::movie::Source::Picture | crate::movie::Source::Comp { .. }
+                )
+            })
+        });
+        self.fold.reads_film = reads_film;
+        self.fold.decl = hash(&format!(
+            "{:?}\0{}/{}\0{:?}\0{}\0{}",
+            movie.buffers,
+            movie.fps_num,
+            movie.fps_den,
+            movie.loop_frames,
+            movie.duration,
+            if reads_film {
+                format!("{:?}{:?}", movie.shots, movie.comps)
+            } else {
+                String::new()
+            }
+        ));
         // Sequences gone with a removed comp: free their targets, not just the handles.
         for s in self
             .seqs
@@ -1843,11 +1929,22 @@ impl Renderer {
             }
         }
         let n = movie.shots.len();
-        for (j, layer) in movie.layers.iter().enumerate() {
-            let Some(k) = self.wanted.get(n + j) else {
+        let spans = movie
+            .layers
+            .iter()
+            .enumerate()
+            .map(|(j, l)| (n + j, layer_distance(movie, l, t)))
+            .chain(
+                movie
+                    .buffers
+                    .iter()
+                    .enumerate()
+                    .map(|(b, x)| (self.buf_base + b, span_distance(movie, x.start, x.end, t))),
+            );
+        for (i, d) in spans {
+            let Some(k) = self.wanted.get(i) else {
                 continue;
             };
-            let d = layer_distance(movie, layer, t);
             v.extend(
                 k.channels
                     .iter()
@@ -2267,6 +2364,15 @@ impl Renderer {
                 v.push((k.scene, d));
                 if let Some(b) = k.trans {
                     v.push((b, d));
+                }
+            }
+        }
+        for (b, buf) in movie.buffers.iter().enumerate() {
+            if let Some(k) = self.wanted.get(self.buf_base + b) {
+                let d = span_distance(movie, buf.start, buf.end, t);
+                v.push((k.scene, d));
+                if let Some(i) = k.trans {
+                    v.push((i, d));
                 }
             }
         }
@@ -2760,6 +2866,12 @@ impl Renderer {
         let mut insts: Vec<(InstKey, SeqPlan)> = vec![];
         let n = film_frame(movie, info.t);
         self.comp_req.clear();
+        // Buffers (#134) step to frame n first (catching up if needed): a frame shows
+        // only once every active buffer holds its state at n.
+        if !self.advance_buffers(movie, n, (w, h), blocking) {
+            self.comp_seen = std::mem::take(&mut self.comp_req);
+            return None;
+        }
         let root = self.plan_seq(
             movie,
             0,
@@ -2900,8 +3012,12 @@ impl Renderer {
         }
         // Layers (#69): a frame is usable only when every active layer is, so playback
         // never shows a frame without a layer that `still` and `export` would draw.
-        let active: Vec<(usize, f32)> = m
-            .layers_at(t)
+        let layers_here = if seq == 0 && self.plan_no_layers {
+            vec![]
+        } else {
+            m.layers_at(t)
+        };
+        let active: Vec<(usize, f32)> = layers_here
             .into_iter()
             .filter(|(j, _)| seq > 0 || !self.hidden.contains(&m.layers[*j].id))
             .collect();
@@ -3230,6 +3346,9 @@ impl Renderer {
                     ];
                     passes.extend(held.iter().copied());
                     passes.extend(self.inst_passes(&p.chans[n_shots + li]));
+                    if p.seq == 0 {
+                        passes.extend(self.buf_passes(film, &layer.channels, self.fold.n));
+                    }
                     let item = Item {
                         start: layer.start,
                         duration: layer.duration(),
@@ -3374,6 +3493,7 @@ impl Renderer {
     fn target(&self, w: Which) -> &Target {
         match w {
             Which::Inst(i) => self.inst[i].as_ref().unwrap(),
+            Which::Ring(b, s) => self.fold.ring_target(b, s),
             _ => {
                 let s = &self.seqs[self.cur];
                 match w {
@@ -3384,7 +3504,7 @@ impl Renderer {
                     Which::Layer => s.layer.as_ref().unwrap(),
                     Which::Picture => s.picture.as_ref().unwrap(),
                     Which::Held(j) => s.held[j].as_ref().unwrap(),
-                    Which::Inst(_) => unreachable!(),
+                    Which::Inst(_) | Which::Ring(..) => unreachable!(),
                 }
             }
         }
@@ -3393,6 +3513,7 @@ impl Renderer {
     fn target_mut(&mut self, w: Which) -> &mut Target {
         match w {
             Which::Inst(i) => self.inst[i].as_mut().unwrap(),
+            Which::Ring(b, s) => self.fold.ring_target_mut(b, s),
             _ => {
                 let s = &mut self.seqs[self.cur];
                 match w {
@@ -3403,7 +3524,7 @@ impl Renderer {
                     Which::Layer => s.layer.as_mut().unwrap(),
                     Which::Picture => s.picture.as_mut().unwrap(),
                     Which::Held(j) => s.held[j].as_mut().unwrap(),
-                    Which::Inst(_) => unreachable!(),
+                    Which::Inst(_) | Which::Ring(..) => unreachable!(),
                 }
             }
         }
@@ -4224,6 +4345,31 @@ pub fn layer_source(
     Ok(b.footer(LAYER_FOOTER).build())
 }
 
+/// The fragment shader for a buffer's scene or init pass (#134): the scene header,
+/// its uniforms (`SG_HAS_<name>`) and params, the cues, the file, and the buffer
+/// footer (the raw state).
+pub fn buffer_source(
+    dialect: Dialect,
+    buffer: &crate::movie::Buffer,
+    file: &Path,
+    cues: &str,
+    movie: &Movie,
+) -> Result<Assembled> {
+    let mut header = SCENE_HEADER.to_string();
+    for (name, a) in &buffer.uniforms {
+        header += &format!("uniform {} {name};\n#define SG_HAS_{name}\n", a.glsl_type());
+    }
+    for (name, v) in &buffer.params {
+        header += &format!("#define {name} {}\n", crate::shader::define_value(v));
+    }
+    header += cues;
+    Ok(Builder::new(dialect, &header, &movie.root)
+        .libraries(&movie.libraries)
+        .file(file)?
+        .footer(BUFFER_FOOTER)
+        .build())
+}
+
 /// The fragment shader for a layer's blend pass (#72): the transition header, with
 /// `getBase`/`getLayer`/`opacity` naming the picture below, the layer and its opacity,
 /// the layer's params as `#define`s, the cues, the pass (a library's or a film file),
@@ -4350,6 +4496,11 @@ fn comp_distances(film: &Movie, t: f32) -> Vec<f32> {
             }
         }
     };
+    for b in &film.buffers {
+        for c in b.channels.iter().flatten().filter_map(comp_of) {
+            d[c] = d[c].min(span_distance(film, b.start, b.end, t));
+        }
+    }
     uses(&film.shots, &film.layers, &mut |i, c| {
         let di = if i < film.shots.len() {
             distance(film, &film.shots[i], t)
@@ -4601,6 +4752,7 @@ impl Drop for Renderer {
                 all.extend(s.held);
             }
             all.extend(std::mem::take(&mut self.inst));
+            all.extend(self.fold.targets().into_iter().map(Some));
             for t in all.into_iter().flatten() {
                 self.gl.delete_framebuffer(t.fbo);
                 self.gl.delete_texture(t.tex);
@@ -4636,6 +4788,8 @@ enum Which {
     Held(usize),
     /// A comp instance's output this frame (#74), at exactly its size.
     Inst(usize),
+    /// Slot `s` of buffer `b`'s ring (#134).
+    Ring(usize, usize),
 }
 
 /// One sequence's scratch targets (#74: the film's, and each comp's).
@@ -4654,6 +4808,14 @@ struct SeqTargets {
     held: Vec<Option<Target>>,
     /// (shot, movie generation, outgoing shot's keys) of the frozen frame.
     freeze_key: Option<(usize, u64, ShotKeys)>,
+}
+
+/// Every target of a sequence's scratch set (to delete).
+fn seq_targets(s: SeqTargets) -> Vec<Target> {
+    let mut all = vec![s.a, s.b, s.freeze, s.layer, s.picture];
+    all.extend(s.work);
+    all.extend(s.held);
+    all.into_iter().flatten().collect()
 }
 
 /// A comp drawn this frame (#74): comp `seq - 1` at its local time, drawn at
@@ -4829,11 +4991,17 @@ fn distance(movie: &Movie, shot: &Shot, t: f32) -> f32 {
 
 /// How far `t` is from a layer's span (0 inside it), like `distance` for shots.
 fn layer_distance(movie: &Movie, layer: &Layer, t: f32) -> f32 {
+    span_distance(movie, layer.start, layer.end, t)
+}
+
+/// How soon the playhead at `t` needs something active on `[start, end)`; behind it
+/// counts double.
+fn span_distance(movie: &Movie, start: f32, end: f32, t: f32) -> f32 {
     let once = |t: f32| {
-        if t < layer.start {
-            layer.start - t
-        } else if t >= layer.end {
-            (t - layer.end) * 2.0
+        if t < start {
+            start - t
+        } else if t >= end {
+            (t - end) * 2.0
         } else {
             0.0
         }

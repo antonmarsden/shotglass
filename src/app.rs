@@ -289,6 +289,8 @@ struct Player {
     status: Option<(String, Instant)>,
     tex: Option<(glow::Texture, egui::TextureId)>,
     rendered_key: Option<(u32, i32, i32, i32, u32, u64)>,
+    /// The clock is held while buffers catch up after a seek during playback (#134).
+    catchup_paused: bool,
     generation: u64,
     scale_mode: ScaleMode,
     auto_scale: f32,
@@ -322,7 +324,9 @@ impl Player {
             .gl
             .clone()
             .ok_or_else(|| anyhow::anyhow!("eframe didn't give us an OpenGL context"))?;
-        let renderer = Renderer::new(gl)?;
+        let mut renderer = Renderer::new(gl)?;
+        // Buffers (#134) catch up in budgeted slices, so a seek never freezes the UI.
+        renderer.set_catchup_slices(true);
         let (audio, sound_info) = match AudioOut::open() {
             Ok(a) => {
                 let s = format!("{} | {} Hz", a.device_name, a.sample_rate);
@@ -364,6 +368,7 @@ impl Player {
             status: None,
             tex: None,
             rendered_key: None,
+            catchup_paused: false,
             generation: 0,
             scale_mode: scale.map_or(ScaleMode::Auto, ScaleMode::Fixed),
             auto_scale: 1.0,
@@ -745,6 +750,7 @@ impl Player {
     }
 
     fn toggle_play(&mut self) {
+        self.catchup_paused = false;
         if self.clock.playing() {
             self.clock.pause();
         } else {
@@ -998,7 +1004,19 @@ impl Player {
         // Paused or scrubbing: compile on the spot if needed. Playing: never stall,
         // keep the previous frame up until the shot's program is ready.
         let blocking = !self.clock.playing();
-        let tex = self.renderer.render(m, w, h, &info, blocking)?;
+        let Some(tex) = self.renderer.render(m, w, h, &info, blocking) else {
+            // Buffers catching up after a seek while playing (#134): the clock waits (a
+            // stall, not a drop), then playback resumes.
+            if playing && self.renderer.catchup_progress().is_some() {
+                self.clock.pause();
+                self.catchup_paused = true;
+            }
+            return None;
+        };
+        if self.catchup_paused && self.renderer.catchup_progress().is_none() {
+            self.catchup_paused = false;
+            self.resume_playback();
+        }
         let tex = Some(tex);
         self.rendered_key = Some(key);
         if let Some(tex) = tex
@@ -1612,6 +1630,16 @@ impl Player {
                 .default_open(false)
                 .show(ui, |ui| {
                     ui.label(RichText::new(&self.renderer.gl_info).small());
+                    let (budget, from) = self.renderer.buffer_cache_budget();
+                    let (n, used) = self.renderer.checkpoint_stats();
+                    ui.label(
+                        RichText::new(format!(
+                            "buffer checkpoints: {n}, {} of {} MB ({from})",
+                            used >> 20,
+                            budget >> 20
+                        ))
+                        .small(),
+                    );
                     ui.label(format!("reloads: {}", self.reloads.saturating_sub(1)));
                 });
             egui::CollapsingHeader::new("Keys")
@@ -1793,6 +1821,12 @@ impl eframe::App for Player {
             if loaded < textures {
                 busy.push(format!("loading textures {loaded}/{textures}"));
             }
+            if let Some((done, total)) = self.renderer.catchup_progress() {
+                busy.push(format!(
+                    "catching up buffers {}%",
+                    done * 100 / total.max(1)
+                ));
+            }
             if !busy.is_empty() {
                 ui.painter().text(
                     view.right_top() + Vec2::new(-10.0, 10.0),
@@ -1828,7 +1862,11 @@ impl eframe::App for Player {
         self.check_gpu(gap);
         let (ready, total) = self.renderer.progress();
         let (loaded, textures) = self.renderer.texture_progress();
-        if self.clock.playing() || ready < total || loaded < textures {
+        if self.clock.playing()
+            || ready < total
+            || loaded < textures
+            || self.renderer.catchup_progress().is_some()
+        {
             ctx.request_repaint();
         } else {
             ctx.request_repaint_after(Duration::from_millis(120));

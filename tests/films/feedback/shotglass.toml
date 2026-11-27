@@ -1,0 +1,2 @@
+# Engine contract: feedback buffers need shotglass 0.1.9.
+shotglass = "0.1.9"
