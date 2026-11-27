@@ -1,6 +1,7 @@
 # Design: feedback buffers in films
 
-Status: **proposal** (#134). Nothing is built yet. Builds on the iChannel design
+Status: **phase 1 built** (#134): `[[buffer]]`, history, resets, checkpoints; user docs in
+[buffers.md](../buffers.md). Phases 2+ (comps, warm loops, `after`) are still proposals. Builds on the iChannel design
 ([ichannel.md](ichannel.md), which deferred `{ buffer = "A" }` to its own design) and on
 layers and comps ([layers-compositing.md](layers-compositing.md), which ruled
 previous-frame inputs out of layers).

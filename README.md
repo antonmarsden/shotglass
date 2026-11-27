@@ -87,6 +87,7 @@ The detailed user documentation lives in [`docs/`](docs/):
 - [Movies: `movie.toml`, shaders and transitions](docs/movies.md): How a film is laid out on disk, every `movie.toml` field, scene shaders and their uniforms, transitions, and writing portable GLSL.
 - [Channels: textures, footage and text](docs/channels.md): What a shot can bind to `iChannel0..7`: images, image sequences (footage), laid-out text, glyph runs, and SRT or WebVTT subtitles, plus getting fonts.
 - [Layers and blends](docs/layers.md): Layers over spans of the film, their opacity and scale, blend modes and reading other layers.
+- [Feedback buffers](docs/buffers.md): State kept from frame to frame (trails, echo, simulations), history, resets, and how seeking stays exact.
 - [Sound](docs/sound.md): Music, per-shot sound and the mix pass, all synthesised on the GPU in GLSL.
 - [Loop films](docs/loop-films.md): Films that play forever (`loop = true`), Shadertoy-style, with a seamless picture and sound.
 - [The player](docs/player.md): The interactive player, avoiding frame drops, and how long films stay fast.
