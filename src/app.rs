@@ -993,7 +993,10 @@ impl Player {
         // and playback shows exactly the frames `still` would.
         let t = self.clock.time_precise();
         let index = m.frame_at_precise(t).min(m.frame_count().saturating_sub(1));
-        let mut info = if playing {
+        // Paused at (or past) the last frame's time, e.g. at the end, show that frame:
+        // the end time itself isn't a film frame, and layers and buffers have ended there.
+        let last = index + 1 >= m.frame_count() && t >= m.frame_time(index) as f64;
+        let mut info = if playing || last {
             FrameInfo::frame(m, index)
         } else {
             FrameInfo::at(m, t as f32)

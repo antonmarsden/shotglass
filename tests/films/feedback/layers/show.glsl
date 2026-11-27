@@ -22,8 +22,10 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
       c = over(c, texture(iChannel2, q), 1.0);
     }
   } else if (uv.x < 0.5) {
+    // It starts with shot "b"; before that the channel is unbound (resolution 0) and
+    // the panel shows the plate.
     vec4 r = texture(iChannel6, q);
-    c = vec3(r.y, 0.4 * r.x, r.z);
+    c = iChannelResolution[6].x > 0.0 ? vec3(r.y, 0.4 * r.x, r.z) : plate;
   } else {
     c = over(plate, texture(iChannel2, q), 1.0);
   }
