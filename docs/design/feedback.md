@@ -29,11 +29,12 @@ shotglass promises that a frame depends only on (movie, t, size, scale), so play
   (GPU memory, adaptively spaced under a fixed budget) keep a seek bounded.
   Catch-up happens only while paused or scrubbing, in budgeted slices, so playback
   never blocks and the player never freezes.
-- **Contract:** additive (`[[buffer]]`, the `@prev` channel source, buffer-local
+- **Contract:** additive (`[[buffer]]`, the `@prev` and `frame = -k` channel sources, buffer-local
   `iFrame`), so a patch bump: the next free version (0.1.9 if #73 hasn't taken it).
   Films without buffers take exactly the old path.
 
-MVP (phase 1): `[[buffer]]` with spans, resets, `@prev`, reading textures, text,
+MVP (phase 1): `[[buffer]]` with spans, resets, `@prev`, a history of the last N
+states (`frame = -k`), reading textures, text,
 footage, `@picture` and other buffers; canonical fold from the reset; GPU checkpoints;
 budgeted catch-up in the player. Then background fill and progressive scrub (phase 2),
 then buffers in comps, seamless loop films and buffers inside the layer stack (phase 3).
@@ -65,8 +66,12 @@ Each of these assumes independence; the sections below say what changes.
    texels; several buffers that read each other (Shadertoy's Buffer A–D).
 4. **Temporal smoothing:** a buffer that averages noisy raymarched frames (TAA-like),
    reset at every cut.
+5. **Echo and frame blend:** distinct past frames rather than a decayed sum: After
+   Effects' Echo, Nuke's FrameBlend, strobe trails, stutter, fake motion blur over a
+   shutter, and at the far end slit-scan / time displacement (each row or pixel from a
+   different past frame). Needs a [history](#history) of the last N frames.
 
-Cases 1 and 4 forget their past quickly; cases 2 and 3 never do. The seek strategy must
+Cases 1, 4 and 5 forget their past quickly; cases 2 and 3 never do. The seek strategy must
 work for both, and be exact for both.
 
 ## Model
@@ -80,7 +85,7 @@ scene = "buffers/trail.glsl"       # mainImage writes the new state
 from = "moon"                      # span, as for layers; default: the whole film
 to = "closeup.end"
 size = [960, 540]                  # or scale = 0.5 (of the output size); fixed, never "auto"
-format = "rgba16f"                 # default; "rgba32f" for simulations that need it
+format = "rgba16f"                 # default; "rgba32f" for simulations, "rgba8" for picture history
 channels = ["@prev", "@picture"]   # iChannel0 = my previous state, iChannel1 = this frame's picture
 reset = ["closeup"]                # also start over at the start of shot "closeup"
 
@@ -93,10 +98,13 @@ channels = ["@trail"]              # this frame's state, after its step
 - **Order:** buffers step in file order, after the picture track and before any layer.
   A buffer may read the current state of an *earlier* buffer (`@a`) and the previous
   state of any buffer, itself included (`@prev`, or `{ source = "@b", frame = "prev" }`).
+  So Buffer A–D chains work and the per-frame graph stays a DAG.
   To get trails of something a layer would draw (a title, a brush tip), render it in a
   **comp** and read `@<comp>`: comps are drawn before the film, so they're available to
   buffers in phase 1.
-  So Buffer A–D chains work and the per-frame graph stays a DAG.
+- **History:** `history = N` keeps a ring of the buffer's last N states, read as
+  `{ source = "@b", frame = -k }` for 1 ≤ k ≤ N (`@prev` and `frame = "prev"` are
+  `frame = -1`; without `history`, N = 1). See [History](#history).
 - **Inputs:** textures, text, footage, comps, `@picture` and buffers. Not `@input` or
   `@<layer>`: buffers step before layers. A buffer that reads `@picture` makes the
   picture part of its fold (see [Invalidation](#invalidation)).
@@ -137,6 +145,58 @@ Consequences:
   output size the command uses, like a fixed-scale layer).
 - **Render scale doesn't touch buffers.** They never draw in strips at a lower scale;
   slow steps are drawn in viewport strips at full buffer size, like slow frames.
+
+### History
+
+One frame of feedback (`@prev`) covers every effect that remembers through a decayed
+sum: trails, smear, accumulation, TAA. Effects that need *distinct* past frames read a
+history:
+
+```toml
+[[buffer]]
+id = "hist"
+scene = "buffers/copy.glsl"        # copies @picture: the state is just the picture
+scale = 0.5
+format = "rgba8"
+history = 8
+channels = ["@picture"]
+
+[[layer]]
+id = "echo"
+scene = "layers/echo.glsl"
+channels = ["@input", "@hist", { source = "@hist", frame = -2 }, { source = "@hist", frame = -4 }]
+```
+
+How many frames typical effects need:
+
+| effect | frames |
+|---|---|
+| trails, smear, accumulation, TAA / denoise | 1 (`@prev` + decay) |
+| frame differencing, datamosh-like | 1–2 |
+| frame blend / fake motion blur | 2–8 |
+| discrete echo, strobe trails, stutter | 4–16 |
+| slit-scan / time displacement | 30–120 |
+
+- **The ring:** N + 1 targets (the N past states plus the one being drawn), rotated
+  every step; no copies. `frame = -k` reads the state of film frame n − k.
+- **Before a reset**, `frame = -k` with n − k < r reads what `@prev` reads on the reset
+  frame: black, or the `init` state. So the fold stays exact and loop films stay
+  seamless-or-reset as before.
+- **Limited by memory, not count:** the ring is required memory ((N + 1) × state size,
+  see [Memory](#memory)), checked at load, with a sanity cap of `history ≤ 64`. Full-HD
+  float history fails at load with a message; slit-scan at half size in `rgba8` fits
+  (960×540 RGBA8 × 60 ≈ 120 MB).
+- **`format = "rgba8"`** is allowed on any buffer (picture history doesn't need floats);
+  it halves the memory of `rgba16f`. Simulations should stay on float formats.
+- **Checkpoints of a buffer with history** hold the whole ring, so they're N× bigger and
+  spaced further apart under the same budget. A **pure history buffer** (one that
+  doesn't read its own or another buffer's past: it only copies its inputs) needs no
+  checkpoints at all: its state at n depends only on frames n − N .. n, so a seek
+  rebuilds it exactly in N steps. The engine detects this from the channels (no `@prev`,
+  no `frame = -k` reads) and skips its checkpoints.
+- **Arbitrary random access** to the past (more than N frames back, or into the future)
+  is out of scope: footage already has it through re-timing, and for shaders it would
+  mean rendering past frames on demand.
 
 ### Buffers in the layer stack (phase 3)
 
@@ -222,7 +282,8 @@ budget in the player's settings stretches that.
 
 Buffer memory never grows without bound. Two kinds, treated differently:
 
-- **Required: the ping-pong targets** (two per active buffer, at its size and format).
+- **Required: the ping-pong targets** (two per active buffer, at its size and format;
+  N + 1 for a buffer with `history = N`).
   They can't be evicted while the buffer is active. `Movie::load` sums them for the
   worst frame (the most buffers active at once, comps included in phase 3) and refuses
   the film when that exceeds a fixed limit, with a message naming the buffers and their
@@ -313,7 +374,7 @@ checkpoints stay until the new version's frame n is ready.
 - `[[buffer]]` in `movie.toml` (fields above), refused by older engines through the
   contract version.
 - Channel sources: `@prev` (buffers only), `@<buffer id>`, and
-  `{ source = "@<id>", frame = "prev" }`, classified in `movie::ChannelSource::of`.
+  `{ source = "@<id>", frame = "prev" | -k }`, classified in `movie::ChannelSource::of`.
 - Buffer-local `iFrame` (frames since reset), `iTime` and the span uniforms as for
   layers. No new uniform names: a pasted Shadertoy Buffer A works with
   `channels = ["@prev"]`.
@@ -322,7 +383,7 @@ checkpoints stay until the new version's frame n is ready.
 
 ## Renderer
 
-- **Targets:** two per buffer (ping-pong), at the buffer's size and format, allocated on
+- **Targets:** two per buffer (ping-pong) (a ring of N + 1 with `history = N`), at the buffer's size and format, allocated on
   first use in the span and freed after it. They count against a buffer budget, not the
   256 MB texture LRU.
 - **Plan:** per frame, after the picture and before layers: for each active buffer, step
@@ -377,13 +438,15 @@ filtering needs `OES_texture_float_linear`, so `rgba32f` buffers default to `nea
   - "buffers: auto scale doesn't touch state".
   - "buffers: playback never blocks": 0 blocking catch-ups while playing.
   - "buffers: resets": state at a reset equals a fresh start.
+  - "buffers: history": `frame = -k` equals the state k frames back, reads `init` before a reset, and a pure history buffer rebuilt after a seek equals one played into.
   - "buffers: edits invalidate": change the scene, a texture, an upstream shot.
-- **Golden:** `tests/films/feedback`: a trail over a moving shape and a few steps of
+- **Golden:** `tests/films/feedback`: a trail over a moving shape, an 8-frame echo and a few steps of
   reaction-diffusion, strip frames crossing a reset.
 
 ## Phased plan
 
-1. **Buffers:** `[[buffer]]`, spans, resets, `init`, `@prev`, `@<buffer>`,
+1. **Buffers:** `[[buffer]]`, spans, resets, `init`, `@prev`, `@<buffer>`, `history`
+   and `frame = -k`, `rgba8`,
    `@picture`/textures/text/footage inputs, canonical fold, GPU checkpoints, budgeted
    catch-up, selftest + golden. Contract patch bump.
 2. **Faster scrubbing:** background fill, progressive scrub, `preview_lookback`,
