@@ -1,9 +1,12 @@
-# Golden-image film for feedback buffers (tests/golden.rs, #134): two shots of a moving
-# dot with a cut at 1 s. "trail" (rgba16f, fixed size) keeps the brighter of the
-# picture and its decayed previous state, reset at every cut; "hist" (rgba8, half
-# size) is a pure history of the picture, 8 frames deep, shown as an echo; "rd"
-# (rgba32f) runs a few reaction-diffusion steps from an init pass, starting at the
-# cut, and shows its buffer-local iFrame in blue. The strip's frames cross the reset.
+# Golden-image film for feedback buffers (tests/golden.rs, #134), set up as a film
+# would: the shots are a background plate (tinted per shot, a cut at 1 s) and the
+# animated element, a moving dot, is drawn on a transparent background into its own
+# buffer, so its trail and echo go over the plate without lifting it. "dot" (rgba8,
+# half size) is a pure history of the element, 8 frames deep, shown as an echo;
+# "trail" (rgba16f, fixed size) keeps the brighter of the element and its decayed
+# previous state, reset at every cut; "rd" (rgba32f) runs a few reaction-diffusion
+# steps from an init pass, starting at the cut, and shows its buffer-local iFrame in
+# blue. One layer composites them over @input. The strip's frames cross the reset.
 # Folds stay short (a few frames after a reset): errors compound across stacks.
 # Shaders are film-local, so the golden only moves when the engine does.
 title = "feedback"
@@ -13,30 +16,28 @@ fps = 30
 id = "a"
 scene = "scenes/dot.glsl"
 duration = 1.0
-uniforms.uColor = [1.0, 0.6, 0.2]
+uniforms.uTint = [1.0, 0.6, 0.2]
 
 [[shot]]
 id = "b"
 scene = "scenes/dot.glsl"
 duration = 1.0
-time_offset = 0.5
-uniforms.uColor = [0.3, 0.7, 1.0]
+uniforms.uTint = [0.3, 0.7, 1.0]
+
+[[buffer]]
+id = "dot"
+scene = "buffers/copy.glsl"
+scale = 0.5
+format = "rgba8"
+history = 8
 
 [[buffer]]
 id = "trail"
 scene = "buffers/trail.glsl"
 size = [160, 90]
 reset = "cuts"
-channels = ["@prev", "@picture"]
+channels = ["@prev", "@dot"]
 uniforms.uDecay = 0.85
-
-[[buffer]]
-id = "hist"
-scene = "buffers/copy.glsl"
-scale = 0.5
-format = "rgba8"
-history = 8
-channels = ["@picture"]
 
 [[buffer]]
 id = "rd"
@@ -51,10 +52,11 @@ channels = ["@prev"]
 id = "show"
 scene = "layers/show.glsl"
 channels = [
+  "@input",
   "@trail",
-  "@hist",
-  { source = "@hist", frame = -2 },
-  { source = "@hist", frame = -4 },
-  { source = "@hist", frame = -8 },
+  "@dot",
+  { source = "@dot", frame = -2 },
+  { source = "@dot", frame = -4 },
+  { source = "@dot", frame = -8 },
   "@rd",
 ]

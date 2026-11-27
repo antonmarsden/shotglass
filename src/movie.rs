@@ -224,6 +224,11 @@ struct BufferFile {
     format: Option<String>,
     /// Keep the last N states, read as `{ source = "@id", frame = -k }` (1 ≤ k ≤ N).
     history: Option<i64>,
+    /// `"dense"`: checkpoints every frame near the playhead (player scrubbing, #137).
+    cache: Option<String>,
+    /// Player only: approximate a far seek by stepping only the last s seconds from
+    /// black (#137). Never used by `still`, `export` or any headless command.
+    preview_lookback: Option<f64>,
     channels: Option<Vec<toml::Value>>,
     #[serde(default)]
     uniforms: BTreeMap<String, toml::Value>,
@@ -1157,6 +1162,10 @@ pub struct Buffer {
     pub format: BufferFormat,
     /// States kept (`history`, default 1: `@prev`).
     pub history: u32,
+    /// `cache = "dense"`: checkpoint every frame instead of every second (#137).
+    pub dense: bool,
+    /// `preview_lookback`, in film frames (player only, #137).
+    pub preview_lookback: Option<u64>,
     pub channels: [Option<Channel>; N_CHANNELS],
     pub uniforms: Vec<(String, Anim)>,
     pub params: Vec<(String, Vec<f32>)>,
@@ -2979,6 +2988,18 @@ fn build_buffers(
             )?,
             None => Default::default(),
         };
+        let dense = match b.cache.as_deref() {
+            None | Some("second") => false,
+            Some("dense") => true,
+            Some(c) => bail!("{what}: cache = \"{c}\": use \"dense\" (or leave it out)"),
+        };
+        let preview_lookback = match b.preview_lookback {
+            None => None,
+            Some(s) if s > 0.0 && s.is_finite() => {
+                Some(((s * sc.fps.0 as f64 / sc.fps.1 as f64).ceil() as u64).max(1))
+            }
+            Some(s) => bail!("{what}: preview_lookback = {s}: seconds, more than 0"),
+        };
         out.push(Buffer {
             id: b.id,
             scene: sc.root.join(&b.scene),
@@ -2991,6 +3012,8 @@ fn build_buffers(
             size,
             format: decl.format,
             history: decl.history,
+            dense,
+            preview_lookback,
             channels,
             uniforms,
             params,
@@ -7134,6 +7157,9 @@ glsl = 450
         assert!(one("format = \"rgb8\"").contains("isn't one of"));
         assert!(one("history = 0").contains("1 to 64"));
         assert!(one("history = 65").contains("1 to 64"));
+        assert!(one("cache = \"sparse\"").contains("use \"dense\""));
+        assert!(one("preview_lookback = 0").contains("more than 0"));
+        assert!(one("preview_lookback = -1").contains("more than 0"));
         assert!(one("reset = [\"nope\"]").contains("no shot or earlier layer"));
         assert!(one("from = 3\nreset = [1]").contains("outside the buffer's span"));
         assert!(one("reset = 3").contains("\"cuts\" or a list"));

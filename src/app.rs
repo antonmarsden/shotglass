@@ -291,6 +291,10 @@ struct Player {
     rendered_key: Option<(u32, i32, i32, i32, u32, u64)>,
     /// The clock is held while buffers catch up after a seek during playback (#134).
     catchup_paused: bool,
+    /// Paused, the background fill is taking buffer checkpoints (#137).
+    filling: bool,
+    /// The player's checkpoint budget setting in MB (#137; None: the detected one).
+    cache_mb: Option<usize>,
     generation: u64,
     scale_mode: ScaleMode,
     auto_scale: f32,
@@ -369,6 +373,8 @@ impl Player {
             tex: None,
             rendered_key: None,
             catchup_paused: false,
+            filling: false,
+            cache_mb: None,
             generation: 0,
             scale_mode: scale.map_or(ScaleMode::Auto, ScaleMode::Fixed),
             auto_scale: 1.0,
@@ -987,7 +993,10 @@ impl Player {
         // and playback shows exactly the frames `still` would.
         let t = self.clock.time_precise();
         let index = m.frame_at_precise(t).min(m.frame_count().saturating_sub(1));
-        let mut info = if playing {
+        // Paused at (or past) the last frame's time, e.g. at the end, show that frame:
+        // the end time itself isn't a film frame, and layers and buffers have ended there.
+        let last = index + 1 >= m.frame_count() && t >= m.frame_time(index) as f64;
+        let mut info = if playing || last {
             FrameInfo::frame(m, index)
         } else {
             FrameInfo::at(m, t as f32)
@@ -1003,9 +1012,13 @@ impl Player {
             info.scale.to_bits(),
             self.generation,
         );
-        if self.rendered_key == Some(key) {
+        // Progressive scrub (#137): while dragging, buffers show the nearest ready
+        // state; once the drag stops, the same frame is drawn again, exact.
+        let scrubbing = self.scrub_resume.is_some();
+        if self.rendered_key == Some(key) && (scrubbing || !self.renderer.buffer_approximate()) {
             return None;
         }
+        self.renderer.set_scrub_preview(scrubbing);
         // Paused or scrubbing: compile on the spot if needed. Playing: never stall,
         // keep the previous frame up until the shot's program is ready.
         let blocking = !playing;
@@ -1647,6 +1660,21 @@ impl Player {
                         ))
                         .small(),
                     );
+                    // The budget only changes how fast a seek is (#137): this session.
+                    let mut mb = self.cache_mb.unwrap_or(budget >> 20);
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("checkpoint budget").small());
+                        let r = ui.add(
+                            egui::DragValue::new(&mut mb)
+                                .range(64..=16384)
+                                .speed(16)
+                                .suffix(" MB"),
+                        );
+                        if r.changed() {
+                            self.cache_mb = Some(mb);
+                            self.renderer.set_buffer_cache_budget(mb << 20);
+                        }
+                    });
                     ui.label(format!("reloads: {}", self.reloads.saturating_sub(1)));
                 });
             egui::CollapsingHeader::new("Keys")
@@ -1754,6 +1782,22 @@ impl eframe::App for Player {
             let (w, h) = ((view.width() * ppp).round() as i32, (view.height() * ppp).round() as i32);
             if w > 0 && h > 0 {
                 rendered = self.render_view(frame, w, h);
+                // Background fill (#137): paused, idle and showing an exact frame, take
+                // the checkpoints ahead of the playhead, a few steps per redraw.
+                let (ready, total) = self.renderer.progress();
+                let (loaded, textures) = self.renderer.texture_progress();
+                self.filling = rendered.is_none()
+                    && !self.clock.playing()
+                    && !self.catchup_paused
+                    && self.scrub_resume.is_none()
+                    && ready == total
+                    && loaded == textures
+                    && self.renderer.catchup_progress().is_none()
+                    && self.rendered_key.is_some()
+                    && match self.movie.as_ref() {
+                        Some(m) => self.renderer.fill_checkpoints(m, w, h),
+                        None => false,
+                    };
                 if let Some((_, id)) = self.tex {
                     ui.painter().image(id, view, Rect::from_min_max(Pos2::new(0.0, 1.0), Pos2::new(1.0, 0.0)), Color32::WHITE);
                 }
@@ -1833,6 +1877,12 @@ impl eframe::App for Player {
                     "catching up buffers {}%",
                     done * 100 / total.max(1)
                 ));
+                if let Some(hint) = self.renderer.slow_seek_hint() {
+                    busy.push(hint);
+                }
+            }
+            if self.renderer.buffer_approximate() {
+                busy.push("buffer approximate".into());
             }
             if !busy.is_empty() {
                 ui.painter().text(
@@ -1873,6 +1923,8 @@ impl eframe::App for Player {
             || ready < total
             || loaded < textures
             || self.renderer.catchup_progress().is_some()
+            || self.filling
+            || (self.renderer.buffer_approximate() && self.scrub_resume.is_none())
         {
             ctx.request_repaint();
         } else {
