@@ -1398,6 +1398,16 @@ impl Renderer {
                 0 => None,
                 _ => movie.comps[q - 1].size,
             };
+            // A sequence whose buffers were all removed frees its rings and checkpoints
+            // now (its fold isn't advanced any more, so nothing else would).
+            if seq.buffers.is_empty() && self.folds[q].holds_targets() {
+                for t in self.folds[q].release() {
+                    unsafe {
+                        self.gl.delete_framebuffer(t.fbo);
+                        self.gl.delete_texture(t.tex);
+                    }
+                }
+            }
             let f = &mut self.folds[q];
             f.reads_film = reads_film;
             f.decl = hash(&format!(
@@ -1745,6 +1755,25 @@ impl Renderer {
                 items.push((n_shots + j, d, from, None));
             }
         }
+        // Buffers (#134): a step reads its footage at the frame it steps, like a layer.
+        let buf_items = |m: &Movie, base: usize, tc: f32, n_c: u64, extra: f32| {
+            m.buffers
+                .iter()
+                .enumerate()
+                .filter_map(move |(b, x)| {
+                    let d = span_distance(m, x.start, x.end, tc);
+                    let from = if d == 0.0 {
+                        n_c
+                    } else {
+                        m.frame_at(x.start).max(0) as u64
+                    };
+                    (d <= FOOTAGE_HEADS).then_some((base + b, d + extra, from, None))
+                })
+                .collect::<Vec<_>>()
+        };
+        if let Some(&base) = self.buf_base.first() {
+            items.extend(buf_items(movie, base, t, n_now, 0.0));
+        }
         // Comps (#74): around each instance drawn last frame (comp time runs on with the
         // film's, as it does when shown at speed 1), and the starts of comps coming up.
         let clocks = comp_clocks(movie, t, &self.comp_seen);
@@ -1779,6 +1808,9 @@ impl Renderer {
                         };
                         items.push((base + m.shots.len() + j, d + extra, from, None));
                     }
+                }
+                if let Some(&bb) = self.buf_base.get(c + 1) {
+                    items.extend(buf_items(m, bb, tc, n_c, extra));
                 }
             }
         }
@@ -2902,15 +2934,14 @@ impl Renderer {
         // Buffers (#134) step to frame n first (catching up if needed): a frame shows
         // only once every active buffer holds its state at n.
         self.fold_out = (w, h);
+        // A comp's catch-up (#138) is reported only while this frame still waits for
+        // it: a comp no longer shown (a seek out of its span) mustn't hold the player.
+        for f in self.folds.iter_mut().skip(1) {
+            f.clear_progress();
+        }
         if !self.advance_to(movie, 0, n, (w, h), blocking) {
             self.comp_seen = std::mem::take(&mut self.comp_req);
-            // Steps drew into buffer targets: leave GL as a finished frame does, or the
-            // player's UI paints into the last ring's framebuffer (a flicker).
-            unsafe {
-                self.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
-                self.gl.use_program(None);
-                self.gl.bind_vertex_array(None);
-            }
+            self.unbind_after_steps();
             return None;
         }
         let root = self.plan_seq(
@@ -2924,7 +2955,11 @@ impl Renderer {
             &mut insts,
         );
         self.comp_seen = std::mem::take(&mut self.comp_req);
-        let root = root?;
+        let Some(root) = root else {
+            // A comp's buffers (#138) may have stepped while this frame was planned.
+            self.unbind_after_steps();
+            return None;
+        };
         let plans: Vec<&SeqPlan> = insts.iter().map(|(_, p)| p).chain([&root]).collect();
         let all_keys: Vec<ShotKeys> = plans
             .iter()
@@ -2981,6 +3016,17 @@ impl Renderer {
             self.gl.bind_vertex_array(None);
         }
         self.out.as_ref().map(|t| t.tex)
+    }
+
+    /// Leave GL as a finished frame does after buffer steps drew into their targets and
+    /// the frame wasn't drawn, or the player's UI paints into the last ring's
+    /// framebuffer (a flicker, and corrupt state).
+    fn unbind_after_steps(&self) {
+        unsafe {
+            self.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            self.gl.use_program(None);
+            self.gl.bind_vertex_array(None);
+        }
     }
 
     /// Plan sequence `seq` (0: the film; 1 + c: comp c) at `(t, iFrame, footage frame)`,

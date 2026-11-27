@@ -75,7 +75,7 @@ struct MovieFile {
     /// the period, and shaders only ever see time within one period.
     /// `"warm"` (#138): also a seamless loop for feedback buffers.
     #[serde(rename = "loop")]
-    looping: Option<LoopFile>,
+    looping: Option<toml::Value>,
     sound: Option<SoundFile>,
     #[serde(rename = "shot", default)]
     shots: Vec<ShotFile>,
@@ -120,24 +120,17 @@ struct CompFile {
     buffers: Vec<BufferFile>,
 }
 
-/// `loop = true | false | "warm"`.
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum LoopFile {
-    Bool(bool),
-    Mode(String),
-}
-
-/// `loop`: (looping, warm). "warm" (#138) is a loop whose buffers carry their state over
-/// the seam: frame 0 continues from a whole period of pre-roll instead of a reset.
-fn loop_mode(what: &str, v: Option<&LoopFile>) -> Result<(bool, bool)> {
+/// `loop = true | false | "warm"`: (looping, warm). "warm" (#138) is a loop whose
+/// buffers carry their state over the seam: frame 0 continues from a whole period of
+/// pre-roll instead of a reset. Films and `[comps]` entries share it.
+fn loop_mode(what: &str, v: Option<&toml::Value>) -> Result<(bool, bool)> {
     match v {
-        None | Some(LoopFile::Bool(false)) => Ok((false, false)),
-        Some(LoopFile::Bool(true)) => Ok((true, false)),
-        Some(LoopFile::Mode(m)) if m == "warm" => Ok((true, true)),
-        Some(LoopFile::Mode(m)) => bail!(
-            "{what}loop = \"{m}\": use true, false or \"warm\" (a loop whose feedback buffers \
-             carry their state over the seam)"
+        None | Some(toml::Value::Boolean(false)) => Ok((false, false)),
+        Some(toml::Value::Boolean(true)) => Ok((true, false)),
+        Some(toml::Value::String(m)) if m == "warm" => Ok((true, true)),
+        Some(other) => bail!(
+            "{what}loop = {other}: loop must be true, false or \"warm\" (a loop whose feedback \
+             buffers carry their state over the seam)"
         ),
     }
 }
@@ -1981,6 +1974,7 @@ impl Movie {
             fps: (fps_num, fps_den),
             buffers: &buffer_decls,
             aspect,
+            size: None,
         };
         let (shots, layers, buffers, duration, loop_frames) = build_sequence(
             &ctx,
@@ -2026,6 +2020,7 @@ impl Movie {
                     Some((w, h)) => w as f32 / h as f32,
                     None => aspect,
                 },
+                size: d.size,
                 ..ctx
             };
             let (shots, layers, buffers, duration, loop_frames) = build_sequence(
@@ -2401,6 +2396,8 @@ struct SeqCtx<'a> {
     buffers: &'a [BufDecl],
     /// The output aspect (the memory check sizes `scale` buffers with it).
     aspect: f32,
+    /// A comp's own `size` (#138): its `scale` buffers are that fraction of it.
+    size: Option<(u32, u32)>,
 }
 
 impl SeqCtx<'_> {
@@ -3076,10 +3073,7 @@ fn build_buffers(
         });
     }
     // Required memory: every ring active on the worst frame (the most buffers at once).
-    let out_size = (
-        (MEMORY_CHECK_HEIGHT * sc.aspect).round() as i32,
-        MEMORY_CHECK_HEIGHT as i32,
-    );
+    let out_size = memory_check_out(sc.aspect, sc.size);
     for b in &out {
         let at = b.start_frame;
         let live: Vec<&Buffer> = out.iter().filter(|o| o.active(at)).collect();
@@ -3121,15 +3115,24 @@ pub fn warm_buffers(m: &Movie) -> impl Iterator<Item = &Buffer> {
         .filter(move |b| p.is_some_and(|p| b.start_frame == 0 && b.end_frame >= p))
 }
 
+/// The output `scale` buffers are sized against in the memory checks: a comp's own
+/// `size` (#138), else a 1080-pixel-high output of the aspect.
+fn memory_check_out(aspect: f32, size: Option<(u32, u32)>) -> (i32, i32) {
+    match size {
+        Some((w, h)) => (w as i32, h as i32),
+        None => (
+            (MEMORY_CHECK_HEIGHT * aspect).round() as i32,
+            MEMORY_CHECK_HEIGHT as i32,
+        ),
+    }
+}
+
 /// Required buffer memory across the film and its comps (#138): each sequence's worst
 /// frame, summed (comps can be active at any film frame). Only comps add anything here:
 /// `build_buffers` already checked each sequence on its own.
 fn check_buffer_memory(film: &Movie) -> Result<()> {
-    let worst = |m: &Movie| -> usize {
-        let out = (
-            (MEMORY_CHECK_HEIGHT * m.aspect).round() as i32,
-            MEMORY_CHECK_HEIGHT as i32,
-        );
+    let worst = |m: &Movie, size: Option<(u32, u32)>| -> usize {
+        let out = memory_check_out(m.aspect, size);
         m.buffers
             .iter()
             .map(|b| {
@@ -3145,11 +3148,11 @@ fn check_buffer_memory(film: &Movie) -> Result<()> {
     if film.comps.iter().all(|c| c.movie.buffers.is_empty()) {
         return Ok(());
     }
-    let parts: Vec<(String, usize)> = std::iter::once(("the film".to_string(), worst(film)))
+    let parts: Vec<(String, usize)> = std::iter::once(("the film".to_string(), worst(film, None)))
         .chain(
             film.comps
                 .iter()
-                .map(|c| (format!("comp \"{}\"", c.name), worst(&c.movie))),
+                .map(|c| (format!("comp \"{}\"", c.name), worst(&c.movie, c.size))),
         )
         .filter(|(_, b)| *b > 0)
         .collect();
@@ -4405,13 +4408,7 @@ fn comp_decls(t: &BTreeMap<String, toml::Value>) -> Result<Vec<CompDecl>> {
                                 _ => bail!("{what}: size must be [width, height] in pixels"),
                             }
                         }
-                        "loop" => {
-                            (looping, warm) = match val {
-                                toml::Value::Boolean(b) => (*b, false),
-                                toml::Value::String(m) if m == "warm" => (true, true),
-                                _ => bail!("{what}: loop must be true, false or \"warm\""),
-                            }
-                        }
+                        "loop" => (looping, warm) = loop_mode(&format!("{what}: "), Some(val))?,
                         other => bail!(
                             "{what}: unknown option `{other}` (a comp has file, size and loop)"
                         ),
@@ -7182,8 +7179,13 @@ glsl = 450
         );
         assert_eq!(warm_buffers(&m).count(), 0);
         // Anything else is refused.
-        let e = err(fixture(&format!("loop = \"hot\"\n{one}"), Path::new(".")));
-        assert!(e.contains("\"warm\""), "{e}");
+        for bad in ["\"hot\"", "1", "[true]"] {
+            let e = err(fixture(&format!("loop = {bad}\n{one}"), Path::new(".")));
+            assert!(
+                e.contains("loop must be true, false or \"warm\""),
+                "{bad}: {e}"
+            );
+        }
         // Comps too.
         let (_d, m) = comps_film(
             "[comps]\nc = { file = \"c.toml\", loop = \"warm\" }\n\
@@ -7554,6 +7556,18 @@ glsl = 450
             e.contains("the film and its comps") && e.contains("comp \"d\""),
             "{e}"
         );
+        // A sized comp's `scale` buffers are counted at its size, not at 1080p: 64×36
+        // rgba32f × 64 states is under 3 MB (at 1920×1080 it would be 2 GB).
+        let (_d, m) = comps_film(
+            "[comps]\nc = { file = \"c.toml\", size = [64, 36] }\n\
+             [[shot]]\nid = \"s\"\ncomp = \"c\"\nduration = 1\n",
+            &[(
+                "c.toml",
+                "[[shot]]\nid = \"a\"\nscene = \"a.glsl\"\nduration = 1\n\
+                 [[buffer]]\nid = \"b\"\nscene = \"b.glsl\"\nformat = \"rgba32f\"\nhistory = 63\n",
+            )],
+        );
+        assert!(m.is_ok(), "{:?}", m.err());
     }
 
     #[test]

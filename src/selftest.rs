@@ -191,6 +191,10 @@ const CHECKS: &[Check] = &[
         run: footage_broken,
     },
     Check {
+        name: "footage: frames a buffer reads are prefetched (no stalls while playing)",
+        run: footage_buffer_prefetch,
+    },
+    Check {
         name: "footage: frame uploads ignore and restore stray unpack state",
         run: footage_unpack_state,
     },
@@ -2686,9 +2690,105 @@ fn buffers_in_comps(gl: &Gl, dir: &Path) -> Result<String> {
     if got == rfwd[40] {
         bail!("editing the comp's shot didn't change the film buffer reading the comp");
     }
+    // 5. A sliced catch-up inside a comp (the player while paused): every held render
+    // leaves the default framebuffer bound (the UI draws next), and when the playhead
+    // leaves the comp mid catch-up, its progress isn't reported any more.
+    let mid_dir = dir.join("mid");
+    files(&mid_dir)?;
+    let mid = movie(
+        &mid_dir,
+        "shotglass = \"0.1.10\"\n[comps]\nc = \"c.toml\"\n\
+         [[shot]]\nid=\"a\"\nscene=\"s.glsl\"\nduration=1\n\
+         [[shot]]\nid=\"s\"\ncomp=\"c\"\nduration=2\n",
+    )?;
+    let mut sl = renderer(gl, &mid)?;
+    sl.set_catchup_slices(true);
+    let far = FrameInfo::frame(&mid, 85);
+    let mut held = 0;
+    while sl.render(&mid, W, H, &far, true).is_none() {
+        let fbo = unsafe { gl.get_parameter_i32(glow::DRAW_FRAMEBUFFER_BINDING) };
+        if fbo != 0 {
+            bail!("a held comp catch-up render left framebuffer {fbo} bound");
+        }
+        if sl.catchup_progress().is_none() {
+            bail!("a held comp catch-up reported no progress");
+        }
+        held += 1;
+        if held == 2 {
+            break;
+        }
+    }
+    if held == 0 {
+        bail!("a 55-frame comp catch-up wasn't sliced");
+    }
+    buf_frame(&mut sl, &mid, 10, 1.0)?;
+    if let Some(p) = sl.catchup_progress() {
+        bail!("frame 10 (no comp) drew, but the comp's catch-up is still reported ({p:?})");
+    }
+    // 6. A film buffer reading a comp without `size` whose buffer is a `scale` of the
+    // output: a resize changes the comp's state size, so the film fold starts over.
+    let size_dir = dir.join("resize");
+    files(&size_dir)?;
+    write(
+        &size_dir,
+        &[(
+            "c.toml",
+            &COMP_BUF_BODY.replace("size=[40, 24]", "scale=0.25"),
+        )],
+    )?;
+    let sfilm = movie(
+        &size_dir,
+        "shotglass = \"0.1.10\"\n[comps]\nc = \"c.toml\"\n\
+         [[shot]]\nid=\"a\"\nscene=\"s.glsl\"\nduration=2\n\
+         [[buffer]]\nid=\"fb\"\nscene=\"acc.glsl\"\nsize=[32, 20]\nformat=\"rgba32f\"\n\
+         channels=[\"@prev\", \"@c\", \"t.png\"]\n\
+         [[layer]]\nid=\"show\"\nscene=\"showacc.glsl\"\nchannels=[\"@fb\"]\n",
+    )?;
+    let at = |r: &mut Renderer, n: u64, (w, h): (i32, i32)| -> Result<Frame> {
+        r.render(&sfilm, w, h, &FrameInfo::frame(&sfilm, n), true)
+            .ok_or_else(|| anyhow!("frame {n}: nothing rendered"))?;
+        r.read_output().ok_or_else(|| anyhow!("no output"))
+    };
+    let mut rs = renderer(gl, &sfilm)?;
+    for n in 0..20 {
+        at(&mut rs, n, (W, H))?;
+    }
+    let big = (W * 2, H * 2);
+    let got = at(&mut rs, 20, big)?;
+    let mut fresh = renderer(gl, &sfilm)?;
+    expect_fold(
+        gl,
+        "frame 20 after a resize (the comp's buffer follows the output)",
+        &got,
+        &at(&mut fresh, 20, big)?,
+        0,
+        0.0,
+    )?;
+    // 7. Removing every buffer from the comp frees its states (no checkpoints left).
+    let (before, _) = r.checkpoint_stats();
+    if before == 0 {
+        bail!("the comp shot film took no checkpoints to free");
+    }
+    write(
+        &shot_dir,
+        &[(
+            "c.toml",
+            "[[shot]]\nid=\"p\"\nscene=\"pat.glsl\"\nduration=2\n",
+        )],
+    )?;
+    let plain = Movie::load(&shot_dir)?;
+    r.load_all(&plain)
+        .map_err(|e| anyhow!("comp without buffers: {}", crate::gfx::join_errors(&e)))?;
+    buf_frame(&mut r, &plain, 10, 1.0)?;
+    if r.checkpoint_stats().0 != 0 {
+        bail!(
+            "{} checkpoints kept after the comp's buffers were removed",
+            r.checkpoint_stats().0
+        );
+    }
     Ok(format!(
         "75 comp-shot frames = the comp as a film; {cks} checkpoints; loop comp wraps; nested folds \
-         agree; a comp edit invalidates"
+         agree; a comp edit, a resize and removing its buffers invalidate"
     ))
 }
 
@@ -5845,6 +5945,60 @@ fn footage_prefetch(gl: &Gl, dir: &Path) -> Result<String> {
             "playback stalled at film frame(s) {stalled:?} (the cut is 30, the frozen \
              transition 48–59, the seam 78)"
         );
+    }
+    Ok(String::new())
+}
+
+/// Footage a buffer reads (#134) is prefetched like a shot's: playing one try per film
+/// frame never stalls on its frames.
+fn footage_buffer_prefetch(gl: &Gl, dir: &Path) -> Result<String> {
+    use crate::movie::ItemRef;
+    sequence(dir, "f/a_", 24, 4, 2)?;
+    write(
+        dir,
+        &[
+            ("s.glsl", &scene("fragColor = vec4(0.0, 0.0, 0.0, 1.0);")),
+            (
+                "copy.glsl",
+                &scene("fragColor = texelFetch(iChannel0, ivec2(0), 0);"),
+            ),
+            (
+                "show.glsl",
+                &scene("fragColor = vec4(texelFetch(iChannel0, ivec2(0), 0).rg, 0.0, 1.0);"),
+            ),
+        ],
+    )?;
+    let m = movie(
+        dir,
+        "shotglass = \"0.1.9\"\nfps = 30\n\
+         [[shot]]\nid=\"a\"\nscene=\"s.glsl\"\nduration=1\n\
+         [[buffer]]\nid=\"fb\"\nscene=\"copy.glsl\"\nsize=[4, 2]\nformat=\"rgba8\"\n\
+         channels = [{ frames = \"f/a_##.png\" }]\n\
+         [[layer]]\nid=\"show\"\nscene=\"show.glsl\"\nchannels=[\"@fb\"]\n",
+    )?;
+    let mut r = renderer(gl, &m)?;
+    r.set_readback(true);
+    r.set_texture_budget(1);
+    let item = ItemRef::Buffer(0);
+    play_footage(&mut r, &m, item, 2..3, 5000)?;
+    let mut stalled = vec![];
+    for n in 3..24u64 {
+        let t = m.frame_time(n);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        r.pump(&m, t, false);
+        match r.render(&m, W, H, &FrameInfo::frame(&m, n), false) {
+            Some(_) => {
+                let f = r.read_output().ok_or_else(|| anyhow!("no output"))?;
+                let want = m.source_frame(item, 0, n);
+                if frame_of(px(&f, 80, 45)) != want {
+                    bail!("film frame {n}: wrong source frame (wanted {want:?})");
+                }
+            }
+            None => stalled.push(n),
+        }
+    }
+    if !stalled.is_empty() {
+        bail!("playback stalled on the buffer's footage at film frame(s) {stalled:?}");
     }
     Ok(String::new())
 }

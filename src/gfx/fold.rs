@@ -172,12 +172,33 @@ impl Fold {
         }
     }
 
+    pub(super) fn clear_progress(&mut self) {
+        self.progress = None;
+    }
+
     pub(super) fn ring_target(&self, b: usize, s: usize) -> &Target {
         &self.rings[b].as_ref().unwrap().slots[s].0
     }
 
     pub(super) fn ring_target_mut(&mut self, b: usize, s: usize) -> &mut Target {
         &mut self.rings[b].as_mut().unwrap().slots[s].0
+    }
+
+    /// Does the fold hold any GPU state (rings, checkpoints, spares, pictures)?
+    pub(super) fn holds_targets(&self) -> bool {
+        self.rings.iter().any(Option::is_some)
+            || !self.checkpoints.is_empty()
+            || !self.spare.is_empty()
+            || !self.pics.is_empty()
+    }
+
+    /// Forget every state (the cursor, a plan) and hand back every GL target to delete:
+    /// its sequence has no buffers any more.
+    pub(super) fn release(&mut self) -> Vec<Target> {
+        self.frame = None;
+        self.plan = None;
+        self.progress = None;
+        self.targets()
     }
 
     /// Every GL target the fold owns (to delete).
@@ -520,6 +541,7 @@ impl Renderer {
     pub fn fill_checkpoints(&mut self, movie: &Movie, w: i32, h: i32) -> bool {
         let out = (w.max(1), h.max(1));
         let q = 0;
+        self.fold_out = out;
         if movie.buffers.is_empty()
             || !self.folds[q].checkpoints_on
             || self.folds[q].preview
@@ -561,11 +583,17 @@ impl Renderer {
                 }
             }
         };
-        let (n, steps) = (self.folds[q].n, self.buffer_steps);
+        // The fill steps elsewhere: every fold's shown frame and playhead (a comp's
+        // moves when a film step nests it, #138) stay where the player is.
+        let kept: Vec<(u64, u64)> = self.folds.iter().map(|f| (f.n, f.playhead)).collect();
+        let steps = self.buffer_steps;
         self.fold_out = out;
         self.advance_buffers(movie, q, target, out, false);
-        self.folds[q].n = n;
-        self.folds[q].progress = None;
+        for (f, (n, playhead)) in self.folds.iter_mut().zip(kept) {
+            f.n = n;
+            f.playhead = playhead;
+            f.progress = None;
+        }
         self.fill_steps += self.buffer_steps - steps;
         unsafe {
             self.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
@@ -639,11 +667,21 @@ impl Renderer {
             hash(&s)
         };
         let mut parts = vec![(self.folds[q].decl, 0)];
-        let sizes: String = movie
+        let mut sizes: String = movie
             .buffers
             .iter()
             .map(|b| format!("{:?}", b.size.at(out)))
             .collect();
+        if self.folds[q].reads_film {
+            // The comps it can read (#138): their buffers' sizes follow the film output
+            // when a comp has no `size`, so a resize changes what this fold reads.
+            for (c, comp) in film.comps.iter().enumerate() {
+                let cout = super::seq_out(film, c + 1, self.fold_out);
+                for b in &comp.movie.buffers {
+                    sizes += &format!("{c}:{:?}", b.size.at(cout));
+                }
+            }
+        }
         parts.push((hash(&sizes), 0));
         let own_bufs = self.buf_base[q]..self.buf_base[q] + movie.buffers.len();
         for (b, buf) in movie.buffers.iter().enumerate() {

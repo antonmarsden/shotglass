@@ -216,7 +216,8 @@ channels = ["@input", "@trail"]
   in slices in the player). Progressive scrub and the background fill are for the
   film's buffers only: a comp's buffers always catch up to the exact frame.
 - Memory: `shotglass check` adds the worst frame of the film's buffers and of every
-  comp's, and refuses more than 1 GB in all.
+  comp's, and refuses more than 1 GB in all (a sized comp's `scale` buffers are counted
+  at its `size`).
 
 ## Seamless loops: `loop = "warm"`
 
