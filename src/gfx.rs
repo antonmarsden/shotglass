@@ -594,6 +594,10 @@ pub struct Renderer {
     pub blocking_catchups: usize,
     /// Checkpoints restored (tests).
     pub buffer_restores: usize,
+    /// Buffer steps the background fill drew (tests).
+    pub fill_steps: usize,
+    /// `preview_lookback` walks (tests).
+    pub lookback_walks: usize,
 }
 
 /// A sound block submitted with `Renderer::submit_audio`, not yet collected.
@@ -889,6 +893,8 @@ impl Renderer {
                 buffer_steps: 0,
                 blocking_catchups: 0,
                 buffer_restores: 0,
+                fill_steps: 0,
+                lookback_walks: 0,
             })
         }
     }
@@ -2868,7 +2874,7 @@ impl Renderer {
         self.comp_req.clear();
         // Buffers (#134) step to frame n first (catching up if needed): a frame shows
         // only once every active buffer holds its state at n.
-        if !self.advance_buffers(movie, n, (w, h), blocking) {
+        if !self.advance_to(movie, n, (w, h), blocking) {
             self.comp_seen = std::mem::take(&mut self.comp_req);
             // Steps drew into buffer targets: leave GL as a finished frame does, or the
             // player's UI paints into the last ring's framebuffer (a flicker).

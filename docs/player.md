@@ -89,5 +89,10 @@ soundtrack (`shotglass wav`) in 4 s:
   blocks per frame without waiting for the GPU, and chunks more than a few seconds away are
   forgotten. Memory stays at a few MB whatever the length. `wav` and `check`
   stream chunk by chunk too.
+- **Feedback buffers** ([buffers.md](buffers.md#determinism-and-seeking)): while
+  paused, the player takes checkpoints ahead of the playhead in the background; while
+  you drag the timeline, a frame shows at once from the nearest saved state ("buffer
+  approximate") and becomes exact when you let go. The System panel shows the
+  checkpoints and sets their budget for the session.
 - The Sound panel shows how much sound is buffered ahead and any underruns.
   The overlay shows shaders still compiling.

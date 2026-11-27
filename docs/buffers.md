@@ -134,14 +134,38 @@ state: the current one if it's behind, a **checkpoint**, or the reset.
   and `export` walk forward).
 - The player copies every buffer's state into a checkpoint once a second of film, in
   GPU memory (no readback). Checkpoints far from the playhead are dropped first, and the
-  spacing doubles away from it when the budget is full. The budget is
-  `SHOTGLASS_BUFFER_CACHE_MB` if set, else 1/8 of the video memory where the driver
-  reports it (256 MB – 2 GB), else 512 MB; the player's System panel shows it.
+  spacing doubles away from it when the budget is full (a checkpoint that would be the
+  first dropped isn't taken). The budget is the player's setting (System panel, for the
+  session), else `SHOTGLASS_BUFFER_CACHE_MB`, else 1/8 of the video memory where the
+  driver reports it (256 MB – 2 GB), else 512 MB. NVIDIA reports total memory; AMD's
+  `GL_ATI_meminfo` reports only free texture memory, so there the budget follows what
+  was free at startup.
+- **Background fill:** while paused and idle (no compiles, uploads or catch-up), the
+  player walks forward from the playhead taking the checkpoints it hasn't got yet, a few
+  steps per redraw, until the end of the film or the budget is full.
+- **`cache = "dense"`** on a buffer checkpoints every frame while it's active instead of
+  every second, within the same budget: at ~4 MB a state, 512 MB holds about 4 s of
+  30 fps, enough to scrub a short passage frame by frame.
 - After a seek the player catches up a few steps per redraw ("catching up buffers 41%"),
   never freezing; while playing, the clock waits for it. Until then the previous frame
-  stays up.
-- Any edit to a buffer, a texture or a shot it reads starts its fold over. A broken
-  edit keeps the last working version and its state.
+  stays up. When a catch-up would take more than about a second, the overlay suggests
+  what would shorten it: a smaller `size`, `cache = "dense"`, or reading a cheaper comp
+  instead of `@picture`.
+- **Progressive scrub:** while you drag the timeline, a frame far from the buffers'
+  state draws at once from the nearest saved state before it (the picture is exact, the
+  buffers are from that earlier frame) and the overlay says "buffer approximate"; when
+  you let go, it catches up to the exact frame. Preview only: `still`, `strip`,
+  `export` and `quality` never approximate.
+- **`preview_lookback = s`** (seconds, opt-in per buffer, player only): when no saved
+  state is within s seconds of a scrubbed frame, step only the last s seconds from black
+  instead (approximate, refined when you let go). Effects that forget (trails, temporal
+  smoothing) look right; simulations don't, so leave it off for them. It applies only
+  when every stateful buffer active at the frame has it.
+- An edit keeps the states before the first frame that reads it: editing a buffer (or a
+  texture it reads) starts its fold over from its span, editing a shot it reads
+  (`@picture`) drops only checkpoints from that shot's start on. Changing a declaration
+  (span, resets, size, format, the film's timing) or a comp it reads starts over. A
+  broken edit keeps the last working version and its state.
 
 Long folds over float state can drift further apart between GPUs and drivers than a
 single frame does (errors compound), so compare long folds on one machine, not against
@@ -150,5 +174,5 @@ reference images from another.
 ## Not yet
 
 Buffers in comps, seamless loop films (`loop = "warm"`), buffers inside the layer stack
-(`after = "<layer>"`), background checkpoint filling and progressive scrubbing come
-later; see [the design](design/feedback.md).
+(`after = "<layer>"`) come later (#138); see [the design](design/feedback.md).
+`check --deep` doesn't yet look for NaN/Inf in float state.

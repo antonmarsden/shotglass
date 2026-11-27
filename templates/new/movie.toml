@@ -54,6 +54,8 @@ sound = "sfx/chime.glsl"
 # scene = "buffers/trail.glsl"
 # scale = 0.5
 # channels = ["@prev", "@picture"]
+# cache = "dense"            # checkpoint every frame: frame-by-frame scrubbing of a short passage
+# preview_lookback = 2.0     # player only: approximate a far scrub from the last 2 s (forgetful effects)
 # and a layer channel "@trail".
 #
 # Text, bound to channels like a texture (shotglass = "0.1.3"; see docs/channels.md, "Text"):

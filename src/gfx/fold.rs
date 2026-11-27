@@ -90,6 +90,22 @@ pub(super) struct Fold {
     checkpoints_on: bool,
     /// The frame the layers of the frame being drawn read.
     pub(super) n: u64,
+    /// The frame the player shows (eviction keeps checkpoints near it); the background
+    /// fill steps elsewhere without moving it.
+    playhead: u64,
+    /// The fold key's parts (hash, first frame that reads it), for per-frame
+    /// invalidation (#137).
+    parts: Vec<(u64, u64)>,
+    /// Progressive scrub (#137, player only): show the nearest ready state.
+    preview: bool,
+    /// The frame whose states the layers of the frame being drawn read instead of `n`
+    /// (an approximate frame), and whether the last frame drawn was approximate.
+    approx: Option<u64>,
+    approximate: bool,
+    /// A `preview_lookback` walk is in progress: its states are not canonical.
+    lookback: bool,
+    /// Seconds per catch-up step (wall time, smoothed), for the slow-seek hint.
+    step_secs: f64,
 }
 
 impl Fold {
@@ -112,6 +128,13 @@ impl Fold {
             step_budget: STEP_BUDGET,
             checkpoints_on: true,
             n: 0,
+            playhead: 0,
+            parts: vec![],
+            preview: false,
+            approx: None,
+            approximate: false,
+            lookback: false,
+            step_secs: 0.0,
         }
     }
 
@@ -302,11 +325,10 @@ impl Renderer {
     }
 
     /// Set the checkpoint budget (the player's setting; tests).
-    #[allow(dead_code)]
     pub fn set_buffer_cache_budget(&mut self, bytes: usize) {
         self.fold.budget = bytes;
         self.fold.budget_source = "setting";
-        self.evict_checkpoints(self.fold.n);
+        self.evict_checkpoints(self.fold.playhead);
     }
 
     /// Catch up in budgeted slices even when rendering blocking (the player while
@@ -335,6 +357,91 @@ impl Renderer {
         self.fold.frame = None;
         self.fold.plan = None;
         self.drop_checkpoints();
+    }
+
+    /// Progressive scrub (#137): while on (the player, while dragging), a frame whose
+    /// buffers aren't at it yet draws at once from the nearest ready state (a
+    /// checkpoint or the cursor before it, or a `preview_lookback` walk) and is marked
+    /// approximate. Headless commands never set it: `still` and `export` are exact.
+    pub fn set_scrub_preview(&mut self, on: bool) {
+        self.fold.preview = on;
+    }
+
+    /// Was the last frame drawn approximate (progressive scrub)?
+    pub fn buffer_approximate(&self) -> bool {
+        self.fold.approximate
+    }
+
+    /// When the catch-up in progress would take more than about a second (from the
+    /// measured step time), what would make seeks here faster.
+    pub fn slow_seek_hint(&self) -> Option<String> {
+        let (done, total) = self.fold.progress?;
+        let secs = total.saturating_sub(done) as f64 * self.fold.step_secs;
+        (secs > 1.0).then(|| {
+            format!(
+                "buffer seeks here take ~{secs:.0} s: a smaller buffer size, \
+                 cache = \"dense\", or reading a cheaper comp instead of @picture \
+                 would shorten them"
+            )
+        })
+    }
+
+    /// Background fill (#137): while paused, walk forward from the cursor taking the
+    /// checkpoints the player hasn't got yet, a few steps per call, never blocking (a
+    /// step whose program or texture isn't ready waits). The player calls it only when
+    /// nothing else is pending (compiles, uploads, a catch-up). Stops at the end of the
+    /// film or when the budget is full. True if it stepped (call again).
+    pub fn fill_checkpoints(&mut self, movie: &Movie, w: i32, h: i32) -> bool {
+        let out = (w.max(1), h.max(1));
+        if movie.buffers.is_empty()
+            || !self.fold.checkpoints_on
+            || self.fold.preview
+            || self.fold.approximate
+            || self.fold.key != self.fold_key(movie, out).0
+        {
+            return false;
+        }
+        let f = &self.fold;
+        let Some(c) = f.frame else { return false };
+        let used: usize = f.checkpoints.iter().map(|c| c.bytes).sum();
+        let each = f.checkpoints.iter().map(|c| c.bytes).max().unwrap_or(0);
+        if used + each > f.budget {
+            return false;
+        }
+        let end = movie.frame_count();
+        let target = match &f.plan {
+            Some(p) if p.key == f.key && p.target > f.playhead => p.target,
+            _ => {
+                if !self.cursor_valid(movie, c) {
+                    return false;
+                }
+                let mut g = c + 1;
+                loop {
+                    if g >= end {
+                        return false;
+                    }
+                    let k = checkpoint_interval(movie, g);
+                    if g.is_multiple_of(k)
+                        && movie.buffers.iter().any(|b| !b.is_pure() && b.active(g))
+                        && !f.checkpoints.iter().any(|x| x.key == f.key && x.frame == g)
+                    {
+                        break g;
+                    }
+                    g += 1;
+                }
+            }
+        };
+        let (n, steps) = (self.fold.n, self.buffer_steps);
+        self.advance_buffers(movie, target, out, false);
+        self.fold.n = n;
+        self.fold.progress = None;
+        self.fill_steps += self.buffer_steps - steps;
+        unsafe {
+            self.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            self.gl.use_program(None);
+            self.gl.bind_vertex_array(None);
+        }
+        self.buffer_steps > steps
     }
 
     /// (frames done, frames to do) of a catch-up in progress.
@@ -385,34 +492,73 @@ impl Renderer {
         }
     }
 
-    /// The fold key (#134, "Invalidation"): everything the buffers' folds read. Phase 1
-    /// invalidates every buffer on any change.
-    fn fold_key(&self, movie: &Movie, out: (i32, i32)) -> u64 {
-        let mut s = format!("{}\0", self.fold.decl);
-        let mut add = |k: ShotKeys| {
-            s += &format!("{}:{:?}", k.scene, k.trans);
+    /// The fold key (#134, "Invalidation"): everything the buffers' folds read, as
+    /// parts with the first film frame that reads each (#137: an edit invalidates only
+    /// states from that frame on). The declarations (spans, resets, the film's timing)
+    /// and the buffer sizes are parts read from frame 0.
+    fn fold_key(&self, movie: &Movie, out: (i32, i32)) -> (u64, Vec<(u64, u64)>) {
+        let item = |k: ShotKeys| {
+            let mut s = format!("{}:{:?}", k.scene, k.trans);
             for c in k.channels.iter().flatten() {
                 s += &format!(",{}/{:?}", c.tex, c.footage);
             }
-            s.push(';');
+            hash(&s)
         };
-        for b in 0..movie.buffers.len() {
+        let mut parts = vec![(self.fold.decl, 0)];
+        let sizes: String = movie
+            .buffers
+            .iter()
+            .map(|b| format!("{:?}", b.size.at(out)))
+            .collect();
+        parts.push((hash(&sizes), 0));
+        for (b, buf) in movie.buffers.iter().enumerate() {
             if let Some(k) = self.fold_pick(self.buf_base + b) {
-                add(k);
+                parts.push((item(k), buf.start_frame));
             }
         }
         if self.fold.reads_film {
-            let layers = movie.shots.len()..movie.shots.len() + movie.layers.len();
+            let shots = movie.shots.len();
+            let layers = shots..shots + movie.layers.len();
             for i in (0..self.buf_base).filter(|i| !layers.contains(i)) {
                 if let Some(k) = self.fold_pick(i) {
-                    add(k);
+                    // A shot is read from its start (its incoming transition's, if
+                    // any; a frame early to be safe); comp items whenever a comp is:
+                    // from frame 0.
+                    let first = movie.shots.get(i).map_or(0, |s| {
+                        let lead = s.transition_in.as_ref().map_or(0.0, |t| t.duration);
+                        (movie.frame_at(s.start - lead).max(0) as u64).saturating_sub(1)
+                    });
+                    parts.push((item(k), first));
                 }
             }
         }
-        for b in &movie.buffers {
-            s += &format!("{:?}", b.size.at(out));
+        let key = hash(&format!("{parts:?}"));
+        (key, parts)
+    }
+
+    /// The first frame whose state an edit from parts `old` to `new` changes.
+    fn first_changed(old: &[(u64, u64)], new: &[(u64, u64)]) -> u64 {
+        if old.len() != new.len() {
+            return 0;
         }
-        hash(&s)
+        old.iter()
+            .zip(new)
+            .filter(|(a, b)| a.0 != b.0)
+            .map(|(a, b)| a.1.min(b.1))
+            .min()
+            .unwrap_or(u64::MAX)
+    }
+
+    /// `advance_buffers` for the frame shown (the playhead).
+    pub(super) fn advance_to(
+        &mut self,
+        movie: &Movie,
+        n: u64,
+        out: (i32, i32),
+        blocking: bool,
+    ) -> bool {
+        self.fold.playhead = n;
+        self.advance_buffers(movie, n, out, blocking)
     }
 
     /// Bring every buffer to film frame `n` (#134) before the frame is planned. False
@@ -426,15 +572,29 @@ impl Renderer {
         blocking: bool,
     ) -> bool {
         self.fold.n = n;
+        self.fold.approx = None;
+        self.fold.approximate = false;
         if movie.buffers.is_empty() {
             return true;
         }
-        let key = self.fold_key(movie, out);
+        let (key, parts) = self.fold_key(movie, out);
         if key != self.fold.key {
+            // Per-frame invalidation (#137): states before the first frame that reads
+            // the change stay valid under the new key; later ones go.
+            let f = Self::first_changed(&self.fold.parts, &parts);
+            let old = self.fold.key;
+            for c in &mut self.fold.checkpoints {
+                if c.key == old && c.frame < f {
+                    c.key = key;
+                }
+            }
             self.fold.key = key;
-            self.fold.frame = None;
+            if self.fold.frame.is_none_or(|c| c >= f) {
+                self.fold.frame = None;
+            }
             self.fold.plan = None;
         }
+        self.fold.parts = parts;
         if self.fold.rings.len() != movie.buffers.len() {
             let old = std::mem::take(&mut self.fold.rings);
             for r in old.into_iter().flatten() {
@@ -450,6 +610,11 @@ impl Renderer {
             self.fold.progress = None;
             return true;
         }
+        if self.fold.preview
+            && let Some(ok) = self.lookback(movie, n, out, blocking)
+        {
+            return ok;
+        }
         let plan = match self.fold.plan.take() {
             Some(p) if p.key == key && p.target == n => p,
             _ => {
@@ -460,9 +625,23 @@ impl Renderer {
                 p
             }
         };
+        if self.fold.preview
+            && let Some(c) = self
+                .fold
+                .frame
+                .filter(|&c| c < n && n - c > self.fold.step_budget as u64 && plan.next == c + 1)
+        {
+            // Progressive scrub: draw now from the state at c; refine when it stops.
+            self.fold.approx = Some(c);
+            self.fold.approximate = true;
+            self.fold.plan = Some(plan);
+            self.fold.progress = None;
+            return true;
+        }
         let limit = (!blocking || self.fold.slices).then_some(self.fold.step_budget as u64);
         let mut m = plan.next;
         let mut done = 0u64;
+        let started = std::time::Instant::now();
         while m <= n {
             if limit.is_some_and(|l| done >= l) {
                 break;
@@ -474,6 +653,14 @@ impl Renderer {
             m += 1;
             done += 1;
         }
+        if done > 0 {
+            let per = started.elapsed().as_secs_f64() / done as f64;
+            self.fold.step_secs = if self.fold.step_secs == 0.0 {
+                per
+            } else {
+                0.8 * self.fold.step_secs + 0.2 * per
+            };
+        }
         if m > n {
             self.fold.progress = None;
             self.free_idle_rings(movie, n);
@@ -483,6 +670,80 @@ impl Renderer {
             self.fold.plan = Some(Plan { next: m, ..plan });
             false
         }
+    }
+
+    /// `preview_lookback` (#137, progressive scrub only): when every non-pure buffer
+    /// active at `n` has one and no known state is within it, step each from black
+    /// over only its last lookback frames, all at once, and draw approximate. The
+    /// states are never checkpointed and the cursor is dropped, so nothing canonical
+    /// continues from them. None: doesn't apply.
+    fn lookback(&mut self, movie: &Movie, n: u64, out: (i32, i32), blocking: bool) -> Option<bool> {
+        let live: Vec<&Buffer> = movie
+            .buffers
+            .iter()
+            .filter(|b| !b.is_pure() && b.active(n))
+            .collect();
+        if live.is_empty() || live.iter().any(|b| b.preview_lookback.is_none()) {
+            return None;
+        }
+        let lb = live.iter().filter_map(|b| b.preview_lookback).max()?;
+        let key = self.fold.key;
+        let cursor = self
+            .fold
+            .frame
+            .filter(|&c| c <= n && self.cursor_valid(movie, c));
+        let known = self
+            .fold
+            .checkpoints
+            .iter()
+            .filter(|c| c.key == key && c.frame <= n)
+            .map(|c| c.frame)
+            .chain(cursor)
+            .max();
+        if known.is_some_and(|k| n - k <= lb) || n - cold_start(movie, n) <= lb {
+            return None;
+        }
+        let starts: Vec<u64> = movie
+            .buffers
+            .iter()
+            .map(|b| match b.preview_lookback {
+                _ if b.is_pure() => pure_start(b, n),
+                Some(l) => n.saturating_sub(l).max(b.reset_at(n).unwrap_or(0)),
+                None => n + 1,
+            })
+            .collect();
+        let clear = |fold: &mut Fold| {
+            for r in fold.rings.iter_mut().flatten() {
+                for s in &mut r.slots {
+                    s.1 = None;
+                }
+                r.last = None;
+            }
+            fold.frame = None;
+            fold.plan = None;
+        };
+        clear(&mut self.fold);
+        self.fold.lookback = true;
+        let mut ok = true;
+        for m in first_step(movie, &starts, n)..=n {
+            if !self.step_frame(movie, m, &starts, out, blocking) {
+                ok = false;
+                break;
+            }
+        }
+        self.fold.lookback = false;
+        if ok {
+            self.fold.approx = Some(n);
+            self.fold.approximate = true;
+            self.fold.progress = None;
+            self.lookback_walks += 1;
+            // The rings hold approximate states: leave them for this frame's layers,
+            // but nothing may step on from them.
+            self.fold.frame = None;
+        } else {
+            clear(&mut self.fold);
+        }
+        Some(ok)
     }
 
     /// Can the fold continue from the cursor at `c`? Every buffer active there was
@@ -660,6 +921,11 @@ impl Renderer {
         if !movie.buffers.get(b)?.active(m) {
             return None;
         }
+        // An approximate frame reads the states of the frame the rings are at.
+        let m = match self.fold.approx {
+            Some(c) if m == self.fold.n => c,
+            _ => m,
+        };
         let r = self.fold.rings.get(b)?.as_ref()?;
         let f = if back == 0 {
             m as i64
@@ -764,7 +1030,10 @@ impl Renderer {
                 None => return false,
             }
         }
-        // GL work: comp instances, the pictures, then each buffer.
+        // GL work: comp instances, the pictures, then each buffer. Never in strips: the
+        // strip count follows the GPU timer, and some renderers (the Apple Software
+        // Renderer) round strips differently, so the state would depend on timing.
+        let tiles = std::mem::replace(&mut self.tiles, 1);
         if self.inst.len() < insts.len() {
             self.inst.resize_with(insts.len(), || None);
         }
@@ -899,6 +1168,7 @@ impl Renderer {
             r.slots[slot].1 = Some(m as i64);
             r.last = Some(m);
         }
+        self.tiles = tiles;
         self.buffer_steps += todo.len();
         self.maybe_checkpoint(movie, m);
         true
@@ -919,11 +1189,10 @@ impl Renderer {
     /// Every `fps` frames (one second), copy the non-pure buffers' rings into a
     /// checkpoint (GPU copies), then keep the checkpoints under the budget.
     fn maybe_checkpoint(&mut self, movie: &Movie, m: u64) {
-        if !self.fold.checkpoints_on {
+        if !self.fold.checkpoints_on || self.fold.lookback {
             return;
         }
-        let k = (movie.fps.round() as u64).max(1);
-        if !m.is_multiple_of(k) {
+        if !m.is_multiple_of(checkpoint_interval(movie, m)) {
             return;
         }
         let key = self.fold.key;
@@ -959,6 +1228,23 @@ impl Renderer {
             .sum();
         if bytes > self.fold.budget {
             return;
+        }
+        // Adaptive spacing (#137): with the budget full, don't take one that would be
+        // the first evicted (far from the playhead, on a fine grid).
+        let used: usize = self.fold.checkpoints.iter().map(|c| c.bytes).sum();
+        if used + bytes > self.fold.budget {
+            let playhead = self.fold.playhead;
+            let keep = self.keep_frame(playhead);
+            let worst = self
+                .fold
+                .checkpoints
+                .iter()
+                .map(|c| evict_score(c.key == key, c.frame, playhead, keep))
+                .fold(f64::NEG_INFINITY, f64::max);
+            let keep_new = keep.max(Some(m).filter(|&m| m <= playhead));
+            if evict_score(true, m, playhead, keep_new) >= worst {
+                return;
+            }
         }
         let gl = self.gl.clone();
         let mut rings = vec![];
@@ -999,7 +1285,18 @@ impl Renderer {
             rings,
             bytes,
         });
-        self.evict_checkpoints(m);
+        self.evict_checkpoints(self.fold.playhead);
+    }
+
+    /// The checkpoint eviction keeps longest: the last one at or before the playhead.
+    fn keep_frame(&self, playhead: u64) -> Option<u64> {
+        let key = self.fold.key;
+        self.fold
+            .checkpoints
+            .iter()
+            .filter(|c| c.key == key && c.frame <= playhead)
+            .map(|c| c.frame)
+            .max()
     }
 
     /// The (frame, slot) states the next step after `m` reads.
@@ -1025,24 +1322,8 @@ impl Renderer {
             if total <= self.fold.budget || self.fold.checkpoints.is_empty() {
                 return;
             }
-            let keep = self
-                .fold
-                .checkpoints
-                .iter()
-                .filter(|c| c.key == key && c.frame <= playhead)
-                .map(|c| c.frame)
-                .max();
-            let score = |c: &Checkpoint| -> f64 {
-                if c.key != key {
-                    return f64::INFINITY;
-                }
-                if Some(c.frame) == keep {
-                    return -1.0;
-                }
-                let d = c.frame.abs_diff(playhead) as f64;
-                let grid = (c.frame.max(1).trailing_zeros()).min(16);
-                d / (1u64 << grid) as f64
-            };
+            let keep = self.keep_frame(playhead);
+            let score = |c: &Checkpoint| evict_score(c.key == key, c.frame, playhead, keep);
             let i = (0..self.fold.checkpoints.len())
                 .max_by(|&a, &b| {
                     score(&self.fold.checkpoints[a]).total_cmp(&score(&self.fold.checkpoints[b]))
@@ -1051,6 +1332,32 @@ impl Renderer {
             let c = self.fold.checkpoints.swap_remove(i);
             self.recycle(c);
         }
+    }
+}
+
+/// Eviction order (higher goes first): stale checkpoints (another fold key), then the
+/// farthest from the playhead, where a frame on a coarser grid (divisible by a higher
+/// power of two) counts as nearer, so far from the playhead the spacing doubles
+/// instead of thrashing (#137). The one just before the playhead (`keep`) stays.
+fn evict_score(current: bool, frame: u64, playhead: u64, keep: Option<u64>) -> f64 {
+    if !current {
+        return f64::INFINITY;
+    }
+    if Some(frame) == keep {
+        return -1.0;
+    }
+    let d = frame.abs_diff(playhead) as f64;
+    let grid = (frame.max(1).trailing_zeros()).min(16);
+    d / (1u64 << grid) as f64
+}
+
+/// Checkpoint spacing at frame `m`: one second of frames, or every frame while a
+/// buffer active there has `cache = "dense"` (#137).
+fn checkpoint_interval(movie: &Movie, m: u64) -> u64 {
+    if movie.buffers.iter().any(|b| b.dense && b.active(m)) {
+        1
+    } else {
+        (movie.fps.round() as u64).max(1)
     }
 }
 

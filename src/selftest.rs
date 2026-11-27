@@ -223,6 +223,18 @@ const CHECKS: &[Check] = &[
         run: buffers_edits,
     },
     Check {
+        name: "buffers: progressive scrub is approximate at once, refines to the canonical frame, never headless; preview_lookback",
+        run: buffers_scrub,
+    },
+    Check {
+        name: "buffers: the background fill takes checkpoints a slice at a time, never blocking; cache = \"dense\"",
+        run: buffers_fill,
+    },
+    Check {
+        name: "buffers: an edit keeps the states before the first frame that reads it",
+        run: buffers_invalidation,
+    },
+    Check {
         name: "chunked sound matches a single-pass render",
         run: sound_chunk_equivalence,
     },
@@ -2717,6 +2729,255 @@ fn buffers_edits(gl: &Gl, dir: &Path) -> Result<String> {
         );
     }
     std::fs::write(dir.join("acc.glsl"), good)?;
+    Ok(String::new())
+}
+
+/// Film frame `n` rendered as the player does while paused (blocking, sliced): retried
+/// until the catch-up reaches it.
+fn buf_sliced(r: &mut Renderer, m: &Movie, n: u64) -> Result<Frame> {
+    let i = FrameInfo::frame(m, n);
+    for _ in 0..2000 {
+        if r.render(m, W, H, &i, true).is_some() {
+            return r.read_output().ok_or_else(|| anyhow!("no output"));
+        }
+    }
+    bail!("frame {n} never caught up")
+}
+
+/// `buffer_film`'s text with `edit` applied, loaded from `sub`.
+fn buffer_film_with(dir: &Path, sub: &str, edit: impl Fn(String) -> String) -> Result<Movie> {
+    let d = dir.join(sub);
+    buffer_film(&d, HIST3)?;
+    let text = std::fs::read_to_string(d.join("movie.toml"))?;
+    std::fs::write(d.join("movie.toml"), edit(text))?;
+    Movie::load(&d)
+}
+
+fn buffers_scrub(gl: &Gl, dir: &Path) -> Result<String> {
+    let m = buffer_film(dir, HIST3)?;
+    let mut c = renderer(gl, &m)?;
+    let canon = buf_frame(&mut c, &m, 50, 1.0)?;
+    let mut r = renderer(gl, &m)?;
+    let mut at31 = None;
+    for n in 0..=31 {
+        at31 = Some(buf_frame(&mut r, &m, n, 1.0)?);
+    }
+    let at31 = at31.unwrap();
+    // Dragging to 50: drawn at once from the state at 31, marked approximate.
+    r.set_catchup_slices(true);
+    r.set_scrub_preview(true);
+    let steps = r.buffer_steps;
+    r.render(&m, W, H, &FrameInfo::frame(&m, 50), true)
+        .ok_or_else(|| anyhow!("the scrubbed frame wasn't drawn at once"))?;
+    if !r.buffer_approximate() {
+        bail!("a scrubbed frame far from any state wasn't marked approximate");
+    }
+    if r.buffer_steps != steps {
+        bail!("scrubbing stepped {} times", r.buffer_steps - steps);
+    }
+    let approx = r.read_output().unwrap();
+    if approx == canon {
+        bail!("the approximate frame equals the exact one: the fixture can't tell them apart");
+    }
+    // The left panel shows only @acc: there, acc's state at 31.
+    expect_same(
+        "@acc on the approximate frame 50 vs frame 31",
+        &half(&approx, true),
+        &half(&at31, true),
+        0,
+        0.0,
+    )?;
+    // The drag stops: the same frame refines to the canonical state.
+    r.set_scrub_preview(false);
+    let got = buf_sliced(&mut r, &m, 50)?;
+    if r.buffer_approximate() {
+        bail!("the refined frame is still approximate");
+    }
+    expect_same("frame 50 refined after a scrub", &got, &canon, 0, 0.0)?;
+    // Headless renders never preview: a far still is exact.
+    let mut h = renderer(gl, &m)?;
+    buf_frame(&mut h, &m, 31, 1.0)?;
+    let got = buf_frame(&mut h, &m, 50, 1.0)?;
+    if h.buffer_approximate() {
+        bail!("a headless render was approximate");
+    }
+    expect_same("a still of frame 50", &got, &canon, 0, 0.0)?;
+    // preview_lookback: a far scrub steps only the last 0.2 s from black, and its
+    // states are never checkpointed (dense would take one every frame).
+    let lm = buffer_film_with(dir, "lookback", |t| {
+        t.replace(
+            "format=\"rgba32f\"",
+            "format=\"rgba32f\"\npreview_lookback=0.2\ncache=\"dense\"",
+        )
+    })?;
+    let mut l = renderer(gl, &lm)?;
+    l.set_scrub_preview(true);
+    let steps = l.buffer_steps;
+    l.render(&lm, W, H, &FrameInfo::frame(&lm, 25), true)
+        .ok_or_else(|| anyhow!("the lookback frame wasn't drawn"))?;
+    let walked = l.buffer_steps - steps;
+    if l.checkpoint_stats().0 != 0 {
+        bail!(
+            "a lookback walk took {} checkpoints",
+            l.checkpoint_stats().0
+        );
+    }
+    if !l.buffer_approximate() || l.lookback_walks != 1 || walked > 2 * 8 {
+        bail!(
+            "a far scrub with preview_lookback: approximate {}, {} walks, {walked} steps",
+            l.buffer_approximate(),
+            l.lookback_walks
+        );
+    }
+    let approx = l.read_output().unwrap();
+    l.set_scrub_preview(false);
+    let got = buf_frame(&mut l, &lm, 25, 1.0)?;
+    let mut lc = renderer(gl, &lm)?;
+    let canon = buf_frame(&mut lc, &lm, 25, 1.0)?;
+    if approx == canon {
+        bail!("the lookback frame equals the exact one: the fixture can't tell them apart");
+    }
+    expect_same(
+        "frame 25 refined after a lookback scrub",
+        &got,
+        &canon,
+        0,
+        0.0,
+    )?;
+    Ok(format!("lookback walked {walked} steps"))
+}
+
+fn buffers_fill(gl: &Gl, dir: &Path) -> Result<String> {
+    // No cut resets: frames 5 → 30 → … are one long fold.
+    let m = buffer_film_with(dir, "nocuts", |t| t.replace("reset=\"cuts\"\n", ""))?;
+    let mut c = renderer(gl, &m)?;
+    let canon45 = buf_frame(&mut c, &m, 45, 1.0)?;
+    let mut r = renderer(gl, &m)?;
+    r.set_catchup_slices(true);
+    let at5 = buf_sliced(&mut r, &m, 5)?;
+    let (before, _) = r.checkpoint_stats();
+    // As the player does while paused and idle: pump, then fill, every redraw.
+    let (mut calls, mut idle) = (0, 0);
+    let t5 = FrameInfo::frame(&m, 5).t;
+    while idle < 20 {
+        r.pump(&m, t5, false);
+        let steps = r.buffer_steps;
+        if r.fill_checkpoints(&m, W, H) {
+            idle = 0;
+            calls += 1;
+        } else {
+            idle += 1;
+        }
+        // At most a step budget of frames per call (two buffers each).
+        if r.buffer_steps - steps > 2 * 8 {
+            bail!("one fill call stepped {} times", r.buffer_steps - steps);
+        }
+        if calls > 500 {
+            bail!("the background fill never finished");
+        }
+    }
+    let (after, _) = r.checkpoint_stats();
+    if after <= before || r.fill_steps == 0 {
+        bail!("the background fill took no checkpoint ({before} → {after})");
+    }
+    if r.blocking_catchups != 0 {
+        bail!("the background fill caught up blocking");
+    }
+    if r.catchup_progress().is_some() {
+        bail!("the background fill shows as a catch-up");
+    }
+    expect_same(
+        "frame 5 after the fill",
+        &buf_sliced(&mut r, &m, 5)?,
+        &at5,
+        0,
+        0.0,
+    )?;
+    let restores = r.buffer_restores;
+    let steps = r.buffer_steps;
+    expect_same(
+        "frame 45 after the fill",
+        &buf_sliced(&mut r, &m, 45)?,
+        &canon45,
+        0,
+        0.0,
+    )?;
+    if r.buffer_restores == restores || r.buffer_steps - steps > 40 {
+        bail!(
+            "frame 45 didn't start from a filled checkpoint ({} steps)",
+            r.buffer_steps - steps
+        );
+    }
+    // cache = "dense": a checkpoint every frame.
+    let dm = buffer_film_with(dir, "dense", |t| {
+        t.replace("format=\"rgba32f\"", "format=\"rgba32f\"\ncache=\"dense\"")
+    })?;
+    let mut d = renderer(gl, &dm)?;
+    for n in 0..=10 {
+        buf_frame(&mut d, &dm, n, 1.0)?;
+    }
+    let (dense, _) = d.checkpoint_stats();
+    if dense < 10 {
+        bail!("cache = \"dense\" took {dense} checkpoints in 11 frames");
+    }
+    Ok(format!("{} checkpoints in {calls} calls", after - before))
+}
+
+fn buffers_invalidation(gl: &Gl, dir: &Path) -> Result<String> {
+    // Three shots, no cut resets; the last uses its own scene.
+    let edit = |t: String| {
+        let t = t.replace("reset=\"cuts\"\n", "");
+        t.replacen(
+            "[[buffer]]",
+            "[[shot]]\nid=\"c\"\nscene=\"s2.glsl\"\nduration=1\n[[buffer]]",
+            1,
+        )
+    };
+    let d = dir.join("third");
+    buffer_film(&d, HIST3)?;
+    std::fs::copy(d.join("s.glsl"), d.join("s2.glsl"))?;
+    let text = std::fs::read_to_string(d.join("movie.toml"))?;
+    std::fs::write(d.join("movie.toml"), edit(text))?;
+    let m = Movie::load(&d)?;
+    let mut r = renderer(gl, &m)?;
+    let mut fwd = vec![];
+    for n in 0..=70 {
+        fwd.push(buf_frame(&mut r, &m, n, 1.0)?);
+    }
+    // Edit the last shot (read from frame 60): states before it stay.
+    write(
+        &d,
+        &[(
+            "s2.glsl",
+            &scene("fragColor = vec4(uv.y, fract(iTime * 0.7), uv.x, 1.0);"),
+        )],
+    )?;
+    let m2 = Movie::load(&d)?;
+    r.load_all(&m2)
+        .map_err(|e| anyhow!("{}", crate::gfx::join_errors(&e)))?;
+    let (restores, steps) = (r.buffer_restores, r.buffer_steps);
+    let got = buf_frame(&mut r, &m2, 45, 1.0)?;
+    if r.buffer_restores == restores || r.buffer_steps - steps > 40 {
+        bail!(
+            "after an edit at frame 60, frame 45 folded {} steps (its checkpoint at 30 was dropped)",
+            r.buffer_steps - steps
+        );
+    }
+    expect_same("frame 45 after an edit at 60", &got, &fwd[45], 0, 0.0)?;
+    let mut fresh = renderer(gl, &m2)?;
+    for n in [65, 61, 70] {
+        let got = buf_frame(&mut r, &m2, n, 1.0)?;
+        expect_same(
+            &format!("frame {n} after the edit vs a cold fold"),
+            &got,
+            &buf_frame(&mut fresh, &m2, n, 1.0)?,
+            0,
+            0.0,
+        )?;
+        if n == 65 && half(&got, true) == half(&fwd[65], true) {
+            bail!("editing the last shot didn't change the buffer at 65");
+        }
+    }
     Ok(String::new())
 }
 

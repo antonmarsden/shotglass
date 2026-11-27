@@ -1,7 +1,9 @@
 # Design: feedback buffers in films
 
-Status: **phase 1 built** (#134): `[[buffer]]`, history, resets, checkpoints; user docs in
-[buffers.md](../buffers.md). Phases 2+ (comps, warm loops, `after`) are still proposals. Builds on the iChannel design
+Status: **phase 1 built** (#134): `[[buffer]]`, history, resets, checkpoints; **phase 2
+built** (#137): background fill, progressive scrub, `preview_lookback`, adaptive spacing,
+`cache = "dense"`, slow-seek hints, per-frame invalidation; user docs in
+[buffers.md](../buffers.md). Phase 3 (comps, warm loops, `after`, #138) is still a proposal. Builds on the iChannel design
 ([ichannel.md](ichannel.md), which deferred `{ buffer = "A" }` to its own design) and on
 layers and comps ([layers-compositing.md](layers-compositing.md), which ruled
 previous-frame inputs out of layers).
@@ -364,8 +366,13 @@ A checkpoint is valid only for its fold key, and only for frames whose fold
 started at the same reset. A live edit therefore invalidates the edited buffer and every
 buffer downstream, from the first reset that sees the change (an edit to shot "closeup"
 only invalidates checkpoints at or after the first frame that reads it, when nothing
-before reads it). Precise per-frame invalidation is phase 2; phase 1 invalidates the
-whole buffer.
+before reads it). Phase 2 (#137) built it per frame, not per buffer: the fold key is a
+list of parts (declarations, sizes, each buffer's keys, each item a buffer's `@picture`
+or comp reads), each with the first frame that reads it (a buffer: its span start; a
+shot: its start, or its incoming transition's, one frame early; comps and declarations:
+frame 0). An edit keeps the cursor and the checkpoints before the earliest changed
+part's frame, re-keyed; all buffers share one cursor, so a change to one buffer drops
+the others' later states too.
 
 **Broken edits** keep the last working version, as today: the old programs *and* their
 checkpoints stay until the new version's frame n is ready.
