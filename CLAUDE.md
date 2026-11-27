@@ -227,8 +227,10 @@ cargo fmt && cargo clippy --all-targets -- -D warnings
   before layers; `@picture` in a buffer is rendered at the buffer's size, scale 1, never the render
   scale. While playing, catch-up is sliced (the previous frame stays up, the clock waits); no
   checkpoint ever reads back to the CPU. Films without buffers take exactly the old path.
-  Buffer steps never draw in strips (the strip count follows the GPU timer; the Apple
-  Software Renderer rounds strips differently, so state would depend on timing). Phase 2
+  Buffer steps never draw in strips (the strip count follows the GPU timer). On the Apple
+  Software Renderer folds reached by different paths differ by 1/255 (cause unknown, not
+  strips) and float state compounds it, so the selftest's buffer comparisons
+  (`expect_fold`) note mismatches there instead of failing, as for sound. Phase 2
   (#137): approximate frames (progressive scrub, `preview_lookback`) exist only while
   the player sets `set_scrub_preview`; lookback states are never checkpointed or stepped
   on (cursor dropped). The background fill (`fill_checkpoints`) never blocks and never

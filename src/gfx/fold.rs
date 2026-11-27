@@ -1031,8 +1031,7 @@ impl Renderer {
             }
         }
         // GL work: comp instances, the pictures, then each buffer. Never in strips: the
-        // strip count follows the GPU timer, and some renderers (the Apple Software
-        // Renderer) round strips differently, so the state would depend on timing.
+        // strip count follows the GPU timer, and the state mustn't depend on timing.
         let tiles = std::mem::replace(&mut self.tiles, 1);
         if self.inst.len() < insts.len() {
             self.inst.resize_with(insts.len(), || None);
