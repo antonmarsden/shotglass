@@ -192,7 +192,7 @@ checkpoint ≤ n and steps at most K − 1 frames.
 
 - Filled during playback for free, and while paused by a background walk forward from
   the playhead (budgeted, lowest priority, behind compiles and uploads).
-- Kept in an LRU with its own budget (default 512 MB): a 960×540 RGBA16F state is ~4 MB,
+- Kept in an LRU with its own budget (512 MB to 2 GB, [from the GPU](#the-checkpoint-budget)): a 960×540 RGBA16F state is ~4 MB,
   so a minute at one per second is ~240 MB per buffer. See [Memory](#memory) for what is
   evictable and how.
 - Checkpoints never go to disk: evicted ones are dropped (see
@@ -227,16 +227,15 @@ Buffer memory never grows without bound. Two kinds, treated differently:
   worst frame (the most buffers active at once, comps included in phase 3) and refuses
   the film when that exceeds a fixed limit, with a message naming the buffers and their
   sizes, like `texture::shot_memory` does for textures.
-- **Evictable: checkpoints.** They live in their own LRU under a fixed budget (default
-  512 MB, set in the player's settings and by `SHOTGLASS_BUFFER_CACHE_MB`). Eviction
+- **Evictable: checkpoints.** They live in their own LRU under a budget sized once at
+  startup (see [the budget](#the-checkpoint-budget) below). Eviction
   changes only how long a seek takes, never what it shows: a missing checkpoint means
   catching up from an earlier one or from the reset.
 
 Rules for the checkpoint cache:
 
-- **Fixed budget, not free GPU memory:** drivers don't report free memory reliably, so
-  the budget is a number, as for the 256 MB texture LRU. Required targets, textures and
-  checkpoints have separate budgets, so one can't starve the others.
+- **Separate budgets:** required targets, textures and checkpoints each have their own,
+  so one can't starve the others.
 - **Eviction order:** farthest from the playhead first. The checkpoint just before the
   playhead and the one just before each reset in view are kept longest, so stepping back
   a little and jumping to a cut stay cheap.
@@ -248,6 +247,23 @@ Rules for the checkpoint cache:
 - **Slow seeks are reported:** when a catch-up would take more than about a second
   (estimated from measured step times), the player says so and suggests what helps: a smaller `size`,
   `cache = "dense"`, or reading a cheaper comp instead of `@picture`.
+
+### The checkpoint budget
+
+The budget only changes how fast a seek is, never what a frame shows, so it may follow
+the GPU. It's decided once at startup (limits are asked once, never per frame):
+
+1. **Your setting wins:** the player's settings, or `SHOTGLASS_BUFFER_CACHE_MB`.
+2. **Otherwise, from total video memory** where the driver reports it:
+   `GL_NVX_gpu_memory_info` (NVIDIA), `GL_ATI_meminfo` (AMD; Mesa drivers often expose
+   one of the two). The budget is 1/8 of it, clamped to 256 MB – 2 GB: a 12 GB card gets
+   ~1.5 GB, about 3× denser checkpoints than the fallback. Total memory, not free memory:
+   free memory moves from moment to moment and isn't reliable enough to plan around.
+3. **Otherwise 512 MB** (Apple, the web player, drivers without either extension).
+
+The player shows the budget and where it came from (setting, video memory, fallback).
+The texture LRU's fixed 256 MB could follow the same rule later; that's a separate
+change.
 
 ### Why no disk checkpoints
 
