@@ -982,10 +982,7 @@ impl Renderer {
         movie: &Movie,
         tex_errors: &mut Vec<ShaderError>,
     ) -> [Option<ChanKey>; N_CHANNELS] {
-        let channels = match item {
-            crate::movie::ItemRef::Shot(i) => &movie.shots[i].channels,
-            crate::movie::ItemRef::Layer(j) => &movie.layers[j].channels,
-        };
+        let channels = movie.item_channels(item);
         let mut keys = [None; N_CHANNELS];
         for (n, c) in channels.iter().enumerate() {
             let Some(c) = c else { continue };

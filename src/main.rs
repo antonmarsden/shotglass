@@ -1238,7 +1238,8 @@ fn check_textures(m: &Movie, web: bool, deep: bool) -> Result<()> {
             movie::Source::Input
             | movie::Source::Picture
             | movie::Source::Layer { .. }
-            | movie::Source::Comp { .. } => continue,
+            | movie::Source::Comp { .. }
+            | movie::Source::Buffer { .. } => continue,
             movie::Source::Frames(seq) => {
                 let label = &seq.pattern.label;
                 let Some(scan) = &seq.scan else {
@@ -1478,18 +1479,25 @@ fn footage_warnings(m: &Movie) {
                 l.start,
                 l.end,
             )
+        }))
+        .chain((0..m.buffers.len()).map(|b| {
+            let x = &m.buffers[b];
+            (
+                ItemRef::Buffer(b),
+                format!("buffer \"{}\"", x.id),
+                x.start,
+                x.end,
+            )
         }));
     for (item, who, start, end) in items {
         for c in 0..movie::N_CHANNELS {
             let Some(map) = m.frame_map(item, c) else {
                 continue;
             };
-            let label = match item {
-                ItemRef::Shot(i) => m.shots[i].channels[c].as_ref(),
-                ItemRef::Layer(j) => m.layers[j].channels[c].as_ref(),
-            }
-            .map(|c| c.label())
-            .unwrap_or_default();
+            let label = m.item_channels(item)[c]
+                .as_ref()
+                .map(|c| c.label())
+                .unwrap_or_default();
             let last = (m.frame_at(end) - 1).max(m.frame_at(start)) as u64;
             if map.timing.end == End::Hold && map.timing.speed > 0.0 {
                 let open = movie::FrameMap {
