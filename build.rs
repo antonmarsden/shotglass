@@ -1,4 +1,4 @@
-//! Builds SVT-AV1 and the small C shim over it for the `webm` feature (#116).
+//! Builds the pinned msdfgen core and, with `webm`, SVT-AV1 (#116).
 //!
 //! Where SVT-AV1 comes from, first match wins:
 //! - `SVT_AV1_DIR`: an installed SVT-AV1 (`include/svt-av1/EbSvtAv1Enc.h`, `lib/`),
@@ -14,6 +14,48 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     #[cfg(feature = "webm")]
     webm::build();
+    build_msdfgen();
+}
+
+fn build_msdfgen() {
+    use std::path::PathBuf;
+
+    println!("cargo:rerun-if-changed=src/msdf/msdfgen.cpp");
+    let root = PathBuf::from("vendor/msdfgen");
+    assert!(
+        root.join("msdfgen.h").is_file(),
+        "msdfgen source is missing. Run `git submodule update --init`."
+    );
+    println!("cargo:rerun-if-changed={}", root.join("core").display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        root.join("msdfgen.h").display()
+    );
+    let mut build = cc::Build::new();
+    build
+        .cpp(true)
+        .std("c++14")
+        .include(&root)
+        .define("MSDFGEN_PUBLIC", Some(""))
+        .define("MSDFGEN_USE_CPP11", None)
+        .file("src/msdf/msdfgen.cpp");
+    // Sign correction stores -1 in a plain char scratch buffer. MSVC uses
+    // signed char by default, while GCC and Clang vary by target.
+    if !build.get_compiler().is_like_msvc() {
+        build.flag("-fsigned-char");
+    }
+    // Keep atlas generation responsive in development builds. Release builds
+    // continue to use the Cargo profile's optimization level.
+    if std::env::var("OPT_LEVEL").as_deref() == Ok("0") {
+        build.opt_level(2);
+    }
+    for file in std::fs::read_dir(root.join("core")).expect("read msdfgen core") {
+        let path = file.expect("read msdfgen core file").path();
+        if path.extension().is_some_and(|ext| ext == "cpp") {
+            build.file(path);
+        }
+    }
+    build.compile("shotglass_msdfgen");
 }
 
 #[cfg(feature = "webm")]

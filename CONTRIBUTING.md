@@ -6,8 +6,9 @@ invariants); user docs are in [README.md](README.md) and [docs/](docs/).
 
 ## Building
 
-`git clone --recursive` (or `git submodule update --init` in an existing clone):
-SVT-AV1 is a submodule in `vendor/SVT-AV1`, built by `build.rs` for the `webm`
+`git clone --recursive` (or `git submodule update --init` in an existing clone)
+fetches the pinned dependencies. A C++14 compiler builds `vendor/msdfgen` for
+glyph atlases. `build.rs` also builds `vendor/SVT-AV1` for the `webm`
 feature (built-in WebM export, #116). You need CMake and a C compiler, and nasm
 2.14+ (from nasm.us, `brew install nasm`, `apt install nasm`; or set
 `NASM` to it) for a fast encoder: without nasm the build warns and SVT-AV1 is C-only.
