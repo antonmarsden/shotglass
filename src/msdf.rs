@@ -205,7 +205,8 @@ fn field(font: &Font, id: u32, em: f64, spread: f64) -> Result<Option<Field>> {
     let mut image = RgbaImage::new(w, h);
     generate_mtsdf(&prepared, 2.0 * spread, &mut image);
     correct_sign_mtsdf(&mut image, &prepared, FillRule::Nonzero);
-    let px = image.pixels().map(|p| p.0).collect();
+    // RgbaImage::new reserves exactly four bytes per pixel.
+    let px = bytemuck::allocation::cast_vec::<u8, [u8; 4]>(image.into_raw());
     Ok(Some(Field {
         image: TooDee::from_vec(w as usize, h as usize, px),
         left: left as f32,
