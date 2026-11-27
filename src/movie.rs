@@ -83,6 +83,10 @@ struct MovieFile {
     /// Layers above the picture track, bottom to top (#69).
     #[serde(rename = "layer", default)]
     layers: Vec<LayerFile>,
+    /// Feedback buffers (#134): stepped once per film frame, after the picture track
+    /// and before any layer, in file order.
+    #[serde(rename = "buffer", default)]
+    buffers: Vec<BufferFile>,
     /// Film-wide channels for every shot that doesn't set its own `channels`.
     channels: Option<Vec<toml::Value>>,
     /// Named textures: `brick = "textures/brick.png"` or `{ file = "…", filter = … }`.
@@ -110,6 +114,9 @@ struct CompFile {
     #[serde(rename = "layer", default)]
     layers: Vec<LayerFile>,
     channels: Option<Vec<toml::Value>>,
+    /// Recognised so the message says buffers in comps arrive later (#134, phase 3).
+    #[serde(rename = "buffer")]
+    buffers: Option<toml::Value>,
 }
 
 #[derive(Deserialize)]
@@ -194,6 +201,34 @@ struct LayerFile {
     // Later phases: recognised so the message names when they arrive.
     transition_in: Option<toml::Value>,
     transition_out: Option<toml::Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BufferFile {
+    id: String,
+    /// A film file whose `mainImage` writes the new state (raw values, no premultiply).
+    scene: String,
+    /// Drawn once at each reset as the state before it (default: black).
+    init: Option<String>,
+    /// The span, as for layers (default: the whole film).
+    from: Option<toml::Value>,
+    to: Option<toml::Value>,
+    /// Extra resets: shot or layer ids (their start), span-style points, seconds; or
+    /// `"cuts"` (every shot start in the span).
+    reset: Option<toml::Value>,
+    /// `[w, h]` in pixels, or `scale` (a fraction of the output size); never "auto".
+    size: Option<[u32; 2]>,
+    scale: Option<toml::Value>,
+    /// `"rgba16f"` (default), `"rgba32f"` or `"rgba8"`.
+    format: Option<String>,
+    /// Keep the last N states, read as `{ source = "@id", frame = -k }` (1 ≤ k ≤ N).
+    history: Option<i64>,
+    channels: Option<Vec<toml::Value>>,
+    #[serde(default)]
+    uniforms: BTreeMap<String, toml::Value>,
+    #[serde(default)]
+    params: BTreeMap<String, toml::Value>,
 }
 
 #[derive(Deserialize)]
@@ -718,6 +753,7 @@ impl FrameMap {
 pub enum ItemRef {
     Shot(usize),
     Layer(usize),
+    Buffer(usize),
 }
 
 /// What a channel shows.
@@ -744,6 +780,14 @@ pub enum Source {
         name: String,
         time_offset: f32,
     },
+    /// `@<buffer>`, `@prev` or `{ source = "@<buffer>", frame = -k }` (#134): buffer
+    /// `Movie::buffers[index]`'s state `back` frames ago (0: this frame's, after its
+    /// step). Black while that buffer isn't active.
+    Buffer {
+        index: usize,
+        id: String,
+        back: u32,
+    },
 }
 
 impl Source {
@@ -751,7 +795,11 @@ impl Source {
     pub fn is_pass(&self) -> bool {
         matches!(
             self,
-            Source::Input | Source::Picture | Source::Layer { .. } | Source::Comp { .. }
+            Source::Input
+                | Source::Picture
+                | Source::Layer { .. }
+                | Source::Comp { .. }
+                | Source::Buffer { .. }
         )
     }
 }
@@ -779,6 +827,7 @@ impl Channel {
             | Source::Picture
             | Source::Layer { .. }
             | Source::Comp { .. }
+            | Source::Buffer { .. }
             | Source::Frames(_) => vec![],
             Source::Image(f) => vec![f],
             Source::Text(t) => {
@@ -803,9 +852,11 @@ impl Channel {
     /// The written paths, to resolve against libraries (`written`).
     pub fn files_mut(&mut self) -> Vec<&mut FileRef> {
         match &mut self.source {
-            Source::Input | Source::Picture | Source::Layer { .. } | Source::Comp { .. } => {
-                vec![]
-            }
+            Source::Input
+            | Source::Picture
+            | Source::Layer { .. }
+            | Source::Comp { .. }
+            | Source::Buffer { .. } => vec![],
             Source::Frames(s) => vec![&mut s.pattern],
             Source::Image(f) => vec![f],
             Source::Text(t) => {
@@ -830,6 +881,8 @@ impl Channel {
             Source::Picture => "@picture".to_string(),
             Source::Layer { id, .. } => format!("@{id}"),
             Source::Comp { name, .. } => format!("@{name}"),
+            Source::Buffer { id, back: 0, .. } => format!("@{id}"),
+            Source::Buffer { id, back, .. } => format!("@{id} (frame -{back})"),
         }
     }
 
@@ -1024,6 +1077,133 @@ impl Layer {
     }
 }
 
+/// A buffer's texel format (#134).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum BufferFormat {
+    Rgba16f,
+    Rgba32f,
+    Rgba8,
+}
+
+impl BufferFormat {
+    pub const NAMES: [&'static str; 3] = ["rgba16f", "rgba32f", "rgba8"];
+
+    pub fn parse(s: &str) -> Option<BufferFormat> {
+        match s {
+            "rgba16f" => Some(BufferFormat::Rgba16f),
+            "rgba32f" => Some(BufferFormat::Rgba32f),
+            "rgba8" => Some(BufferFormat::Rgba8),
+            _ => None,
+        }
+    }
+
+    /// Bytes per texel.
+    pub fn bytes(self) -> usize {
+        match self {
+            BufferFormat::Rgba16f => 8,
+            BufferFormat::Rgba32f => 16,
+            BufferFormat::Rgba8 => 4,
+        }
+    }
+}
+
+/// A buffer's size: fixed pixels, or a fraction of the output size (never the render
+/// scale).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum BufferSize {
+    Fixed(u32, u32),
+    Scale(f32),
+}
+
+impl BufferSize {
+    /// The size for an output of `w` × `h`.
+    pub fn at(self, (w, h): (i32, i32)) -> (i32, i32) {
+        match self {
+            BufferSize::Fixed(bw, bh) => (bw as i32, bh as i32),
+            BufferSize::Scale(s) => (
+                ((w as f32 * s).round() as i32).clamp(1, w.max(1)),
+                ((h as f32 * s).round() as i32).clamp(1, h.max(1)),
+            ),
+        }
+    }
+}
+
+/// The most states a buffer's `history` may keep.
+pub const MAX_HISTORY: u32 = 64;
+/// The most buffers a film may have.
+pub const MAX_BUFFERS: usize = 64;
+/// Required buffer memory (rings of every buffer active at once) a film may need.
+pub const BUFFER_MEMORY_LIMIT: usize = 1 << 30;
+/// The output height `scale = …` buffers are sized for in the memory check.
+const MEMORY_CHECK_HEIGHT: f32 = 1080.0;
+
+/// A `[[buffer]]` (#134): state kept from one film frame to the next. Its state at
+/// film frame n is its state at the last reset r ≤ n, stepped once per film frame from
+/// r to n (`state(r) = step(r, init)`): a pure function of the movie and n.
+#[derive(Clone, Debug)]
+pub struct Buffer {
+    pub id: String,
+    pub scene: PathBuf,
+    pub init: Option<PathBuf>,
+    /// The span in movie seconds, and the film frames it covers: active on frames
+    /// `start_frame..end_frame` (those whose time is in `[start, end)`).
+    pub start: f32,
+    pub end: f32,
+    pub start_frame: u64,
+    pub end_frame: u64,
+    /// Reset frames, sorted, the span start first.
+    pub resets: Vec<u64>,
+    pub size: BufferSize,
+    pub format: BufferFormat,
+    /// States kept (`history`, default 1: `@prev`).
+    pub history: u32,
+    pub channels: [Option<Channel>; N_CHANNELS],
+    pub uniforms: Vec<(String, Anim)>,
+    pub params: Vec<(String, Vec<f32>)>,
+}
+
+impl Buffer {
+    /// Is the buffer active on film frame `m`?
+    pub fn active(&self, m: u64) -> bool {
+        (self.start_frame..self.end_frame).contains(&m)
+    }
+
+    /// The last reset at or before frame `m` (None before the span).
+    pub fn reset_at(&self, m: u64) -> Option<u64> {
+        let i = self.resets.partition_point(|&r| r <= m);
+        (i > 0).then(|| self.resets[i - 1])
+    }
+
+    /// A pure history buffer reads no buffer state (not even its own `@prev`): its
+    /// state at n depends only on frame n's inputs, so it needs no checkpoints.
+    pub fn is_pure(&self) -> bool {
+        !self
+            .channels
+            .iter()
+            .flatten()
+            .any(|c| matches!(c.source, Source::Buffer { .. }))
+    }
+
+    /// GPU memory its ring needs at an output of `out` (history + 1 states).
+    pub fn ring_bytes(&self, out: (i32, i32)) -> usize {
+        let (w, h) = self.size.at(out);
+        (self.history as usize + 1) * w as usize * h as usize * self.format.bytes()
+    }
+
+    /// iTime etc. are span-local, like a layer's.
+    pub fn duration(&self) -> f32 {
+        self.end - self.start
+    }
+}
+
+/// What a channel needs to know about the film's buffers while they are parsed.
+#[derive(Clone, Debug)]
+struct BufDecl {
+    id: String,
+    history: u32,
+    format: BufferFormat,
+}
+
 #[derive(Clone, Debug)]
 pub struct Marker {
     pub t: f32,
@@ -1059,6 +1239,8 @@ pub struct Movie {
     pub shots: Vec<Shot>,
     /// Layers above the picture track, bottom to top.
     pub layers: Vec<Layer>,
+    /// Feedback buffers (#134), in step order. Always empty in a comp's movie.
+    pub buffers: Vec<Buffer>,
     /// `[comps]` (#74), in name order. Always empty in a comp's own movie: comps refer
     /// to the film's by index.
     pub comps: Vec<Comp>,
@@ -1143,7 +1325,8 @@ impl Movie {
             .any(|s| s.channels.iter().any(Option::is_some))
     }
 
-    /// Every bound channel of every shot, then of every layer, then of every comp.
+    /// Every bound channel of every shot, then of every layer, then of every buffer,
+    /// then of every comp.
     pub fn channels(&self) -> impl Iterator<Item = &Channel> + '_ {
         let comps: Box<dyn Iterator<Item = &Channel>> =
             Box::new(self.comps.iter().flat_map(|c| c.movie.channels()));
@@ -1151,6 +1334,11 @@ impl Movie {
             .iter()
             .flat_map(|s| s.channels.iter().flatten())
             .chain(self.layers.iter().flat_map(|l| l.channels.iter().flatten()))
+            .chain(
+                self.buffers
+                    .iter()
+                    .flat_map(|b| b.channels.iter().flatten()),
+            )
             .chain(comps)
     }
 
@@ -1171,7 +1359,8 @@ impl Movie {
 
     /// `check`'s warning for a film that uses a feature newer than the engine contract
     /// it says it needs (textures: 0.1.1, `loop`: 0.1.2, text and iChannel4..7: 0.1.3,
-    /// layers: 0.1.4, blends: 0.1.5, image sequences: 0.1.6):
+    /// layers: 0.1.4, blends: 0.1.5, image sequences: 0.1.6, comps: 0.1.7, glyph runs:
+    /// 0.1.8, buffers: 0.1.9):
     /// older engines would then fail
     /// on an "unknown field" instead of asking for a newer shotglass.
     pub fn contract_warning(&self) -> Option<String> {
@@ -1228,6 +1417,10 @@ impl Movie {
             features.push("glyph runs, glyph sets or subtitles, which need shotglass 0.1.8");
             need = semver::Version::new(0, 1, 8);
         }
+        if !self.buffers.is_empty() {
+            features.push("feedback buffers ([[buffer]]), which need shotglass 0.1.9");
+            need = semver::Version::new(0, 1, 9);
+        }
         if features.is_empty() {
             return None;
         }
@@ -1241,6 +1434,7 @@ impl Movie {
             semver::Version::new(0, 1, 5),
             semver::Version::new(0, 1, 6),
             semver::Version::new(0, 1, 7),
+            semver::Version::new(0, 1, 8),
         ];
         let allows_old = match &self.shotglass {
             None => true,
@@ -1280,6 +1474,11 @@ impl Movie {
                 self.layers
                     .iter_mut()
                     .map(|l| (format!("layer \"{}\"", l.id), &mut l.channels)),
+            )
+            .chain(
+                self.buffers
+                    .iter_mut()
+                    .map(|b| (format!("buffer \"{}\"", b.id), &mut b.channels)),
             );
         for (who, channels) in items {
             for (n, c) in channels.iter_mut().enumerate() {
@@ -1344,6 +1543,11 @@ impl Movie {
                 self.layers
                     .iter()
                     .map(|l| (format!("layer \"{}\"", l.id), &l.channels)),
+            )
+            .chain(
+                self.buffers
+                    .iter()
+                    .map(|b| (format!("buffer \"{}\"", b.id), &b.channels)),
             );
         for (who, channels) in items {
             for (n, c) in channels.iter().enumerate() {
@@ -1556,6 +1760,15 @@ impl Movie {
                 }
             }
         }
+        for b in &self.buffers {
+            v.push(b.scene.clone());
+            v.extend(b.init.clone());
+            for f in b.channels.iter().flatten().flat_map(Channel::files) {
+                if f.library.is_none() {
+                    v.push(f.file.clone());
+                }
+            }
+        }
         // Comps (#74): their files (the watcher reloads on an edit) and what they read.
         for c in &self.comps {
             v.push(c.file.clone());
@@ -1632,7 +1845,7 @@ impl Movie {
                     "{what}: a texture name may only use letters, digits and _ (and not start with a digit)"
                 );
             }
-            match texture_spec(&what, v, None, &library_specs, root, None, &[])? {
+            match texture_spec(&what, v, None, &library_specs, root, None, &[], &[])? {
                 Some(c) => textures.insert(name.clone(), c),
                 None => bail!("{what}: \"\" names no file"),
             };
@@ -1705,6 +1918,7 @@ impl Movie {
             Some(f) => parse_fps(f)?,
             None => (30, 1),
         };
+        let buffer_decls = buffer_decls(&f.buffers)?;
         // [comps] (#74): names first; shots, layers and comps refer to them by index.
         let decls = comp_decls(&f.comps)?;
         let comp_names: Vec<String> = decls.iter().map(|d| d.name.clone()).collect();
@@ -1718,12 +1932,15 @@ impl Movie {
             comp_rels: &comp_rels,
             comp: None,
             fps: (fps_num, fps_den),
+            buffers: &buffer_decls,
+            aspect,
         };
-        let (shots, layers, duration, loop_frames) = build_sequence(
+        let (shots, layers, buffers, duration, loop_frames) = build_sequence(
             &ctx,
             &mut used,
             f.shots,
             f.layers,
+            f.buffers,
             f.channels.as_deref(),
             f.looping == Some(true),
         )?;
@@ -1753,15 +1970,27 @@ impl Movie {
             let text = std::fs::read_to_string(&file)
                 .with_context(|| format!("{what}: reading {}", d.rel))?;
             let cf: CompFile = parse_comp_file(&text).with_context(|| format!("in {}", d.rel))?;
+            if cf.buffers.is_some() {
+                bail!(
+                    "comp \"{}\" ({}): [[buffer]] goes in movie.toml; buffers in comps arrive \
+                     in a later phase (#134). Read the comp from a film buffer instead \
+                     (channels = [\"@{}\"])",
+                    d.name,
+                    d.rel,
+                    d.name
+                );
+            }
             let ctx = SeqCtx {
                 comp: Some(&d.name),
+                buffers: &[],
                 ..ctx
             };
-            let (shots, layers, duration, loop_frames) = build_sequence(
+            let (shots, layers, _, duration, loop_frames) = build_sequence(
                 &ctx,
                 &mut used,
                 cf.shots,
                 cf.layers,
+                vec![],
                 cf.channels.as_deref(),
                 d.looping,
             )
@@ -1786,6 +2015,7 @@ impl Movie {
                     volume: 1.0,
                     shots,
                     layers,
+                    buffers: vec![],
                     comps: vec![],
                     markers: vec![],
                     duration,
@@ -1826,6 +2056,7 @@ impl Movie {
             mix_lookback: f.sound.as_ref().and_then(|s| s.mix_lookback).unwrap_or(1.0),
             shots,
             layers,
+            buffers,
             comps,
             markers: f
                 .markers
@@ -1891,11 +2122,12 @@ impl Movie {
     /// The footage mapping of channel `c` of a shot or layer (None if it isn't a
     /// scanned sequence).
     pub fn frame_map(&self, item: ItemRef, c: usize) -> Option<FrameMap> {
-        let (origin, ch) = match item {
-            ItemRef::Shot(i) => (self.shots[i].start, &self.shots[i].channels[c]),
-            ItemRef::Layer(j) => (self.layers[j].start, &self.layers[j].channels[c]),
+        let origin = match item {
+            ItemRef::Shot(i) => self.shots[i].start,
+            ItemRef::Layer(j) => self.layers[j].start,
+            ItemRef::Buffer(b) => self.buffers[b].start,
         };
-        let ch = ch.as_ref()?;
+        let ch = self.item_channels(item)[c].as_ref()?;
         let seq = ch.sequence()?;
         Some(FrameMap {
             film: (self.fps_num, self.fps_den),
@@ -1905,6 +2137,15 @@ impl Movie {
             src: seq.fps.unwrap_or((self.fps_num, self.fps_den)),
             count: seq.scan.as_ref()?.count,
         })
+    }
+
+    /// The channels of a shot, layer or buffer.
+    pub fn item_channels(&self, item: ItemRef) -> &[Option<Channel>; N_CHANNELS] {
+        match item {
+            ItemRef::Shot(i) => &self.shots[i].channels,
+            ItemRef::Layer(j) => &self.layers[j].channels,
+            ItemRef::Buffer(b) => &self.buffers[b].channels,
+        }
     }
 
     /// The source frame channel `c` of a shot or layer shows on film frame `n` (None:
@@ -2091,6 +2332,10 @@ struct SeqCtx<'a> {
     comp_rels: &'a [String],
     comp: Option<&'a str>,
     fps: (u32, u32),
+    /// The film's buffers (#134), by index; none in a comp.
+    buffers: &'a [BufDecl],
+    /// The output aspect (the memory check sizes `scale` buffers with it).
+    aspect: f32,
 }
 
 impl SeqCtx<'_> {
@@ -2120,7 +2365,7 @@ impl SeqCtx<'_> {
 
 /// Shots, then layers (bottom to top), of the film or a comp: (shots, layers,
 /// duration, loop frames).
-type SeqParts = (Vec<Shot>, Vec<Layer>, f32, Option<u64>);
+type SeqParts = (Vec<Shot>, Vec<Layer>, Vec<Buffer>, f32, Option<u64>);
 
 /// Builds a [`SeqParts`].
 fn build_sequence(
@@ -2128,6 +2373,7 @@ fn build_sequence(
     used: &mut std::collections::HashSet<String>,
     shot_files: Vec<ShotFile>,
     layer_files: Vec<LayerFile>,
+    buffer_files: Vec<BufferFile>,
     channels: Option<&[toml::Value]>,
     looping: bool,
 ) -> Result<SeqParts> {
@@ -2172,6 +2418,7 @@ fn build_sequence(
                 sc.root,
                 on_layer,
                 sc.comps,
+                sc.buffers,
             )?;
         }
         Ok(out)
@@ -2534,6 +2781,7 @@ fn build_sequence(
                 Some(LayerRefs {
                     earlier: &layer_ids[..index],
                     later: &layer_ids[index..],
+                    on_buffer: None,
                 }),
             )?,
             None => Default::default(),
@@ -2559,7 +2807,268 @@ fn build_sequence(
             matte,
         });
     }
-    Ok((shots, layers, duration, loop_frames))
+    let buffers = build_buffers(
+        sc,
+        &mut channel_list,
+        buffer_files,
+        &shots,
+        &layers,
+        duration,
+        loop_frames,
+    )?;
+    Ok((shots, layers, buffers, duration, loop_frames))
+}
+
+/// The film's `[[buffer]]`s (#134), after its shots and layers (spans and resets may
+/// name either).
+#[allow(clippy::type_complexity)]
+fn build_buffers(
+    sc: &SeqCtx,
+    channel_list: &mut dyn FnMut(
+        &str,
+        &[toml::Value],
+        Option<LayerRefs>,
+    ) -> Result<[Option<Channel>; N_CHANNELS]>,
+    files: Vec<BufferFile>,
+    shots: &[Shot],
+    layers: &[Layer],
+    duration: f32,
+    loop_frames: Option<u64>,
+) -> Result<Vec<Buffer>> {
+    let (num, den) = (sc.fps.0 as f64, sc.fps.1 as f64);
+    // The first film frame at or after `t` (frame m shows at m·den/num).
+    let frame_ceil = |t: f32| -> u64 { ((t as f64 * num / den) - 1e-6).ceil().max(0.0) as u64 };
+    let n_frames = loop_frames.unwrap_or_else(|| frame_ceil(duration));
+    let mut out: Vec<Buffer> = vec![];
+    for (i, b) in files.into_iter().enumerate() {
+        let what = format!("buffer \"{}\"", b.id);
+        if !is_pass_id(&b.id) || b.id == "prev" || b.id == "input" || b.id == "picture" {
+            bail!(
+                "buffer id \"{}\" may only use letters, digits, _ and - (and isn't prev, \
+                 input or picture)",
+                b.id
+            );
+        }
+        if shots.iter().any(|s| s.id == b.id)
+            || layers.iter().any(|l| l.id == b.id)
+            || out.iter().any(|o| o.id == b.id)
+            || sc.comps.contains(&b.id)
+        {
+            bail!(
+                "{what}: the id is taken; shots, layers, buffers and comps share ids (they \
+                 name cues, fallbacks and @ sources)"
+            );
+        }
+        library::check_rel_path(&b.scene).map_err(|e| anyhow!("{what}: scene: {e}"))?;
+        if let Some(p) = &b.init {
+            library::check_rel_path(p).map_err(|e| anyhow!("{what}: init: {e}"))?;
+        }
+        let start = match &b.from {
+            None => 0.0,
+            Some(v) => span_point(&format!("{what}: from"), v, true, shots, layers)?,
+        };
+        let end = match &b.to {
+            None => duration,
+            Some(v) => span_point(&format!("{what}: to"), v, false, shots, layers)?,
+        };
+        if !(0.0..duration).contains(&start) || !(start < end && end <= duration + 1e-4) {
+            bail!(
+                "{what}: the span {}–{} s must lie within the film (0–{} s), from before to",
+                glsl_float(start),
+                glsl_float(end),
+                glsl_float(duration)
+            );
+        }
+        let end = end.min(duration);
+        let start_frame = frame_ceil(start);
+        let end_frame = frame_ceil(end).min(n_frames);
+        if start_frame >= end_frame {
+            bail!("{what}: the span covers no film frame");
+        }
+        let size = match (&b.size, &b.scale) {
+            (Some(_), Some(_)) => bail!("{what}: give size or scale, not both"),
+            (Some([w, h]), None) => {
+                if !(1..=8192).contains(w) || !(1..=8192).contains(h) {
+                    bail!("{what}: size = [{w}, {h}] must be 1–8192 pixels each way");
+                }
+                BufferSize::Fixed(*w, *h)
+            }
+            (None, Some(v)) => {
+                if v.as_str() == Some("auto") {
+                    bail!(
+                        "{what}: scale can't be \"auto\": a buffer's state would then change \
+                         with the player's render scale; give a fraction of the output size \
+                         or size = [w, h]"
+                    );
+                }
+                let x = v
+                    .as_float()
+                    .or_else(|| v.as_integer().map(|i| i as f64))
+                    .unwrap_or(-1.0) as f32;
+                if !(x > 0.0 && x <= 1.0) {
+                    bail!("{what}: scale must be a fraction of the output size in (0, 1]");
+                }
+                BufferSize::Scale(x)
+            }
+            (None, None) => BufferSize::Scale(1.0),
+        };
+        let decl = &sc.buffers[i];
+        let point = |v: &toml::Value| -> Result<u64> {
+            let t = span_point(&format!("{what}: reset"), v, true, shots, layers)?;
+            let f = frame_ceil(t);
+            if !(start_frame..end_frame).contains(&f) {
+                bail!(
+                    "{what}: reset at {} s is outside the buffer's span ({}–{} s)",
+                    glsl_float(t),
+                    glsl_float(start),
+                    glsl_float(end)
+                );
+            }
+            Ok(f)
+        };
+        let mut resets = vec![start_frame];
+        match &b.reset {
+            None => {}
+            Some(toml::Value::String(s)) if s == "cuts" => {
+                resets.extend(
+                    shots
+                        .iter()
+                        .map(|s| frame_ceil(s.start))
+                        .filter(|f| (start_frame..end_frame).contains(f)),
+                );
+            }
+            Some(toml::Value::Array(list)) => {
+                for v in list {
+                    resets.push(point(v)?);
+                }
+            }
+            Some(_) => bail!(
+                "{what}: reset is \"cuts\" or a list of shot or layer ids, \"<id> ± s\" points \
+                 and seconds"
+            ),
+        }
+        resets.sort_unstable();
+        resets.dedup();
+        let mut uniforms = Vec::new();
+        for (name, v) in &b.uniforms {
+            if !is_ident(name) {
+                bail!("{what}: \"{name}\" is not a valid GLSL name");
+            }
+            let a = Anim::from_toml(v).with_context(|| format!("{what}: uniform {name}"))?;
+            uniforms.push((name.clone(), a));
+        }
+        let mut params = Vec::new();
+        for (name, v) in &b.params {
+            if !is_ident(name) {
+                bail!("{what}: param \"{name}\" is not a valid GLSL name");
+            }
+            params.push((
+                name.clone(),
+                vector(v).with_context(|| format!("{what}: param {name}"))?,
+            ));
+        }
+        let channels = match &b.channels {
+            Some(list) => channel_list(
+                &format!("{what}: "),
+                list,
+                Some(LayerRefs {
+                    earlier: &[],
+                    later: &[],
+                    on_buffer: Some(i),
+                }),
+            )?,
+            None => Default::default(),
+        };
+        out.push(Buffer {
+            id: b.id,
+            scene: sc.root.join(&b.scene),
+            init: b.init.as_ref().map(|p| sc.root.join(p)),
+            start,
+            end,
+            start_frame,
+            end_frame,
+            resets,
+            size,
+            format: decl.format,
+            history: decl.history,
+            channels,
+            uniforms,
+            params,
+        });
+    }
+    // Required memory: every ring active on the worst frame (the most buffers at once).
+    let out_size = (
+        (MEMORY_CHECK_HEIGHT * sc.aspect).round() as i32,
+        MEMORY_CHECK_HEIGHT as i32,
+    );
+    for b in &out {
+        let at = b.start_frame;
+        let live: Vec<&Buffer> = out.iter().filter(|o| o.active(at)).collect();
+        let total: usize = live.iter().map(|o| o.ring_bytes(out_size)).sum();
+        if total > BUFFER_MEMORY_LIMIT {
+            let list: Vec<String> = live
+                .iter()
+                .map(|o| {
+                    let (w, h) = o.size.at(out_size);
+                    format!(
+                        "\"{}\" {w}×{h} {} × {} states = {} MB",
+                        o.id,
+                        BufferFormat::NAMES[o.format as usize],
+                        o.history + 1,
+                        o.ring_bytes(out_size) >> 20
+                    )
+                })
+                .collect();
+            bail!(
+                "buffers need {} MB of GPU memory at once (limit {} MB; `scale` buffers counted \
+                 at a {}-pixel-high output): {}; use a smaller size or scale, rgba8, or a \
+                 shorter history",
+                total >> 20,
+                BUFFER_MEMORY_LIMIT >> 20,
+                MEMORY_CHECK_HEIGHT,
+                list.join(", ")
+            );
+        }
+    }
+    Ok(out)
+}
+
+/// `[[buffer]]` ids, formats and histories (#134), known before any channel is parsed.
+fn buffer_decls(files: &[BufferFile]) -> Result<Vec<BufDecl>> {
+    if files.len() > MAX_BUFFERS {
+        bail!(
+            "a film has at most {MAX_BUFFERS} buffers (this one has {})",
+            files.len()
+        );
+    }
+    files
+        .iter()
+        .map(|b| {
+            let what = format!("buffer \"{}\"", b.id);
+            let format = match b.format.as_deref() {
+                None => BufferFormat::Rgba16f,
+                Some(f) => BufferFormat::parse(f).ok_or_else(|| {
+                    anyhow!(
+                        "{what}: format \"{f}\" isn't one of {:?}",
+                        BufferFormat::NAMES
+                    )
+                })?,
+            };
+            let history = match b.history {
+                None => 1,
+                Some(n) if (1..=MAX_HISTORY as i64).contains(&n) => n as u32,
+                Some(n) => bail!(
+                    "{what}: history = {n}: keep 1 to {MAX_HISTORY} states (memory limits it \
+                     further)"
+                ),
+            };
+            Ok(BufDecl {
+                id: b.id.clone(),
+                history,
+                format,
+            })
+        })
+        .collect()
 }
 
 /// `t` in [0, period): the f64 remainder, kept below the period after rounding.
@@ -3111,6 +3620,7 @@ fn is_texture_name(s: &str) -> bool {
 /// Resolve one `channels` entry (with `names`) or `[textures]` value (without):
 /// "" (nothing), a `[textures]` name, a film path, `<lib/path>`, or a table with `file`
 /// and options. Library paths stay relative until `resolve_libraries`.
+#[allow(clippy::too_many_arguments)]
 fn texture_spec(
     what: &str,
     v: &toml::Value,
@@ -3119,7 +3629,27 @@ fn texture_spec(
     root: &Path,
     on_layer: Option<LayerRefs>,
     comps: &[String],
+    buffers: &[BufDecl],
 ) -> Result<Option<Channel>> {
+    // A buffer's state (#134): linear, clamped; rgba32f nearest (float filtering isn't
+    // portable: WebGL2 needs OES_texture_float_linear).
+    let buffer_channel = |j: usize, back: u32| Channel {
+        source: Source::Buffer {
+            index: j,
+            id: buffers[j].id.clone(),
+            back,
+        },
+        filter: if buffers[j].format == BufferFormat::Rgba32f {
+            Filter::Nearest
+        } else {
+            Filter::Linear
+        },
+        wrap: Wrap::Clamp,
+        vflip: false,
+        srgb: false,
+        timing: Timing::default(),
+    };
+    let on_buffer = on_layer.and_then(|r| r.on_buffer);
     let file_channel = |s: &str| -> Result<Channel> {
         let f = file_ref(what, s, specs, root)?;
         if !crate::texture::has_image_extension(&f.rel) {
@@ -3215,6 +3745,47 @@ fn texture_spec(
                         "{what}: \"{s}\": after @ comes input, picture, or the id of a layer or comp"
                     );
                 }
+                if out == "prev" {
+                    let Some(i) = on_buffer else {
+                        bail!(
+                            "{what}: \"@prev\" is a buffer's own previous state; only a \
+                             [[buffer]]'s channels can read it (layers read {{ source = \
+                             \"@<buffer>\", frame = \"prev\" }})"
+                        );
+                    };
+                    return Ok(Some(buffer_channel(i, 1)));
+                }
+                if let Some(j) = buffers.iter().position(|b| b.id == out) {
+                    match on_buffer {
+                        _ if on_layer.is_none() => bail!(
+                            "{what}: \"{s}\" is a buffer; shots and transitions draw before \
+                             buffers step, so only layers and later buffers read one"
+                        ),
+                        Some(i) if j == i => bail!(
+                            "{what}: \"{s}\" is this buffer; read its previous state with \"@prev\""
+                        ),
+                        Some(i) if j > i => bail!(
+                            "{what}: \"{s}\" is a later buffer (buffers step in file order); \
+                             read its previous state with {{ source = \"{s}\", frame = \"prev\" }}"
+                        ),
+                        _ => return Ok(Some(buffer_channel(j, 0))),
+                    }
+                }
+                if on_buffer.is_some() {
+                    if out == "input" {
+                        bail!(
+                            "{what}: \"@input\" is the picture below a layer; buffers step \
+                             before layers, so read \"@picture\" (the picture track)"
+                        );
+                    }
+                    if out != "picture" && !comps.iter().any(|c| c == out) {
+                        bail!(
+                            "{what}: \"{s}\": a buffer reads @picture, @prev, earlier buffers \
+                             and comps; layers draw after buffers step (render it in a comp \
+                             and read @<comp>)"
+                        );
+                    }
+                }
                 let comp = comps.iter().position(|c| c == out);
                 let earlier = on_layer.is_some_and(|r| r.earlier.iter().any(|e| e == out));
                 if let (Some(index), false) = (comp, earlier) {
@@ -3297,21 +3868,62 @@ fn texture_spec(
             let Some(src) = t["source"].as_str().filter(|s| s.starts_with('@')) else {
                 bail!("{what}: source must be an @ source (\"@<comp>\", \"@input\", …)");
             };
-            let Some(mut c) = texture_spec(
-                what,
-                &toml::Value::String(src.to_string()),
-                names,
-                specs,
-                root,
-                on_layer,
-                comps,
-            )?
-            else {
-                unreachable!("an @ source binds something")
+            let mut c = if let Some(fv) = t.get("frame") {
+                // `frame = "prev" | -k` (#134): a buffer's state k frames ago.
+                let back = match fv {
+                    toml::Value::String(p) if p == "prev" => 1,
+                    toml::Value::Integer(k) if *k < 0 => {
+                        k.unsigned_abs().min(u32::MAX as u64) as u32
+                    }
+                    _ => bail!(
+                        "{what}: frame must be \"prev\" or a negative whole number of frames \
+                         (-1 is the previous state)"
+                    ),
+                };
+                let id = &src[1..];
+                let j = match buffers.iter().position(|b| b.id == id) {
+                    Some(j) => j,
+                    None if id == "prev" => match on_buffer {
+                        Some(i) => i,
+                        None => bail!("{what}: \"@prev\" is for buffers' channels"),
+                    },
+                    None => bail!("{what}: frame is for buffers; \"{src}\" isn't a [[buffer]]"),
+                };
+                if on_layer.is_none() {
+                    bail!(
+                        "{what}: \"{src}\" is a buffer; shots and transitions draw before \
+                         buffers step, so only layers and buffers read one"
+                    );
+                }
+                if back > buffers[j].history {
+                    bail!(
+                        "{what}: frame = -{back}, but buffer \"{}\" keeps {} state{}; set \
+                         history = {back} on it",
+                        buffers[j].id,
+                        buffers[j].history,
+                        if buffers[j].history == 1 { "" } else { "s" }
+                    );
+                }
+                buffer_channel(j, back)
+            } else {
+                let Some(c) = texture_spec(
+                    what,
+                    &toml::Value::String(src.to_string()),
+                    names,
+                    specs,
+                    root,
+                    on_layer,
+                    comps,
+                    buffers,
+                )?
+                else {
+                    unreachable!("an @ source binds something")
+                };
+                c
             };
             for (k, val) in t {
                 match k.as_str() {
-                    "source" => {}
+                    "source" | "frame" => {}
                     "filter" => {
                         let s = val.as_str().unwrap_or("");
                         c.filter = match Filter::parse(s) {
@@ -3342,7 +3954,7 @@ fn texture_spec(
                     }
                     other => bail!(
                         "{what}: unknown option `{other}` (an @ source has source, filter, wrap \
-                         and, for a comp, time_offset)"
+                         and, for a comp, time_offset, for a buffer, frame)"
                     ),
                 }
             }
@@ -3836,6 +4448,8 @@ fn matte_spec(what: &str, v: &toml::Value, earlier: &[String], sc: &SeqCtx) -> R
 struct LayerRefs<'a> {
     earlier: &'a [String],
     later: &'a [String],
+    /// The channels are buffer `i`'s (#134): `@prev`, and earlier buffers only.
+    on_buffer: Option<usize>,
 }
 
 /// What a transition's `type` names.
@@ -6430,5 +7044,172 @@ glsl = 450
         assert!(m.contract_warning().unwrap().contains("it says \"0.1.1\""));
         let m = loop_film("shotglass = \"0.1.2\"", M).unwrap();
         assert_eq!(m.contract_warning(), None);
+    }
+
+    #[test]
+    fn buffers_parse_spans_resets_and_channels() {
+        // moon: 0–3 s, closeup: 2–5 s (frames 60–150 at 30 fps).
+        let m = layers_film(
+            "[[buffer]]\nid = \"trail\"\nscene = \"buf/trail.glsl\"\ninit = \"buf/seed.glsl\"\n\
+             from = \"moon\"\nto = \"closeup.end\"\nsize = [96, 54]\nreset = [\"closeup\", 4.5]\n\
+             channels = [\"@prev\", \"@picture\"]\nuniforms = { decay = 0.9 }\n\
+             [[buffer]]\nid = \"hist\"\nscene = \"buf/copy.glsl\"\nscale = 0.5\nformat = \"rgba8\"\n\
+             history = 8\nreset = \"cuts\"\n\
+             channels = [\"@trail\", { source = \"@trail\", frame = \"prev\" }, \"@picture\"]\n\
+             [[buffer]]\nid = \"sim\"\nscene = \"buf/rd.glsl\"\nformat = \"rgba32f\"\nfrom = 1\n\
+             channels = [\"@prev\", { source = \"@sim\", frame = -1 }]\n\
+             [[layer]]\nid = \"show\"\nscene = \"l.glsl\"\n\
+             channels = [\"@trail\", { source = \"@hist\", frame = -8 }, \"@input\"]\n",
+        )
+        .unwrap();
+        assert_eq!(m.buffers.len(), 3);
+        let t = &m.buffers[0];
+        assert_eq!((t.start_frame, t.end_frame), (0, 150));
+        assert_eq!(t.resets, vec![0, 60, 135]);
+        assert_eq!(t.reset_at(59), Some(0));
+        assert_eq!(t.reset_at(60), Some(60));
+        assert_eq!(t.reset_at(149), Some(135));
+        assert_eq!(t.size, BufferSize::Fixed(96, 54));
+        assert_eq!(t.format, BufferFormat::Rgba16f);
+        assert_eq!(t.history, 1);
+        assert!(t.init.is_some() && !t.is_pure());
+        assert_eq!(
+            t.channels[0].as_ref().unwrap().source,
+            Source::Buffer {
+                index: 0,
+                id: "trail".into(),
+                back: 1
+            }
+        );
+        assert_eq!(t.channels[1].as_ref().unwrap().source, Source::Picture);
+        let h = &m.buffers[1];
+        assert_eq!(h.resets, vec![0, 60], "cuts: every shot start in the span");
+        assert_eq!((h.history, h.format), (8, BufferFormat::Rgba8));
+        assert_eq!(h.size.at((1920, 1080)), (960, 540));
+        assert!(!h.is_pure(), "it reads another buffer");
+        let sim = &m.buffers[2];
+        assert_eq!((sim.start_frame, sim.resets.clone()), (30, vec![30]));
+        assert!(!sim.active(29) && sim.active(30) && sim.active(149) && !sim.active(150));
+        // rgba32f is read nearest (float filtering isn't portable).
+        assert_eq!(sim.channels[0].as_ref().unwrap().filter, Filter::Nearest);
+        assert_eq!(t.channels[0].as_ref().unwrap().filter, Filter::Linear);
+        let l = &m.layers[0];
+        assert_eq!(
+            l.channels[1].as_ref().unwrap().source,
+            Source::Buffer {
+                index: 1,
+                id: "hist".into(),
+                back: 8
+            }
+        );
+        // A pure history buffer reads no buffer state.
+        let m = layers_film(
+            "[[buffer]]\nid = \"h\"\nscene = \"c.glsl\"\nhistory = 4\nchannels = [\"@picture\"]\n",
+        )
+        .unwrap();
+        assert!(m.buffers[0].is_pure());
+        // Loop films reset every buffer at frame 0 (its span start).
+        let m = loop_film(
+            "shotglass = \"0.1.9\"",
+            "[[shot]]\nid = \"a\"\nscene = \"a.glsl\"\nduration = 2\n\
+             [[buffer]]\nid = \"b\"\nscene = \"b.glsl\"\nchannels = [\"@prev\"]\n",
+        )
+        .unwrap();
+        assert_eq!(m.buffers[0].resets, vec![0]);
+        assert_eq!(m.buffers[0].end_frame, 60);
+    }
+
+    #[test]
+    fn buffers_are_validated() {
+        let bad = |b: &str| err(layers_film(b));
+        let one = |extra: &str| {
+            bad(&format!(
+                "[[buffer]]\nid = \"b\"\nscene = \"b.glsl\"\n{extra}\n"
+            ))
+        };
+        assert!(one("scale = \"auto\"").contains("can't be \"auto\""));
+        assert!(one("scale = 1.5").contains("(0, 1]"));
+        assert!(one("size = [10, 10]\nscale = 0.5").contains("not both"));
+        assert!(one("size = [0, 10]").contains("1–8192"));
+        assert!(one("format = \"rgb8\"").contains("isn't one of"));
+        assert!(one("history = 0").contains("1 to 64"));
+        assert!(one("history = 65").contains("1 to 64"));
+        assert!(one("reset = [\"nope\"]").contains("no shot or earlier layer"));
+        assert!(one("from = 3\nreset = [1]").contains("outside the buffer's span"));
+        assert!(one("reset = 3").contains("\"cuts\" or a list"));
+        assert!(one("blend = \"x\"").contains("unknown field"));
+        assert!(one("channels = [\"@input\"]").contains("buffers step before layers"));
+        assert!(one("channels = [\"@b\"]").contains("is this buffer; read its previous state"));
+        assert!(one("channels = [{ source = \"@b\", frame = -2 }]").contains("history = 2"));
+        assert!(one("channels = [{ source = \"@b\", frame = 1 }]").contains("negative"));
+        assert!(
+            one("channels = [{ source = \"@picture\", frame = -1 }]")
+                .contains("isn't a [[buffer]]")
+        );
+        // Forward-only: a later buffer's current state can't be read, its previous can.
+        let two = |chans: &str| {
+            layers_film(&format!(
+                "[[buffer]]\nid = \"a\"\nscene = \"a.glsl\"\nchannels = {chans}\n\
+                 [[buffer]]\nid = \"b\"\nscene = \"b.glsl\"\n"
+            ))
+        };
+        assert!(err(two("[\"@b\"]")).contains("later buffer"));
+        assert!(two("[{ source = \"@b\", frame = \"prev\" }]").is_ok());
+        // Layers aren't readable from buffers; buffers aren't readable from shots.
+        let e = bad("[[layer]]\nid = \"t\"\nscene = \"t.glsl\"\n\
+             [[buffer]]\nid = \"b\"\nscene = \"b.glsl\"\nchannels = [\"@t\"]\n");
+        assert!(e.contains("layers draw after buffers step"), "{e}");
+        let e = err(fixture(
+            "[[shot]]\nid = \"a\"\nscene = \"a.glsl\"\nduration = 1\nchannels = [\"@b\"]\n\
+             [[buffer]]\nid = \"b\"\nscene = \"b.glsl\"\n",
+            Path::new("/film"),
+        ));
+        assert!(e.contains("draw before buffers step"), "{e}");
+        let e = err(fixture(
+            "[[shot]]\nid = \"a\"\nscene = \"a.glsl\"\nduration = 1\nchannels = [\"@prev\"]\n",
+            Path::new("/film"),
+        ));
+        assert!(e.contains("only a [[buffer]]'s channels"), "{e}");
+        let e = bad("[[layer]]\nid = \"t\"\nscene = \"t.glsl\"\nchannels = [\"@prev\"]\n");
+        assert!(e.contains("only a [[buffer]]'s channels"), "{e}");
+        // Ids are shared with shots, layers and comps.
+        let e = bad("[[buffer]]\nid = \"moon\"\nscene = \"b.glsl\"\n");
+        assert!(e.contains("the id is taken"), "{e}");
+        let e = bad("[[buffer]]\nid = \"prev\"\nscene = \"b.glsl\"\n");
+        assert!(e.contains("isn't prev"), "{e}");
+        // Required memory is checked at load.
+        let e = bad(
+            "[[buffer]]\nid = \"big\"\nscene = \"b.glsl\"\nformat = \"rgba32f\"\nhistory = 64\n",
+        );
+        assert!(
+            e.contains("MB of GPU memory at once") && e.contains("\"big\""),
+            "{e}"
+        );
+        // Buffers in comps arrive later.
+        let (_d, m) = comps_film(
+            "[comps]\nc = \"c.toml\"\n[[shot]]\nid = \"s\"\ncomp = \"c\"\nduration = 1\n",
+            &[(
+                "c.toml",
+                "[[shot]]\nid = \"a\"\nscene = \"a.glsl\"\nduration = 1\n\
+                 [[buffer]]\nid = \"b\"\nscene = \"b.glsl\"\n",
+            )],
+        );
+        assert!(err(m).contains("buffers in comps arrive"));
+    }
+
+    #[test]
+    fn buffers_need_contract_0_1_9() {
+        let film = |v: &str| {
+            fixture(
+                &format!(
+                    "shotglass = \"{v}\"\n[[shot]]\nid = \"a\"\nscene = \"a.glsl\"\nduration = 1\n\
+                     [[buffer]]\nid = \"b\"\nscene = \"b.glsl\"\n"
+                ),
+                Path::new("/film"),
+            )
+            .unwrap()
+        };
+        assert!(film("0.1.8").contract_warning().unwrap().contains("0.1.9"));
+        assert_eq!(film("0.1.9").contract_warning(), None);
     }
 }

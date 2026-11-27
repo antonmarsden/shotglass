@@ -289,6 +289,8 @@ struct Player {
     status: Option<(String, Instant)>,
     tex: Option<(glow::Texture, egui::TextureId)>,
     rendered_key: Option<(u32, i32, i32, i32, u32, u64)>,
+    /// The clock is held while buffers catch up after a seek during playback (#134).
+    catchup_paused: bool,
     generation: u64,
     scale_mode: ScaleMode,
     auto_scale: f32,
@@ -322,7 +324,9 @@ impl Player {
             .gl
             .clone()
             .ok_or_else(|| anyhow::anyhow!("eframe didn't give us an OpenGL context"))?;
-        let renderer = Renderer::new(gl)?;
+        let mut renderer = Renderer::new(gl)?;
+        // Buffers (#134) catch up in budgeted slices, so a seek never freezes the UI.
+        renderer.set_catchup_slices(true);
         let (audio, sound_info) = match AudioOut::open() {
             Ok(a) => {
                 let s = format!("{} | {} Hz", a.device_name, a.sample_rate);
@@ -364,6 +368,7 @@ impl Player {
             status: None,
             tex: None,
             rendered_key: None,
+            catchup_paused: false,
             generation: 0,
             scale_mode: scale.map_or(ScaleMode::Auto, ScaleMode::Fixed),
             auto_scale: 1.0,
@@ -609,6 +614,7 @@ impl Player {
 
     fn step(&mut self, frames: i64) {
         self.clock.pause();
+        self.catchup_paused = false;
         if let Some(m) = &self.movie {
             let index = m.frame_at_precise(self.clock.time_precise());
             let next = index
@@ -745,7 +751,9 @@ impl Player {
     }
 
     fn toggle_play(&mut self) {
-        if self.clock.playing() {
+        let was_catching_up = std::mem::replace(&mut self.catchup_paused, false);
+        if playback_state(self.clock.playing(), was_catching_up) {
+            // Held for a buffer catch-up (#134) counts as playing: pause stays paused.
             self.clock.pause();
         } else {
             if self.clock.time() >= self.duration() - 1e-3 {
@@ -757,6 +765,7 @@ impl Player {
     }
 
     fn resume_playback(&mut self) {
+        self.catchup_paused = false;
         let previous_rate = self.clock.sample_rate();
         match self.clock.reconnect_audio() {
             Ok(Some(a)) => {
@@ -962,6 +971,7 @@ impl Player {
         {
             self.gpu_lost = true;
             self.clock.pause();
+            self.catchup_paused = false;
         }
     }
 
@@ -970,7 +980,8 @@ impl Player {
             return None;
         }
         let m = self.movie.as_ref()?;
-        let playing = self.clock.playing();
+        // Held for a buffer catch-up (#134) is still playing: same frames, never blocking.
+        let playing = playback_state(self.clock.playing(), self.catchup_paused);
         // While playing, render each film frame once (fps from movie.toml) and keep it
         // up until the next: a 30 fps film needs half the GPU work of a 60 Hz redraw,
         // and playback shows exactly the frames `still` would.
@@ -997,8 +1008,20 @@ impl Player {
         }
         // Paused or scrubbing: compile on the spot if needed. Playing: never stall,
         // keep the previous frame up until the shot's program is ready.
-        let blocking = !self.clock.playing();
-        let tex = self.renderer.render(m, w, h, &info, blocking)?;
+        let blocking = !playing;
+        let Some(tex) = self.renderer.render(m, w, h, &info, blocking) else {
+            // Buffers catching up after a seek while playing (#134): the clock waits (a
+            // stall, not a drop), then playback resumes.
+            if self.clock.playing() && self.renderer.catchup_progress().is_some() {
+                self.clock.pause();
+                self.catchup_paused = true;
+            }
+            return None;
+        };
+        if self.catchup_paused && self.renderer.catchup_progress().is_none() {
+            self.catchup_paused = false;
+            self.resume_playback();
+        }
         let tex = Some(tex);
         self.rendered_key = Some(key);
         if let Some(tex) = tex
@@ -1332,9 +1355,11 @@ impl Player {
         if let Some(pos) = resp.interact_pointer_pos() {
             if resp.drag_started() || resp.clicked() {
                 if self.scrub_resume.is_none() {
-                    self.scrub_resume = Some(self.clock.playing());
+                    self.scrub_resume =
+                        Some(playback_state(self.clock.playing(), self.catchup_paused));
                 }
                 self.clock.pause();
+                self.catchup_paused = false;
             }
             if resp.dragged() || resp.clicked() || resp.drag_started() {
                 self.seek(t_of(pos.x));
@@ -1612,6 +1637,16 @@ impl Player {
                 .default_open(false)
                 .show(ui, |ui| {
                     ui.label(RichText::new(&self.renderer.gl_info).small());
+                    let (budget, from) = self.renderer.buffer_cache_budget();
+                    let (n, used) = self.renderer.checkpoint_stats();
+                    ui.label(
+                        RichText::new(format!(
+                            "buffer checkpoints: {n}, {} of {} MB ({from})",
+                            used >> 20,
+                            budget >> 20
+                        ))
+                        .small(),
+                    );
                     ui.label(format!("reloads: {}", self.reloads.saturating_sub(1)));
                 });
             egui::CollapsingHeader::new("Keys")
@@ -1793,6 +1828,12 @@ impl eframe::App for Player {
             if loaded < textures {
                 busy.push(format!("loading textures {loaded}/{textures}"));
             }
+            if let Some((done, total)) = self.renderer.catchup_progress() {
+                busy.push(format!(
+                    "catching up buffers {}%",
+                    done * 100 / total.max(1)
+                ));
+            }
             if !busy.is_empty() {
                 ui.painter().text(
                     view.right_top() + Vec2::new(-10.0, 10.0),
@@ -1828,7 +1869,11 @@ impl eframe::App for Player {
         self.check_gpu(gap);
         let (ready, total) = self.renderer.progress();
         let (loaded, textures) = self.renderer.texture_progress();
-        if self.clock.playing() || ready < total || loaded < textures {
+        if self.clock.playing()
+            || ready < total
+            || loaded < textures
+            || self.renderer.catchup_progress().is_some()
+        {
             ctx.request_repaint();
         } else {
             ctx.request_repaint_after(Duration::from_millis(120));
@@ -2044,10 +2089,24 @@ fn clock_text(t: f32) -> String {
     format!("{:02}:{:05.2}", (t / 60.0) as u32, t % 60.0)
 }
 
+/// Is the player playing? The clock runs, or it's held while buffers catch up after a
+/// seek during playback (#134): renders stay non-blocking and pause still pauses.
+fn playback_state(clock_playing: bool, catchup_paused: bool) -> bool {
+    clock_playing || catchup_paused
+}
+
 #[cfg(test)]
 mod tests {
     use super::{LiveReload, RecursiveMode, channel, egui, next_scale};
     use std::{fs, time::Duration};
+
+    #[test]
+    fn buffer_catchup_hold_counts_as_playing() {
+        // Held for a catch-up: renders don't block, and toggling pauses.
+        assert!(super::playback_state(false, true));
+        assert!(super::playback_state(true, false));
+        assert!(!super::playback_state(false, false));
+    }
 
     #[test]
     fn live_reload_retries_a_failed_library_watch() {

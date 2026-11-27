@@ -1,0 +1,60 @@
+# Golden-image film for feedback buffers (tests/golden.rs, #134): two shots of a moving
+# dot with a cut at 1 s. "trail" (rgba16f, fixed size) keeps the brighter of the
+# picture and its decayed previous state, reset at every cut; "hist" (rgba8, half
+# size) is a pure history of the picture, 8 frames deep, shown as an echo; "rd"
+# (rgba32f) runs a few reaction-diffusion steps from an init pass, starting at the
+# cut, and shows its buffer-local iFrame in blue. The strip's frames cross the reset.
+# Folds stay short (a few frames after a reset): errors compound across stacks.
+# Shaders are film-local, so the golden only moves when the engine does.
+title = "feedback"
+fps = 30
+
+[[shot]]
+id = "a"
+scene = "scenes/dot.glsl"
+duration = 1.0
+uniforms.uColor = [1.0, 0.6, 0.2]
+
+[[shot]]
+id = "b"
+scene = "scenes/dot.glsl"
+duration = 1.0
+time_offset = 0.5
+uniforms.uColor = [0.3, 0.7, 1.0]
+
+[[buffer]]
+id = "trail"
+scene = "buffers/trail.glsl"
+size = [160, 90]
+reset = "cuts"
+channels = ["@prev", "@picture"]
+uniforms.uDecay = 0.85
+
+[[buffer]]
+id = "hist"
+scene = "buffers/copy.glsl"
+scale = 0.5
+format = "rgba8"
+history = 8
+channels = ["@picture"]
+
+[[buffer]]
+id = "rd"
+scene = "buffers/rd.glsl"
+init = "buffers/rd_seed.glsl"
+from = "b"
+size = [64, 36]
+format = "rgba32f"
+channels = ["@prev"]
+
+[[layer]]
+id = "show"
+scene = "layers/show.glsl"
+channels = [
+  "@trail",
+  "@hist",
+  { source = "@hist", frame = -2 },
+  { source = "@hist", frame = -4 },
+  { source = "@hist", frame = -8 },
+  "@rd",
+]

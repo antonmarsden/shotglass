@@ -2,7 +2,7 @@
 
 How a film is laid out on disk, every `movie.toml` field, scene shaders and their uniforms, transitions, and writing portable GLSL.
 
-[README](../README.md) · [Movies](movies.md) · [Channels](channels.md) · [Layers and blends](layers.md) · [Sound](sound.md) · [Loop films](loop-films.md) · [The player](player.md) · [Projects and libraries](libraries.md) · [Testing GLSL and quality metrics](testing-and-quality.md) · [Command line and export](cli.md) · [Testing shotglass](testing.md)
+[README](../README.md) · [Movies](movies.md) · [Channels](channels.md) · [Layers and blends](layers.md) · [Feedback buffers](buffers.md) · [Sound](sound.md) · [Loop films](loop-films.md) · [The player](player.md) · [Projects and libraries](libraries.md) · [Testing GLSL and quality metrics](testing-and-quality.md) · [Command line and export](cli.md) · [Testing shotglass](testing.md)
 
 ## A movie
 
@@ -84,6 +84,9 @@ any transition that is longer than its shots allow.
 A shot can be a comp instead of a scene (`comp = "intro"`, with the comp declared in
 `[comps]`), and layers can be comps or carry a `matte`: see
 [Layers and blends](layers.md#comps).
+
+Feedback buffers (`[[buffer]]`) keep state from one frame to the next (trails, echo,
+simulations) and are read by layers: see [Feedback buffers](buffers.md).
 
 Keyframe times are in shot-local seconds. The eases are `linear`, `smooth`
 (default), `smoother`, `in`, `out`, `inout` and `step`.

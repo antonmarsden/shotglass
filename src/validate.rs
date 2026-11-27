@@ -136,6 +136,19 @@ pub(crate) fn movie_sources_with_provenance(m: &Movie, d: Dialect) -> Vec<Source
             }
         }
     }
+    // Buffers (#134): their scenes and init passes.
+    for b in &m.buffers {
+        frag(
+            format!("buffer \"{}\" ({})", b.id, rel(&b.scene)),
+            crate::gfx::buffer_source(d, b, &b.scene, &cues, m),
+        );
+        if let Some(p) = &b.init {
+            frag(
+                format!("init of buffer \"{}\" ({})", b.id, rel(p)),
+                crate::gfx::buffer_source(d, b, p, &cues, m),
+            );
+        }
+    }
     if let Some(p) = &m.music {
         frag(format!("music ({})", rel(p)), music_source(d, m, &cues, p));
     }

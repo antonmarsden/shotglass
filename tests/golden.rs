@@ -2,7 +2,7 @@
 //! (and contact sheets of tests/films/channels, the
 //! iChannel textures film, tests/films/text, the text film, tests/films/layers and
 //! tests/films/blends, the layer films, tests/films/footage, image sequences, tests/films/glyphs, glyph runs and
-//! subtitles, and both
+//! subtitles, tests/films/feedback, feedback buffers, and both
 //! of tests/films/loop, a `loop = true` film) and compares them with reference PNGs and WAVs in tests/golden/, so "compiles but looks (or sounds) wrong" fails `cargo test` (and
 //! CI, on software OpenGL).
 //!
@@ -367,6 +367,23 @@ fn comps_film() {
         "comps",
         &root().join("tests").join("films").join("comps"),
         &["--count", COUNT],
+        &[],
+    );
+}
+
+/// Feedback buffers (#134): tests/films/feedback, a trail reset at the cut, an 8-frame
+/// echo from a pure history buffer (reading the init state before the first frame) and
+/// reaction-diffusion from an init pass with its buffer-local iFrame; the frames cross
+/// the reset, and every fold is short (errors compound across stacks).
+#[test]
+fn feedback_film() {
+    if skip() {
+        return;
+    }
+    golden_frames(
+        "feedback",
+        &root().join("tests").join("films").join("feedback"),
+        &["--at", "0.1,0.2,0.3,0.5,1.0,1.1,1.2,1.4"],
         &[],
     );
 }
