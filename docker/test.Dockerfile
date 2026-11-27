@@ -19,7 +19,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml Cargo.lock build.rs ./
+COPY vendor/msdfgen vendor/msdfgen
 COPY .cargo .cargo
 COPY src src
 COPY tests tests

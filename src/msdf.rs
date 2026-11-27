@@ -4,34 +4,27 @@
 //!
 //! Tile format: RGB = multi-channel distance (the median is the distance; corners
 //! stay sharp), A = true distance. A signed distance d px (inside positive) is
-//! stored as ⌊255 · (d / (2 · spread) + 0.5)⌋ (fdsm truncates), so the outline
+//! stored as ⌊255 · (d / (2 · spread) + 0.5)⌋, so the outline
 //! lies between 127 and 128: threshold at 127.5 / 255. Values saturate `spread`
 //! px from the edge.
 //! Rows are top first, glyphs upright (y down), like every texture we decode.
 //!
-//! Generated with the `fdsm` crate. Output is the same on every run on one
-//! machine; across platforms its cubic solver uses the platform's `acos`/`cbrt`,
-//! so tests compare against a reference with a one-level tolerance, not a hash.
+//! Generated with the vendored msdfgen core. The atlas reference allows a
+//! one-level tolerance for platform differences in floating-point math.
 
 use anyhow::{Context, Result, bail};
-use fdsm::bezier::scanline::FillRule;
-use fdsm::bezier::{Point, Segment};
-use fdsm::generate::generate_mtsdf;
-use fdsm::render::correct_sign_mtsdf;
-use fdsm::shape::{Contour, Shape};
-use image::RgbaImage;
 use skrifa::font::glyph::outline::PathSink;
 use toodee::{CopyOps, TooDee, TooDeeOps, TooDeeOpsMut};
 
 use crate::text::Font;
+
+mod msdfgen;
 
 /// Largest atlas side, as for any texture.
 pub const MAX_SIDE: usize = 4096;
 /// Empty texels around every tile (atlas edges included), so linear filtering
 /// at a tile's edge never reads a neighbour, whatever the wrap mode.
 const GUTTER: usize = 1;
-/// Corner threshold for edge colouring (sine of the angle), fdsm's default.
-const CORNER_SIN: f64 = 0.03;
 /// Edge-colouring seed: fixed, so the atlas is reproducible.
 const SEED: u64 = 69441337420;
 
@@ -183,32 +176,14 @@ fn field(font: &Font, id: u32, em: f64, spread: f64) -> Result<Option<Field>> {
     let left = x0 * scale - spread;
     let top = y1 * scale + spread;
     // Font units, y up → tile pixels, y down.
-    let to_px = |(x, y): (f64, f64)| Point::new(x * scale - left, top - y * scale);
-    let contours = pen
-        .contours
-        .iter()
-        .map(|c| Contour {
-            segments: c
-                .iter()
-                .map(|s| match *s {
-                    Seg::Line(a, b) => Segment::line(to_px(a), to_px(b)),
-                    Seg::Quad(a, b, c) => Segment::quad(to_px(a), to_px(b), to_px(c)),
-                    Seg::Cubic(a, b, c, d) => {
-                        Segment::cubic(to_px(a), to_px(b), to_px(c), to_px(d))
-                    }
-                })
-                .collect(),
-        })
-        .collect();
-    let colored = Shape::edge_coloring_simple(Shape { contours }, CORNER_SIN, SEED);
-    let prepared = colored.prepare();
-    let mut image = RgbaImage::new(w, h);
-    generate_mtsdf(&prepared, 2.0 * spread, &mut image);
-    correct_sign_mtsdf(&mut image, &prepared, FillRule::Nonzero);
-    // RgbaImage::new reserves exactly four bytes per pixel.
-    let px = bytemuck::allocation::cast_vec::<u8, [u8; 4]>(image.into_raw());
+    let to_px = |(x, y): (f64, f64)| (x * scale - left, top - y * scale);
+    anyhow::ensure!(
+        w as usize <= MAX_SIDE && h as usize <= MAX_SIDE,
+        "glyph tile exceeds atlas limits"
+    );
+    let image = msdfgen::generate(&pen.contours, to_px, w, h, spread)?;
     Ok(Some(Field {
-        image: TooDee::from_vec(w as usize, h as usize, px),
+        image,
         left: left as f32,
         top: top as f32,
     }))
@@ -270,7 +245,7 @@ impl PathSink for Pen {
     fn quad_to(&mut self, x1: f32, y1: f32, x: f32, y: f32) {
         let (c, p) = ((x1 as f64, y1 as f64), (x as f64, y as f64));
         // Degenerate curves (a control point on an end point) are lines, or
-        // nothing: fdsm can't take a zero-length segment.
+        // nothing: exclude zero-length segments from the distance calculation.
         if c == self.last || c == p {
             return self.line_to(x, y);
         }
@@ -458,7 +433,7 @@ mod tests {
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/msdf-atlas.png");
         let (w, h) = (a.image.num_cols() as u32, a.image.num_rows() as u32);
         let bytes = a.image.data().iter().flatten().copied().collect();
-        let img = RgbaImage::from_raw(w, h, bytes).unwrap();
+        let img = image::RgbaImage::from_raw(w, h, bytes).unwrap();
         if std::env::var_os("SHOTGLASS_BLESS").is_some() {
             img.save(&path).unwrap();
             return;

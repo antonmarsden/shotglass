@@ -58,6 +58,8 @@ assertions aborts `shotglass check` on valid shaders. Inside this repository,
 `.cargo/config.toml` sets it for you, but Cargo ignores that file when installing
 from crates.io.
 
+The vendored [msdfgen core](vendor/msdfgen/README.md) requires a C++14 compiler.
+
 The built-in WebM export (`export --format webm`, the `webm` cargo feature) builds
 SVT-AV1 and libopus from source, so building shotglass needs
 [CMake](https://cmake.org), and [nasm](https://nasm.us) 2.14 or newer for SVT-AV1's
@@ -106,7 +108,8 @@ the PR checklist, licensing, and how to work on shotglass with AI coding agents.
 ## Licence
 
 Licensed under either of [Apache License 2.0](LICENSE-APACHE) or
-[MIT](LICENSE-MIT), at your option.
+[MIT](LICENSE-MIT), at your option. The vendored msdfgen core carries its own
+[MIT license](vendor/msdfgen/LICENSE.txt).
 
 Shaders copied from shadertoy.com are usually licensed CC BY-NC-SA 3.0 by their
 authors. If you include them in a movie, keep their licence notes with them.

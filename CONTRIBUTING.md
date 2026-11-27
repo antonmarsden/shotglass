@@ -6,6 +6,8 @@ invariants); user docs are in [README.md](README.md) and [docs/](docs/).
 
 ## Building
 
+A C++14 compiler builds the vendored msdfgen core for glyph atlases.
+
 `git clone --recursive` (or `git submodule update --init` in an existing clone):
 SVT-AV1 is a submodule in `vendor/SVT-AV1`, built by `build.rs` for the `webm`
 feature (built-in WebM export, #116). You need CMake and a C compiler, and nasm

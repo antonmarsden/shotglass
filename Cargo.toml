@@ -20,7 +20,6 @@ exclude = [
 [dependencies]
 anyhow = "1.0.104"
 arc-swap = "1.9.5"
-bytemuck = { version = "1.25", features = ["extern_crate_alloc"] }
 clap = { version = "4.6.9", features = ["derive"] }
 cpal = "0.18.2"
 eframe = { version = "0.37.0", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
@@ -51,7 +50,6 @@ unicode-linebreak = "0.1.5"
 unicode-segmentation = "1.13.3"
 ctrlc = "3.5"
 winit = "0.30"
-fdsm = "0.8.0"
 
 # Dependencies are slow unoptimised; this keeps `cargo run` snappy.
 [profile.dev.package."*"]
@@ -64,8 +62,9 @@ name = "gpu"
 harness = false
 
 [build-dependencies]
-# Built-in WebM export (#116): SVT-AV1 is built with CMake, the shim over it with cc.
-cc = { version = "1.11.2", optional = true }
+# Vendored msdfgen core and the SVT-AV1 shim.
+cc = "1.11.2"
+# Built-in WebM export (#116): SVT-AV1 is built with CMake.
 cmake = { version = "0.1.54", optional = true }
 
 [features]
@@ -73,7 +72,7 @@ default = ["strict-glsl", "webm"]
 # `export --format webm` without ffmpeg: SVT-AV1 (vendor/SVT-AV1, or SVT_AV1_SRC /
 # SVT_AV1_DIR) + libopus, muxed by shotglass. Needs CMake, and nasm for SVT-AV1's
 # SIMD on x86 (without it, a much slower C-only build). See docs/building.md.
-webm = ["dep:opus", "dep:cc", "dep:cmake"]
+webm = ["dep:opus", "dep:cmake"]
 # Strict GLSL validation in `check` (needs a C++ compiler at build time).
 strict-glsl = ["dep:glslang"]
 

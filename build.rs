@@ -1,4 +1,4 @@
-//! Builds SVT-AV1 and the small C shim over it for the `webm` feature (#116).
+//! Builds the vendored msdfgen core and, with `webm`, SVT-AV1 (#116).
 //!
 //! Where SVT-AV1 comes from, first match wins:
 //! - `SVT_AV1_DIR`: an installed SVT-AV1 (`include/svt-av1/EbSvtAv1Enc.h`, `lib/`),
@@ -14,6 +14,34 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     #[cfg(feature = "webm")]
     webm::build();
+    build_msdfgen();
+}
+
+fn build_msdfgen() {
+    use std::path::PathBuf;
+
+    println!("cargo:rerun-if-changed=src/msdf/msdfgen.cpp");
+    let root = PathBuf::from("vendor/msdfgen");
+    println!("cargo:rerun-if-changed={}", root.join("core").display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        root.join("msdfgen.h").display()
+    );
+    let mut build = cc::Build::new();
+    build
+        .cpp(true)
+        .std("c++14")
+        .include(&root)
+        .define("MSDFGEN_PUBLIC", Some(""))
+        .define("MSDFGEN_USE_CPP11", None)
+        .file("src/msdf/msdfgen.cpp");
+    for file in std::fs::read_dir(root.join("core")).expect("read msdfgen core") {
+        let path = file.expect("read msdfgen core file").path();
+        if path.extension().is_some_and(|ext| ext == "cpp") {
+            build.file(path);
+        }
+    }
+    build.compile("shotglass_msdfgen");
 }
 
 #[cfg(feature = "webm")]
