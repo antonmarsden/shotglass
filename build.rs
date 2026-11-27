@@ -35,6 +35,16 @@ fn build_msdfgen() {
         .define("MSDFGEN_PUBLIC", Some(""))
         .define("MSDFGEN_USE_CPP11", None)
         .file("src/msdf/msdfgen.cpp");
+    // Sign correction stores -1 in a plain char scratch buffer. MSVC uses
+    // signed char by default, while GCC and Clang vary by target.
+    if !build.get_compiler().is_like_msvc() {
+        build.flag("-fsigned-char");
+    }
+    // Keep atlas generation responsive in development builds. Release builds
+    // continue to use the Cargo profile's optimization level.
+    if std::env::var("OPT_LEVEL").as_deref() == Ok("0") {
+        build.opt_level(2);
+    }
     for file in std::fs::read_dir(root.join("core")).expect("read msdfgen core") {
         let path = file.expect("read msdfgen core file").path();
         if path.extension().is_some_and(|ext| ext == "cpp") {
