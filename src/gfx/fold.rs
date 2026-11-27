@@ -938,7 +938,15 @@ impl Renderer {
         let live: Vec<usize> = (0..movie.buffers.len())
             .filter(|&b| !movie.buffers[b].is_pure() && movie.buffers[b].active(m))
             .collect();
-        if live.is_empty() {
+        // A pure buffer can step ahead of the others (it starts `history` back): their
+        // rings then hold another frame's state, or none. Only a whole fold at m is saved.
+        if live.is_empty()
+            || live.iter().any(|&b| {
+                self.fold.rings[b]
+                    .as_ref()
+                    .is_none_or(|r| r.last != Some(m))
+            })
+        {
             return;
         }
         let bytes: usize = live

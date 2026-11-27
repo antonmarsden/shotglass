@@ -2327,6 +2327,33 @@ fn buffers_agree(gl: &Gl, dir: &Path) -> Result<String> {
             0.0,
         )?;
     }
+    // A deep pure history (40) starts before acc's reset at the cut: stepping it alone
+    // through frame 0 mustn't checkpoint acc (no state there yet), and later seeks
+    // restore only true states.
+    let ddir = dir.join("deep-hist");
+    buffer_film(&ddir, HIST3)?;
+    let text = std::fs::read_to_string(ddir.join("movie.toml"))?;
+    std::fs::write(
+        ddir.join("movie.toml"),
+        text.replace("history=4", "history=40"),
+    )?;
+    let deep = Movie::load(&ddir)?;
+    let mut d = renderer(gl, &deep)?;
+    let mut dfwd = vec![];
+    for n in 0..=45 {
+        dfwd.push(buf_frame(&mut d, &deep, n, 1.0)?);
+    }
+    drop(d);
+    let mut d = renderer(gl, &deep)?;
+    for n in [45, 15, 44, 31, 0] {
+        expect_same(
+            &format!("deep history: frame {n} after a cold seek"),
+            &buf_frame(&mut d, &deep, n, 1.0)?,
+            &dfwd[n as usize],
+            0,
+            0.0,
+        )?;
+    }
     // Only non-pure buffers: a seek back onto a checkpoint's own frame steps nothing.
     let adir = dir.join("acc-only");
     let only = buffer_film(&adir, "\"@acc\"")?;
