@@ -1577,7 +1577,8 @@ impl Renderer {
                 self.compile_now(k);
             }
         }
-        let order = self.priority(movie, t);
+        let comp_dist = comp_distances(movie, t);
+        let order = self.priority(movie, t, &comp_dist);
         let in_flight = |r: &Renderer| {
             r.programs
                 .values()
@@ -1617,10 +1618,10 @@ impl Renderer {
             }
         }
         let t_tex = std::time::Instant::now();
-        let mut tex_order = self.texture_order(movie, t);
+        let mut tex_order = self.texture_order(movie, t, &comp_dist);
         let footage = !self.footage.is_empty();
         if footage {
-            tex_order.extend(self.footage_order(movie, t));
+            tex_order.extend(self.footage_order(movie, t, &comp_dist));
             tex_order.sort_by(|a, b| a.1.total_cmp(&b.1));
             let mut seen = std::collections::HashSet::new();
             tex_order.retain(|(k, _)| seen.insert(*k));
@@ -1665,7 +1666,7 @@ impl Renderer {
     /// `FOOTAGE_HEADS` seconds (a loop film's first shots near the end of the period
     /// too), its first frames: cuts and loop seams then don't stall. Frames are mapped
     /// through `source_frame`, so repeats, speed and `end` count exactly.
-    fn footage_order(&mut self, movie: &Movie, t: f32) -> Vec<(u64, f32)> {
+    fn footage_order(&mut self, movie: &Movie, t: f32, comp_dist: &[f32]) -> Vec<(u64, f32)> {
         let n_now = film_frame(movie, t);
         let dt = movie.fps_den as f64 / movie.fps_num as f64;
         let n_shots = movie.shots.len();
@@ -1706,27 +1707,14 @@ impl Renderer {
         }
         // Comps (#74): around each instance drawn last frame (comp time runs on with the
         // film's, as it does when shown at speed 1), and the starts of comps coming up.
-        let seen = self.comp_seen.clone();
-        let cd = comp_distances(movie, t);
-        for (c, comp) in movie.comps.iter().enumerate() {
+        let clocks = comp_clocks(movie, t, &self.comp_seen);
+        for (c, (comp, mut clocks)) in movie.comps.iter().zip(clocks).enumerate() {
             let Some(&base) = self.seq_base.get(c + 1) else {
                 continue;
             };
             let m = &comp.movie;
-            let mut clocks: Vec<(f32, f32)> = seen
-                .iter()
-                .filter(|(sc, _)| *sc == c)
-                .map(|(_, tc)| (*tc, 0.0))
-                .collect();
-            // The film's own users: where comp time will be when they're on screen.
-            clocks.extend(
-                comp_clocks(movie, t)
-                    .into_iter()
-                    .filter(|(x, _, d)| *x == c && *d <= FOOTAGE_HEADS)
-                    .map(|(_, tc, d)| (comp.local(tc), d)),
-            );
-            if clocks.is_empty() && cd[c] <= FOOTAGE_HEADS {
-                clocks.push((0.0, cd[c]));
+            if clocks.is_empty() && comp_dist[c] <= FOOTAGE_HEADS {
+                clocks.push((0.0, comp_dist[c]));
             }
             for (tc, extra) in clocks {
                 let n_c = m.frame_at(tc).max(0) as u64;
@@ -1904,7 +1892,7 @@ impl Renderer {
     }
 
     /// Textures sorted by how soon the playhead needs them (seconds).
-    fn texture_order(&self, movie: &Movie, t: f32) -> Vec<(u64, f32)> {
+    fn texture_order(&self, movie: &Movie, t: f32, comp_dist: &[f32]) -> Vec<(u64, f32)> {
         let mut v: Vec<(u64, f32)> = vec![];
         for (i, shot) in movie.shots.iter().enumerate() {
             let Some(k) = self.wanted.get(i) else {
@@ -1920,7 +1908,7 @@ impl Renderer {
             );
         }
         // Comps (#74): their textures are as near as the comp's nearest user.
-        for (c, d) in comp_distances(movie, t).into_iter().enumerate() {
+        for (c, &d) in comp_dist.iter().enumerate() {
             if !d.is_finite() {
                 continue;
             }
@@ -2351,7 +2339,7 @@ impl Renderer {
     }
 
     /// Program keys sorted by how soon the playhead needs them (seconds).
-    fn priority(&self, movie: &Movie, t: f32) -> Vec<(u64, f32)> {
+    fn priority(&self, movie: &Movie, t: f32, comp_dist: &[f32]) -> Vec<(u64, f32)> {
         let mut v: Vec<(u64, f32)> = vec![];
         for (i, shot) in movie.shots.iter().enumerate() {
             let Some(k) = self.wanted.get(i) else {
@@ -2383,8 +2371,7 @@ impl Renderer {
             }
         }
         // Comps (#74): every program of a comp is as near as its nearest user.
-        let cd = comp_distances(movie, t);
-        for (c, &d) in cd.iter().enumerate() {
+        for (c, &d) in comp_dist.iter().enumerate() {
             if !d.is_finite() {
                 continue;
             }
@@ -2402,7 +2389,8 @@ impl Renderer {
                 .iter()
                 .map(|l| layer_distance(movie, l, t))
                 .chain(
-                    cd.iter()
+                    comp_dist
+                        .iter()
                         .enumerate()
                         .filter(|(c, _)| !movie.comps[*c].movie.layers.is_empty())
                         .map(|(_, d)| *d),
@@ -4535,22 +4523,35 @@ fn comp_distances(film: &Movie, t: f32) -> Vec<f32> {
     d
 }
 
-/// The film's direct uses of comps near `t` (#74): (comp, comp time when the user is
-/// on screen, distance). A user ahead of the playhead counts from its start.
-fn comp_clocks(film: &Movie, t: f32) -> Vec<(usize, f32, f32)> {
-    let mut v = vec![];
+/// Footage clocks grouped by comp (#74): last frame's instances, then nearby direct
+/// users in film order. A user ahead of the playhead counts from its start.
+fn comp_clocks(film: &Movie, t: f32, seen: &[(usize, f32)]) -> Vec<Vec<(f32, f32)>> {
+    let mut clocks = vec![vec![]; film.comps.len()];
+    if clocks.is_empty() {
+        return clocks;
+    }
+    for &(c, tc) in seen {
+        if let Some(clocks) = clocks.get_mut(c) {
+            clocks.push((tc, 0.0));
+        }
+    }
+    let mut add = |c: usize, tc, d| {
+        if d <= FOOTAGE_HEADS {
+            clocks[c].push((film.comps[c].local(tc), d));
+        }
+    };
     for s in &film.shots {
         let d = distance(film, s, t);
         let itime = s.scene_time((t - s.start).clamp(0.0, s.duration));
         for c in s.comp.into_iter() {
-            v.push((c, itime, d));
+            add(c, itime, d);
         }
         for ch in s.channels.iter().flatten() {
             if let crate::movie::Source::Comp {
                 index, time_offset, ..
             } = ch.source
             {
-                v.push((index, itime + time_offset, d));
+                add(index, itime + time_offset, d);
             }
         }
     }
@@ -4558,25 +4559,25 @@ fn comp_clocks(film: &Movie, t: f32) -> Vec<(usize, f32, f32)> {
         let d = layer_distance(film, l, t);
         let itime = l.scene_time((t - l.start).clamp(0.0, l.duration()));
         if let LayerScene::Comp(c) = l.scene {
-            v.push((c, itime, d));
+            add(c, itime, d);
         }
         if let Some(crate::movie::Matte {
             source: crate::movie::MatteSource::Comp(c),
             ..
         }) = l.matte
         {
-            v.push((c, itime, d));
+            add(c, itime, d);
         }
         for ch in l.channels.iter().flatten() {
             if let crate::movie::Source::Comp {
                 index, time_offset, ..
             } = ch.source
             {
-                v.push((index, itime + time_offset, d));
+                add(index, itime + time_offset, d);
             }
         }
     }
-    v
+    clocks
 }
 
 fn comp_of(c: &crate::movie::Channel) -> Option<usize> {
