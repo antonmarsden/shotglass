@@ -371,7 +371,8 @@ fn comps_film() {
     );
 }
 
-/// Feedback buffers (#134): tests/films/feedback, a trail reset at the cut, an 8-frame
+/// Feedback buffers (#134): tests/films/feedback, set up as a film would (a background
+/// plate, the element on transparent in its own buffer): a trail reset at the cut, an 8-frame
 /// echo from a pure history buffer (reading the init state before the first frame) and
 /// reaction-diffusion from an init pass with its buffer-local iFrame; the frames cross
 /// the reset, and every fold is short (errors compound across stacks).

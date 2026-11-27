@@ -1,7 +1,8 @@
-// A dot crossing the frame on a dark ground.
+// The background plate: a dark vertical gradient, tinted per shot. The moving element
+// is drawn into its own buffer (buffers/dot.glsl), as a film would keep an animated
+// element apart from its background to echo or trail it.
 void mainImage(out vec4 fragColor, in vec2 fragCoord) {
-  vec2 p = fragCoord / iResolution.y;
-  vec2 c = vec2(0.2 + 1.2 * fract(iTime * 0.7), 0.5 + 0.25 * sin(iTime * 5.0));
-  float d = smoothstep(0.09, 0.07, length(p - c));
-  fragColor = vec4(vec3(0.05) + uColor * d, 1.0);
+  vec2 uv = fragCoord / iResolution.xy;
+  vec3 ground = mix(vec3(0.02), vec3(0.09), uv.y) + 0.04 * uTint;
+  fragColor = vec4(ground, 1.0);
 }
