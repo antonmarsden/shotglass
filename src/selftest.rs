@@ -2445,6 +2445,11 @@ fn buffers_playback(gl: &Gl, dir: &Path) -> Result<String> {
     let mut tries = 0;
     let i = FrameInfo::frame(&m, 57);
     while p.render(&m, W, H, &i, true).is_none() {
+        // A held render leaves the default framebuffer bound (the UI draws next).
+        let fbo = unsafe { gl.get_parameter_i32(glow::DRAW_FRAMEBUFFER_BINDING) };
+        if fbo != 0 {
+            bail!("a held catch-up render left framebuffer {fbo} bound");
+        }
         tries += 1;
         if p.catchup_progress().is_none() || tries > 100 {
             bail!("a paused catch-up returned nothing without progress");

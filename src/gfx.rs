@@ -2870,6 +2870,13 @@ impl Renderer {
         // only once every active buffer holds its state at n.
         if !self.advance_buffers(movie, n, (w, h), blocking) {
             self.comp_seen = std::mem::take(&mut self.comp_req);
+            // Steps drew into buffer targets: leave GL as a finished frame does, or the
+            // player's UI paints into the last ring's framebuffer (a flicker).
+            unsafe {
+                self.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+                self.gl.use_program(None);
+                self.gl.bind_vertex_array(None);
+            }
             return None;
         }
         let root = self.plan_seq(
