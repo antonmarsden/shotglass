@@ -218,6 +218,8 @@ pub struct Soundtrack {
     chunk_size: usize,
     /// (track or bus key, chunk index) → interleaved stereo for that chunk.
     chunks: HashMap<(u64, usize), Arc<Vec<f32>>>,
+    /// Shared zero PCM for films without a music track.
+    music_silence: Option<Chunk>,
     /// Names of tracks synthesised since the last call to `take_rendered`.
     rendered: Vec<String>,
     /// Blocks queued on the GPU by `stream`, keyed like `chunks`.
@@ -243,6 +245,7 @@ impl Soundtrack {
             plan: None,
             chunk_size: chunk,
             chunks: HashMap::new(),
+            music_silence: None,
             rendered: vec![],
             in_flight: HashMap::new(),
             stats: StreamStats::default(),
@@ -672,12 +675,14 @@ impl Soundtrack {
             }
             None => {
                 let music = self.music_range(r, lo, hi, mode)?;
-                let sfx = self.sfx_range(r, lo, hi, mode)?;
-                let (Some(music), Some(sfx)) = (music, sfx) else {
+                let sfx_chunks = self.sfx_range(r, lo, hi, mode)?;
+                let (Some(music), Some(sfx_chunks)) = (music, sfx_chunks) else {
                     return Ok(None);
                 };
-                let mut o = self.splice(&music, lo, hi);
-                let sfx = self.splice(&sfx, lo, hi);
+                let mut o = Vec::with_capacity((hi - lo) * 2);
+                let mut sfx = Vec::with_capacity((hi - lo) * 2);
+                self.append_range(&mut o, &music, lo, hi);
+                self.append_range(&mut sfx, &sfx_chunks, lo, hi);
                 for (a, b) in o.iter_mut().zip(&sfx) {
                     *a += b;
                 }
@@ -697,7 +702,9 @@ impl Soundtrack {
         mode: &mut Mode,
     ) -> Result<Option<Vec<Chunk>>, String> {
         let Some(t) = self.plan.as_ref().and_then(|p| p.music.clone()) else {
-            let silence = Arc::new(vec![0.0; self.chunk_size * 2]);
+            let silence = self
+                .music_silence
+                .get_or_insert_with(|| Arc::new(vec![0.0; self.chunk_size * 2]));
             return Ok(Some(
                 (lo / self.chunk_size..hi.div_ceil(self.chunk_size))
                     .map(|_| silence.clone())
@@ -751,16 +758,16 @@ impl Soundtrack {
 
     /// The samples of every segment, one after the other.
     fn splice_segments(&self, segs: &[(usize, usize)], parts: &[Vec<Chunk>]) -> Vec<f32> {
-        let mut out = vec![];
+        let samples: usize = segs.iter().map(|&(a, b)| b - a).sum();
+        let mut out = Vec::with_capacity(samples * 2);
         for (&(a, b), p) in segs.iter().zip(parts) {
-            out.extend(self.splice(p, a, b));
+            self.append_range(&mut out, p, a, b);
         }
         out
     }
 
-    /// Samples lo..hi out of `parts`, the chunks covering them (from `range`).
-    fn splice(&self, parts: &[Chunk], lo: usize, hi: usize) -> Vec<f32> {
-        let mut out = Vec::with_capacity((hi - lo) * 2);
+    /// Append samples lo..hi from the cached chunks covering them.
+    fn append_range(&self, out: &mut Vec<f32>, parts: &[Chunk], lo: usize, hi: usize) {
         let first = lo / self.chunk_size;
         for (i, d) in parts.iter().enumerate() {
             let c = first + i;
@@ -768,7 +775,6 @@ impl Soundtrack {
             let b = hi.min((c + 1) * self.chunk_size) - c * self.chunk_size;
             out.extend_from_slice(&d[a * 2..b * 2]);
         }
-        out
     }
 
     /// One chunk of one track; zero outside the track's window.
