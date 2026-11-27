@@ -93,6 +93,9 @@ channels = ["@trail"]              # this frame's state, after its step
 - **Order:** buffers step in file order, after the picture track and before any layer.
   A buffer may read the current state of an *earlier* buffer (`@a`) and the previous
   state of any buffer, itself included (`@prev`, or `{ source = "@b", frame = "prev" }`).
+  To get trails of something a layer would draw (a title, a brush tip), render it in a
+  **comp** and read `@<comp>`: comps are drawn before the film, so they're available to
+  buffers in phase 1.
   So Buffer A–D chains work and the per-frame graph stays a DAG.
 - **Inputs:** textures, text, footage, comps, `@picture` and buffers. Not `@input` or
   `@<layer>`: buffers step before layers. A buffer that reads `@picture` makes the
@@ -134,6 +137,16 @@ Consequences:
   output size the command uses, like a fixed-scale layer).
 - **Render scale doesn't touch buffers.** They never draw in strips at a lower scale;
   slow steps are drawn in viewport strips at full buffer size, like slow frames.
+
+### Buffers in the layer stack (phase 4)
+
+Some effects want a partly composited picture: temporal denoise or smear of the final
+picture (titles and grade included), or trails of one layer without wrapping it in a
+comp. Phase 4 adds `after = "<layer id>"`: the buffer steps right after that layer is
+composited and may read `@input` (the composite so far) and `@<layer>` of earlier
+layers; later layers read it as usual. A field is needed because TOML loses the
+relative order of `[[buffer]]` and `[[layer]]` entries. It's additive: buffers without
+`after` keep stepping before all layers, so phase 1 doesn't block it.
 
 ### Loop films
 
@@ -180,8 +193,8 @@ checkpoint ≤ n and steps at most K − 1 frames.
 - Filled during playback for free, and while paused by a background walk forward from
   the playhead (budgeted, lowest priority, behind compiles and uploads).
 - Kept in an LRU with its own budget (default 512 MB): a 960×540 RGBA16F state is ~4 MB,
-  so a minute at one per second is ~240 MB per buffer. Checkpoints nearest the playhead
-  are kept first.
+  so a minute at one per second is ~240 MB per buffer. See [Memory](#memory) for what is
+  evictable and how.
 - Phase 2 spills evicted checkpoints to disk (a raw f16/f32 file per checkpoint under
   `target`-style cache dir, keyed by the [fold key](#invalidation)), read back by the
   decode pool and uploaded in bands like footage frames. Then a reopened film scrubs
@@ -208,6 +221,37 @@ so the files are our own raw format (or EXR), not the PNG footage reader. The ba
 keyed by the fold key: editing the buffer marks it stale and the player falls back to
 checkpoints. `bundle` doesn't include bakes (they're derived); `export` may use a fresh
 one.
+
+## Memory
+
+Buffer memory never grows without bound. Two kinds, treated differently:
+
+- **Required: the ping-pong targets** (two per active buffer, at its size and format).
+  They can't be evicted while the buffer is active. `Movie::load` sums them for the
+  worst frame (the most buffers active at once, comps included in phase 4) and refuses
+  the film when that exceeds a fixed limit, with a message naming the buffers and their
+  sizes, like `texture::shot_memory` does for textures.
+- **Evictable: checkpoints.** They live in their own LRU under a fixed budget (default
+  512 MB, set in the player's settings and by `SHOTGLASS_BUFFER_CACHE_MB`). Eviction
+  changes only how long a seek takes, never what it shows: a missing checkpoint means
+  catching up from an earlier one or from the reset.
+
+Rules for the checkpoint cache:
+
+- **Fixed budget, not free GPU memory:** drivers don't report free memory reliably, so
+  the budget is a number, as for the 256 MB texture LRU. Required targets, textures and
+  checkpoints have separate budgets, so one can't starve the others.
+- **Eviction order:** farthest from the playhead first. The checkpoint just before the
+  playhead and the one just before each reset in view are kept longest, so stepping back
+  a little and jumping to a cut stay cheap.
+- **Adaptive spacing:** when the budget can't hold one checkpoint per K frames across a
+  buffer's span, K doubles (every 2 s, then 4 s, …) for the part farther from the
+  playhead instead of thrashing. The worst-case seek is then 2K steps, still bounded.
+- **Allocation:** checkpoint textures are reused from a free list (like footage's
+  `spare`), so filling and evicting doesn't churn GL allocations.
+- **Phase 2:** evicted checkpoints go to the disk cache instead of being dropped (its
+  own size limit, oldest fold keys removed first), so a long film scrubs fast without
+  holding much in GPU memory.
 
 ## Invalidation
 
@@ -312,7 +356,8 @@ filtering needs `OES_texture_float_linear`, so `rgba32f` buffers default to `nea
 2. **Faster scrubbing:** disk checkpoints, background fill, progressive scrub,
    `preview_lookback`, per-frame invalidation.
 3. **Bakes:** `shotglass bake`, baked lookup through the footage machinery.
-4. **Reach:** buffers in comps, `loop = "warm"`, kit examples (trails, echo, TAA,
+4. **Reach:** buffers in comps, `loop = "warm"`, `after = "<layer>"`
+   ([buffers in the layer stack](#buffers-in-the-layer-stack-phase-4)), kit examples (trails, echo, TAA,
    reaction-diffusion) in shotglass-kit.
 
 ## Alternatives considered
@@ -333,12 +378,9 @@ filtering needs `OES_texture_float_linear`, so `rgba32f` buffers default to `nea
 
 ## Open questions
 
-1. Is K = one second of frames right, or should spacing adapt (dense near the playhead,
-   sparse further away)?
-2. Should buffers read `@input`-like full composites (after some layers)? That would
-   need buffers interleaved with layers rather than a block before them.
-3. Disk cache location and eviction (`target/`-like per film, or the shared library
+1. Is K = one second of frames the right starting spacing (before adaptive doubling)?
+2. Disk cache location and eviction (`target/`-like per film, or the shared library
    cache dir)?
-4. Should `check --deep` measure how fast a buffer forgets (the frame where fold-from-r
+3. Should `check --deep` measure how fast a buffer forgets (the frame where fold-from-r
    and fold-from-(n − L) agree within 1/255) and suggest `preview_lookback`?
-5. Bake file format: raw f16 with a small header, or EXR (an extra dependency)?
+4. Bake file format: raw f16 with a small header, or EXR (an extra dependency)?
