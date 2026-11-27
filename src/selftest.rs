@@ -2567,7 +2567,8 @@ fn buffers_edits(gl: &Gl, dir: &Path) -> Result<String> {
     }
     let before = before.unwrap();
     let mut last = before;
-    let edits: [(&str, Box<dyn Fn() -> Result<()>>); 3] = [
+    type Edit<'a> = (&'static str, Box<dyn Fn() -> Result<()> + 'a>);
+    let edits: [Edit; 3] = [
         (
             "the buffer's scene",
             Box::new(|| {

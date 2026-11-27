@@ -302,6 +302,7 @@ impl Renderer {
     }
 
     /// Set the checkpoint budget (the player's setting; tests).
+    #[allow(dead_code)]
     pub fn set_buffer_cache_budget(&mut self, bytes: usize) {
         self.fold.budget = bytes;
         self.fold.budget_source = "setting";
@@ -315,6 +316,7 @@ impl Renderer {
         self.fold.slices = on;
     }
 
+    #[allow(dead_code)]
     pub fn set_buffer_step_budget(&mut self, steps: usize) {
         self.fold.step_budget = steps.max(1);
     }
@@ -567,6 +569,7 @@ impl Renderer {
     }
 
     /// Copy checkpoint `i` into the rings.
+    #[allow(clippy::type_complexity)]
     fn restore(&mut self, movie: &Movie, i: usize, out: (i32, i32)) {
         let gl = self.gl.clone();
         let saved: Vec<(usize, u64, Vec<(i64, glow::Framebuffer)>, u64)> = {
@@ -920,7 +923,7 @@ impl Renderer {
             return;
         }
         let k = (movie.fps.round() as u64).max(1);
-        if m % k != 0 {
+        if !m.is_multiple_of(k) {
             return;
         }
         let key = self.fold.key;

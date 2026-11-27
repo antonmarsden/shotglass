@@ -2821,6 +2821,7 @@ fn build_sequence(
 
 /// The film's `[[buffer]]`s (#134), after its shots and layers (spans and resets may
 /// name either).
+#[allow(clippy::type_complexity)]
 fn build_buffers(
     sc: &SeqCtx,
     channel_list: &mut dyn FnMut(
@@ -3619,6 +3620,7 @@ fn is_texture_name(s: &str) -> bool {
 /// Resolve one `channels` entry (with `names`) or `[textures]` value (without):
 /// "" (nothing), a `[textures]` name, a film path, `<lib/path>`, or a table with `file`
 /// and options. Library paths stay relative until `resolve_libraries`.
+#[allow(clippy::too_many_arguments)]
 fn texture_spec(
     what: &str,
     v: &toml::Value,
