@@ -1,3 +1,6 @@
 [submodule "vendor/SVT-AV1"]
 	path = vendor/SVT-AV1
 	url = https://github.com/AOMediaCodec/SVT-AV1.git
+[submodule "msdfgen"]
+	path = vendor/msdfgen
+	url = https://github.com/Chlumsky/msdfgen.git

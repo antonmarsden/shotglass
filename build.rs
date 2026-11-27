@@ -1,4 +1,4 @@
-//! Builds the vendored msdfgen core and, with `webm`, SVT-AV1 (#116).
+//! Builds the pinned msdfgen core and, with `webm`, SVT-AV1 (#116).
 //!
 //! Where SVT-AV1 comes from, first match wins:
 //! - `SVT_AV1_DIR`: an installed SVT-AV1 (`include/svt-av1/EbSvtAv1Enc.h`, `lib/`),
@@ -22,6 +22,10 @@ fn build_msdfgen() {
 
     println!("cargo:rerun-if-changed=src/msdf/msdfgen.cpp");
     let root = PathBuf::from("vendor/msdfgen");
+    assert!(
+        root.join("msdfgen.h").is_file(),
+        "msdfgen source is missing. Run `git submodule update --init`."
+    );
     println!("cargo:rerun-if-changed={}", root.join("core").display());
     println!(
         "cargo:rerun-if-changed={}",

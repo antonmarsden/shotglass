@@ -20,7 +20,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /src
 COPY Cargo.toml Cargo.lock build.rs ./
-COPY vendor/msdfgen vendor/msdfgen
+COPY vendor/msdfgen/core vendor/msdfgen/core
+COPY vendor/msdfgen/msdfgen.h vendor/msdfgen/msdfgen.h
 COPY .cargo .cargo
 COPY src src
 COPY tests tests
