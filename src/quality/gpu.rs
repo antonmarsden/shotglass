@@ -185,23 +185,15 @@ impl Target {
             (self.fbo, glow::COLOR_ATTACHMENT0 + i),
             [0, 0, w, h],
             ReadFormat::RgbaF32,
-            bytemuck_bytes(px.data_mut()),
+            bytemuck::cast_slice_mut(px.data_mut()),
             (w as usize, (0, 0)),
         );
         px
     }
 }
 
-/// Texels as the bytes GL reads into and uploads from.
-fn bytemuck_bytes(px: &mut [[f32; 4]]) -> &mut [u8] {
-    let len = std::mem::size_of_val(px);
-    // SAFETY: [f32; 4] has no padding and every bit pattern is a valid f32.
-    unsafe { std::slice::from_raw_parts_mut(px.as_mut_ptr().cast::<u8>(), len) }
-}
-
 /// Upload texels as an RGBA32F texture.
 pub unsafe fn upload(gl: &glow::Context, px: &Texels) -> Result<glow::Texture> {
-    let mut data = px.data().to_vec();
     unsafe {
         let tex = gl.create_texture().map_err(|e| anyhow!(e))?;
         gl.bind_buffer(glow::PIXEL_UNPACK_BUFFER, None);
@@ -219,7 +211,7 @@ pub unsafe fn upload(gl: &glow::Context, px: &Texels) -> Result<glow::Texture> {
             0,
             glow::RGBA,
             glow::FLOAT,
-            glow::PixelUnpackData::Slice(Some(bytemuck_bytes(&mut data))),
+            glow::PixelUnpackData::Slice(Some(bytemuck::cast_slice(px.data()))),
         );
         nearest(gl);
         gl.bind_texture(glow::TEXTURE_2D, None);
