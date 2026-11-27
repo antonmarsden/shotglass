@@ -162,13 +162,13 @@ pub fn export(
         .name("av1 encoder".into())
         .spawn(move || -> Result<()> {
             let mut enc = enc;
+            let (track, packets) = audio.unzip();
             let mut mux = mux::Writer::new(
                 std::io::BufWriter::new(file),
                 doc_type,
                 &video,
-                audio.as_ref().map(|(t, p)| (t, p.clone())),
+                track.as_ref().zip(packets),
             )?;
-            drop(audio);
             let ns = |n: i64| frame_ns(fps, n.max(0) as u64);
             let mut next = 0i64;
             let mut write = |mux: &mut mux::Writer<_>, p: super::encode::Packet| -> Result<()> {
