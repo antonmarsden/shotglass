@@ -26,7 +26,8 @@ shotglass promises that a frame depends only on (movie, t, size, scale), so play
 - **State is fixed-size floats**, independent of render scale and of the player's
   window, so the auto scale never changes results.
 - **Seeking is the engine's problem, solved with caches.** Checkpoints of the state
-  (GPU, then disk) make a seek cost at most K steps; a baked buffer costs none.
+  (GPU memory, adaptively spaced under a fixed budget) keep a seek bounded; a baked
+  buffer costs none.
   Catch-up happens only while paused or scrubbing, in budgeted slices, so playback
   never blocks and the player never freezes.
 - **Contract:** additive (`[[buffer]]`, the `@prev` channel source, buffer-local
@@ -35,7 +36,7 @@ shotglass promises that a frame depends only on (movie, t, size, scale), so play
 
 MVP (phase 1): `[[buffer]]` with spans, resets, `@prev`, reading textures, text,
 footage, `@picture` and other buffers; canonical fold from the reset; GPU checkpoints;
-budgeted catch-up in the player. Then disk checkpoints and progressive scrub (phase 2),
+budgeted catch-up in the player. Then background fill and progressive scrub (phase 2),
 bakes (phase 3), buffers in comps and seamless loop films (phase 4).
 
 Not in this design: buffers whose state depends on input or wall-clock time (that's
@@ -184,7 +185,7 @@ freezing. Until it's done, the frame isn't usable and the previous frame stays u
 an unready texture. While playing, a seek forward or back first pauses the fold, catches
 up, then resumes; the clock waits (a stall, not a drop).
 
-### 2. Checkpoints (phase 1 in GPU memory, phase 2 on disk)
+### 2. Checkpoints (GPU memory)
 
 Every K film frames (default: one second of frames), copy each buffer's state into a
 checkpoint texture: a GPU copy, no readback, no sync. A seek restores the nearest
@@ -195,10 +196,8 @@ checkpoint ≤ n and steps at most K − 1 frames.
 - Kept in an LRU with its own budget (default 512 MB): a 960×540 RGBA16F state is ~4 MB,
   so a minute at one per second is ~240 MB per buffer. See [Memory](#memory) for what is
   evictable and how.
-- Phase 2 spills evicted checkpoints to disk (a raw f16/f32 file per checkpoint under
-  `target`-style cache dir, keyed by the [fold key](#invalidation)), read back by the
-  decode pool and uploaded in bands like footage frames. Then a reopened film scrubs
-  fast from the first scrub.
+- Checkpoints never go to disk: evicted ones are dropped (see
+  [Why no disk checkpoints](#why-no-disk-checkpoints)).
 
 ### 3. Progressive scrub (phase 2)
 
@@ -249,9 +248,28 @@ Rules for the checkpoint cache:
   playhead instead of thrashing. The worst-case seek is then 2K steps, still bounded.
 - **Allocation:** checkpoint textures are reused from a free list (like footage's
   `spare`), so filling and evicting doesn't churn GL allocations.
-- **Phase 2:** evicted checkpoints go to the disk cache instead of being dropped (its
-  own size limit, oldest fold keys removed first), so a long film scrubs fast without
-  holding much in GPU memory.
+- **Slow seeks are reported:** when a catch-up would take more than about a second
+  (estimated from measured step times), the player says so and suggests baking that
+  buffer.
+
+### Why no disk checkpoints
+
+With B checkpoints over a span of N frames, spacing settles near N/B, so a seek is at
+most about N/B steps. At 960×540 RGBA16F (~4 MB) the default budget holds ~128:
+
+| film | frames | spacing | worst seek, sim step ~0.5 ms | worst seek, step also renders `@picture` (~20 ms) |
+|---|---|---|---|---|
+| 1 min @ 30 fps | 1 800 | ~14 | ~7 ms | ~0.3 s |
+| 10 min @ 30 fps | 18 000 | ~140 | ~70 ms | ~2.8 s |
+
+That's enough for short films and pure simulations. Spilling evicted checkpoints to disk
+would help only with long films whose steps are expensive (they read `@picture` or a
+comp), with the first scrub after reopening a film, and with many buffers sharing the
+budget. A bake removes the seek cost entirely for the first, and the background fill
+covers the second. Disk checkpoints also save nothing in the usual edit-scrub loop:
+an edit changes the fold key and invalidates them anyway. They'd add a cache format, a
+location, eviction and a readback path for little gain, so they're left out; revisit
+only if real films hit the limit.
 
 ## Invalidation
 
@@ -297,8 +315,9 @@ checkpoints stay until the new version's frame n is ready.
   frame n.
 - **Stalls while playing:** missed frames are stepped before the frame is drawn (the GPU
   cost of k steps, counted as housekeeping, so the auto scale doesn't react).
-- **No per-frame syncs:** steps and checkpoint copies are draws and copies. Disk
-  checkpoints read back through the PBO + fence path, polled oldest first, like audio.
+- **No per-frame syncs:** steps and checkpoint copies are draws and copies on the GPU;
+  nothing is read back. Bakes (phase 3) read back through the PBO + fence path, polled
+  oldest first, like audio.
 - **Strips:** a slow step is drawn in viewport strips at full buffer size, like slow
   frames.
 
@@ -353,8 +372,8 @@ filtering needs `OES_texture_float_linear`, so `rgba32f` buffers default to `nea
 1. **Buffers:** `[[buffer]]`, spans, resets, `init`, `@prev`, `@<buffer>`,
    `@picture`/textures/text/footage inputs, canonical fold, GPU checkpoints, budgeted
    catch-up, selftest + golden. Contract patch bump.
-2. **Faster scrubbing:** disk checkpoints, background fill, progressive scrub,
-   `preview_lookback`, per-frame invalidation.
+2. **Faster scrubbing:** background fill, progressive scrub, `preview_lookback`,
+   per-frame invalidation, slow-seek hints.
 3. **Bakes:** `shotglass bake`, baked lookup through the footage machinery.
 4. **Reach:** buffers in comps, `loop = "warm"`, `after = "<layer>"`
    ([buffers in the layer stack](#buffers-in-the-layer-stack-phase-4)), kit examples (trails, echo, TAA,
@@ -375,11 +394,14 @@ filtering needs `OES_texture_float_linear`, so `rgba32f` buffers default to `nea
 - **Feedback in layers** (`@self` on a `[[layer]]`). Mixes compositing with simulation
   state, and layers have opacity, fades and mattes that make "the previous state"
   ambiguous. Buffers are separate and layers read them.
+- **Disk checkpoints** (spill evicted checkpoints to disk). Bounded GPU checkpoints plus
+  bakes cover the same cases with less machinery; see
+  [Why no disk checkpoints](#why-no-disk-checkpoints).
 
 ## Open questions
 
 1. Is K = one second of frames the right starting spacing (before adaptive doubling)?
-2. Disk cache location and eviction (`target/`-like per film, or the shared library
+2. Bake cache location and eviction (`target/`-like per film, or the shared library
    cache dir)?
 3. Should `check --deep` measure how fast a buffer forgets (the frame where fold-from-r
    and fold-from-(n − L) agree within 1/255) and suggest `preview_lookback`?
