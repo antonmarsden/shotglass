@@ -192,7 +192,7 @@ checkpoint ≤ n and steps at most K − 1 frames.
 
 - Filled during playback for free, and while paused by a background walk forward from
   the playhead (budgeted, lowest priority, behind compiles and uploads).
-- Kept in an LRU with its own budget (512 MB to 2 GB, [from the GPU](#the-checkpoint-budget)): a 960×540 RGBA16F state is ~4 MB,
+- Kept in an LRU with its own budget (256 MB – 2 GB [from the GPU](#the-checkpoint-budget), 512 MB without it): a 960×540 RGBA16F state is ~4 MB,
   so a minute at one per second is ~240 MB per buffer. See [Memory](#memory) for what is
   evictable and how.
 - Checkpoints never go to disk: evicted ones are dropped (see
@@ -268,7 +268,7 @@ change.
 ### Why no disk checkpoints
 
 With B checkpoints over a span of N frames, spacing settles near N/B, so a seek is at
-most about N/B steps. At 960×540 RGBA16F (~4 MB) the default budget holds ~128:
+most about N/B steps. At 960×540 RGBA16F (~4 MB) the 512 MB fallback budget holds ~128 (a 1.5 GB one, ~380):
 
 | film | frames | spacing | worst seek, sim step ~0.5 ms | worst seek, step also renders `@picture` (~20 ms) |
 |---|---|---|---|---|
