@@ -391,7 +391,7 @@ filtering needs `OES_texture_float_linear`, so `rgba32f` buffers default to `nea
 - **Feedback in layers** (`@self` on a `[[layer]]`). Mixes compositing with simulation
   state, and layers have opacity, fades and mattes that make "the previous state"
   ambiguous. Buffers are separate and layers read them.
-- **Disk checkpoints** (spill evicted checkpoints to disk). Bounded GPU checkpoints cover
+- **Disk checkpoints and persistent bakes** (spill evicted checkpoints, or every frame's state, to disk). Bounded GPU checkpoints cover
   short films; the rest isn't worth the machinery yet; see
   [Why no disk checkpoints](#why-no-disk-checkpoints).
 
