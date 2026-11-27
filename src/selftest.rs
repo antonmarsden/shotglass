@@ -235,6 +235,10 @@ const CHECKS: &[Check] = &[
         run: buffers_invalidation,
     },
     Check {
+        name: "buffers in comps: they fold over comp-local frames (offset, held, looped, read by a film buffer); every path agrees",
+        run: buffers_in_comps,
+    },
+    Check {
         name: "chunked sound matches a single-pass render",
         run: sound_chunk_equivalence,
     },
@@ -2315,6 +2319,213 @@ fn half(f: &Frame, left: bool) -> Frame {
         }
     }
     out
+}
+
+/// The comp of `buffers_in_comps` (#138): a moving picture, a float accumulator with
+/// an init pass and a reset at 1 s (comp time), and a layer that shows it.
+const COMP_BUF_BODY: &str = "[[shot]]\nid=\"p\"\nscene=\"pat.glsl\"\nduration=2\n\
+     [[buffer]]\nid=\"acc\"\nscene=\"acc.glsl\"\ninit=\"seed.glsl\"\nsize=[40, 24]\n\
+     format=\"rgba32f\"\nreset=[1]\nchannels=[\"@prev\", \"@picture\", \"t.png\"]\n\
+     [[layer]]\nid=\"show\"\nscene=\"showacc.glsl\"\nchannels=[\"@acc\"]\n";
+
+fn buffers_in_comps(gl: &Gl, dir: &Path) -> Result<String> {
+    let files = |d: &Path| -> Result<()> {
+        buffer_film(d, HIST3)?;
+        write(
+            d,
+            &[
+                (
+                    "pat.glsl",
+                    &scene(
+                        "fragColor = vec4(fract(uv.x + iTime * 0.9), uv.y, fract(iTime * 0.37), 1.0);",
+                    ),
+                ),
+                (
+                    "showacc.glsl",
+                    &scene("fragColor = vec4(texture(iChannel0, uv).rgb, 1.0);"),
+                ),
+                ("c.toml", COMP_BUF_BODY),
+            ],
+        )
+    };
+    // The comp's content as a film of its own: the reference for comp-local frames.
+    let alone_dir = dir.join("alone");
+    files(&alone_dir)?;
+    let alone = movie(
+        &alone_dir,
+        &format!("shotglass = \"0.1.10\"\n{COMP_BUF_BODY}"),
+    )?;
+    let mut a = renderer(gl, &alone)?;
+    let want: Vec<Frame> = (0..60)
+        .map(|n| buf_frame(&mut a, &alone, n, 1.0))
+        .collect::<Result<_>>()?;
+    if want[40] == want[41] {
+        bail!("the comp's buffer doesn't change from frame to frame");
+    }
+    // 1. A comp shot half a second in: comp frame n + 15, held at 59 after the comp ends.
+    let shot_dir = dir.join("shot");
+    files(&shot_dir)?;
+    let film = movie(
+        &shot_dir,
+        "shotglass = \"0.1.10\"\n[comps]\nc = \"c.toml\"\n\
+         [[shot]]\nid=\"s\"\ncomp=\"c\"\ntime_offset=0.5\nduration=2.5\n",
+    )?;
+    let comp_frame = |n: u64| (n + 15).min(59) as usize;
+    let mut r = renderer(gl, &film)?;
+    let mut fwd = vec![];
+    for n in 0..75 {
+        let f = buf_frame(&mut r, &film, n, 1.0)?;
+        expect_fold(
+            gl,
+            &format!(
+                "comp shot, film frame {n} vs the comp as a film, frame {}",
+                comp_frame(n)
+            ),
+            &f,
+            &want[comp_frame(n)],
+            0,
+            0.0,
+        )?;
+        fwd.push(f);
+    }
+    if r.blocking_catchups > 1 {
+        // The first frame starts the comp's fold at comp frame 15 (one catch-up).
+        bail!("forward rendering caught up {} times", r.blocking_catchups);
+    }
+    let (cks, _) = r.checkpoint_stats();
+    if cks == 0 {
+        bail!("75 frames forward took no checkpoint of the comp's buffer");
+    }
+    let before = r.buffer_restores;
+    for n in [40u64, 3, 70, 16, 14, 44, 0] {
+        expect_fold(
+            gl,
+            &format!("comp shot, film frame {n} after seeking"),
+            &buf_frame(&mut r, &film, n, 1.0)?,
+            &fwd[n as usize],
+            0,
+            0.0,
+        )?;
+    }
+    if r.buffer_restores == before {
+        bail!("seeking back in the comp didn't restore a checkpoint");
+    }
+    for n in [44u64, 10, 74] {
+        let mut c = renderer(gl, &film)?;
+        expect_fold(
+            gl,
+            &format!("comp shot, cold still of film frame {n}"),
+            &buf_frame(&mut c, &film, n, 1.0)?,
+            &fwd[n as usize],
+            0,
+            0.0,
+        )?;
+    }
+    // Playing (not blocking) from the start shows the same frames and never blocks.
+    let mut p = renderer(gl, &film)?;
+    for n in 0..30u64 {
+        let (f, _) = buf_play(&mut p, &film, n)?;
+        expect_fold(
+            gl,
+            &format!("comp shot played, frame {n}"),
+            &f,
+            &fwd[n as usize],
+            0,
+            0.0,
+        )?;
+    }
+    if p.blocking_catchups != 0 {
+        bail!("playback caught up blocking {} times", p.blocking_catchups);
+    }
+    // 2. A loop comp wraps: its frame 0 is a reset, so period k equals period 0.
+    let loop_dir = dir.join("loop");
+    files(&loop_dir)?;
+    let lfilm = movie(
+        &loop_dir,
+        "shotglass = \"0.1.10\"\n[comps]\nc = { file = \"c.toml\", loop = true }\n\
+         [[shot]]\nid=\"s\"\ncomp=\"c\"\nduration=3\n",
+    )?;
+    let mut l = renderer(gl, &lfilm)?;
+    for n in [5u64, 59, 60, 65, 89, 31] {
+        expect_fold(
+            gl,
+            &format!("loop comp, film frame {n} vs comp frame {}", n % 60),
+            &buf_frame(&mut l, &lfilm, n, 1.0)?,
+            &want[(n % 60) as usize],
+            0,
+            0.0,
+        )?;
+    }
+    // 3. A film buffer reads the comp (nested folds): every path agrees.
+    let read_dir = dir.join("read");
+    files(&read_dir)?;
+    let rfilm = movie(
+        &read_dir,
+        "shotglass = \"0.1.10\"\n[comps]\nc = \"c.toml\"\n\
+         [[shot]]\nid=\"a\"\nscene=\"s.glsl\"\nduration=2\n\
+         [[buffer]]\nid=\"fb\"\nscene=\"acc.glsl\"\nsize=[32, 20]\nformat=\"rgba32f\"\n\
+         channels=[\"@prev\", \"@c\", \"t.png\"]\n\
+         [[layer]]\nid=\"show\"\nscene=\"showacc.glsl\"\nchannels=[\"@fb\"]\n",
+    )?;
+    let mut f = renderer(gl, &rfilm)?;
+    let rfwd: Vec<Frame> = (0..50)
+        .map(|n| buf_frame(&mut f, &rfilm, n, 1.0))
+        .collect::<Result<_>>()?;
+    if rfwd[20] == rfwd[21] {
+        bail!("the film buffer reading the comp doesn't change");
+    }
+    for n in [45u64, 12, 31, 49, 0] {
+        expect_fold(
+            gl,
+            &format!("film buffer reading the comp, frame {n} after seeking"),
+            &buf_frame(&mut f, &rfilm, n, 1.0)?,
+            &rfwd[n as usize],
+            0,
+            0.0,
+        )?;
+    }
+    let mut c = renderer(gl, &rfilm)?;
+    c.set_buffer_checkpoints(false);
+    for n in [37u64, 8] {
+        c.forget_buffer_state();
+        expect_fold(
+            gl,
+            &format!("film buffer reading the comp, frame {n} folded from the resets"),
+            &buf_frame(&mut c, &rfilm, n, 1.0)?,
+            &rfwd[n as usize],
+            0,
+            0.0,
+        )?;
+    }
+    // 4. Editing the comp's shot (which its buffer reads as @picture) invalidates the
+    // comp's fold and the film buffer's that reads the comp.
+    write(
+        &read_dir,
+        &[(
+            "pat.glsl",
+            &scene("fragColor = vec4(uv.y, fract(uv.x - iTime * 0.6), 0.3, 1.0);"),
+        )],
+    )?;
+    let edited = Movie::load(&read_dir)?;
+    f.load_all(&edited)
+        .map_err(|e| anyhow!("comp edit: {}", crate::gfx::join_errors(&e)))?;
+    let got = buf_frame(&mut f, &edited, 40, 1.0)?;
+    let mut fresh = renderer(gl, &edited)?;
+    expect_fold(
+        gl,
+        "frame 40 after editing the comp's shot",
+        &got,
+        &buf_frame(&mut fresh, &edited, 40, 1.0)?,
+        0,
+        0.0,
+    )?;
+    if got == rfwd[40] {
+        bail!("editing the comp's shot didn't change the film buffer reading the comp");
+    }
+    Ok(format!(
+        "75 comp-shot frames = the comp as a film; {cks} checkpoints; loop comp wraps; nested folds \
+         agree; a comp edit invalidates"
+    ))
 }
 
 fn buffers_agree(gl: &Gl, dir: &Path) -> Result<String> {

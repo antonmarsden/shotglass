@@ -1,0 +1,19 @@
+# The comp: a dot over black, a trail of it (reset at 1 s of comp time), and a layer
+# that shows the trail over the comp's picture.
+[[shot]]
+id = "dot"
+scene = "scenes/dot.glsl"
+duration = 2.0
+
+[[buffer]]
+id = "trail"
+scene = "buffers/trail.glsl"
+size = [80, 45]
+reset = [1.0]
+channels = ["@prev", "@picture"]
+uniforms.uDecay = 0.85
+
+[[layer]]
+id = "show"
+scene = "layers/show.glsl"
+channels = ["@input", "@trail"]

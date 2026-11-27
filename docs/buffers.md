@@ -77,7 +77,8 @@ names.
   any buffer, so Buffer A–D chains work. A later buffer's state this frame isn't drawn
   yet: read its previous state. On a later buffer's own reset frame, its previous state
   reads black from earlier buffers (its init pass hasn't run yet).
-- Buffers read textures, text, footage, comps, `@picture` (the picture track, rendered
+- Buffers read textures, text, footage, comps (including comps with
+  [buffers of their own](#buffers-in-comps)), `@picture` (the picture track, rendered
   at the buffer's size) and other buffers; not `@input` or `@<layer>`, since layers draw
   after buffers step. For trails of something a layer would draw, render it in a
   [comp](layers.md#comps) and read `@<comp>`.
@@ -171,8 +172,52 @@ Long folds over float state can drift further apart between GPUs and drivers tha
 single frame does (errors compound), so compare long folds on one machine, not against
 reference images from another.
 
+## Buffers in comps
+
+A [comp](layers.md#comps) file may have `[[buffer]]`s too (needs `shotglass = "0.1.10"`).
+They work as in a film, inside the comp: they step after the comp's shots and before
+its layers, `@picture` is the comp's picture track, the comp's layers read them, and
+spans, resets and seconds are comp-local:
+
+```toml
+# comps/spark.toml
+[[shot]]
+id = "dot"
+scene = "scenes/dot.glsl"
+duration = 2.0
+
+[[buffer]]
+id = "trail"
+scene = "buffers/trail.glsl"
+size = [80, 45]
+reset = [1.0]                      # 1 s of comp time
+channels = ["@prev", "@picture"]   # the comp's picture track
+
+[[layer]]
+id = "show"
+scene = "layers/show.glsl"
+channels = ["@input", "@trail"]
+```
+
+- **The fold is over comp frames.** A comp buffer's state at comp frame c is the fold
+  from its last reset to c, whoever shows the comp and whenever: exactly what the comp
+  would show as a film of its own. A comp shown from 0.5 s in (`time_offset = 0.5`) starts
+  at comp frame 15 (at 30 fps), with the state of 15 steps; a comp that holds its last
+  frame holds its state too; a `loop = true` comp resets at its frame 0, like a loop film.
+- **Shown in one place.** A comp with buffers (or that shows one) may be used once in
+  the film and its comps: one shot, layer, matte or channel (a film buffer's included).
+  Two uses could ask for two comp frames at once. For a second use, make a second comp
+  file (they can share shaders). Comps without buffers can still be used anywhere.
+- **Size:** `scale` is a fraction of the comp's `size`, or of the film's output size if
+  it has none, never the size of whatever shows it.
+- Seeking works as for the film's buffers (checkpoints under the same budget, catch-up
+  in slices in the player). Progressive scrub and the background fill are for the
+  film's buffers only: a comp's buffers always catch up to the exact frame.
+- Memory: `shotglass check` adds the worst frame of the film's buffers and of every
+  comp's, and refuses more than 1 GB in all.
+
 ## Not yet
 
-Buffers in comps, seamless loop films (`loop = "warm"`), buffers inside the layer stack
+Seamless loop films (`loop = "warm"`) and buffers inside the layer stack
 (`after = "<layer>"`) come later (#138); see [the design](design/feedback.md).
 `check --deep` doesn't yet look for NaN/Inf in float state.

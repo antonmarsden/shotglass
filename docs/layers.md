@@ -157,6 +157,9 @@ so comps share the film's `scenes/` and textures. Shaders in a comp see:
   player's render scale); without it a comp shot or channel is the output size and a
   comp layer the layer's size.
 
+A comp may keep [feedback buffers](buffers.md#buffers-in-comps) of its own (0.1.10);
+such a comp is shown in one place only.
+
 Comps are picture only: a comp shot's `sound` is refused, and comps can use other comps
 up to 4 deep (never themselves). A comp's picture is opaque. Footage inside a comp
 follows the comp's frames, so `still`, `export` and playback show the same source frame.
