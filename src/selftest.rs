@@ -2552,6 +2552,62 @@ fn buffers_history(gl: &Gl, dir: &Path) -> Result<String> {
         0,
         0.0,
     )?;
+    // An init pass reading its own history ({ source = "@sim", frame = -2 }) reads black,
+    // never the slot it's drawing into, also when that slot holds an old fold's state.
+    let idir = dir.join("init-self");
+    write(
+        &idir,
+        &[
+            ("s.glsl", &scene("fragColor = vec4(uv, 0.0, 1.0);")),
+            (
+                "step.glsl",
+                &scene("fragColor = texture(iChannel0, uv) + vec4(0.1);"),
+            ),
+            (
+                "ini.glsl",
+                &scene("fragColor = vec4(0.5) + texture(iChannel0, uv);"),
+            ),
+            (
+                "show.glsl",
+                &scene("fragColor = vec4(texture(iChannel0, uv).rgb, 1.0);"),
+            ),
+        ],
+    )?;
+    let im = movie(
+        &idir,
+        "shotglass = \"0.1.9\"
+[[shot]]
+id=\"a\"
+scene=\"s.glsl\"
+duration=1
+         [[buffer]]
+id=\"sim\"
+scene=\"step.glsl\"
+init=\"ini.glsl\"
+size=[16, 16]
+         history=2
+channels=[{ source = \"@sim\", frame = -2 }]
+         [[layer]]
+id=\"l\"
+scene=\"show.glsl\"
+channels=[\"@sim\"]
+",
+    )?;
+    let mut ri = renderer(gl, &im)?;
+    for n in [0, 1, 2, 3, 4, 5, 6, 0] {
+        let f = buf_frame(&mut ri, &im, n, 1.0)?;
+        if n == 0 {
+            // Frame 0 reads frame -2, clamped to the init state: 0.5 + 0.1.
+            expect_px(
+                "init reading its own history (frame 0)",
+                &f,
+                10,
+                10,
+                [153, 153, 153],
+                1,
+            )?;
+        }
+    }
     // A film with only a pure history buffer takes no checkpoints.
     let pdir = dir.join("pure");
     write(

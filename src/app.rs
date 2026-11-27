@@ -614,6 +614,7 @@ impl Player {
 
     fn step(&mut self, frames: i64) {
         self.clock.pause();
+        self.catchup_paused = false;
         if let Some(m) = &self.movie {
             let index = m.frame_at_precise(self.clock.time_precise());
             let next = index
@@ -750,8 +751,9 @@ impl Player {
     }
 
     fn toggle_play(&mut self) {
-        self.catchup_paused = false;
-        if self.clock.playing() {
+        let was_catching_up = std::mem::replace(&mut self.catchup_paused, false);
+        if playback_state(self.clock.playing(), was_catching_up) {
+            // Held for a buffer catch-up (#134) counts as playing: pause stays paused.
             self.clock.pause();
         } else {
             if self.clock.time() >= self.duration() - 1e-3 {
@@ -763,6 +765,7 @@ impl Player {
     }
 
     fn resume_playback(&mut self) {
+        self.catchup_paused = false;
         let previous_rate = self.clock.sample_rate();
         match self.clock.reconnect_audio() {
             Ok(Some(a)) => {
@@ -968,6 +971,7 @@ impl Player {
         {
             self.gpu_lost = true;
             self.clock.pause();
+            self.catchup_paused = false;
         }
     }
 
@@ -976,7 +980,8 @@ impl Player {
             return None;
         }
         let m = self.movie.as_ref()?;
-        let playing = self.clock.playing();
+        // Held for a buffer catch-up (#134) is still playing: same frames, never blocking.
+        let playing = playback_state(self.clock.playing(), self.catchup_paused);
         // While playing, render each film frame once (fps from movie.toml) and keep it
         // up until the next: a 30 fps film needs half the GPU work of a 60 Hz redraw,
         // and playback shows exactly the frames `still` would.
@@ -1003,11 +1008,11 @@ impl Player {
         }
         // Paused or scrubbing: compile on the spot if needed. Playing: never stall,
         // keep the previous frame up until the shot's program is ready.
-        let blocking = !self.clock.playing();
+        let blocking = !playing;
         let Some(tex) = self.renderer.render(m, w, h, &info, blocking) else {
             // Buffers catching up after a seek while playing (#134): the clock waits (a
             // stall, not a drop), then playback resumes.
-            if playing && self.renderer.catchup_progress().is_some() {
+            if self.clock.playing() && self.renderer.catchup_progress().is_some() {
                 self.clock.pause();
                 self.catchup_paused = true;
             }
@@ -1350,9 +1355,11 @@ impl Player {
         if let Some(pos) = resp.interact_pointer_pos() {
             if resp.drag_started() || resp.clicked() {
                 if self.scrub_resume.is_none() {
-                    self.scrub_resume = Some(self.clock.playing());
+                    self.scrub_resume =
+                        Some(playback_state(self.clock.playing(), self.catchup_paused));
                 }
                 self.clock.pause();
+                self.catchup_paused = false;
             }
             if resp.dragged() || resp.clicked() || resp.drag_started() {
                 self.seek(t_of(pos.x));
@@ -2082,10 +2089,24 @@ fn clock_text(t: f32) -> String {
     format!("{:02}:{:05.2}", (t / 60.0) as u32, t % 60.0)
 }
 
+/// Is the player playing? The clock runs, or it's held while buffers catch up after a
+/// seek during playback (#134): renders stay non-blocking and pause still pauses.
+fn playback_state(clock_playing: bool, catchup_paused: bool) -> bool {
+    clock_playing || catchup_paused
+}
+
 #[cfg(test)]
 mod tests {
     use super::{LiveReload, RecursiveMode, channel, egui, next_scale};
     use std::{fs, time::Duration};
+
+    #[test]
+    fn buffer_catchup_hold_counts_as_playing() {
+        // Held for a catch-up: renders don't block, and toggling pauses.
+        assert!(super::playback_state(false, true));
+        assert!(super::playback_state(true, false));
+        assert!(!super::playback_state(false, false));
+    }
 
     #[test]
     fn live_reload_retries_a_failed_library_watch() {
