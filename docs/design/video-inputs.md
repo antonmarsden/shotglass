@@ -5,9 +5,12 @@ and other follow-ups are in #75. Builds on [ichannel.md](ichannel.md) (#22), whi
 left room for `{ video = "…" }` channels, and touches #32 (heavy assets) and #2 (web player).
 
 **Where the build differs from this proposal:**
-- Video decodes from a cached intra-only conform by default: every clip is transcoded
-  once to an all-intra, constant-rate copy in the cache rather than seeking in camera
-  files. The CFR-only probe and `shotglass conform` as a fallback (below) are superseded.
+- Phase 2 (video) was revised after review (#73): video is **WebM only (AV1)**, demuxed and
+  decoded **in-process** and seeked through the file's Cues, with no ffmpeg at playback and no
+  disk cache. Other formats go through an explicit `shotglass conform`, which writes a WebM
+  into the film folder. An automatic conform cache was considered and dropped: its disk use
+  grows with the footage, which is unsafe where temp space is small (cloud machines). The
+  sections on video below describe the revised design.
 - Open questions 1, 2 and 4 are settled as proposed: `end = "hold"`, footage
   `filter = "linear"`, exact frame or stall (no preview mode).
 
@@ -20,10 +23,12 @@ contents change with film time. Two kinds of footage source:
    No new dependencies: frames go through the existing `texture.rs` decoder, every frame
    is addressable on its own, so seeking is free and frame-exact. That covers Blender and
    other renderers, mattes, and re-using a shotglass `export --format png`.
-2. **Video files** (`footage/surf.mp4`): phase 2, decoded by the user's **ffmpeg run as a
-   subprocess** (as `export` already does), constant-frame-rate clips only, YUV converted
-   to RGBA in Rust on a worker thread. Nothing linked or bundled; no new licence
-   obligations.
+2. **Video files** (`footage/surf.webm`): phase 2, **AV1 in WebM**, demuxed by our own
+   Matroska reader and decoded in-process (rav1d, behind a feature), seeking to the
+   keyframe before a frame through the Cues; constant-frame-rate clips only, YUV converted
+   to RGBA in Rust on a worker thread. No ffmpeg at playback and no cache on disk; other
+   formats are converted once with `shotglass conform` (ffmpeg), which writes a WebM the
+   user keeps.
 
 The core of the design is the same for both:
 
@@ -71,8 +76,8 @@ shotglass = "0.1.6"            # the contract with footage (sequences)
 grain = "<kit/textures/grain_##.png>"                     # a library sequence (#: frame number)
 fog   = "renders/fog_####.png"                            # a sequence in the film folder
 matte = { frames = "renders/matte_####.png", fps = 24, first = 1001 }
-surf  = "footage/surf.mp4"                                # a video (phase 2)
-plate = { video = "footage/plate.mov", in = 12.5, srgb = true, filter = "mipmap" }
+surf  = "footage/surf.webm"                                # a video (phase 2)
+plate = { video = "footage/plate.webm", in = 12.5, srgb = true, filter = "mipmap" }
 
 [[shot]]
 id = "beach"
@@ -100,7 +105,7 @@ channels = [{ frames = "precomp/title_######.png", fps = "30000/1001", end = "bl
 | `"brick"` | a name from `[textures]` |
 | `"textures/brick.png"` | an image (`.png`, `.jpg`, `.jpeg`) |
 | `"renders/fog_####.png"` | an image sequence: an image path with one run of `#` in its **file name** |
-| `"footage/surf.mp4"` | a video: `.mp4`, `.m4v`, `.mov`, `.mkv`, `.webm`, `.avi` (any case) |
+| `"footage/surf.webm"` | a video: `.webm` (any case). `.mp4`, `.m4v`, `.mov`, `.mkv`, `.avi` are refused with the `shotglass conform` command that converts them |
 | `"<lib/…>"` | any of those from a library |
 
 **Tables** take exactly one of `file` (image), `frames` (sequence), `video`, or `texture`
@@ -145,7 +150,7 @@ and README plus `templates/new/movie.toml` (a commented example) are updated.
 pub enum Source {
     Image,                                   // as today
     Frames { pattern: Pattern, fps: Fps, first: u64, count: u64 },
-    Video { probe: Probe, fps: Fps },        // phase 2
+    Video { info: VideoInfo, fps: Fps },     // phase 2: from the WebM headers
 }
 pub struct Timing { pub in_s: f64, pub speed: f64, pub clock: Clock, pub end: End }
 ```
@@ -168,10 +173,10 @@ broken version before the renderer sees it):
   (open question 5). Frame 0's dimensions are read (`texture::dimensions`), and every
   frame must match: checked lazily as frames decode (a mismatch is that frame's error),
   and fully by `check`.
-- **Videos** are probed (`ffprobe`, see [Decoding](#decoding)): stream present, size,
-  rate, constant frame rate, frame count, pixel format, colour tags, rotation. Probe
-  results are cached in memory and in `cache_dir()` keyed by (path, length, mtime), so
-  reloads don't re-probe.
+- **Videos** are read by our WebM reader (see [Decoding](#decoding)): an AV1 video track,
+  size, constant frame rate, frame count, bit depth, colour (Matroska Colour element and
+  the AV1 sequence header), and the Cues. Reading headers and Cues is cheap (no decode);
+  results are kept in memory keyed by (path, length, mtime) so reloads don't re-read.
 - Size limits are #22's (4096 per side; `check --web` warns above 2048, and for footage
   above 1920×1080). The per-shot budget check counts footage by its streaming window
   (see [Memory](#memory)).
@@ -185,12 +190,14 @@ movie.toml: shot "beach": channels[1]: "renders/mate_####.png" matches no files 
 renders/fog_####.png: frames 1034–1036 are missing (between 1001 and 1100)
 renders/fog_1042.png: 1280×720, but the sequence is 1920×1080 (frame 1001)
 renders/fog_1042.png: unexpected end of PNG data (still being written?)
-footage/surf.mp4: variable frame rate (23.2–30.0 fps); shotglass needs constant-rate clips: shotglass conform footage/surf.mp4
-footage/surf.mp4: ffprobe not found (looked for "ffprobe" next to "ffmpeg"); video channels need ffmpeg: …install hints as in export…
-footage/hdr.mov: HDR (smpte2084) isn't supported yet; convert to SDR BT.709 first
-footage/plate.webm: VP9 with alpha: decoding with libvpx-vp9 to keep the alpha channel
+footage/surf.mp4: shotglass reads video as AV1 in WebM; convert it once: shotglass conform footage/surf.mp4
+footage/surf.webm: variable frame rate (frame 212 at 7.071 s, expected 7.067 s); convert it once: shotglass conform footage/surf.webm
+footage/plate.webm: VP9; shotglass decodes AV1 only: shotglass conform footage/plate.webm
+footage/plate.webm: no Cues (seeking needs them); convert it: shotglass conform footage/plate.webm
+footage/hdr.webm: HDR (smpte2084) isn't supported yet; convert to SDR BT.709 first
+footage/surf.webm: keyframes up to 10.0 s apart: a paused seek decodes up to 300 frames; shotglass conform --keyint for faster scrubbing   [check note]
 movie.toml: shot "titles": channels[0]: in = 12.0 is past the end of precomp/title_######.png (4.0 s, 120 frames)
-shot "beach" (6.0 s) runs past the end of footage/surf.mp4 (5.2 s from in = 3.0); end = "hold" freezes the last frame   [check warning]
+shot "beach" (6.0 s) runs past the end of footage/surf.webm (5.2 s from in = 3.0); end = "hold" freezes the last frame   [check warning]
 ```
 
 ## Time mapping
@@ -243,15 +250,17 @@ divide the period (`a visible jump at 4.0 s each loop`). The seam is handled lik
 ### Video timestamps
 
 A video's frame `k` must mean the same thing whether reached by decoding from the start or
-by seeking. Phase 2 accepts **constant-frame-rate** streams only: the probe requires
-`r_frame_rate == avg_frame_rate` and a frame count consistent with duration × rate (±1),
-and frame `k` is the frame at presentation time `start_time + k / rate`. Phone footage is
-often VFR; it gets a clear error pointing to `shotglass conform` (phase 2; superseded, see above), which runs
-ffmpeg once to write a CFR, all-intra copy (`-fps_mode cfr`, FFV1 or MJPEG) into the film
-folder. All-intra copies also make seeking, `speed > 2` and (later) reverse playback cheap.
+by seeking. Phase 2 accepts **constant-frame-rate** streams only. The rate comes from the
+track's `DefaultDuration`; frame `k` is the block whose timestamp, minus the first block's,
+rounds to `k · den / num` seconds at the file's timestamp scale. Matroska timestamps are
+usually whole milliseconds (our own export rounds to the nearest one), so the reader maps
+a timestamp to the **nearest** frame, never the floor: at 30000/1001 a floor would put some
+frames in the wrong slot. A block more than a quarter of a frame from its slot, a missing
+slot or a duplicate makes the file VFR, refused with the `conform` hint. Frames are counted
+in presentation order; AV1 in WebM stores them that way (hidden frames live inside a
+temporal unit).
 
-Rotation metadata (phones) is honoured as ffmpeg does by default (`autorotate`); the probe
-reports the rotated size, which is what `iChannelResolution` shows.
+Rotation and cropping metadata aren't read in phase 2 (`conform` applies rotation).
 
 ## Decoding
 
@@ -267,68 +276,101 @@ anything with alpha, and smaller frames on slow machines. (QOI, a fast lossless 
 `image` crate supports behind a feature, is a cheap later addition if PNG decode is the
 bottleneck.)
 
-### Phase 2: video via an ffmpeg subprocess
+### Phase 2: video, WebM + AV1 in-process
 
-Same model as export: the user's `ffmpeg` (`SHOTGLASS_FFMPEG` or the PATH) and `ffprobe`
-(`SHOTGLASS_FFPROBE`, else next to the chosen ffmpeg, else the PATH). Nothing linked.
+Revised after review (#73). The original proposal ran ffmpeg readers per seek position;
+then an automatic intra-only conform cache was proposed. Both are replaced by this.
 
-- **Probe** (at `Movie::load`, cached): `ffprobe -v error -select_streams v:0
-  -show_entries stream=… -of json`. `serde_json` parses it (a small new dependency). Unit tests parse recorded JSON for CFR, VFR, rotated, alpha, HDR and
-  10-bit files, so no ffmpeg is needed for them.
-- **Readers.** A reader is one ffmpeg process positioned at a source frame, writing raw
-  frames to a pipe that a worker thread reads:
+- **Container: WebM only.** Our Matroska code (`webm/mux.rs`, which already writes
+  clusters with one Cue per keyframe and has a test reader) grows a real demuxer: EBML
+  header, Tracks (the AV1 track's `CodecPrivate` = `av1C`, Colour, DefaultDuration), Cues,
+  and Clusters read on demand (SimpleBlock and BlockGroup). A file without Cues is refused
+  (seeking needs them).
+- **Codec: AV1 only** in phase 2, 8- and 10-bit 4:2:0 (4:4:4 if the decoder offers it).
+  Decoded by **rav1d** (the Rust port of dav1d, BSD-2) behind a `video` feature: it builds
+  with cargo, so no meson on Windows. dav1d itself is the fallback if rav1d proves too slow
+  or awkward. AV1 decoding is bit-exact by specification, threads or not.
+- **No VP9 in-process.** VP9 WebMs go through `conform`, where the user's ffmpeg decodes
+  them with its native decoder (ffvp9, the fastest VP9 decoder). ffvp9 itself can't be
+  used in-process without linking libavcodec (ruled out: build pain, LGPL, version
+  coupling), and its VP9-alpha support has historically needed libvpx anyway. If in-process
+  VP9 alpha is ever really needed, libvpx (BSD) behind a feature is the route.
+- **Alpha comes from matte clips:** a PNG sequence, or a second AV1 WebM whose luma is the
+  alpha, bound on another channel and read as `.r`. That works with phase 1 today and with
+  AV1, with no second codec.
+- **Seeking.** To get frame `k`: the Cue at or before `k` gives the cluster that starts with
+  its keyframe (our export writes closed GOPs, a cluster per keyframe); the decoder is reset
+  there and frames are decoded and dropped up to `k`. A seek costs the distance back to the
+  previous keyframe. **Fast scrubbing is not a requirement**: the rule is exact frame or
+  stall, and paused/scrubbing renders may block. With 2 s keyframes (our export's default) a
+  worst-case paused seek decodes ~60 frames, roughly 100–300 ms at 1080p on a desktop.
+- **Readers.** A reader is (an open file, a decoder, its position). A request for `k` is
+  served by a reader positioned at most one GOP before `k` (it decodes on); otherwise one
+  seeks. Reading forward, playback and export decode each frame once. A small pool per clip
+  (at most 4 readers, least recently used dropped) covers the cases that need separate
+  playheads on one clip: two shots of the same clip at different `in` crossing in a
+  transition, a comp channel with `time_offset`, `speed` above ~2. Readers run on the
+  `gfx::Decoder` pool as a decode-job kind behind the same "give me frame k" interface as
+  sequences (`trait FrameSource`); a reader belongs to one worker at a time.
+- **The current GOP is kept.** Frames decoded on the way to `k` are offered to the texture
+  store (within the footage budget and window) rather than dropped, so stepping back within
+  a GOP is cheap; stepping back past a keyframe seeks again.
+- **Back-pressure.** Readers decode only for requested frames (the window from
+  `footage_order`), bounded by the CPU-side cap. Nothing spins.
+- **Determinism.** Decoded YUV depends only on the file and `k`; the YUV→RGB step is
+  shotglass's own Rust code. So a video frame's texels depend only on the file, `k` and the
+  options, which is what play/`still`/`export` agreement needs. A selftest checks
+  seek-vs-sequential equality (see [Tests](#tests)), and `check --deep` decodes every frame
+  of the film's clips once, sequentially, and compares a sample against seeks.
+- **Errors.** A decode error becomes the frame's `Failed` message with the file and frame.
+  A build without the `video` feature refuses video channels at `Movie::load`, naming the
+  feature. Long GOPs aren't an error: `check` notes keyframes more than 4 s apart.
 
-  ```
-  ffmpeg -nostdin -hide_banner -loglevel error [-c:v libvpx-vp9]
-         -ss <start_time + (k − 0.5)/rate> -i <clip>
-         -map 0:v:0 -an -sn -dn -fps_mode passthrough
-         -f rawvideo -pix_fmt <fmt> -
-  ```
+#### `shotglass conform`
 
-  Input seeking (`-ss` before `-i`) decodes from the previous keyframe and discards up to
-  the seek time, so the first frame out is frame `k` of a CFR clip (the half-frame bias
-  absorbs timestamp rounding). The reader then serves `k+1, k+2, …` sequentially.
-  `-c:v libvpx-vp9` is added for VP9 with alpha (ffmpeg's native VP9 decoder drops it).
-- **Seek vs read on.** A request for frame `j` is served by a reader whose next frame is at
-  most `j` and no more than 2 s of frames before it (it reads and discards up to `j`); otherwise a new reader is
-  spawned at `j` and the old one killed. Playback at `speed ≤ 2` therefore runs one
-  process per active channel; scrubbing spawns per scrub position (debounced to the
-  latest request). At most 4 readers live at once, least recently used killed first;
-  readers of shots outside the lookahead are killed in `evict`.
-- **Back-pressure.** The worker thread pushes decoded frames into a bounded queue (the
-  CPU-side window); when it's full the thread stops reading and ffmpeg blocks on the
-  pipe. Nothing spins.
-- **Pixel formats.** Ask ffmpeg for the clip's *native* 8-bit planar format when it's one
-  of `yuv420p`, `yuvj420p`, `yuv422p`, `yuv444p`, `yuva420p`, `yuva444p`, `gbrp`,
-  `rgb24`, `rgba`, and convert in Rust (below). Other formats (10-bit, NV12-only
-  hardware formats, …) are requested as `rgba` with a `check` note that ffmpeg's
-  converter, whose rounding can change between ffmpeg versions, did the conversion.
-- **Determinism.** The mainstream codecs (H.264, HEVC, VP9, AV1, ProRes, FFV1) have
-  bit-exact decoders by specification, so the decoded YUV is the same from a seek or a
-  sequential read, with or without threads, on any machine with the same codec support.
-  The YUV→RGB step is shotglass's own Rust code. So a video frame's texels depend only on
-  the file, `k` and the options, which is what play/`still`/`export` agreement needs.
-  A selftest checks seek-vs-sequential equality on a generated clip (see [Tests](#tests)),
-  and `check --deep` (new flag, phase 2) does the same on a sample of frames of the
-  film's own clips, catching odd files (open GOPs with broken timestamps, edit lists).
-- **Errors.** A reader's stderr is kept (bounded) and becomes the frame's `Failed`
-  message. ffmpeg missing gives export's install hints. A film with video channels runs
-  without ffmpeg only for `check --no-gpu` without `--deep` (probe skipped, a warning).
+Explicit, never automatic: `shotglass conform footage/surf.mp4 [-o footage/surf.webm]`
+writes a WebM next to the source (or where `-o` says), which the user keeps, commits (Git
+LFS) or deletes. Nothing goes to a cache. ffmpeg is needed only here, as a decoder
+(`SHOTGLASS_FFMPEG` or the PATH, export's install hints): it decodes to raw YUV at a
+constant rate (`-fps_mode cfr`, autorotate applied) into a pipe, and our built-in encoder
+(`webm::encode`, SVT-AV1, the `webm` feature) and muxer write the file. Options:
+
+- `--keyint N` (default: export's ~2 s); smaller for faster scrubbing.
+- `--crf` (default: higher quality than export's), `--lossless` where the encoder supports
+  it, `--bits 8|10` (default: the source's depth, at most 10).
+- Colour: the source's matrix, range and chroma siting are kept (no trip through RGB); HDR
+  sources are refused.
+
+Conforming re-encodes, so pixels change slightly (generation loss) unless `--lossless`, and
+a VFR source gets frames duplicated or dropped onto the constant-rate grid. `conform`
+prints what it did. Encoders aren't bit-exact across versions, so the conformed file, not
+the source, is the film's input. A source that is already suitable (AV1, CFR, Cues) needs
+no conform; `conform` says so and writes nothing.
+
+**Our own export is already readable:** built-in `export --format webm` writes AV1, CFR
+(frame n at n·den/num s, nearest millisecond), closed GOPs with a cluster and Cue per
+keyframe, BT.709 limited range tagged in both the sequence header and the Colour element.
+Its 10-bit default is fine (the reader handles 10-bit). `--keyint` becomes a command-line
+option on both. AV1 in WebM has no standard alpha: an exported film with transparency is
+read back as a PNG sequence (phase 1) or as a separate matte clip.
+
+**Open for phase 2:** rav1d vs dav1d after measuring; the long-GOP note's threshold.
 
 ### Colour
 
 **YUV → RGB on the CPU, in Rust**, on the reader's worker thread: fixed-point BT.601,
 BT.709 or BT.2020 (non-constant luminance) matrices, limited or full range, chroma
 upsampled with a fixed bilinear filter whose phase follows the stream's chroma siting
-from the probe (`left`, the H.264/HEVC default for 4:2:0, when untagged). Output is RGBA8 with alpha 255
+from the file (`left`, the AV1 and H.264/HEVC default for 4:2:0, when untagged). Output is RGBA8 with alpha 255
 (or the clip's alpha plane), gamma-encoded as the file's transfer leaves it, i.e. the
 same kind of numbers as a JPEG photo. So `srgb = false` (the default) reads the encoded
 values as on Shadertoy, and `srgb = true` uploads as `SRGB8_ALPHA8` for linear sampling,
 exactly as for images. (BT.709's transfer isn't sRGB's, but the difference is small and is
 the convention every NLE and browser uses for SDR video on an sRGB display.)
 
-Matrix and range come from the file's tags; untagged files follow ffmpeg's own rule
-(height ≥ 720 → BT.709, else BT.601; YUV → limited range). `matrix`/`range` override.
+Matrix and range come from the file's tags (the Matroska Colour element, else the AV1
+sequence header); untagged files follow ffmpeg's rule (height ≥ 720 → BT.709, else
+BT.601; YUV → limited range). `matrix`/`range` override.
 HDR transfers (PQ, HLG) are refused in phase 2.
 
 Why not on the GPU: a YUV→RGB pass would be engine-provided GLSL, which CLAUDE.md rules
@@ -452,26 +494,26 @@ than being deleted, and pools are deleted when their footage leaves 1.5 × `LOOK
 
 ### Performance expectations
 
-- Real GPU, 1080p30 JPEG sequence or H.264: real time with a 3–4-thread pool or one
+- Real GPU, 1080p30 JPEG sequence or AV1 WebM: real time with a 3–4-thread pool or one
   reader; 4K60 is beyond the client-memory path's comfort and wants the PBO ring.
 - llvmpipe: uploads and sampling are slow; CI only uses tiny frames (64×36) and judges
   correctness, never speed.
 - When decode can't keep up while playing, the player stalls on those frames (the clock and
   sound carry on, as for any stall), the panel says which footage is behind, and README
-  suggests JPEG, smaller frames, or `shotglass conform` (all-intra) for long-GOP files.
+  suggests JPEG, smaller frames, or `shotglass conform --keyint` for long-GOP files.
 
 ## Export, still, strip, check
 
 - `export` renders frame `n` with `blocking = true` in order, so a video channel is read
   by one sequential reader for the whole export (no seeks; exports run as fast as decode
-  allows). Its ffmpeg encoder and the footage readers are separate processes.
-- `still`/`strip` at arbitrary frames seek per frame (strips of 8 frames: 8 short reads).
+  allows).
+- `still`/`strip` at arbitrary frames seek per frame (up to one GOP of decoding each).
 - `check` lists footage with size, rate, length, frame count, memory per window, and
   warns about: a shot running past the clip end with `hold`, loop-length mismatches in loop
-  films, VFR (error), untagged colour (note), large files not in Git LFS (see below),
+  films, VFR (error), untagged colour (note), keyframes more than 4 s apart (note), large files not in Git LFS (see below),
   reading an `iChannel` a shot doesn't bind (existing lint). `check --deep` decodes every
-  sequence frame (sizes, corrupt files) and does the seek-vs-sequential video check on a
-  sample.
+  sequence frame (sizes, corrupt files) and every video frame (sequentially), comparing a
+  sample against seeks.
 - `check --web` (phase 1): sequences pass (same decoder in wasm, preloaded); video is
   reported as not playable on the web yet (#2 decides), and footage larger than 1080p or
   more than ~200 MB total preload gets a warning.
@@ -497,10 +539,10 @@ than being deleted, and pools are deleted when their footage leaves 1.5 × `LOOK
 
 ## Audio in clips
 
-Phases 1–2 **ignore clip audio** (`-an`). shotglass's sound is GLSL synthesised in
+Phases 1–2 **ignore clip audio** (the reader skips other tracks; `conform` drops audio). shotglass's sound is GLSL synthesised in
 chunks, deterministic and chunk-size independent; an audio file is a different kind of
 input. When it's wanted, the natural design (with #32's audio samples) is a sound-side
-input: `[sound] samples = { surf = "footage/surf.mp4" }` decoded once by ffmpeg to PCM at
+input: `[sound] samples = { surf = "footage/surf.webm" }` decoded once to PCM at
 the soundtrack rate, uploaded as a texture, and read by sound shaders through a contract
 function (`sample(SURF, samp)`), with the same `in`/`speed` timing as the picture channel
 so picture and sound stay locked. A sample lookup is a pure function of the sample index,
@@ -510,16 +552,14 @@ listed under phase 3 and needs its own design.
 ## Dependencies and licensing
 
 - **Phase 1 adds nothing.** `image` already has `png` and `jpeg`.
-- **Phase 2 runs ffmpeg/ffprobe as processes**, as `export` does: no linking, so no
-  LGPL/GPL obligations for shotglass, and the user's build decides codec support
-  (and any codec patent questions, as for export). `licenses`/`bundle` don't change; a
-  bundled film's README notes "video channels need ffmpeg". The only new crate is
-  `serde_json` (MIT/Apache) for ffprobe's output.
-- **Availability.** Linux: distribution packages (CI's Ubuntu job installs it already).
-  macOS: `brew install ffmpeg`. Windows: `winget install ffmpeg` (Gyan builds include
-  ffprobe and libvpx). Windows CI has no ffmpeg (CONTRIBUTING.md already lists the video
-  export skip); video selftests skip there with the same note, and the macOS job can
-  install it with brew.
+- **Phase 2 adds rav1d** (BSD-2, Rust) behind a `video` feature, listed by `shotglass
+  licenses` like `ENCODER_LICENCES`. The demuxer is ours. AV1 is royalty-free. Playback
+  needs no ffmpeg; `shotglass conform` runs the user's ffmpeg as a process (as `export`
+  can), so nothing is linked and there are no LGPL/GPL obligations.
+- **Availability.** The video selftests and golden need only the `video` feature (the test
+  clip is committed; fixtures are written by our own encoder with the `webm` feature), so
+  they run on every CI platform. Only `conform`'s tests need ffmpeg and skip without it
+  (Windows CI), as export's do.
 - **Phase 3 EXR**: the `image` crate's `exr` feature (pure Rust, BSD-3), fine for wasm.
 - **Footage in git.** Plates are large. `.gitattributes` in the template gains `*.mp4`,
   `*.mov`, `*.webm`, `*.mkv` as `binary`, and README recommends Git LFS (the existing
@@ -568,7 +608,7 @@ shotglass 0.1.x" message and a `check` warning when a film uses footage but its
   the error messages above, unknown keys, the near-valid-`movie.toml` proptest.
 - **Sequence scanning** (temp dirs of empty files): `first` detection, gaps, padding
   overflow (`fog_10000.png` in `####`), case mismatches, `%04d` hint.
-- **Probe parsing** from recorded ffprobe JSON: CFR/VFR, rotation, alpha, HDR, 10-bit,
+- **WebM reading** from small committed and generated files: CFR/VFR detection, Cues, nearest-ms timestamps, HDR refused, 10-bit,
   colour tags and the untagged rule.
 - **YUV → RGB** (`footage.rs`): known colours (BT.601/709/2020 × tv/pc) to the expected
   RGBA8, chroma siting, alpha plane, odd widths/heights.
@@ -600,11 +640,13 @@ at 330 and ES 3.00.
    version is refused.
 7. *Uploads restore unpack state* with footage interleaved with sound streaming (extends
    #22's check).
-8. Phase 2, *video*: the selftest asks ffmpeg to encode the generated sequence into a
-   long-GOP H.264 (`-g 12 -bf 2`) and a VP9-with-alpha clip, then checks: frame `k` from a
-   seek equals frame `k` read sequentially (bit for bit); the mapping matches
-   `source_frame`; colour of known YUV bars is within 1 of the expected RGBA8; alpha
-   survives. Skipped with a message when ffmpeg isn't there (Windows CI).
+8. Phase 2, *video*: the selftest encodes the generated sequence with our encoder (short
+   and long `keyint`, 8- and 10-bit) and checks: frame `k` from a seek equals frame `k`
+   read sequentially (bit for bit), from every position including across GOPs; the mapping
+   matches `source_frame` at 30000/1001 (nearest-millisecond timestamps); playback of the
+   clip has no `footage_misses` and no blocking loads; known YUV bars convert to within 1
+   of the expected RGBA8. `conform` (skipped without ffmpeg): an already suitable WebM is
+   left alone, and a conformed VFR clip reads as CFR.
 9. Phase 3: the PBO path and the client-memory path give identical frames, with and
    without persistent buffers, as for sound.
 
@@ -617,8 +659,8 @@ glance. The film exercises 24 fps in a 30 fps film, `in`, `speed = 0.5`, `end = 
 `clock = "movie"` across a cut, and the matte's alpha. Reference
 `tests/golden/footage.png` (8 frames, 320×180, llvmpipe), and the film joins
 `validate.rs`'s "passes everywhere" list. Phase 2 adds `tests/films/footage-video/` with a
-tiny committed clip (VP9 in WebM, royalty-free, about 20 KB), golden on Linux and skipped
-where ffmpeg is missing. The demo and the template keep their looks (no re-bless).
+tiny committed clip (AV1 in WebM written by our own export, about 20 KB, keyframes every 8
+frames so the strip crosses a GOP), golden wherever the `video` feature is built. The demo and the template keep their looks (no re-bless).
 
 ## Phased plan
 
@@ -636,12 +678,13 @@ where ffmpeg is missing. The demo and the template keep their looks (no re-bless
   patch bump. Owner checks real-time 1080p JPEG playback on Windows/NVIDIA and tunes
   the budget.
 
-**Phase 2: video via ffmpeg.** `footage.rs` probe, readers, YUV→RGBA; `shotglass
-conform`; the renderer side should need no change beyond a new decode job kind (the
-reader is behind the same "give me frame k" interface as sequences:
-`trait FrameSource { fn frame(&mut self, k: u64) -> Result<Decoded> }`, sequential
-sources cheap for k+1). Selftest 8, video golden case, contract patch bump, README
-"Footage" + ffmpeg notes.
+**Phase 2: video, WebM + AV1 in-process (#73).** WebM demuxer (from `webm/mux.rs`'s
+reader), rav1d behind a `video` feature, YUV→RGBA in Rust (`footage.rs`), readers that
+seek through the Cues; the renderer side should need no change beyond a new decode job
+kind (`trait FrameSource { fn frame(&mut self, k: u64) -> Result<Decoded> }`, sequential
+sources cheap for k+1) and a reader pool per clip. `--keyint` on export; `shotglass
+conform` (ffmpeg decode → our encoder). Selftest 8, video golden case, contract patch
+bump, README "Footage" (WebM, conform, LFS).
 
 **Phase 3 (each its own issue):** RGBA16F (EXR, 16-bit PNG); persistent PBO upload ring;
 clip audio as sound samples (#32); reverse `speed`; frame blending; footage on the web
@@ -653,11 +696,12 @@ the bottleneck.
 
 | option | for | against | verdict |
 |---|---|---|---|
-| **ffmpeg subprocess** (proposed, phase 2) | every codec the user's ffmpeg has; nothing linked or bundled; same model and install story as export; bit-exact decoders | process per reader; seek latency of a process start plus a GOP; needs CFR for exact frame mapping; parsing ffprobe output | recommended |
-| **Image sequences only** (phase 1) | zero dependencies, trivially frame-exact, random access, works on the web today, the format renderers write anyway | huge on disk for live-action; PNG decode is slow; users must convert clips themselves | the MVP, and the format `conform` could target |
+| **ffmpeg subprocess** (the first proposal) | every codec the user's ffmpeg has; nothing linked or bundled; same model and install story as export; bit-exact decoders | process per reader; seek latency of a process start plus a GOP; needs CFR for exact frame mapping; parsing ffprobe output | replaced by in-process WebM (#73); ffmpeg kept only for `conform` |
+| **Automatic intra-only conform cache** (#73's first revision) | every seek is one frame; VFR handled once | disk use grows with the footage (unsafe with small temp space, e.g. cloud machines); a hidden re-encode changes pixels; encoder output differs across versions | dropped; `conform` is explicit and writes a file the user keeps |
+| **Image sequences only** (phase 1) | zero dependencies, trivially frame-exact, random access, works on the web today, the format renderers write anyway | huge on disk for live-action; PNG decode is slow; users must convert clips themselves | the MVP |
 | **`ffmpeg-next` / `video-rs` (linked libav)** | no process overhead, precise seeking by pts, VFR possible | C build pain on Windows/macOS (vcpkg, pkg-config), version coupling, LGPL (or GPL with x264-enabled builds) obligations when distributing binaries, doesn't build for wasm | not now; revisit if subprocess latency proves a problem |
 | **Platform decoders** (Media Foundation, AVFoundation, VA-API) | hardware decode, no install | three code paths; colour conversion and rounding differ per OS, breaking cross-machine agreement; frame-accurate seeking is awkward | no |
-| **Pure-Rust decoder** (rav1d for AV1 + a WebM/MP4 demuxer) | no external tool, bit-exact everywhere, builds for wasm (a path for #2) | one codec (users must transcode to AV1, slow to encode), demuxing and seeking to write ourselves | promising for "shotglass's own footage format" later, especially for the web |
+| **Pure-Rust decoder** (rav1d for AV1 + a WebM demuxer) | no external tool, no process per seek, no disk cache, bit-exact everywhere | one codec (users must transcode to AV1, slow to encode), demuxing and seeking to write ourselves | **chosen for phase 2** (#73): WebM only, our demuxer (we already write WebM), `conform` for other formats; browsers decode the same files with WebCodecs (#2) |
 | **GStreamer** | full pipeline, hardware decode | very heavy dependency, same linking/install issues as libav | no |
 | **Hardware decode with GL interop** (NVDEC, VA-API → GL) | zero-copy 4K | vendor-specific, not on llvmpipe or macOS GL 4.1, nondeterministic conversion | no |
 | **YUV→RGB in an engine GLSL pass** | a third of the upload bandwidth at 4:2:0 | built-in GLSL (against CLAUDE.md), GPU-dependent rounding | no; `planes = true` + a library conversion is the compliant version |
