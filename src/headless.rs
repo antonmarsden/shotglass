@@ -67,9 +67,10 @@ fn run<R>(el: &ActiveEventLoop, job: Job<R>) -> Result<R> {
     let surface = unsafe { display.create_window_surface(&config, &surface_attrs)? };
     let context = not_current.make_current(&surface)?;
     let _ = surface.swap_buffers(&context);
-    let gl = Arc::new(unsafe {
-        glow::Context::from_loader_function_cstr(|s| display.get_proc_address(s))
-    });
+    let mut gl =
+        unsafe { glow::Context::from_loader_function_cstr(|s| display.get_proc_address(s)) };
+    crate::gfx::gldebug::install(&mut gl);
+    let gl = Arc::new(gl);
     let out = job(gl);
     drop(context);
     drop(surface);

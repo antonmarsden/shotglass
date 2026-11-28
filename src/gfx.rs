@@ -16,6 +16,7 @@ use std::sync::Arc;
 use toodee::{TooDeeOps, TooDeeOpsMut, TranslateOps};
 
 mod fold;
+pub mod gldebug;
 pub mod glstate;
 pub mod ledger;
 pub use ledger::{GlObjects, Tracked};
@@ -491,6 +492,8 @@ pub struct Renderer {
     /// KHR_parallel_shader_compile: compiles run on driver threads.
     pub parallel: bool,
     binary_dir: Option<PathBuf>,
+    /// GL_PROGRAM_BINARY_FORMATS (asked once at startup).
+    binary_formats: Vec<u32>,
     frame_no: u64,
     /// Programs loaded from the on-disk cache instead of compiled.
     pub binary_hits: usize,
@@ -795,6 +798,13 @@ impl Renderer {
                 gl.max_shader_compiler_threads(0xFFFF_FFFF);
             }
             let formats = gl.get_parameter_i32(glow::NUM_PROGRAM_BINARY_FORMATS);
+            // The formats themselves, asked once: a cached binary in any other format
+            // (a corrupt file, another driver's) is stale, never handed to GL (an error).
+            let mut binary_formats = vec![0i32; formats.max(0) as usize];
+            if formats > 0 {
+                gl.get_parameter_i32_slice(glow::PROGRAM_BINARY_FORMATS, &mut binary_formats);
+            }
+            let binary_formats: Vec<u32> = binary_formats.into_iter().map(|f| f as u32).collect();
             let v = gl.version();
             let can_persist = !driver.es
                 && ((v.major, v.minor) >= (4, 4) || ext.contains("GL_ARB_buffer_storage"))
@@ -846,6 +856,7 @@ impl Renderer {
                 fallback: HashMap::new(),
                 parallel,
                 binary_dir,
+                binary_formats,
                 frame_no: 0,
                 binary_hits: 0,
                 compiles_started: 0,
@@ -2777,6 +2788,9 @@ impl Renderer {
         unsafe {
             if let Some(bytes) = self.binary_path(src).and_then(|p| std::fs::read(p).ok())
                 && bytes.len() > 4
+                && self.binary_formats.contains(&u32::from_le_bytes([
+                    bytes[0], bytes[1], bytes[2], bytes[3],
+                ]))
             {
                 let format = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
                 let prog = gl.new_program().map_err(|e| vec![e])?;
