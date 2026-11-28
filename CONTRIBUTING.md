@@ -99,7 +99,7 @@ tested by the owner on a real GPU. If you work that way too:
   The right-hand files hold the invariants about blocking, GPU syncs, the audio
   callback and bit-exact sound; two concurrent changes there interact in ways neither
   session's tests see. Finish, review and merge one before starting the next.
-  `movie.rs`, `shader.rs` and `selftest/mod.rs` (the `CHECKS` list) are shared by many changes: expect
+  `movie/`, `shader.rs` and `selftest/mod.rs` (the `CHECKS` list) are shared by many changes: expect
   conflicts and rebase rather than merge by hand.
 - **Fresh-context review before the real-GPU test.** When the session says it's done,
   review the diff in a new session (`/code-review`, or a plain "review this branch
