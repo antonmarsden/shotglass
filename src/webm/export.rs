@@ -26,6 +26,78 @@ fn frame_ns((num, den): (u32, u32), n: u64) -> u64 {
     (u128::from(n) * 1_000_000_000 * u128::from(den) / u128::from(num)) as u64
 }
 
+/// Encoded Opus as the muxer's track and packets (DiscardPadding on the last one).
+pub fn audio_track(s: OpusPackets) -> (mux::Audio, Vec<mux::AudioPacket>) {
+    let track = mux::Audio {
+        channels: 2,
+        pre_skip: s.pre_skip,
+    };
+    let last = s.packets.len().saturating_sub(1);
+    // Rounded to the nearest ns, so demuxers converting back to samples get exactly
+    // `padding` whichever way they round.
+    let pad_ns = ((s.padding as u64 * 1_000_000_000 + 24_000) / 48_000) as i64;
+    let packets = s
+        .packets
+        .into_iter()
+        .enumerate()
+        .map(|(k, data)| mux::AudioPacket {
+            pts_ns: k as u64 * OPUS_FRAME as u64 * 1_000_000_000 / 48_000,
+            data,
+            discard_padding_ns: if k == last { pad_ns } else { 0 },
+        })
+        .collect();
+    (track, packets)
+}
+
+/// Encode I420 frames (as `yuv::frame_bytes` lays them out) into a WebM, with an
+/// Opus track when `audio` is given: test fixtures for footage (#73), and what
+/// `shotglass conform` writes (the clip's sound kept for later, #32).
+pub fn write_clip(
+    path: &Path,
+    set: &Av1Settings,
+    frames: impl IntoIterator<Item = Vec<u8>>,
+    audio: Option<OpusPackets>,
+) -> Result<()> {
+    let mut enc = Av1Encoder::new(set)?;
+    let (seq, seq_obu) = av1::find_sequence_header(enc.header())?;
+    let video = mux::Video {
+        width: set.width as u32,
+        height: set.height as u32,
+        codec_private: av1::av1c(&seq, &seq_obu),
+        bit_depth: set.depth,
+        fps: set.fps,
+        colour: set.colour,
+    };
+    let file = std::io::BufWriter::new(std::fs::File::create(path)?);
+    let (track, packets) = audio.map(audio_track).unzip();
+    let mut mux = mux::Writer::new(file, "webm", &video, track.as_ref().zip(packets))?;
+    let mut next = 0i64;
+    let mut write = |mux: &mut mux::Writer<_>, p: super::encode::Packet| -> Result<()> {
+        if p.pts != next {
+            bail!(
+                "the encoder returned frame {} when frame {next} was due",
+                p.pts
+            );
+        }
+        next += 1;
+        let tu = av1::strip_temporal_delimiters(&p.data)?;
+        mux.video(frame_ns(set.fps, p.pts as u64), p.keyframe, &tu)?;
+        Ok(())
+    };
+    for (n, f) in frames.into_iter().enumerate() {
+        enc.send(&f, n as i64)?;
+        while let Some(p) = enc.receive()? {
+            write(&mut mux, p)?;
+        }
+    }
+    enc.finish()?;
+    while let Some(p) = enc.receive()? {
+        write(&mut mux, p)?;
+    }
+    mux.finish(frame_ns(set.fps, next as u64))?;
+    Ok(())
+}
+
 /// Frames between keyframes: about two seconds, so browsers seek quickly.
 pub fn keyint((num, den): (u32, u32)) -> u32 {
     ((2.0 * f64::from(num) / f64::from(den)).round() as u32).max(1)
@@ -44,6 +116,7 @@ pub fn settings(m: &Movie, w: usize, h: usize, o: &Av1Options) -> Av1Settings {
         speed: o.speed,
         keyint: o.keyint.unwrap_or_else(|| keyint((m.fps_num, m.fps_den))),
         grain: o.grain,
+        colour: super::ColourTags::BT709,
     }
 }
 
@@ -124,29 +197,10 @@ pub fn export(
         codec_private: av1::av1c(&seq, &seq_obu),
         bit_depth: av1o.depth,
         fps: (m.fps_num, m.fps_den),
+        colour: set.colour,
     };
     let audio_frames = sound.as_ref().map_or(0, |s| s.samples);
-    let audio = sound.map(|s| {
-        let track = mux::Audio {
-            channels: 2,
-            pre_skip: s.pre_skip,
-        };
-        let last = s.packets.len().saturating_sub(1);
-        // Rounded to the nearest ns, so demuxers converting back to samples get exactly
-        // `padding` whichever way they round.
-        let pad_ns = ((s.padding as u64 * 1_000_000_000 + 24_000) / 48_000) as i64;
-        let packets = s
-            .packets
-            .into_iter()
-            .enumerate()
-            .map(|(k, data)| mux::AudioPacket {
-                pts_ns: k as u64 * OPUS_FRAME as u64 * 1_000_000_000 / 48_000,
-                data,
-                discard_padding_ns: if k == last { pad_ns } else { 0 },
-            })
-            .collect::<Vec<_>>();
-        (track, packets)
-    });
+    let audio = sound.map(audio_track);
 
     let total = m.frame_count() * loops;
     let duration_ns = frame_ns((m.fps_num, m.fps_den), total);

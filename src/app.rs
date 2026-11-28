@@ -240,6 +240,8 @@ impl LiveReload {
                                     | "PNG"
                                     | "JPG"
                                     | "JPEG"
+                                    | "webm"
+                                    | "WEBM"
                                     | "ttf"
                                     | "otf"
                                     | "ttc"

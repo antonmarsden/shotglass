@@ -12,6 +12,15 @@
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    // `rav1d`: this build decodes video (the `video` feature, on a target rav1d
+    // builds for on stable Rust; see Cargo.toml).
+    println!("cargo::rustc-check-cfg=cfg(rav1d)");
+    let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    if std::env::var_os("CARGO_FEATURE_VIDEO").is_some()
+        && !matches!(arch.as_str(), "arm" | "riscv32" | "riscv64")
+    {
+        println!("cargo::rustc-cfg=rav1d");
+    }
     #[cfg(feature = "webm")]
     webm::build();
     build_msdfgen();

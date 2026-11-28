@@ -9,10 +9,11 @@
 #
 # Built without the `webm` feature (built-in WebM export: CMake, SVT-AV1, libopus):
 # the goldens and the GL checks don't need it, and CI's clippy covers that build.
+# With `video` (rav1d, whose x86 asm needs nasm): the video golden film needs it.
 FROM rust:1-bookworm
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        libasound2-dev pkg-config \
+        libasound2-dev pkg-config nasm \
         xvfb xauth \
         libgl1 libegl1 libgl1-mesa-dri \
         libx11-xcb1 libxkbcommon-x11-0 libxcursor1 libxrandr2 libxi6 \
@@ -27,6 +28,6 @@ COPY src src
 COPY tests tests
 COPY templates templates
 COPY movies movies
-RUN cargo build --release --tests --no-default-features --features strict-glsl
+RUN cargo build --release --tests --no-default-features --features strict-glsl,video
 
-CMD ["xvfb-run", "-a", "cargo", "test", "--release", "--no-default-features", "--features", "strict-glsl"]
+CMD ["xvfb-run", "-a", "cargo", "test", "--release", "--no-default-features", "--features", "strict-glsl,video"]

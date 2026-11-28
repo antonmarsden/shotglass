@@ -85,3 +85,5 @@ sound = "sfx/chime.glsl"
 # fog = "renders/fog_####.png"
 # plate = { frames = "renders/plate_####.jpg", fps = 24, first = 1001, end = "loop" }
 # and in a shot, re-timed: channels = [{ texture = "plate", in = 2.0, speed = 0.5, clock = "shot" }]
+# Video, AV1 in WebM (shotglass = "0.1.12"; other formats: shotglass conform clip.mp4):
+# surf = { video = "footage/surf.webm", in = 3.0 }

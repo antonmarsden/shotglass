@@ -47,18 +47,17 @@ shotglass tells what an entry is from how it's written, the same way everywhere:
 | `"brick"` (no `.`, `/` or `<`) | a name from `[textures]` |
 | `"textures/brick.png"`, `"<kit/textures/noise.png>"` | an image (`.png`, `.jpg`, `.jpeg`) |
 | `"renders/fog_####.png"` (one run of `#` in the file name) | an image sequence, `#` = frame number (see [Footage](#footage)) |
-| `"footage/surf.mp4"` (`.mp4`, `.m4v`, `.mov`, `.mkv`, `.webm`, `.avi`) | a video (not yet: footage phase 2) |
+| `"footage/surf.webm"` | a video: AV1 in WebM (see [Video](#video)); `.mp4`, `.m4v`, `.mov`, `.mkv`, `.avi` get the `shotglass conform` command that converts them |
 | `"@input"`, `"@picture"`, `"@title"` | on a [layer](layers.md#layers): another pass's picture |
 | `"@intro"` (a `[comps]` name) | a [comp](layers.md#comps)'s picture, at the reader's `iTime` |
 | `{ file = "…", … }` | an image with options |
 | `{ frames = "…", … }` | an image sequence with options |
-| `{ texture = "plate", in = 2.0, … }` | a `[textures]` image sequence, re-timed |
+| `{ video = "…", … }` | a video with options |
+| `{ texture = "plate", in = 2.0, … }` | a `[textures]` image sequence or video, re-timed |
 | `{ text = "title", … }` | a `[texts]` entry with sampling options (`filter`, `wrap`, `vflip`) |
 | `{ source = "@intro", time_offset = 1.0, … }` | a comp, shifted in time, with `filter` (no `"mipmap"`) and `wrap` |
 
-Names come from `[textures]` and `[texts]`, which share one namespace. Videos are
-recognised so a film that uses one gets a clear message (they arrive with footage
-phase 2; convert a clip to an image sequence meanwhile), instead of an unrelated error.
+Names come from `[textures]` and `[texts]`, which share one namespace.
 
 | option | values | default |
 |---|---|---|
@@ -152,8 +151,56 @@ channels = [{ texture = "fog", in = 4.0, speed = 0.5 }, "matte"]
   its first frame; `check --deep` decodes every frame. It warns when a shot runs past
   the end of its sequence with `end = "hold"`, and when an `end = "loop"` sequence on the
   movie clock doesn't fit a loop film's period a whole number of times.
-- Video files come with footage phase 2. Meanwhile convert a clip to a sequence:
-  `ffmpeg -i clip.mp4 frames/clip_%05d.png`, then `"frames/clip_#####.png"`.
+
+### Video
+
+A video channel plays a clip (needs `shotglass = "0.1.12"`): **AV1 in WebM**, decoded
+by shotglass itself (rav1d, the Rust port of dav1d), with the timing options above.
+Its rate is the clip's own (`fps` reinterprets it, as for a sequence: a 23.976 clip
+played as 24).
+
+```toml
+[textures]
+plate = "footage/plate.webm"
+surf  = { video = "footage/surf.webm", in = 3.0, matrix = "bt709", range = "tv" }
+
+[[shot]]
+id = "beach"
+scene = "scenes/beach.glsl"
+duration = 6.0
+channels = ["plate", { texture = "surf", speed = 0.5 }]
+```
+
+| option | values | default | meaning |
+|---|---|---|---|
+| `fps` | a number or `"num/den"` | the clip's | reinterprets the clip's rate |
+| `matrix` | `"bt601"`, `"bt709"`, `"bt2020"` | the file's tags, else BT.709 from 720 lines up, BT.601 below | Y'CbCr → RGB matrix, for badly tagged files |
+| `range` | `"tv"` (16–235), `"pc"` (full) | the file's tags, else `"tv"` | the samples' range |
+
+- Clips must have a constant frame rate. Other formats (MP4, MOV, ProRes, VP9 WebM,
+  phone footage with a variable rate) are converted once with
+  [`shotglass conform`](cli.md#conform), which writes an AV1 WebM next to the source:
+  a file you keep (and commit, with Git LFS), not a cache.
+- A frame is exact: it depends only on the file and the frame number, and shotglass's
+  own Rust code converts Y'CbCr to RGB (chroma upsampled at the stream's siting), so
+  playing, scrubbing, `still` and `export` show the same pixels. Output is RGBA8 with
+  alpha 1, as the file's transfer leaves it (like a JPEG photo).
+- Playing reads the clip forward. A paused seek decodes from the keyframe before the
+  frame, so scrubbing costs up to one keyframe interval of decoding (about 0.1–0.3 s at
+  1080p for `export`'s 2 s keyframes). `check` notes clips whose keyframes are more than
+  4 s apart; `shotglass conform --keyint 15` makes scrubbing faster.
+- AV1 in WebM has no alpha: put a matte in its own channel (a PNG sequence, or a second
+  clip whose luma is the matte, read as `.r`).
+- A clip's sound isn't played yet (shotglass's sound is GLSL); `shotglass conform` keeps
+  it in the file as Opus, so it's there when films can use it (#32). HDR (PQ, HLG) clips are
+  refused for now.
+- `shotglass export --format webm` writes clips shotglass reads back, so one film can be
+  footage in another.
+- `check` lists each clip (frames, size, rate, keyframe spacing, colour) and decodes its
+  first frame; `check --deep` decodes every frame and checks that frames reached by a
+  seek match frames read in order. Video doesn't play in the web player yet (#2).
+- Builds for 32-bit ARM and RISC-V have no video decoder (rav1d needs a nightly
+  compiler there); a video channel is refused with a message.
 
 ## Text
 

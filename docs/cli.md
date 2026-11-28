@@ -14,7 +14,7 @@ shotglass strip  <movie> [--count 12 | --at ...] [--size 384x216] [--cols 4] [--
                  # --compare: fail if the strip differs from ref.png (writes strip.diff.png)
 shotglass check  <movie> [--web] [--strict] [--no-gpu] [--deep] [--size 1280x720] [--frames 8]
                  # validate movie.toml and the GLSL (strictly), compile, synth, time
-                 # --deep: also decode every frame of every image sequence
+                 # --deep: also decode every frame of every image sequence and video
                  # --strict: fail if it printed any warning (with --web: browser ones too)
 shotglass wav    <movie> [--out sound.wav] [--rate 48000] [--allow-silence]
                  [--compare ref.wav [--bless] [--max-rms 0.0015] [--max-peak 0.01]]
@@ -22,6 +22,8 @@ shotglass wav    <movie> [--out sound.wav] [--rate 48000] [--allow-silence]
 shotglass export <movie> --out film.webm [--size 1920x1080] [--format webm|av1|ffv1|png|ffmpeg] [--rate 48000]
                  [--loops N]                               # loop = true films: N periods
                  [--quality 30 | --bitrate K] [--speed 6] [--depth 10|8] [--grain N]  # webm/av1
+shotglass conform <clip|frames/f_####.png> [-o out.webm] [--keyint N] [--crf 20] [--depth 8|10] [--fps F]
+                 # convert a clip once into AV1 WebM footage (needs ffmpeg to decode)
 shotglass new    <dir>
 shotglass fetch  <movie>                                   # download libraries, write shotglass.lock
 shotglass update <movie> [library..]                       # move library pins to the newest allowed
@@ -155,6 +157,42 @@ and libopus.
 Check with `ffmpeg -encoders`: `ffv1` needs `ffv1` and `flac` (built in); without the
 `webm` feature, `webm` needs `libvpx-vp9` and `libopus`, and `av1` needs `libsvtav1` or
 `libaom-av1`.
+
+## Conform
+
+`shotglass conform` converts a clip once into footage shotglass reads: AV1 in WebM at a
+constant frame rate (see [Video](channels.md#video)). It writes `<name>.webm` next to
+the source (or `-o`): a file you keep, commit or delete; nothing is cached.
+
+```sh
+shotglass conform footage/surf.mp4                          # → footage/surf.webm
+shotglass conform footage/plate.mov --keyint 12 --crf 16    # faster scrubbing, higher quality
+shotglass conform "renders/fog_####.png" --fps 24           # an image sequence → renders/fog.webm
+```
+
+ffmpeg decodes the source (any format it reads; phones' rotation applied) into raw
+Y'CbCr at a constant rate; shotglass's own encoder (SVT-AV1, the `webm` feature) and
+WebM writer do the rest. It needs ffmpeg and ffprobe (see [Installing ffmpeg](#installing-ffmpeg);
+`SHOTGLASS_FFPROBE`, else next to ffmpeg, else the `PATH`).
+
+| flag | default | what it does |
+|---|---|---|
+| `--keyint N` | about 2 s | frames between keyframes; smaller scrubs faster, a little bigger |
+| `--crf 0..63` | 20 | constant quality (lower is better and bigger) |
+| `--depth 8\|10` | the source's (at most 10) | bits per sample |
+| `--fps F` | the source's | output rate (`24`, `30000/1001`); an image sequence's rate (required for one) |
+| `--speed 0..13` | 8 | encoder preset: higher is faster |
+
+- **It re-encodes**, so pixels differ slightly from the source (generation loss), and a
+  variable-rate source (most phone footage) gets frames repeated or dropped onto the
+  constant-rate grid; it says so. Encoders aren't bit-exact across versions, so the
+  conformed file, not the source, is the film's input: commit it.
+- The source's matrix and range are kept (tagged in the file) when SVT-AV1 can tag them;
+  RGB sources and unusual tags are converted to BT.709, limited range. HDR is refused.
+- The first audio track is kept, as Opus at 48 kHz stereo, aligned to the first frame.
+  Films don't play clip sound yet (#32); it's kept so the clip needn't be conformed again.
+- An AV1 WebM shotglass can already read is left alone ("nothing to do"), or copied to `-o`.
+- Audio is dropped.
 
 ## Exporting assembled shaders
 

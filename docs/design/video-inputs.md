@@ -1,6 +1,6 @@
 # Design: moving-image inputs (footage on iChannels)
 
-Status: **phase 1 (image sequences) implemented**. Phase 2, video, is #73; RGBA16F/EXR
+Status: **phases 1 (image sequences) and 2 (AV1 WebM video, #73) implemented**; RGBA16F/EXR
 and other follow-ups are in #75. Builds on [ichannel.md](ichannel.md) (#22), which
 left room for `{ video = "…" }` channels, and touches #32 (heavy assets) and #2 (web player).
 
@@ -574,7 +574,7 @@ than being deleted, and pools are deleted when their footage leaves 1.5 × `LOOK
 
 ## Audio in clips
 
-Phases 1–2 **ignore clip audio** (the reader skips other tracks; `conform` drops audio). shotglass's sound is GLSL synthesised in
+Phases 1–2 **ignore clip audio** (the reader skips other tracks; `conform` keeps the first audio track as Opus, aligned to the first frame, so a clip needn't be conformed again once sound can use it). shotglass's sound is GLSL synthesised in
 chunks, deterministic and chunk-size independent; an audio file is a different kind of
 input. When it's wanted, the natural design (with #32's audio samples) is a sound-side
 input: `[sound] samples = { surf = "footage/surf.webm" }` decoded once to PCM at

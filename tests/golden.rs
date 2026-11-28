@@ -1,7 +1,7 @@
 //! Golden regression tests: renders a contact sheet and the soundtrack of the demo film
 //! (and contact sheets of tests/films/channels, the
 //! iChannel textures film, tests/films/text, the text film, tests/films/layers and
-//! tests/films/blends, the layer films, tests/films/footage, image sequences, tests/films/footage-places, footage in a shot, layer, comp and buffer, tests/films/glyphs, glyph runs and
+//! tests/films/blends, the layer films, tests/films/footage, image sequences, tests/films/footage-places, footage in a shot, layer, comp and buffer, tests/films/footage-video, video channels, tests/films/glyphs, glyph runs and
 //! subtitles, tests/films/feedback, feedback buffers, tests/films/comp-feedback, buffers
 //! in comps, tests/films/warm-loop, `loop = "warm"`, tests/films/layer-feedback, buffers
 //! in the layer stack, and both
@@ -453,6 +453,33 @@ fn footage_film() {
     golden_frames(
         "footage",
         &root().join("tests").join("films").join("footage"),
+        &["--count", COUNT],
+        &[],
+    );
+}
+
+/// Video (#73): tests/films/footage-video, the footage film's plate as AV1 in WebM
+/// (keyframes every 8 frames) under the same PNG-sequence matte: the same timing as
+/// `footage`, through the decoder, seeks across keyframes and the colour conversion
+/// (BT.601 full range). Needs a video decoder (the `video` feature).
+#[test]
+fn footage_video_film() {
+    if skip() {
+        return;
+    }
+    if !cfg!(feature = "video")
+        || cfg!(any(
+            target_arch = "arm",
+            target_arch = "riscv32",
+            target_arch = "riscv64"
+        ))
+    {
+        println!("golden-image test skipped (no video decoder in this build)");
+        return;
+    }
+    golden_frames(
+        "footage-video",
+        &root().join("tests").join("films").join("footage-video"),
         &["--count", COUNT],
         &[],
     );

@@ -521,6 +521,7 @@ pub(super) fn texture_spec(
                 fps: None,
                 first: None,
                 scan: None,
+                video: None,
             })),
             filter: Filter::Linear,
             wrap: Wrap::Repeat,
@@ -529,11 +530,37 @@ pub(super) fn texture_spec(
             timing: Timing::default(),
         })
     };
-    // A file entry by its kind: images bind now, the rest name the version that brings them.
+    // A video (#73): AV1 in WebM. Other containers are converted once with
+    // `shotglass conform`. Footage defaults: linear, upright.
+    let video_channel = |s: &str| -> Result<Channel> {
+        let path = s.trim_start_matches('<').trim_end_matches('>');
+        if !path.to_ascii_lowercase().ends_with(".webm") {
+            bail!(
+                "{what}: \"{s}\": shotglass reads video as AV1 in WebM; convert it once: \
+                 shotglass conform {path}"
+            );
+        }
+        let f = file_ref(what, s, specs, root)?;
+        Ok(Channel {
+            source: Source::Frames(Box::new(Sequence {
+                pattern: f,
+                fps: None,
+                first: None,
+                scan: None,
+                video: Some(VideoOptions::default()),
+            })),
+            filter: Filter::Linear,
+            wrap: Wrap::Repeat,
+            vflip: true,
+            srgb: false,
+            timing: Timing::default(),
+        })
+    };
+    // A file entry by its kind.
     let file_source = |s: &str| -> Result<Channel> {
         match ChannelSource::of(s) {
             ChannelSource::Sequence(_) => sequence_channel(s),
-            ChannelSource::Video(_) => Err(not_yet(what, s, "video")),
+            ChannelSource::Video(_) => video_channel(s),
             _ => {
                 if let Some(i) = s.find('%')
                     && s[i + 1..]
@@ -851,13 +878,6 @@ pub(super) fn texture_spec(
                     sources.join(" and ")
                 );
             }
-            let shown = |k: &str| match t.get(k) {
-                Some(toml::Value::String(s)) => s.clone(),
-                _ => "…".to_string(),
-            };
-            if sources.first() == Some(&"video") {
-                return Err(not_yet(what, &shown("video"), "video"));
-            }
             if t.contains_key("part") && !t.contains_key("text") {
                 bail!("{what}: part picks a glyph run's texture; it goes with text = \"…\"");
             }
@@ -932,13 +952,22 @@ pub(super) fn texture_spec(
             } else {
                 let (key, image) = if t.contains_key("frames") {
                     ("frames", false)
+                } else if t.contains_key("video") {
+                    ("video", false)
                 } else {
                     ("file", true)
                 };
                 match t.get(key) {
                     Some(toml::Value::String(s)) if !s.is_empty() && !is_texture_name(s) => {
                         let c = file_source(s)?;
-                        if !image && c.sequence().is_none() {
+                        let is_video = c.sequence().is_some_and(|q| q.video.is_some());
+                        if key == "video" && !is_video {
+                            bail!("{what}: video = \"{s}\" must be a video file (.webm)");
+                        }
+                        if key != "video" && is_video {
+                            bail!("{what}: \"{s}\" is a video; write video = \"{s}\"");
+                        }
+                        if key == "frames" && c.sequence().is_none() {
                             bail!(
                                 "{what}: frames = \"{s}\" needs one run of # in its file name, \
                                  the frame number (\"renders/fog_####.png\")"
@@ -1015,14 +1044,49 @@ pub(super) fn texture_spec(
                          texture = \"…\"; `{k}` goes on the [textures] entry"
                     );
                 }
+                let video = c.sequence().is_some_and(|q| q.video.is_some());
                 if matches!(k.as_str(), "fps" | "first") && !footage {
                     bail!(
                         "{what}: {k} is for image sequences (frames = \"…\"); {} isn't one",
                         c.label()
                     );
                 }
+                if k == "first" && video {
+                    bail!(
+                        "{what}: first is for image sequences; a video starts at frame 0 (use in or in_frame)"
+                    );
+                }
+                if matches!(k.as_str(), "matrix" | "range") && !video {
+                    bail!(
+                        "{what}: {k} is for videos (video = \"….webm\"); {} isn't one",
+                        c.label()
+                    );
+                }
                 match k.as_str() {
-                    "file" | "text" | "frames" | "texture" | "part" => {}
+                    "file" | "text" | "frames" | "video" | "texture" | "part" => {}
+                    "matrix" => {
+                        let s = word(&["bt601", "bt709", "bt2020"])?;
+                        let m = crate::video::Matrix::parse(&s)
+                            .ok_or_else(|| not_one_of(&s, &["bt601", "bt709", "bt2020"]))?;
+                        if let Source::Frames(q) = &mut c.source
+                            && let Some(v) = &mut q.video
+                        {
+                            v.matrix = Some(m);
+                        }
+                    }
+                    "range" => {
+                        let s = word(&["tv", "pc"])?;
+                        let full = match s.as_str() {
+                            "tv" => false,
+                            "pc" => true,
+                            _ => return Err(not_one_of(&s, &["tv", "pc"])),
+                        };
+                        if let Source::Frames(q) = &mut c.source
+                            && let Some(v) = &mut q.video
+                        {
+                            v.full_range = Some(full);
+                        }
+                    }
                     "filter" => {
                         let s = word(Filter::NAMES)?;
                         c.filter =
@@ -1075,6 +1139,10 @@ pub(super) fn texture_spec(
                             _ => return Err(not_one_of(&s, End::NAMES)),
                         };
                     }
+                    other if video => bail!(
+                        "{what}: unknown option `{other}` (a video has video, fps, matrix, range, \
+                         in, in_frame, speed, clock, end, filter, wrap, vflip and srgb)"
+                    ),
                     other if footage => bail!(
                         "{what}: unknown option `{other}` (an image sequence has frames, fps, \
                          first, in, in_frame, speed, clock, end, filter, wrap, vflip and srgb)"

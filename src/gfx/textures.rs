@@ -161,10 +161,7 @@ impl Renderer {
                 })
                 .fold((0, 0, 0), |(n, f, b), e| {
                     if e.footage {
-                        let bytes = match &e.source {
-                            TexSource::Frame(_, Some((w, h))) => w * h * 4,
-                            _ => 0,
-                        };
+                        let bytes = e.source.frame_bytes();
                         (n, f + 1, b + bytes)
                     } else {
                         (n + 1, f, b)
@@ -185,10 +182,7 @@ impl Renderer {
                 continue;
             }
             if e.footage {
-                let bytes = match &e.source {
-                    TexSource::Frame(_, Some((w, h))) => w * h * 4,
-                    _ => 0,
-                };
+                let bytes = e.source.frame_bytes();
                 let over_cpu =
                     frames >= FOOTAGE_MIN_IN_FLIGHT && frame_bytes + bytes > FOOTAGE_CPU_BYTES;
                 if frames >= footage_cap || over_cpu {

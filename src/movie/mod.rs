@@ -28,6 +28,22 @@ fn gcd(a: u64, b: u64) -> u64 {
     if b == 0 { a } else { gcd(b, a % b) }
 }
 
+/// A rate from the command line: `24`, `29.97`, `30000/1001`.
+#[cfg_attr(not(feature = "webm"), allow(dead_code))]
+pub fn parse_fps_arg(s: &str) -> Result<(u32, u32)> {
+    let f = if s.contains('/') {
+        FpsFile::Ratio(s.to_string())
+    } else if let Ok(i) = s.parse() {
+        FpsFile::Int(i)
+    } else {
+        FpsFile::Float(
+            s.parse()
+                .map_err(|_| anyhow!("fps \"{s}\" must look like 24 or 30000/1001"))?,
+        )
+    };
+    parse_fps(f)
+}
+
 /// `fps` → (numerator, denominator), reduced. NTSC-style decimals (29.97, 23.976,
 /// 59.94) mean n×1000/1001, as video tools assume.
 fn parse_fps(f: FpsFile) -> Result<(u32, u32)> {
@@ -372,12 +388,6 @@ fn not_yet(what: &str, s: &str, kind: &str) -> anyhow::Error {
             "not a layer below this one",
             "@ names input, picture, an earlier layer, or a comp from [comps]",
         ),
-        "video" => (
-            "a video",
-            "video files arrive with footage phase 2, after shotglass 0.1.6; meanwhile \
-             convert it to an image sequence (ffmpeg -i clip.mp4 frames/clip_%05d.png, then \
-             \"frames/clip_#####.png\")",
-        ),
         _ => (
             "a text block",
             "text arrives with [fonts] and [texts] in shotglass 0.1.3",
@@ -650,6 +660,29 @@ pub struct Sequence {
     pub first: Option<u64>,
     /// What `Movie::load` found on disk (None after a bare `parse`).
     pub scan: Option<std::sync::Arc<crate::footage::Scan>>,
+    /// A video (#73): `pattern` is the WebM file (no #), frames come from it.
+    pub video: Option<VideoOptions>,
+}
+
+/// A video channel's colour overrides (#73); None = from the file's tags.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct VideoOptions {
+    pub matrix: Option<crate::video::Matrix>,
+    pub full_range: Option<bool>,
+}
+
+impl Sequence {
+    /// Source frames per second: `fps`, else a video's own rate, else the film's.
+    pub fn rate(&self, film: (u32, u32)) -> (u32, u32) {
+        self.fps
+            .or_else(|| {
+                self.scan
+                    .as_ref()
+                    .and_then(|s| s.video.as_ref())
+                    .map(|v| v.clip.fps)
+            })
+            .unwrap_or(film)
+    }
 }
 
 /// Where footage starts: `in` (source seconds) or `in_frame` (a source frame).
@@ -856,10 +889,11 @@ pub struct Channel {
 }
 
 impl Channel {
-    /// Every single file the channel reads: the image, or a text's file and fonts.
-    /// A sequence's frames are in its scan (`Sequence::scan`), not here.
+    /// Every single file the channel reads: the image, a video, or a text's file and
+    /// fonts. A sequence's frames are in its scan (`Sequence::scan`), not here.
     pub fn files(&self) -> Vec<&FileRef> {
         match &self.source {
+            Source::Frames(s) if s.video.is_some() => vec![&s.pattern],
             Source::Input
             | Source::Picture
             | Source::Layer { .. }
@@ -953,6 +987,9 @@ impl Channel {
         let Some(scan) = &seq.scan else {
             return vec![];
         };
+        if seq.video.is_some() {
+            return vec![]; // one file, in `files()`
+        }
         let dir = seq.pattern.rel.rsplit_once('/').map(|(d, _)| d);
         (0..scan.count)
             .map(|k| {
@@ -1507,6 +1544,14 @@ impl Movie {
             );
             need = semver::Version::new(0, 1, 11);
         }
+        let video = |m: &Movie| {
+            m.channels()
+                .any(|c| c.sequence().is_some_and(|q| q.video.is_some()))
+        };
+        if video(self) || self.comps.iter().any(|c| video(&c.movie)) {
+            features.push("video channels (video = \"….webm\"), which need shotglass 0.1.12");
+            need = semver::Version::new(0, 1, 12);
+        }
         if features.is_empty() {
             return None;
         }
@@ -1523,6 +1568,7 @@ impl Movie {
             semver::Version::new(0, 1, 8),
             semver::Version::new(0, 1, 9),
             semver::Version::new(0, 1, 10),
+            semver::Version::new(0, 1, 11),
         ];
         let allows_old = match &self.shotglass {
             None => true,
@@ -1552,7 +1598,10 @@ impl Movie {
         }
         let film = (self.fps_num, self.fps_den);
         // Each pattern (and `first`) is scanned once, whichever channels use it.
-        type Found = ((PathBuf, Option<u64>), std::sync::Arc<crate::footage::Scan>);
+        type Found = (
+            (PathBuf, Option<u64>, Option<VideoOptions>),
+            std::sync::Arc<crate::footage::Scan>,
+        );
         let mut found: Vec<Found> = vec![];
         let items = self
             .shots
@@ -1575,9 +1624,22 @@ impl Movie {
                 let Source::Frames(seq) = &mut c.source else {
                     continue;
                 };
-                let key = (seq.pattern.file.clone(), seq.first);
+                // A missing video is reported by `check_textures`, with a "did you mean".
+                if seq.video.is_some() && !seq.pattern.file.is_file() {
+                    continue;
+                }
+                let key = (seq.pattern.file.clone(), seq.first, seq.video.clone());
                 let scan = match found.iter().find(|(k, _)| *k == key) {
                     Some((_, s)) => s.clone(),
+                    None if seq.video.is_some() => {
+                        let opts = seq.video.as_ref().unwrap();
+                        let s =
+                            crate::footage::scan_video(&seq.pattern.file, &seq.pattern.label, opts)
+                                .map_err(|e| anyhow!("{who}: channels[{n}]: {e}"))?;
+                        let s = std::sync::Arc::new(s);
+                        found.push((key, s.clone()));
+                        s
+                    }
                     None => {
                         let file = &seq.pattern.file;
                         let name = file.file_name().map(|n| n.to_string_lossy().into_owned());
@@ -1592,7 +1654,8 @@ impl Movie {
                         s
                     }
                 };
-                let rate = seq.fps.unwrap_or(film);
+                seq.scan = Some(scan.clone());
+                let rate = seq.rate(film);
                 let start = match timing.start {
                     In::Seconds(s) => source_snap(s * rate.0 as f64 / rate.1 as f64).max(0) as u64,
                     In::Frame(k) => k,
@@ -1609,7 +1672,6 @@ impl Movie {
                         scan.count
                     );
                 }
-                seq.scan = Some(scan);
             }
         }
         Ok(())
@@ -2243,7 +2305,7 @@ impl Movie {
             loop_frames: self.loop_frames,
             origin,
             timing: ch.timing,
-            src: seq.fps.unwrap_or((self.fps_num, self.fps_den)),
+            src: seq.rate((self.fps_num, self.fps_den)),
             count: seq.scan.as_ref()?.count,
         })
     }
