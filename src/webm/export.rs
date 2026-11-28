@@ -26,6 +26,51 @@ fn frame_ns((num, den): (u32, u32), n: u64) -> u64 {
     (u128::from(n) * 1_000_000_000 * u128::from(den) / u128::from(num)) as u64
 }
 
+/// Encode I420 frames (as `yuv::frame_bytes` lays them out) into a video-only WebM:
+/// test fixtures for footage (#73), and what `shotglass conform` writes.
+pub fn write_clip(
+    path: &Path,
+    set: &Av1Settings,
+    frames: impl IntoIterator<Item = Vec<u8>>,
+) -> Result<()> {
+    let mut enc = Av1Encoder::new(set)?;
+    let (seq, seq_obu) = av1::find_sequence_header(enc.header())?;
+    let video = mux::Video {
+        width: set.width as u32,
+        height: set.height as u32,
+        codec_private: av1::av1c(&seq, &seq_obu),
+        bit_depth: set.depth,
+        fps: set.fps,
+    };
+    let file = std::io::BufWriter::new(std::fs::File::create(path)?);
+    let mut mux = mux::Writer::new(file, "webm", &video, None)?;
+    let mut next = 0i64;
+    let mut write = |mux: &mut mux::Writer<_>, p: super::encode::Packet| -> Result<()> {
+        if p.pts != next {
+            bail!(
+                "the encoder returned frame {} when frame {next} was due",
+                p.pts
+            );
+        }
+        next += 1;
+        let tu = av1::strip_temporal_delimiters(&p.data)?;
+        mux.video(frame_ns(set.fps, p.pts as u64), p.keyframe, &tu)?;
+        Ok(())
+    };
+    for (n, f) in frames.into_iter().enumerate() {
+        enc.send(&f, n as i64)?;
+        while let Some(p) = enc.receive()? {
+            write(&mut mux, p)?;
+        }
+    }
+    enc.finish()?;
+    while let Some(p) = enc.receive()? {
+        write(&mut mux, p)?;
+    }
+    mux.finish(frame_ns(set.fps, next as u64))?;
+    Ok(())
+}
+
 /// Frames between keyframes: about two seconds, so browsers seek quickly.
 pub fn keyint((num, den): (u32, u32)) -> u32 {
     ((2.0 * f64::from(num) / f64::from(den)).round() as u32).max(1)

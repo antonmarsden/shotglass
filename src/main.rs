@@ -25,6 +25,7 @@ mod subtitles;
 mod text;
 mod texture;
 mod validate;
+mod video;
 mod webm;
 mod yuv;
 

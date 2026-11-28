@@ -7,6 +7,7 @@
 #![cfg_attr(not(feature = "webm"), allow(dead_code))]
 
 pub mod av1;
+pub mod demux;
 #[cfg(feature = "webm")]
 pub mod encode;
 #[cfg(feature = "webm")]

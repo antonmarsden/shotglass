@@ -286,6 +286,14 @@ pub fn find_sequence_header(data: &[u8]) -> Result<(SequenceHeader, Vec<u8>)> {
     bail!("no AV1 sequence header")
 }
 
+/// The sequence header in an `av1C` record's config OBUs (after its four bytes).
+pub fn find_sequence_header_in_av1c(av1c: &[u8]) -> Result<(SequenceHeader, Vec<u8>)> {
+    if av1c.len() < 4 || av1c[0] != 0x81 {
+        bail!("not an av1C record");
+    }
+    find_sequence_header(&av1c[4..])
+}
+
 /// The `av1C` record (AV1-ISOBMFF 2.3): four bytes of sequence header fields, then
 /// the sequence header OBU itself as the only config OBU.
 pub fn av1c(seq: &SequenceHeader, seq_obu: &[u8]) -> Vec<u8> {

@@ -51,6 +51,14 @@ unicode-segmentation = "1.13.3"
 ctrlc = "3.5"
 winit = "0.30"
 
+# Video footage (#73): rav1d, the Rust port of dav1d (BSD-2-Clause). Its asm needs nasm
+# on x86 (as SVT-AV1's does). Not on 32-bit ARM or RISC-V: rav1d needs a nightly
+# compiler there, so those builds have no video decoder (video channels are refused).
+# No SVE2 asm: Apple chips have no SVE, and it needs an armv8.6 C compiler.
+[target.'cfg(not(any(target_arch = "arm", target_arch = "riscv32", target_arch = "riscv64")))'.dependencies]
+rav1d = { version = "1.1.0", optional = true, default-features = false, features = ["asm", "asm_arm64_dotprod", "asm_arm64_i8mm", "bitdepth_8", "bitdepth_16"] }
+libc = { version = "0.2.191", optional = true }
+
 # Dependencies are slow unoptimised; this keeps `cargo run` snappy.
 [profile.dev.package."*"]
 opt-level = 2
@@ -68,7 +76,9 @@ cc = "1.11.2"
 cmake = { version = "0.1.54", optional = true }
 
 [features]
-default = ["strict-glsl", "webm"]
+default = ["strict-glsl", "webm", "video"]
+# Video footage (#73): AV1 in WebM, decoded in-process by rav1d.
+video = ["dep:rav1d", "dep:libc"]
 # `export --format webm` without ffmpeg: SVT-AV1 (vendor/SVT-AV1, or SVT_AV1_SRC /
 # SVT_AV1_DIR) + libopus, muxed by shotglass. Needs CMake, and nasm for SVT-AV1's
 # SIMD on x86 (without it, a much slower C-only build). See docs/building.md.
