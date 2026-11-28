@@ -1,0 +1,41 @@
+# Footage in every place an item can read it (#70, #74, #134): a cut between two shots,
+# a layer that starts mid-film, a comp shot, and a buffer that starts mid-film. Each
+# reads its own sequence, so no frame file is shared and every head has to be
+# prefetched for itself. The selftest "footage: the repo's footage films play …" plays
+# it one try per film frame and fails on any prefetch miss; tests/golden.rs keeps a
+# strip of it. Shaders are film-local.
+title = "footage-places"
+fps = 30
+
+[comps]
+inner = "comps/inner.toml"
+
+[[shot]]
+id = "a"
+scene = "scenes/show.glsl"
+duration = 1.0
+channels = [{ frames = "frames/a_##.png", fps = 30 }]
+
+[[shot]]
+id = "b"
+scene = "scenes/show.glsl"
+duration = 1.0
+channels = [{ frames = "frames/b_##.png", fps = 30 }]
+
+[[shot]]
+id = "c"
+comp = "inner"
+duration = 1.0
+
+[[buffer]]
+id = "tr"
+scene = "scenes/trail.glsl"
+from = 1.5
+size = [32, 18]
+channels = ["@prev", { frames = "frames/e_##.png", fps = 30 }]
+
+[[layer]]
+id = "ov"
+scene = "scenes/overlay.glsl"
+from = 0.5
+channels = [{ frames = "frames/d_##.png", fps = 30 }, "@tr"]

@@ -200,6 +200,10 @@ const CHECKS: &[Check] = &[
         run: footage_unpack_state,
     },
     Check {
+        name: "footage: the repo's footage films play start to end without a prefetch miss",
+        run: footage_films_no_misses,
+    },
+    Check {
         name: "buffers: every path agrees (forward, checkpoint, seeks, cold stills), bit for bit",
         run: buffers_agree,
     },
@@ -6834,6 +6838,63 @@ fn footage_broken(gl: &Gl, dir: &Path) -> Result<String> {
         Err(_) => {}
     }
     Ok(String::new())
+}
+
+/// Every footage film in the repo played as the player does, one pump and one
+/// non-blocking try per film frame from the start: a frame whose footage isn't resident
+/// yet (`footage_misses`) is a prefetch gap (#74, #134 review fixes were such gaps:
+/// nested comps, buffers). `tests/films/footage` mixes re-timing, `clock = "movie"`
+/// and `end = "black"`; `tests/films/footage-places` reads its own sequence in each
+/// place an item can (a cut, a layer and a buffer starting mid-film, a comp shot), so
+/// every head is prefetched for itself. Skipped where the films aren't (an installed
+/// binary).
+fn footage_films_no_misses(gl: &Gl, _dir: &Path) -> Result<String> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/films");
+    let mut notes = vec![];
+    for name in ["footage", "footage-places"] {
+        let d = root.join(name);
+        if !d.join("movie.toml").exists() {
+            notes.push(format!("{name}: not here, skipped"));
+            continue;
+        }
+        let m = Movie::load(&d)?;
+        let mut r = renderer(gl, &m)?;
+        // The first frame may load (as opening a film does).
+        r.render(&m, W, H, &FrameInfo::frame(&m, 0), true)
+            .ok_or_else(|| anyhow!("{name}: frame 0 didn't render"))?;
+        // Paused on frame 0 for a moment before play, as the player pumps every UI frame.
+        for _ in 0..20 {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            r.pump(&m, 0.0, false);
+        }
+        let loads = r.blocking_footage_loads;
+        let mut stalled = vec![];
+        for n in 1..m.frame_count() {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            r.pump(&m, m.frame_time(n), false);
+            let misses = r.footage_misses;
+            if r.render(&m, W, H, &FrameInfo::frame(&m, n), false)
+                .is_none()
+                && r.footage_misses > misses
+            {
+                stalled.push(n);
+            }
+        }
+        if !stalled.is_empty() {
+            bail!(
+                "{name}: playback waited for footage at film frame(s) {stalled:?} of {}",
+                m.frame_count()
+            );
+        }
+        if r.blocking_footage_loads > loads {
+            bail!(
+                "{name}: {} footage frames loaded on the spot while playing",
+                r.blocking_footage_loads - loads
+            );
+        }
+        notes.push(format!("{name}: {} frames", m.frame_count()));
+    }
+    Ok(notes.join(", "))
 }
 
 fn footage_unpack_state(gl: &Gl, dir: &Path) -> Result<String> {

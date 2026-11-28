@@ -1,7 +1,7 @@
 //! Golden regression tests: renders a contact sheet and the soundtrack of the demo film
 //! (and contact sheets of tests/films/channels, the
 //! iChannel textures film, tests/films/text, the text film, tests/films/layers and
-//! tests/films/blends, the layer films, tests/films/footage, image sequences, tests/films/glyphs, glyph runs and
+//! tests/films/blends, the layer films, tests/films/footage, image sequences, tests/films/footage-places, footage in a shot, layer, comp and buffer, tests/films/glyphs, glyph runs and
 //! subtitles, tests/films/feedback, feedback buffers, tests/films/comp-feedback, buffers
 //! in comps, tests/films/warm-loop, `loop = "warm"`, tests/films/layer-feedback, buffers
 //! in the layer stack, and both
@@ -453,6 +453,23 @@ fn footage_film() {
     golden_frames(
         "footage",
         &root().join("tests").join("films").join("footage"),
+        &["--count", COUNT],
+        &[],
+    );
+}
+
+/// Footage in every place (#70, #74, #134): tests/films/footage-places, a cut between
+/// two footage shots, a comp shot reading its own sequence, a layer inset from 0.5 s and
+/// a buffer trail inset from 1.5 s, each on a sequence of its own (a bar that grows a
+/// step per frame). The selftest plays it for prefetch misses; this pins what it shows.
+#[test]
+fn footage_places_film() {
+    if skip() {
+        return;
+    }
+    golden_frames(
+        "footage-places",
+        &root().join("tests").join("films").join("footage-places"),
         &["--count", COUNT],
         &[],
     );
