@@ -354,6 +354,41 @@ Its 10-bit default is fine (the reader handles 10-bit). `--keyint` becomes a com
 option on both. AV1 in WebM has no standard alpha: an exported film with transparency is
 read back as a PNG sequence (phase 1) or as a separate matte clip.
 
+**The decoder is behind a trait** so hardware decoding can be added later without touching
+readers or the renderer:
+
+```rust
+trait VideoDecoder {
+    fn reset(&mut self);                                     // before a keyframe (a seek)
+    fn send(&mut self, temporal_unit: &[u8]) -> Result<()>;
+    fn receive(&mut self) -> Result<Option<YuvFrame>>;       // planes, 8 or 10 bit
+}
+```
+
+Phase 2 ships one implementation, software (rav1d).
+
+#### Hardware decoding (later)
+
+AV1 decoding is bit-exact by specification, hardware included, so a conformant hardware
+decoder gives the same YUV as rav1d and frames stay deterministic. AV1 decode is common
+(NVIDIA RTX 30+, AMD RDNA2+, Intel Xe/Arc, Apple M3+). It pays off for 4K, 60 fps, several
+video channels, laptops on battery and long-GOP seeks; at 1080p30 rav1d on a desktop CPU
+is enough, so it is not part of phase 2.
+
+- **One backend at a time**, each a `VideoDecoder`: D3D11 video on Windows first (all three
+  GPU vendors, and the owner's machine), then VA-API (Linux) and VideoToolbox (macOS).
+  Vulkan Video would be one API everywhere but is a second graphics stack beside OpenGL.
+- **Readback first:** decode on the GPU, read NV12/P010 back to the CPU, then the same Rust
+  YUV→RGBA and upload path. Zero-copy interop (WGL_NV_DX_interop, EGL dmabuf, IOSurface)
+  only if profiling shows the readback hurts; it would also move YUV→RGBA to the GPU,
+  which needs a contract-respecting answer (no built-in GLSL; GPUs differ slightly).
+- **Used only when verified:** on first use per (device, driver, profile, bit depth), a
+  small clip is decoded both ways and compared bit for bit; any mismatch, unsupported
+  profile, session limit or decode error falls back to software, logged with the reason.
+  `SHOTGLASS_VIDEO_DECODER=software|hardware` forces a choice; export and headless commands
+  may default to software. Selftest: hardware and software agree on the video fixtures
+  where a hardware decoder exists.
+
 **Open for phase 2:** rav1d vs dav1d after measuring; the long-GOP note's threshold.
 
 ### Colour
@@ -682,7 +717,7 @@ frames so the strip crosses a GOP), golden wherever the `video` feature is built
 reader), rav1d behind a `video` feature, YUV→RGBA in Rust (`footage.rs`), readers that
 seek through the Cues; the renderer side should need no change beyond a new decode job
 kind (`trait FrameSource { fn frame(&mut self, k: u64) -> Result<Decoded> }`, sequential
-sources cheap for k+1) and a reader pool per clip. `--keyint` on export; `shotglass
+sources cheap for k+1), a `VideoDecoder` trait (rav1d only; hardware backends later, own issues) and a reader pool per clip. `--keyint` on export; `shotglass
 conform` (ffmpeg decode → our encoder). Selftest 8, video golden case, contract patch
 bump, README "Footage" (WebM, conform, LFS).
 
