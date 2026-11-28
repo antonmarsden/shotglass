@@ -220,7 +220,10 @@ cargo fmt && cargo clippy --all-targets -- -D warnings
   shot is usable only when *that* frame is `Ready` on every footage channel (or the
   fallback version has it), never a neighbour. Frames decode on the pool and upload in
   bands in `pump` with their own budget; only `usable(.., blocking=true)` loads one on the
-  spot, counted in `blocking_footage_loads` (selftest: 0 while playing). Footage entries
+  spot, counted in `blocking_footage_loads` (selftest: 0 while playing).
+  Selftest "footage: the repo's footage films play …" plays `tests/films/footage` and
+  `tests/films/channels` one try per film frame and fails on any `footage_misses`: a new
+  kind of item with footage (a channel source, a place items live) must join `footage_order`. Footage entries
   are per version (`generation` in the key), so a re-rendered frame reloads and a
   half-written one falls back to the previous version's frame; a missing frame in the
   middle (a gap) refuses the version at `Movie::load`. Don't use `floor_snap` for source
