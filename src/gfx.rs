@@ -16,6 +16,8 @@ use std::sync::Arc;
 use toodee::{TooDeeOps, TooDeeOpsMut, TranslateOps};
 
 mod fold;
+pub mod ledger;
+pub use ledger::{GlObjects, Tracked};
 
 /// The engine's own pass that shows one shot unchanged (`transition_source(.., "copy", ..)`).
 /// Not a transition films can name: their transitions come from libraries or files.
@@ -634,7 +636,7 @@ struct GpuBuf {
 impl Drop for GpuBuf {
     fn drop(&mut self) {
         // Deletion unmaps the buffer. GL keeps storage alive for queued commands.
-        unsafe { self.gl.delete_buffer(self.buf) };
+        unsafe { self.gl.free_buffer(self.buf) };
     }
 }
 
@@ -663,7 +665,7 @@ struct AudioFence {
 
 impl Drop for AudioFence {
     fn drop(&mut self) {
-        unsafe { self.gl.delete_sync(self.sync) };
+        unsafe { self.gl.free_fence(self.sync) };
     }
 }
 
@@ -681,7 +683,7 @@ impl Drop for AudioSubmit<'_> {
             for (unit, tex) in self.input_tex.drain(..).enumerate() {
                 gl.active_texture(glow::TEXTURE0 + unit as u32);
                 gl.bind_texture(glow::TEXTURE_2D, None);
-                gl.delete_texture(tex);
+                gl.free_texture(tex);
             }
             gl.active_texture(glow::TEXTURE0);
             gl.use_program(None);
@@ -747,8 +749,8 @@ impl Renderer {
             let renderer = gl.get_parameter_string(glow::RENDERER);
             let driver = DriverGlsl::detect(&glsl, &version);
             let dialect = driver.dialect(None).map_err(|e| anyhow!(e))?;
-            let vao = gl.create_vertex_array().map_err(|e| anyhow!(e))?;
-            let dummy = gl.create_texture().map_err(|e| anyhow!(e))?;
+            let vao = gl.new_vertex_array().map_err(|e| anyhow!(e))?;
+            let dummy = gl.new_texture().map_err(|e| anyhow!(e))?;
             gl.bind_texture(glow::TEXTURE_2D, Some(dummy));
             gl.tex_image_2d(
                 glow::TEXTURE_2D,
@@ -767,7 +769,7 @@ impl Renderer {
                 gl.tex_parameter_i32(glow::TEXTURE_2D, p, glow::NEAREST as i32);
             }
             // A matte whose source layer isn't drawn this frame (#74): nothing.
-            let clear = gl.create_texture().map_err(|e| anyhow!(e))?;
+            let clear = gl.new_texture().map_err(|e| anyhow!(e))?;
             gl.bind_texture(glow::TEXTURE_2D, Some(clear));
             gl.tex_image_2d(
                 glow::TEXTURE_2D,
@@ -802,7 +804,7 @@ impl Renderer {
             let mut samplers = vec![];
             for filter in [Filter::Mipmap, Filter::Linear, Filter::Nearest] {
                 for wrap in [Wrap::Repeat, Wrap::Clamp, Wrap::Mirror] {
-                    let s = gl.create_sampler().map_err(|e| anyhow!(e))?;
+                    let s = gl.new_sampler().map_err(|e| anyhow!(e))?;
                     let (min, mag) = match filter {
                         Filter::Mipmap => (glow::LINEAR_MIPMAP_LINEAR, glow::LINEAR),
                         Filter::Linear => (glow::LINEAR, glow::LINEAR),
@@ -1377,8 +1379,8 @@ impl Renderer {
         {
             for t in f.targets() {
                 unsafe {
-                    self.gl.delete_framebuffer(t.fbo);
-                    self.gl.delete_texture(t.tex);
+                    self.gl.free_framebuffer(t.fbo);
+                    self.gl.free_texture(t.tex);
                 }
             }
         }
@@ -1408,8 +1410,8 @@ impl Renderer {
             if seq.buffers.is_empty() && self.folds[q].holds_targets() {
                 for t in self.folds[q].release() {
                     unsafe {
-                        self.gl.delete_framebuffer(t.fbo);
-                        self.gl.delete_texture(t.tex);
+                        self.gl.free_framebuffer(t.fbo);
+                        self.gl.free_texture(t.tex);
                     }
                 }
             }
@@ -1444,12 +1446,33 @@ impl Renderer {
         {
             for x in seq_targets(s) {
                 unsafe {
-                    self.gl.delete_framebuffer(x.fbo);
-                    self.gl.delete_texture(x.tex);
+                    self.gl.free_framebuffer(x.fbo);
+                    self.gl.free_texture(x.tex);
                 }
             }
         }
         self.seqs.resize_with(seqs.len(), SeqTargets::default);
+        // A sequence that lost its layers frees their targets; held outputs past the
+        // last layer go too (they'd stay full size until the next resize otherwise).
+        let mut gone = vec![];
+        for (s, (_, seq, _)) in self.seqs.iter_mut().zip(&seqs) {
+            if seq.layers.is_empty() {
+                gone.extend(s.work.iter_mut().map(Option::take));
+                gone.extend([s.layer.take(), s.picture.take(), s.input.take()]);
+                gone.append(&mut s.held);
+            } else if s.held.len() > seq.layers.len() {
+                gone.extend(s.held.drain(seq.layers.len()..));
+            }
+        }
+        // Comp instance targets are sized per frame plan: an edit starts them over, so
+        // instances of a removed or resized comp don't stay allocated.
+        gone.append(&mut self.inst);
+        for x in gone.into_iter().flatten() {
+            unsafe {
+                self.gl.free_framebuffer(x.fbo);
+                self.gl.free_texture(x.tex);
+            }
+        }
         self.over = over;
         self.over_matte = over_matte;
         self.copy = copy;
@@ -2228,7 +2251,7 @@ impl Renderer {
         self.texture_creates += 1;
         let gl = &self.gl;
         unsafe {
-            let tex = gl.create_texture()?;
+            let tex = gl.new_texture()?;
             gl.active_texture(glow::TEXTURE0);
             gl.bind_texture(glow::TEXTURE_2D, Some(tex));
             let internal = if srgb {
@@ -2412,7 +2435,7 @@ impl Renderer {
 
     fn delete_texture_state(&self, s: TexState) {
         if let TexState::Ready { tex, .. } | TexState::Uploading { tex, .. } = s {
-            unsafe { self.gl.delete_texture(tex) };
+            unsafe { self.gl.free_texture(tex) };
         }
     }
 
@@ -2703,12 +2726,12 @@ impl Renderer {
     fn delete_state(&self, s: State) {
         unsafe {
             match s {
-                State::Ready(p) => self.gl.delete_program(p.prog),
+                State::Ready(p) => self.gl.free_program(p.prog),
                 State::Pending(p) => {
                     for sh in p.shaders {
-                        self.gl.delete_shader(sh);
+                        self.gl.free_shader(sh);
                     }
-                    self.gl.delete_program(p.prog);
+                    self.gl.free_program(p.prog);
                 }
                 _ => {}
             }
@@ -2744,7 +2767,7 @@ impl Renderer {
                 && bytes.len() > 4
             {
                 let format = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-                let prog = gl.create_program().map_err(|e| vec![e])?;
+                let prog = gl.new_program().map_err(|e| vec![e])?;
                 gl.program_binary(
                     prog,
                     &glow::ProgramBinary {
@@ -2759,18 +2782,16 @@ impl Renderer {
                         from_binary: true,
                     });
                 }
-                gl.delete_program(prog); // stale (driver update): compile from source
+                gl.free_program(prog); // stale (driver update): compile from source
             }
             let vs_src = vertex_source(src.dialect);
-            let vs = gl.create_shader(glow::VERTEX_SHADER).map_err(|e| vec![e])?;
+            let vs = gl.new_shader(glow::VERTEX_SHADER).map_err(|e| vec![e])?;
             gl.shader_source(vs, &vs_src);
             gl.compile_shader(vs);
-            let fs = gl
-                .create_shader(glow::FRAGMENT_SHADER)
-                .map_err(|e| vec![e])?;
+            let fs = gl.new_shader(glow::FRAGMENT_SHADER).map_err(|e| vec![e])?;
             gl.shader_source(fs, &src.text);
             gl.compile_shader(fs);
-            let prog = gl.create_program().map_err(|e| vec![e])?;
+            let prog = gl.new_program().map_err(|e| vec![e])?;
             gl.attach_shader(prog, vs);
             gl.attach_shader(prog, fs);
             if self.binary_dir.is_some() {
@@ -2818,10 +2839,10 @@ impl Renderer {
             }
             for sh in &p.shaders {
                 gl.detach_shader(p.prog, *sh);
-                gl.delete_shader(*sh);
+                gl.free_shader(*sh);
             }
             if !linked {
-                gl.delete_program(p.prog);
+                gl.free_program(p.prog);
                 return Err(src.explain(errors));
             }
             let mut locs = HashMap::new();
@@ -4030,7 +4051,7 @@ impl Renderer {
             .collect();
         for k in drop {
             if let Some(p) = self.audio.remove(&k) {
-                unsafe { self.gl.delete_program(p.prog) };
+                unsafe { self.gl.free_program(p.prog) };
             }
         }
     }
@@ -4060,7 +4081,7 @@ impl Renderer {
         };
         unsafe {
             if self.audio_target.is_none() {
-                let tex = gl.create_texture()?;
+                let tex = gl.new_texture()?;
                 gl.bind_texture(glow::TEXTURE_2D, Some(tex));
                 gl.tex_image_2d(
                     glow::TEXTURE_2D,
@@ -4084,9 +4105,7 @@ impl Renderer {
                     glow::NEAREST as i32,
                 );
                 gl.bind_texture(glow::TEXTURE_2D, None);
-                let fbo = gl
-                    .create_framebuffer()
-                    .inspect_err(|_| gl.delete_texture(tex))?;
+                let fbo = gl.new_framebuffer().inspect_err(|_| gl.free_texture(tex))?;
                 gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
                 gl.framebuffer_texture_2d(
                     glow::FRAMEBUFFER,
@@ -4099,8 +4118,8 @@ impl Renderer {
                     gl.check_framebuffer_status(glow::FRAMEBUFFER) == glow::FRAMEBUFFER_COMPLETE;
                 gl.bind_framebuffer(glow::FRAMEBUFFER, None);
                 if !ok {
-                    gl.delete_framebuffer(fbo);
-                    gl.delete_texture(tex);
+                    gl.free_framebuffer(fbo);
+                    gl.free_texture(tex);
                     return Err(
                         "this GPU can't render to float textures, so GLSL sound is unavailable"
                             .into(),
@@ -4152,7 +4171,7 @@ impl Renderer {
                         gl.active_texture(glow::TEXTURE0 + unit as u32);
                         let tex = new_track_texture(&gl, rows)?;
                         if let Some((old, _)) = self.audio_inputs[unit].replace((tex, rows)) {
-                            gl.delete_texture(old);
+                            gl.free_texture(old);
                         }
                     }
                     gl.bind_buffer(glow::PIXEL_UNPACK_BUFFER, Some(st.buf));
@@ -4259,7 +4278,7 @@ impl Renderer {
             let t_fence = std::time::Instant::now();
             let fence = AudioFence {
                 gl: gl.clone(),
-                sync: gl.fence_sync(glow::SYNC_GPU_COMMANDS_COMPLETE, 0)?,
+                sync: gl.new_fence(glow::SYNC_GPU_COMMANDS_COMPLETE, 0)?,
             };
             // Make sure the fence reaches the GPU without anyone waiting on it.
             gl.flush();
@@ -4778,7 +4797,7 @@ unsafe fn take_buf(
         glow::PIXEL_UNPACK_BUFFER
     };
     unsafe {
-        let buf = gl.create_buffer()?;
+        let buf = gl.new_buffer()?;
         gl.bind_buffer(target, Some(buf));
         let mut ptr = std::ptr::null_mut();
         if persistent {
@@ -4818,7 +4837,7 @@ unsafe fn new_track_texture(
     rows: usize,
 ) -> std::result::Result<glow::Texture, String> {
     unsafe {
-        let tex = gl.create_texture()?;
+        let tex = gl.new_texture()?;
         gl.bind_texture(glow::TEXTURE_2D, Some(tex));
         gl.tex_image_2d(
             glow::TEXTURE_2D,
@@ -4856,7 +4875,7 @@ unsafe fn upload_track(
     let bytes =
         unsafe { std::slice::from_raw_parts(padded.as_ptr() as *const u8, padded.len() * 4) };
     unsafe {
-        let tex = gl.create_texture()?;
+        let tex = gl.new_texture()?;
         gl.bind_texture(glow::TEXTURE_2D, Some(tex));
         gl.tex_image_2d(
             glow::TEXTURE_2D,
@@ -4895,44 +4914,50 @@ impl Drop for Renderer {
                 self.delete_state(e.state);
             }
             for (_, p) in std::mem::take(&mut self.audio) {
-                self.gl.delete_program(p.prog);
+                self.gl.free_program(p.prog);
             }
             self.audio_jobs.clear();
             self.audio_pbos.clear();
             self.audio_staging.clear();
             for (t, _) in self.audio_inputs.iter().flatten() {
-                self.gl.delete_texture(*t);
+                self.gl.free_texture(*t);
             }
             if let Some((fbo, tex)) = self.audio_target.take() {
-                self.gl.delete_framebuffer(fbo);
-                self.gl.delete_texture(tex);
+                self.gl.free_framebuffer(fbo);
+                self.gl.free_texture(tex);
             }
             let mut all: Vec<Option<Target>> = vec![self.out.take()];
             for s in std::mem::take(&mut self.seqs) {
-                all.extend([s.a, s.b, s.freeze, s.layer, s.picture]);
-                all.extend(s.work);
-                all.extend(s.held);
+                all.extend(seq_targets(s).into_iter().map(Some));
             }
             all.extend(std::mem::take(&mut self.inst));
             for f in &mut self.folds {
                 all.extend(f.targets().into_iter().map(Some));
             }
             for t in all.into_iter().flatten() {
-                self.gl.delete_framebuffer(t.fbo);
-                self.gl.delete_texture(t.tex);
+                self.gl.free_framebuffer(t.fbo);
+                self.gl.free_texture(t.tex);
             }
             for (_, e) in std::mem::take(&mut self.textures) {
                 self.delete_texture_state(e.state);
             }
             for (_, t) in std::mem::take(&mut self.spare) {
-                self.gl.delete_texture(t);
+                self.gl.free_texture(t);
             }
             for (_, s) in std::mem::take(&mut self.samplers) {
-                self.gl.delete_sampler(s);
+                self.gl.free_sampler(s);
             }
-            self.gl.delete_vertex_array(self.vao);
-            self.gl.delete_texture(self.dummy);
-            self.gl.delete_texture(self.clear);
+            if let Some(t) = self.timer.take() {
+                if t.active.is_some() {
+                    self.gl.end_query(glow::TIME_ELAPSED);
+                }
+                for q in t.free.into_iter().chain(t.pending).chain(t.active) {
+                    self.gl.free_query(q);
+                }
+            }
+            self.gl.free_vertex_array(self.vao);
+            self.gl.free_texture(self.dummy);
+            self.gl.free_texture(self.clear);
         }
     }
 }
@@ -5073,10 +5098,10 @@ fn ensure_target<'a>(
     }
     unsafe {
         if let Some(old) = slot.take() {
-            gl.delete_framebuffer(old.fbo);
-            gl.delete_texture(old.tex);
+            gl.free_framebuffer(old.fbo);
+            gl.free_texture(old.tex);
         }
-        let tex = gl.create_texture().expect("create texture");
+        let tex = gl.new_texture().expect("create texture");
         gl.bind_texture(glow::TEXTURE_2D, Some(tex));
         gl.tex_image_2d(
             glow::TEXTURE_2D,
@@ -5110,7 +5135,7 @@ fn ensure_target<'a>(
             glow::CLAMP_TO_EDGE as i32,
         );
         gl.bind_texture(glow::TEXTURE_2D, None);
-        let fbo = gl.create_framebuffer().expect("create framebuffer");
+        let fbo = gl.new_framebuffer().expect("create framebuffer");
         gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
         gl.framebuffer_texture_2d(
             glow::FRAMEBUFFER,
@@ -5251,7 +5276,7 @@ impl GpuTimer {
     fn new(gl: &glow::Context) -> Option<GpuTimer> {
         let mut queries = vec![];
         for _ in 0..6 {
-            queries.push(unsafe { gl.create_query().ok()? });
+            queries.push(unsafe { gl.new_query().ok()? });
         }
         Some(GpuTimer {
             free: queries,

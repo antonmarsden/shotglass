@@ -4,7 +4,8 @@
 //! `cargo test` runs it too (tests/gpu.rs), so CI exercises it on software OpenGL
 //! and you can run it on a real GPU after a driver update.
 
-use crate::gfx::{Frame, FrameInfo, Renderer};
+use crate::gfx::Tracked;
+use crate::gfx::{Frame, FrameInfo, GlObjects, Renderer};
 use crate::movie::{At, Movie};
 use crate::shader::Dialect;
 use crate::sound::Soundtrack;
@@ -249,6 +250,10 @@ const CHECKS: &[Check] = &[
     Check {
         name: "buffers: after = \"<layer>\" steps after that layer (@input, @<layer>); paths agree; hidden layers and layers above don't touch it",
         run: buffers_after_layer,
+    },
+    Check {
+        name: "GL objects: edits, resizes and removals return to the same counts; a dropped renderer frees everything",
+        run: gl_object_churn,
     },
     Check {
         name: "chunked sound matches a single-pass render",
@@ -853,7 +858,7 @@ fn glsl_tests(gl: &Gl, dir: &Path) -> Result<String> {
         report += l;
         report.push('\n');
     });
-    unsafe { gl.delete_buffer(junk) };
+    unsafe { gl.free_buffer(junk) };
     let sum = sum?;
     let expected = "\
 unit/fx.test.glsl
@@ -1544,7 +1549,7 @@ duration=2
 
 fn dirty_pack_state(gl: &Gl) -> Result<glow::Buffer> {
     unsafe {
-        let buf = gl.create_buffer().map_err(|e| anyhow!(e))?;
+        let buf = gl.new_buffer().map_err(|e| anyhow!(e))?;
         gl.bind_buffer(glow::PIXEL_PACK_BUFFER, Some(buf));
         gl.buffer_data_size(glow::PIXEL_PACK_BUFFER, 4096, glow::STREAM_READ);
         gl.pixel_store_i32(glow::PACK_ALIGNMENT, 8);
@@ -1730,7 +1735,7 @@ fn readback_into(gl: &Gl, dir: &Path) -> Result<String> {
                 let junk = dirty_pack_state(gl)?;
                 r.read_output_into(&mut dst, (x, y));
                 let state = r.pack_state();
-                unsafe { gl.delete_buffer(junk) };
+                unsafe { gl.free_buffer(junk) };
                 let window = (x, y, x + W as usize, y + H as usize);
                 if dst.view((window.0, window.1), (window.2, window.3)) != want_frame {
                     bail!("{what}, {name}, at ({x}, {y}): the window differs from read_output");
@@ -4048,6 +4053,119 @@ sound = "tone.glsl"
 uniforms.uPitch = 2.0
 "#;
 
+/// The GL object ledger (`gfx::ledger`) across a renderer's life. GL handles are plain
+/// numbers, so a target dropped from a `Vec` leaks silently (#74, #138 review fixes).
+/// One renderer cycles through edits that add and remove buffers, layers, a comp with
+/// buffers and a texture, at several output sizes; the second cycle must end on the
+/// same counts as the first (caches have filled by then), and dropping the renderer
+/// must bring every kind back to where it started.
+fn gl_object_churn(gl: &Gl, dir: &Path) -> Result<String> {
+    let base = GlObjects::live();
+    let bdir = dir.join("bufs");
+    let bufs = buffer_film(&bdir, "\"@hist\"")?;
+    let cdir = dir.join("comp");
+    buffer_film(&cdir, "\"@hist\"")?;
+    write(
+        &cdir,
+        &[
+            (
+                "pat.glsl",
+                &scene("fragColor = vec4(fract(uv.x + iTime * 0.9), uv.y, 0.5, 1.0);"),
+            ),
+            (
+                "showacc.glsl",
+                &scene("fragColor = vec4(texture(iChannel0, uv).rgb, 1.0);"),
+            ),
+            ("c.toml", COMP_BUF_BODY),
+        ],
+    )?;
+    let comp = movie(
+        &cdir,
+        "shotglass = \"0.1.10\"
+[comps]
+c = \"c.toml\"
+         [[shot]]
+id=\"s\"
+comp=\"c\"
+duration=2
+",
+    )?;
+    let pdir = dir.join("plain");
+    write(
+        &pdir,
+        &[("s.glsl", &scene("fragColor = vec4(uv, 0.5, 1.0);"))],
+    )?;
+    let plain = movie(
+        &pdir,
+        "shotglass = \"0.1.9\"
+[[shot]]
+id=\"a\"
+scene=\"s.glsl\"
+duration=2
+",
+    )?;
+    let mut r = renderer(gl, &bufs)?;
+    let draw = |r: &mut Renderer, m: &Movie, w: i32, h: i32, what: &str| -> Result<()> {
+        if let Err(e) = r.set_movie(m) {
+            bail!(
+                "{what}: {}",
+                e.iter().map(|e| e.to_string()).collect::<String>()
+            );
+        }
+        for n in [0, 10, 40] {
+            r.render(m, w, h, &FrameInfo::frame(m, n), true)
+                .ok_or_else(|| anyhow!("{what}, frame {n} at {w}x{h}: nothing rendered"))?;
+        }
+        Ok(())
+    };
+    // Framebuffers belong to render targets only (caches keep textures and programs),
+    // so after each step the renderer holds exactly as many as a fresh renderer that
+    // drew just that film at that size: nothing kept for what was removed or resized.
+    let fbos = |o: &GlObjects| o.counts[1];
+    let step = |r: &mut Renderer, m: &Movie, w: i32, h: i32, what: &str| -> Result<()> {
+        draw(r, m, w, h, what)?;
+        let held = fbos(&GlObjects::live()) - fbos(&base);
+        let before = GlObjects::live();
+        let mut f = renderer(gl, m)?;
+        draw(&mut f, m, w, h, what)?;
+        let fresh = fbos(&GlObjects::live()) - fbos(&before);
+        drop(f);
+        if held != fresh {
+            bail!("{what} at {w}x{h}: {held} framebuffers held after the edits, {fresh} fresh");
+        }
+        Ok(())
+    };
+    let cycle = |r: &mut Renderer| -> Result<GlObjects> {
+        step(r, &bufs, W, H, "buffers")?;
+        step(r, &comp, W, H, "comp with buffers")?;
+        step(r, &bufs, W / 2, H / 2, "buffers at half size")?;
+        step(r, &plain, W - 8, H, "plain film")?;
+        step(r, &comp, W / 2, H, "comp at another size")?;
+        step(r, &bufs, W, H, "buffers again")?;
+        Ok(GlObjects::live())
+    };
+    let first = cycle(&mut r)?;
+    let second = cycle(&mut r)?;
+    if first != second {
+        bail!(
+            "a second cycle of edits and resizes ended on other GL object counts: {}",
+            second.diff(&first)
+        );
+    }
+    drop(r);
+    let end = GlObjects::live();
+    if end != base {
+        bail!(
+            "a dropped renderer left GL objects behind: {}",
+            end.diff(&base)
+        );
+    }
+    Ok(format!(
+        "{} GL objects live mid-cycle, all freed",
+        first.counts.iter().sum::<i64>() - base.counts.iter().sum::<i64>()
+    ))
+}
+
 fn sound_fixture(dir: &Path) -> Result<Movie> {
     write(
         dir,
@@ -6127,6 +6245,7 @@ fn texture_freeze(gl: &Gl, dir: &Path) -> Result<String> {
 }
 
 fn texture_unpack_state(gl: &Gl, dir: &Path) -> Result<String> {
+    use crate::gfx::Tracked;
     use eframe::glow::{self, HasContext};
     // 3 px wide: 12-byte rows, which a stray alignment of 8 or row length would misread.
     png(dir, "t.png", 3, 3, |x, y| {
@@ -6148,7 +6267,7 @@ fn texture_unpack_state(gl: &Gl, dir: &Path) -> Result<String> {
     r.set_movie(&m).map_err(|e| anyhow!("{e:?}"))?;
     // What other code (the sound path's staging buffers, egui) may leave behind.
     let junk = unsafe {
-        let b = gl.create_buffer().map_err(|e| anyhow!(e))?;
+        let b = gl.new_buffer().map_err(|e| anyhow!(e))?;
         gl.bind_buffer(glow::PIXEL_UNPACK_BUFFER, Some(b));
         gl.buffer_data_u8_slice(glow::PIXEL_UNPACK_BUFFER, &[9u8; 4096], glow::STATIC_DRAW);
         gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 8);
@@ -6158,7 +6277,7 @@ fn texture_unpack_state(gl: &Gl, dir: &Path) -> Result<String> {
     };
     let f = shot(&mut r, &m, at_shot(0, 0.5), 1.0)?;
     let state = r.unpack_state();
-    unsafe { gl.delete_buffer(junk) };
+    unsafe { gl.free_buffer(junk) };
     // Rows of the frame are top first; texelFetch row 0 is the frame's bottom row,
     // and vflip = false keeps the file's top row as texel row 0.
     for (x, y) in [(0usize, 0usize), (1, 0), (2, 1), (1, 2)] {
@@ -6677,6 +6796,7 @@ fn footage_broken(gl: &Gl, dir: &Path) -> Result<String> {
 }
 
 fn footage_unpack_state(gl: &Gl, dir: &Path) -> Result<String> {
+    use crate::gfx::Tracked;
     use eframe::glow::{self, HasContext};
     // 3 px wide frames (12-byte rows), each texel (x·100, y·100, 10·k).
     for k in 0..4u32 {
@@ -6703,7 +6823,7 @@ fn footage_unpack_state(gl: &Gl, dir: &Path) -> Result<String> {
     r.set_movie(&m).map_err(|e| anyhow!("{e:?}"))?;
     // What the sound path's staging buffers (or egui) may leave behind, before every pump.
     let junk = unsafe {
-        let b = gl.create_buffer().map_err(|e| anyhow!(e))?;
+        let b = gl.new_buffer().map_err(|e| anyhow!(e))?;
         gl.bind_buffer(glow::PIXEL_UNPACK_BUFFER, Some(b));
         gl.buffer_data_u8_slice(glow::PIXEL_UNPACK_BUFFER, &[9u8; 4096], glow::STATIC_DRAW);
         gl.bind_buffer(glow::PIXEL_UNPACK_BUFFER, None);
@@ -6758,7 +6878,7 @@ fn footage_unpack_state(gl: &Gl, dir: &Path) -> Result<String> {
     }
     unsafe {
         gl.bind_buffer(glow::PIXEL_UNPACK_BUFFER, None);
-        gl.delete_buffer(junk);
+        gl.free_buffer(junk);
         gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 4);
         gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, 0);
         gl.pixel_store_i32(glow::UNPACK_SKIP_ROWS, 0);

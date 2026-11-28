@@ -13,6 +13,8 @@
 //! exact call, even several on one line, without GLSL needing strings.
 
 use crate::WebChecks;
+
+use crate::gfx::Tracked;
 use crate::gfx::{ReadFormat, read_pixels_into};
 use crate::library::Library;
 use crate::shader::{Assembled, Builder, Dialect, DriverGlsl, compile, top_level_definitions};
@@ -877,7 +879,7 @@ pub fn run(
                 }
             }
         }
-        unsafe { gl.delete_program(prog) };
+        unsafe { gl.free_program(prog) };
     }
     unsafe { gpu.delete(gl) };
     Ok(sum)
@@ -886,11 +888,11 @@ pub fn run(
 impl Gpu {
     unsafe fn new(gl: &glow::Context) -> Result<Gpu> {
         unsafe {
-            let vao = gl.create_vertex_array().map_err(|e| anyhow!(e))?;
-            let fbo = gl.create_framebuffer().map_err(|e| anyhow!(e))?;
+            let vao = gl.new_vertex_array().map_err(|e| anyhow!(e))?;
+            let fbo = gl.new_framebuffer().map_err(|e| anyhow!(e))?;
             let mut tex = vec![];
             for _ in 0..3 {
-                tex.push(gl.create_texture().map_err(|e| anyhow!(e))?);
+                tex.push(gl.new_texture().map_err(|e| anyhow!(e))?);
             }
             Ok(Gpu {
                 vao,
@@ -903,10 +905,10 @@ impl Gpu {
 
     unsafe fn delete(&self, gl: &glow::Context) {
         unsafe {
-            gl.delete_vertex_array(self.vao);
-            gl.delete_framebuffer(self.fbo);
+            gl.free_vertex_array(self.vao);
+            gl.free_framebuffer(self.fbo);
             for t in self.tex {
-                gl.delete_texture(t);
+                gl.free_texture(t);
             }
         }
     }

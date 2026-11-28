@@ -36,6 +36,8 @@ use super::{
     run_sound_metrics,
 };
 use crate::WebChecks;
+
+use crate::gfx::Tracked;
 use crate::glsl_test::{Summary, TestFile};
 use crate::glsl_test::{check_test_shader, test_dialects};
 use crate::shader::{Builder, Dialect, DriverGlsl};
@@ -283,7 +285,7 @@ fn picture(
         }
         Ok(t)
     });
-    unsafe { gl.delete_program(prog) };
+    unsafe { gl.free_program(prog) };
     out
 }
 
@@ -310,7 +312,7 @@ fn sound(gl: &glow::Context, d: Dialect, p: &Path, f: &TestFile, n: usize) -> Re
         let t = g.map.read(gl, 0);
         Ok(t.data()[..n].iter().flat_map(|v| [v[0], v[1]]).collect())
     });
-    unsafe { gl.delete_program(prog) };
+    unsafe { gl.free_program(prog) };
     out
 }
 
@@ -377,7 +379,7 @@ fn measure_case(
                     match unsafe { gpu::upload(gl, t) } {
                         Ok(t) => tex.push(t),
                         Err(e) => {
-                            tex.iter().for_each(|t| unsafe { gl.delete_texture(*t) });
+                            tex.iter().for_each(|t| unsafe { gl.free_texture(*t) });
                             return Err(e);
                         }
                     }
@@ -405,7 +407,7 @@ fn measure_case(
                     );
                     Ok((vec![m.reduced], vec![m.histogram]))
                 });
-                tex.iter().for_each(|t| unsafe { gl.delete_texture(*t) });
+                tex.iter().for_each(|t| unsafe { gl.free_texture(*t) });
                 r
             })();
             progs.delete(gl);

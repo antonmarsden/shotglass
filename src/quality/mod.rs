@@ -29,6 +29,7 @@ pub mod testing;
 pub use config::{Config, Kind, QUALITY_FILE, SOUND_MARGIN_DB, tighten};
 pub use stats::Report;
 
+use crate::gfx::Tracked;
 use crate::gfx::{Frame, FrameInfo, Renderer};
 use crate::library::Library;
 use crate::movie::{Movie, TransitionKind};
@@ -284,7 +285,7 @@ impl Programs {
 
     fn delete(&self, gl: &glow::Context) {
         for p in &self.progs {
-            unsafe { gl.delete_program(*p) };
+            unsafe { gl.free_program(*p) };
         }
     }
 }
@@ -348,7 +349,7 @@ impl Variants {
 
     fn delete(&self, gl: &glow::Context) {
         for t in self.tex.iter().flatten() {
-            unsafe { gl.delete_texture(*t) };
+            unsafe { gl.free_texture(*t) };
         }
     }
 }
@@ -488,7 +489,7 @@ fn run_sound_metrics(
                     c.histograms.push(g.histogram(gl, x.range, count as i32));
                 }
             }
-            unsafe { gl.delete_texture(tex) };
+            unsafe { gl.free_texture(tex) };
         }
         Ok(())
     });
@@ -599,7 +600,7 @@ pub fn run(
                             .copy_from_toodee(heat);
                     }
                 }
-                unsafe { gl.delete_texture(frame_tex) };
+                unsafe { gl.free_texture(frame_tex) };
                 variants.delete(&gl);
                 frames.push(FrameReport {
                     index: i,
