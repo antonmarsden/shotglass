@@ -99,7 +99,7 @@ tested by the owner on a real GPU. If you work that way too:
   The right-hand files hold the invariants about blocking, GPU syncs, the audio
   callback and bit-exact sound; two concurrent changes there interact in ways neither
   session's tests see. Finish, review and merge one before starting the next.
-  `movie.rs`, `shader.rs` and `selftest.rs` are shared by many changes: expect
+  `movie.rs`, `shader.rs` and `selftest/mod.rs` (the `CHECKS` list) are shared by many changes: expect
   conflicts and rebase rather than merge by hand.
 - **Fresh-context review before the real-GPU test.** When the session says it's done,
   review the diff in a new session (`/code-review`, or a plain "review this branch
@@ -132,7 +132,7 @@ None of the machines has a real GPU:
 |---|---|---|
 | Linux | Mesa llvmpipe under Xvfb | nothing (also renders and exports the demo) |
 | Windows | Mesa llvmpipe ([mesa-dist-win](https://github.com/pal1000/mesa-dist-win)) | the selftest's video export (no ffmpeg; PNG + WAV export still checked) |
-| macOS | Apple Software Renderer (OpenGL 4.1; the runners have no GPU) | none of the golden tests (they compare against the same llvmpipe references; this renderer's built-in `sin`/`cos` are ~5e-4 off, so the demo computes its camera rotation itself; it blends mipmaps a little differently, so the textures film `tests/films/channels` allows a mean difference of 0.4/255 instead of 0.25). The selftest's "sound matches exactly" comparisons (chunked, banded, streamed, exported) are reported, not failed: this renderer's sound differs by about 1e-5 with the size of the block drawn (`INEXACT_SOUND_RENDERERS` in `selftest.rs`); everything else in those checks still runs. Also the video export, as on Windows. |
+| macOS | Apple Software Renderer (OpenGL 4.1; the runners have no GPU) | none of the golden tests (they compare against the same llvmpipe references; this renderer's built-in `sin`/`cos` are ~5e-4 off, so the demo computes its camera rotation itself; it blends mipmaps a little differently, so the textures film `tests/films/channels` allows a mean difference of 0.4/255 instead of 0.25). The selftest's "sound matches exactly" comparisons (chunked, banded, streamed, exported) are reported, not failed: this renderer's sound differs by about 1e-5 with the size of the block drawn (`INEXACT_SOUND_RENDERERS` in `selftest/support.rs`); everything else in those checks still runs. Also the video export, as on Windows. |
 
 ### Kit canary
 
