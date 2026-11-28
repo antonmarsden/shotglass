@@ -1015,7 +1015,12 @@ impl Player {
         // Progressive scrub (#137): while dragging, buffers show the nearest ready
         // state; once the drag stops, the same frame is drawn again, exact.
         let scrubbing = self.scrub_resume.is_some();
-        if self.rendered_key == Some(key) && (scrubbing || !self.renderer.buffer_approximate()) {
+        if skip_render(
+            self.rendered_key,
+            key,
+            scrubbing,
+            self.renderer.buffer_approximate(),
+        ) {
             return None;
         }
         self.renderer.set_scrub_preview(scrubbing);
@@ -1023,6 +1028,10 @@ impl Player {
         // keep the previous frame up until the shot's program is ready.
         let blocking = !playing;
         let Some(tex) = self.renderer.render(m, w, h, &info, blocking) else {
+            // Nothing new on screen: draw again on the next repaint. A catch-up after a
+            // progressive scrub (#159) clears the approximate flag before its first
+            // slice returns None; a kept key would stop the remaining slices.
+            self.rendered_key = None;
             // Buffers catching up after a seek while playing (#134): the clock waits (a
             // stall, not a drop), then playback resumes.
             if self.clock.playing() && self.renderer.catchup_progress().is_some() {
@@ -2147,10 +2156,39 @@ fn playback_state(clock_playing: bool, catchup_paused: bool) -> bool {
     clock_playing || catchup_paused
 }
 
+/// Is the frame with this key already on screen? `rendered` is the key of the last
+/// frame `render` returned (None after a render that drew nothing). A scrub keeps an
+/// approximate frame up; once the drag stops it is drawn again, exact.
+fn skip_render<K: PartialEq>(
+    rendered: Option<K>,
+    key: K,
+    scrubbing: bool,
+    approximate: bool,
+) -> bool {
+    rendered == Some(key) && (scrubbing || !approximate)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{LiveReload, RecursiveMode, channel, egui, next_scale};
     use std::{fs, time::Duration};
+
+    #[test]
+    fn catchup_after_a_scrub_keeps_rendering() {
+        // #159: the drag draws frame k approximate and records its key.
+        let mut rendered = None;
+        assert!(!super::skip_render(rendered, 7, true, false));
+        rendered = Some(7);
+        assert!(super::skip_render(rendered, 7, true, true));
+        // Released: the approximate frame is drawn again.
+        assert!(!super::skip_render(rendered, 7, false, true));
+        // That render cleared the flag, ran one slice and drew nothing, so the key goes.
+        rendered = None;
+        assert!(!super::skip_render(rendered, 7, false, false));
+        // The exact frame drawn: later repaints skip it.
+        rendered = Some(7);
+        assert!(super::skip_render(rendered, 7, false, false));
+    }
 
     #[test]
     fn buffer_catchup_hold_counts_as_playing() {
