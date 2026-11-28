@@ -586,7 +586,10 @@ pub(super) fn video_play_matches_seeks(gl: &Gl, _dir: &Path) -> Result<String> {
         b.render(&m, W, H, &info(m.frame_time(k), 1.0), true)
             .ok_or_else(|| anyhow!("frame {k} didn't render"))?;
         let f = b.read_output().ok_or_else(|| anyhow!("no output"))?;
-        expect_same(
+        // The decoded texels are bit-exact (CPU; `seek_equals_sequential…` pins that);
+        // the Apple Software Renderer's draws differ by 1/255 by path, as for folds.
+        expect_fold(
+            gl,
             &format!("film frame {k}: played vs sought"),
             &played[k as usize],
             &f,
