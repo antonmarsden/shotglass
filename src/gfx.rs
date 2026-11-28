@@ -16,6 +16,7 @@ use std::sync::Arc;
 use toodee::{TooDeeOps, TooDeeOpsMut, TranslateOps};
 
 mod fold;
+pub mod glstate;
 pub mod ledger;
 pub use ledger::{GlObjects, Tracked};
 
@@ -1638,7 +1639,18 @@ impl Renderer {
 
     /// Per-frame housekeeping: finish compiles that are done, start the ones the
     /// playhead will need next, compile the rest in the background, evict old ones.
+    /// Tests (gfx::glstate::set_audit): record GL state a public entry point left
+    /// behind. Off, this is one relaxed atomic load.
+    fn audit(&self, what: &str) {
+        glstate::audit(&self.gl, what);
+    }
+
     pub fn pump(&mut self, movie: &Movie, t: f32, background: bool) {
+        self.pump_inner(movie, t, background);
+        self.audit("pump");
+    }
+
+    fn pump_inner(&mut self, movie: &Movie, t: f32, background: bool) {
         self.frame_no += 1;
         let pending: Vec<u64> = self
             .programs
@@ -2944,6 +2956,20 @@ impl Renderer {
         at: At,
         blocking: bool,
     ) -> Option<glow::Texture> {
+        let r = self.render_at_inner(movie, w, h, info, at, blocking);
+        self.audit("render_at");
+        r
+    }
+
+    fn render_at_inner(
+        &mut self,
+        movie: &Movie,
+        w: i32,
+        h: i32,
+        info: &FrameInfo,
+        at: At,
+        blocking: bool,
+    ) -> Option<glow::Texture> {
         let copy = self.copy?;
         let (w, h) = (w.max(1), h.max(1));
         let sw = ((w as f32 * info.scale).round() as i32).clamp(1, w);
@@ -3984,6 +4010,11 @@ impl Renderer {
     /// window are untouched. Panics if the window doesn't fit, or if nothing has
     /// been rendered yet.
     pub fn read_output_into(&self, dst: &mut Frame, (x, y): (usize, usize)) {
+        self.read_output_into_inner(dst, (x, y));
+        self.audit("read_output_into");
+    }
+
+    fn read_output_into_inner(&self, dst: &mut Frame, (x, y): (usize, usize)) {
         let t = self
             .out
             .as_ref()
@@ -4064,6 +4095,20 @@ impl Renderer {
     /// and fenced. Collect it with `poll_audio` (never blocks) or `wait_audio` (blocks).
     /// Only WebGL 2 features are used (fences, PBOs), so a web build can do the same.
     pub fn submit_audio(
+        &mut self,
+        key: u64,
+        first: usize,
+        count: usize,
+        sample_rate: u32,
+        shot: (f32, f32),
+        inputs: Option<(&[f32], &[f32], i64)>,
+    ) -> std::result::Result<AudioTicket, String> {
+        let r = self.submit_audio_inner(key, first, count, sample_rate, shot, inputs);
+        self.audit("submit_audio");
+        r
+    }
+
+    fn submit_audio_inner(
         &mut self,
         key: u64,
         first: usize,
@@ -4301,6 +4346,15 @@ impl Renderer {
     /// The samples of a submitted block if the GPU has finished it, without waiting.
     /// None = not yet; the ticket stays valid. Some = done; the ticket is used up.
     pub fn poll_audio(&mut self, t: AudioTicket) -> Option<std::result::Result<Vec<f32>, String>> {
+        let r = self.poll_audio_inner(t);
+        self.audit("poll_audio");
+        r
+    }
+
+    fn poll_audio_inner(
+        &mut self,
+        t: AudioTicket,
+    ) -> Option<std::result::Result<Vec<f32>, String>> {
         let Some(job) = self.audio_jobs.get(&t.0) else {
             return Some(Err("unknown sound block".into()));
         };
@@ -4323,6 +4377,12 @@ impl Renderer {
     /// GPU→CPU sync (counted in `blocking_audio_reads`): only for headless use, or
     /// for the chunk under a paused playhead.
     pub fn wait_audio(&mut self, t: AudioTicket) -> std::result::Result<Vec<f32>, String> {
+        let r = self.wait_audio_inner(t);
+        self.audit("wait_audio");
+        r
+    }
+
+    fn wait_audio_inner(&mut self, t: AudioTicket) -> std::result::Result<Vec<f32>, String> {
         let job = self.audio_jobs.remove(&t.0).ok_or("unknown sound block")?;
         self.blocking_audio_reads += 1;
         loop {

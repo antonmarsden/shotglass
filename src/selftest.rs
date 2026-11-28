@@ -722,6 +722,7 @@ pub fn run(filter: Option<String>) -> Result<()> {
             let sub = dir2.join(format!("check{i}"));
             std::fs::create_dir_all(&sub)?;
             let t = Instant::now();
+            crate::gfx::glstate::set_audit(true);
             let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (c.run)(&gl, &sub)))
                 .unwrap_or_else(|p| {
                     let msg = p
@@ -731,6 +732,20 @@ pub fn run(filter: Option<String>) -> Result<()> {
                         .unwrap_or_default();
                     Err(anyhow!("panicked: {msg}"))
                 });
+            // Whatever a check did, the GL state it leaves is the defaults the renderer
+            // promises (gfx::glstate): a framebuffer, buffer, sampler or pixel-store
+            // setting left behind leaks into the next pass, egui's or our own.
+            let mut dirty = crate::gfx::glstate::take_audit();
+            let end = crate::gfx::glstate::dirty(&gl);
+            crate::gfx::glstate::reset(&gl);
+            dirty.extend(end.into_iter().map(|x| format!("the check left {x}")));
+            let res = res.and_then(|note| {
+                if dirty.is_empty() {
+                    Ok(note)
+                } else {
+                    Err(anyhow!("left GL state behind: {}", dirty.join(", ")))
+                }
+            });
             let ms = t.elapsed().as_secs_f32() * 1000.0;
             let skipped = FOLD_NOTES.with(|n| std::mem::take(&mut *n.borrow_mut()));
             let res = res.map(|note| {
@@ -6821,6 +6836,9 @@ fn footage_unpack_state(gl: &Gl, dir: &Path) -> Result<String> {
     r.set_readback(true);
     r.set_upload_budget(12); // one row per band
     r.set_movie(&m).map_err(|e| anyhow!("{e:?}"))?;
+    // This check leaves stray state on purpose before every pump (a pump that uploads
+    // nothing rightly leaves it alone): no entry-point audit here, only the end check.
+    crate::gfx::glstate::set_audit(false);
     // What the sound path's staging buffers (or egui) may leave behind, before every pump.
     let junk = unsafe {
         let b = gl.new_buffer().map_err(|e| anyhow!(e))?;
