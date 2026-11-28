@@ -60,6 +60,9 @@ sound = "sfx/chime.glsl"
 # and a layer channel "@trail".
 # A comp file may have [[buffer]]s too (shotglass = "0.1.10"): they fold over the comp's own
 # frames, and such a comp is shown in one place only.
+# after = "grade"            # step right after layer "grade" instead of before every layer
+#                            # (shotglass = "0.1.11"): then it may read "@input", the composite
+#                            # so far, and "@grade" and layers below it; layers above read it
 #
 # Text, bound to channels like a texture (shotglass = "0.1.3"; see docs/channels.md, "Text"):
 # `shotglass fonts add "Inter"` (in the film folder) adds a Google Fonts family and writes, e.g.:

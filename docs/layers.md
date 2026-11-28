@@ -112,6 +112,8 @@ digits, underscores, or hyphens. For example, a later layer can read
 `@picture` keep their meanings above.
 
 A layer can read only layers below it (earlier in `movie.toml`), so passes never loop.
+A [feedback buffer](buffers.md#buffers-in-the-layer-stack-after) can step between layers
+(`after = "<layer>"`, 0.1.11) to keep state of the picture so far, or of one layer.
 
 ## Comps
 

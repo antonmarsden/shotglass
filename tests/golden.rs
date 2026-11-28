@@ -3,7 +3,8 @@
 //! iChannel textures film, tests/films/text, the text film, tests/films/layers and
 //! tests/films/blends, the layer films, tests/films/footage, image sequences, tests/films/glyphs, glyph runs and
 //! subtitles, tests/films/feedback, feedback buffers, tests/films/comp-feedback, buffers
-//! in comps, tests/films/warm-loop, `loop = "warm"`, and both
+//! in comps, tests/films/warm-loop, `loop = "warm"`, tests/films/layer-feedback, buffers
+//! in the layer stack, and both
 //! of tests/films/loop, a `loop = true` film) and compares them with reference PNGs and WAVs in tests/golden/, so "compiles but looks (or sounds) wrong" fails `cargo test` (and
 //! CI, on software OpenGL).
 //!
@@ -403,6 +404,23 @@ fn comp_feedback_film() {
         "comp-feedback",
         &root().join("tests").join("films").join("comp-feedback"),
         &["--at", "0.2,0.4,0.7,1.2,1.3,1.45,2.0,2.5"],
+        &[],
+    );
+}
+
+/// Buffers in the layer stack (#138): tests/films/layer-feedback, a buffer stepping
+/// after a grade layer smears the composite so far (`@input`), and one stepping after a
+/// title layer trails that layer's own picture (`@title`, unbound before the layer
+/// starts), reset at 1 s; a layer above both shows them. Folds stay short.
+#[test]
+fn layer_feedback_film() {
+    if skip() {
+        return;
+    }
+    golden_frames(
+        "layer-feedback",
+        &root().join("tests").join("films").join("layer-feedback"),
+        &["--at", "0.1,0.2,0.3,0.5,0.8,1.0,1.1,1.4"],
         &[],
     );
 }

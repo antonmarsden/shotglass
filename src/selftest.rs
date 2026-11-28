@@ -247,6 +247,10 @@ const CHECKS: &[Check] = &[
         run: buffers_warm_loop,
     },
     Check {
+        name: "buffers: after = \"<layer>\" steps after that layer (@input, @<layer>); paths agree; hidden layers and layers above don't touch it",
+        run: buffers_after_layer,
+    },
+    Check {
         name: "chunked sound matches a single-pass render",
         run: sound_chunk_equivalence,
     },
@@ -3508,6 +3512,389 @@ fn buffers_invalidation(gl: &Gl, dir: &Path) -> Result<String> {
         if n == 65 && half(&got, true) == half(&fwd[65], true) {
             bail!("editing the last shot didn't change the buffer at 65");
         }
+    }
+    Ok(String::new())
+}
+
+/// `buffers_after_layer`'s fixture (#138), on `buffer_film`'s files: "stk" (rgba32f,
+/// declared first) steps after layer "grade" and folds its previous state with the
+/// composite so far (`@input`), layer "lo" (`@lo`) and "pre"'s state this frame; its
+/// init pass reads `@input` too. "pre" is an ordinary buffer (before every layer) that
+/// "lo" reads, so "stk" must step after it whatever the file order. "grade" starts at
+/// 1.2 s (before that the anchor is inactive); "above" is over the anchor. "show"
+/// (opaque, on top) shows stk (left) and the picture below it (right).
+const STACK_BODY: &str = "[[shot]]\nid=\"a\"\nscene=\"s.glsl\"\nduration=1\n\
+     [[shot]]\nid=\"b\"\nscene=\"s.glsl\"\nduration=1\n\
+     [[buffer]]\nid=\"stk\"\nscene=\"stk.glsl\"\ninit=\"sinit.glsl\"\nafter=\"grade\"\n\
+     size=[40, 24]\nformat=\"rgba32f\"\nchannels=[\"@prev\", \"@input\", \"@lo\", \"@pre\"]\n\
+     [[buffer]]\nid=\"pre\"\nscene=\"acc.glsl\"\ninit=\"seed.glsl\"\nsize=[40, 24]\n\
+     format=\"rgba32f\"\nchannels=[\"@prev\", \"@picture\", \"t.png\"]\n\
+     [[layer]]\nid=\"lo\"\nscene=\"lo.glsl\"\nchannels=[\"@pre\"]\n\
+     [[layer]]\nid=\"grade\"\nscene=\"grade.glsl\"\nfrom=1.2\nchannels=[\"@input\"]\n\
+     [[layer]]\nid=\"above\"\nscene=\"above.glsl\"\nfrom=0.25\nchannels=[\"@input\"]\n";
+
+/// The fixture's layer and buffer shaders.
+fn stack_files(d: &Path) -> Result<()> {
+    buffer_film(d, HIST3)?;
+    write(
+        d,
+        &[
+            (
+                "lo.glsl",
+                &scene(
+                    "vec4 p = texture(iChannel0, uv);\n  \
+                     fragColor = vec4(p.bgr, step(0.5, fract(uv.x * 3.0 + iTime)) * 0.8);",
+                ),
+            ),
+            (
+                "grade.glsl",
+                &scene("fragColor = vec4(texture(iChannel0, uv).rgb * vec3(1.2, 0.9, 0.7), 1.0);"),
+            ),
+            (
+                "above.glsl",
+                &scene("fragColor = vec4(1.0 - texture(iChannel0, uv).rgb, 0.5);"),
+            ),
+            (
+                "stk.glsl",
+                &scene(
+                    "vec4 p = texture(iChannel0, uv);\n  vec4 i = texture(iChannel1, uv);\n  \
+                     vec4 l = texture(iChannel2, uv);\n  vec4 q = texture(iChannel3, uv);\n  \
+                     fragColor = vec4(fract(p.rgb * 1.37 + i.rgb * 0.53 + l.rgb * 0.29 + \
+                     q.rgb * 0.17 + float(iFrame) * 0.011), 1.0);",
+                ),
+            ),
+            (
+                "sinit.glsl",
+                &scene("fragColor = vec4(texture(iChannel1, uv).rgb * 0.5, 1.0);"),
+            ),
+            (
+                "show.glsl",
+                &scene(
+                    "fragColor = uv.x < 0.5 ? texture(iChannel0, vec2(uv.x * 2.0, uv.y)) \
+                     : texture(iChannel1, vec2(uv.x * 2.0 - 1.0, uv.y));\n  fragColor.a = 1.0;",
+                ),
+            ),
+            (
+                "view.glsl",
+                &scene("fragColor = vec4(texture(iChannel0, uv).rgb, 1.0);"),
+            ),
+        ],
+    )
+}
+
+fn buffers_after_layer(gl: &Gl, dir: &Path) -> Result<String> {
+    let film = |sub: &str, top: &str| -> Result<Movie> {
+        let d = dir.join(sub);
+        stack_files(&d)?;
+        movie(&d, &format!("shotglass = \"0.1.11\"\n{STACK_BODY}{top}"))
+    };
+    let show =
+        "[[layer]]\nid=\"show\"\nscene=\"show.glsl\"\nscale=1\nchannels=[\"@stk\", \"@input\"]\n";
+    let m = film("main", show)?;
+    if m.buffers[0].is_pure() {
+        bail!("stk reads a layer that reads buffer state: it can't be pure");
+    }
+    // 1. Every path agrees: forward, checkpoint, seeks, cold stills, folds from resets,
+    //    non-blocking playback.
+    let mut r = renderer(gl, &m)?;
+    let mut fwd = vec![];
+    for n in 0..=55 {
+        fwd.push(buf_frame(&mut r, &m, n, 1.0)?);
+    }
+    if r.blocking_catchups != 0 {
+        bail!("forward rendering caught up {} times", r.blocking_catchups);
+    }
+    if half(&fwd[20], true) == half(&fwd[21], true) {
+        bail!("the after buffer doesn't change from frame to frame");
+    }
+    let before = r.buffer_restores;
+    expect_fold(
+        gl,
+        "frame 45 from a checkpoint",
+        &buf_frame(&mut r, &m, 45, 1.0)?,
+        &fwd[45],
+        0,
+        0.0,
+    )?;
+    if r.buffer_restores == before {
+        bail!("seeking back to frame 45 didn't restore a checkpoint");
+    }
+    for n in [10, 52, 35, 36, 37, 3, 55] {
+        expect_fold(
+            gl,
+            &format!("frame {n} after seeking"),
+            &buf_frame(&mut r, &m, n, 1.0)?,
+            &fwd[n as usize],
+            0,
+            0.0,
+        )?;
+    }
+    for n in [0, 1, 29, 36, 44] {
+        let mut c = renderer(gl, &m)?;
+        expect_fold(
+            gl,
+            &format!("cold still of frame {n}"),
+            &buf_frame(&mut c, &m, n, 1.0)?,
+            &fwd[n as usize],
+            0,
+            0.0,
+        )?;
+    }
+    let mut c = renderer(gl, &m)?;
+    c.set_buffer_checkpoints(false);
+    for n in [50, 12, 40] {
+        c.forget_buffer_state();
+        expect_fold(
+            gl,
+            &format!("frame {n} folded from the reset"),
+            &buf_frame(&mut c, &m, n, 1.0)?,
+            &fwd[n as usize],
+            0,
+            0.0,
+        )?;
+    }
+    let mut p = renderer(gl, &m)?;
+    for n in 0..=8 {
+        let (got, _) = buf_play(&mut p, &m, n)?;
+        expect_fold(
+            gl,
+            &format!("frame {n} played"),
+            &got,
+            &fwd[n as usize],
+            0,
+            0.0,
+        )?;
+    }
+    let (got, held) = buf_play(&mut p, &m, 50)?;
+    expect_fold(
+        gl,
+        "frame 50 played after a far seek",
+        &got,
+        &fwd[50],
+        0,
+        0.0,
+    )?;
+    if held == 0 || p.blocking_catchups != 0 {
+        bail!(
+            "a far seek while playing: {held} renders held, {} blocking catch-ups",
+            p.blocking_catchups
+        );
+    }
+    // 2. Hidden layers are preview only: the state is the same with "lo" and "grade"
+    //    hidden from the start (the picture below "show" isn't).
+    let mut h = renderer(gl, &m)?;
+    h.set_hidden_layers(["lo".to_string(), "grade".to_string()].into());
+    for n in 0..=40 {
+        let f = buf_frame(&mut h, &m, n, 1.0)?;
+        expect_fold(
+            gl,
+            &format!("frame {n} with layers below the anchor hidden"),
+            &half(&f, true),
+            &half(&fwd[n as usize], true),
+            0,
+            0.0,
+        )?;
+        if n == 40 && half(&f, false) == half(&fwd[40], false) {
+            bail!("hiding \"lo\" and \"grade\" didn't change the picture");
+        }
+    }
+    // 3. The composite a step reads is the frame drawn up to its layer: a copy buffer
+    //    after "grade" at the output size, shown alone 3 frames back, equals the film
+    //    without it 3 frames earlier (both without "above"). cp is declared before
+    //    "pre", which "lo" reads, and it isn't a pure history: its states 3 back from a
+    //    checkpoint need pre's states then.
+    let base = &STACK_BODY[..STACK_BODY.find("[[layer]]\nid=\"above\"").unwrap()];
+    let cp = "[[buffer]]\nid=\"cp\"\nscene=\"copy.glsl\"\nafter=\"grade\"\nformat=\"rgba8\"\n\
+              history=3\nchannels=[\"@input\"]\n";
+    let view = "[[layer]]\nid=\"view\"\nscene=\"view.glsl\"\nscale=1\n\
+                channels=[{ source = \"@cp\", frame = -3 }]\n";
+    let with_cp = format!(
+        "{}{view}",
+        base.replacen("[[buffer]]", &format!("{cp}[[buffer]]"), 1)
+    );
+    let (dw, dp) = (dir.join("copy"), dir.join("plain"));
+    stack_files(&dw)?;
+    stack_files(&dp)?;
+    let with = movie(&dw, &format!("shotglass = \"0.1.11\"\n{with_cp}"))?;
+    let plain = movie(&dp, &format!("shotglass = \"0.1.11\"\n{base}"))?;
+    if with.buffers[0].is_pure() {
+        bail!("cp's composite reads buffer state: it can't be pure");
+    }
+    let (mut a, mut b) = (renderer(gl, &with)?, renderer(gl, &plain)?);
+    for n in [3, 20, 40, 31] {
+        expect_same(
+            &format!(
+                "frame {n}: the composite after \"grade\" 3 frames back vs frame {} drawn \
+                 without the buffer",
+                n - 3
+            ),
+            &buf_frame(&mut a, &with, n, 1.0)?,
+            &buf_frame(&mut b, &plain, n - 3, 1.0)?,
+            1,
+            0.0,
+        )?;
+    }
+    // `@<layer>`: a copy of "lo" taken right after it equals a top layer reading "@lo"
+    // (a layer only a buffer reads is held in the step's composite).
+    let cl = "[[buffer]]\nid=\"cl\"\nscene=\"copy.glsl\"\nafter=\"lo\"\nformat=\"rgba8\"\n\
+              channels=[\"@lo\"]\n";
+    let top = |c: &str| {
+        format!("[[layer]]\nid=\"view\"\nscene=\"view.glsl\"\nscale=1\nchannels=[\"{c}\"]\n")
+    };
+    let (dw, dp) = (dir.join("copy-layer"), dir.join("read-layer"));
+    stack_files(&dw)?;
+    stack_files(&dp)?;
+    let with = movie(
+        &dw,
+        &format!("shotglass = \"0.1.11\"\n{base}{cl}{}", top("@cl")),
+    )?;
+    let plain = movie(
+        &dp,
+        &format!("shotglass = \"0.1.11\"\n{base}{}", top("@lo")),
+    )?;
+    let (mut a, mut b) = (renderer(gl, &with)?, renderer(gl, &plain)?);
+    for n in [0, 20, 40] {
+        expect_same(
+            &format!("frame {n}: a copy of @lo after \"lo\" vs a layer reading @lo"),
+            &buf_frame(&mut a, &with, n, 1.0)?,
+            &buf_frame(&mut b, &plain, n, 1.0)?,
+            1,
+            0.0,
+        )?;
+    }
+    // In a comp (its layers, comp-local frames): a comp shot equals the comp as a film.
+    let dc = dir.join("comp");
+    stack_files(&dc)?;
+    write(&dc, &[("c.toml", &format!("{STACK_BODY}{show}"))])?;
+    let cm = movie(
+        &dc,
+        "shotglass = \"0.1.11\"\n[comps]\nc = \"c.toml\"\n\
+         [[shot]]\nid=\"s\"\ncomp=\"c\"\nduration=2\n",
+    )?;
+    let mut cr = renderer(gl, &cm)?;
+    for n in [0, 1, 2, 40, 41, 12, 55] {
+        expect_fold(
+            gl,
+            &format!("comp shot, frame {n} vs the comp as a film"),
+            &buf_frame(&mut cr, &cm, n, 1.0)?,
+            &fwd[n as usize],
+            0,
+            0.0,
+        )?;
+    }
+    // 4. Edits: a layer below the anchor ("grade", from 1.2 s = frame 36) invalidates from
+    //    its start; a layer above it ("above") doesn't touch the fold.
+    let d = dir.join("main");
+    write(
+        &d,
+        &[(
+            "above.glsl",
+            &scene("fragColor = vec4(texture(iChannel0, uv).gbr, 0.6);"),
+        )],
+    )?;
+    let m2 = Movie::load(&d)?;
+    r.load_all(&m2)
+        .map_err(|e| anyhow!("{}", crate::gfx::join_errors(&e)))?;
+    let (restores, steps) = (r.buffer_restores, r.buffer_steps);
+    let got = buf_frame(&mut r, &m2, 55, 1.0)?;
+    if r.buffer_restores != restores || r.buffer_steps != steps {
+        bail!(
+            "editing a layer above the anchor moved the fold ({} restores, {} steps)",
+            r.buffer_restores - restores,
+            r.buffer_steps - steps
+        );
+    }
+    expect_fold(
+        gl,
+        "frame 55's state after editing a layer above the anchor",
+        &half(&got, true),
+        &half(&fwd[55], true),
+        0,
+        0.0,
+    )?;
+    write(
+        &d,
+        &[(
+            "grade.glsl",
+            &scene("fragColor = vec4(texture(iChannel0, uv).rgb * vec3(0.7, 1.1, 1.3), 1.0);"),
+        )],
+    )?;
+    let m3 = Movie::load(&d)?;
+    r.load_all(&m3)
+        .map_err(|e| anyhow!("{}", crate::gfx::join_errors(&e)))?;
+    let mut fresh = renderer(gl, &m3)?;
+    // The cursor is at 55, after the edited layer starts: it mustn't be kept.
+    let steps = r.buffer_steps;
+    let got = buf_frame(&mut r, &m3, 55, 1.0)?;
+    if r.buffer_steps == steps {
+        bail!("editing a layer below the anchor kept the state at the cursor (frame 55)");
+    }
+    expect_fold(
+        gl,
+        "frame 55 after editing a layer below the anchor vs a cold fold",
+        &got,
+        &buf_frame(&mut fresh, &m3, 55, 1.0)?,
+        0,
+        0.0,
+    )?;
+    let (restores, steps) = (r.buffer_restores, r.buffer_steps);
+    let got = buf_frame(&mut r, &m3, 34, 1.0)?;
+    if r.buffer_restores == restores || r.buffer_steps - steps > 34 {
+        bail!(
+            "after editing a layer from frame 36, frame 34 folded {} steps (its checkpoint at 30 was dropped)",
+            r.buffer_steps - steps
+        );
+    }
+    expect_fold(
+        gl,
+        "frame 34 after editing a layer from 36",
+        &half(&got, true),
+        &half(&fwd[34], true),
+        0,
+        0.0,
+    )?;
+    for n in [37, 50] {
+        let got = buf_frame(&mut r, &m3, n, 1.0)?;
+        expect_fold(
+            gl,
+            &format!("frame {n} after the edit vs a cold fold"),
+            &got,
+            &buf_frame(&mut fresh, &m3, n, 1.0)?,
+            0,
+            0.0,
+        )?;
+        if half(&got, true) == half(&fwd[n as usize], true) {
+            bail!("editing \"grade\" didn't change the after buffer at frame {n}");
+        }
+    }
+    // Declarations in movie.toml: "above"'s opacity doesn't touch the fold, "grade"'s
+    // does. The cursor is at 50.
+    let toml = d.join("movie.toml");
+    let text = std::fs::read_to_string(&toml)?;
+    for (layer, moves) in [("above", false), ("grade", true)] {
+        let from = format!("scene=\"{layer}.glsl\"\n");
+        let text = text.replacen(&from, &format!("{from}opacity=0.7\n"), 1);
+        std::fs::write(&toml, &text)?;
+        let m4 = Movie::load(&d)?;
+        r.load_all(&m4)
+            .map_err(|e| anyhow!("{}", crate::gfx::join_errors(&e)))?;
+        let steps = r.buffer_steps;
+        let got = buf_frame(&mut r, &m4, 50, 1.0)?;
+        if (r.buffer_steps != steps) != moves {
+            bail!(
+                "changing \"{layer}\"'s opacity: {} steps at the cursor",
+                r.buffer_steps - steps
+            );
+        }
+        let mut cold = renderer(gl, &m4)?;
+        expect_fold(
+            gl,
+            &format!("frame 50 after changing \"{layer}\"'s opacity vs a cold fold"),
+            &got,
+            &buf_frame(&mut cold, &m4, 50, 1.0)?,
+            0,
+            0.0,
+        )?;
     }
     Ok(String::new())
 }

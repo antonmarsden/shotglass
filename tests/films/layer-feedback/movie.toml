@@ -1,0 +1,49 @@
+# Golden-image film for buffers in the layer stack (tests/golden.rs, #138): buffers
+# that step right after a layer (`after`) instead of before every layer. The shot is a
+# background plate; layer "title" draws a moving disc on transparent from 0.2 s;
+# layer "grade" warms everything below it. "smear" steps after "grade" and smears the
+# composite so far (@input: plate, disc and grade), so the plate stays put and the disc
+# leaves a smear; "ttrail" steps after "title" and trails that layer's own picture
+# (@title, premultiplied), reset at 1 s; before 0.2 s its layer is inactive and reads
+# black. Layer "show" (above both) shows the smear on the left and the trail over the
+# picture on the right. Folds stay short: errors compound across stacks.
+# Shaders are film-local, so the golden only moves when the engine does.
+title = "layer-feedback"
+fps = 30
+
+[[shot]]
+id = "plate"
+scene = "scenes/plate.glsl"
+duration = 1.5
+
+[[layer]]
+id = "title"
+scene = "layers/disc.glsl"
+from = 0.2
+
+[[layer]]
+id = "grade"
+scene = "layers/grade.glsl"
+channels = ["@input"]
+
+[[buffer]]
+id = "smear"
+scene = "buffers/smear.glsl"
+after = "grade"
+size = [160, 90]
+channels = ["@prev", "@input"]
+uniforms.uKeep = 0.75
+
+[[buffer]]
+id = "ttrail"
+scene = "buffers/trail.glsl"
+after = "title"
+scale = 0.5
+reset = [1.0]
+channels = ["@prev", "@title"]
+uniforms.uDecay = 0.8
+
+[[layer]]
+id = "show"
+scene = "layers/show.glsl"
+channels = ["@input", "@smear", "@ttrail"]

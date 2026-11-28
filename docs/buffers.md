@@ -9,7 +9,9 @@ cellular automata, simple fluids. Needs `shotglass = "0.1.9"`.
 
 A buffer is a scene shader whose output is kept and read back on the next frame, like
 Shadertoy's Buffer A–D. Buffers step once per film frame, after the shots (the picture
-track) and before any layer, in file order. Layers and later buffers read them:
+track) and before any layer, in file order (or right after a layer they name:
+[buffers in the layer stack](#buffers-in-the-layer-stack-after)). Layers and later
+buffers read them:
 
 ```toml
 [[buffer]]
@@ -70,7 +72,7 @@ names.
 | channel | reads | who |
 |---|---|---|
 | `"@prev"` | this buffer's previous state | buffers |
-| `"@<buffer>"` | that buffer's state this frame, after its step | layers, later buffers |
+| `"@<buffer>"` | that buffer's state this frame, after its step | layers (above its `after` layer), buffers stepping after it |
 | `{ source = "@<buffer>", frame = "prev" }` | its previous state | layers, any buffer |
 | `{ source = "@<buffer>", frame = -k }` | its state k frames ago (1 ≤ k ≤ `history`) | layers, any buffer |
 
@@ -80,9 +82,9 @@ names.
   reads black from earlier buffers (its init pass hasn't run yet).
 - Buffers read textures, text, footage, comps (including comps with
   [buffers of their own](#buffers-in-comps)), `@picture` (the picture track, rendered
-  at the buffer's size) and other buffers; not `@input` or `@<layer>`, since layers draw
-  after buffers step. For trails of something a layer would draw, render it in a
-  [comp](layers.md#comps) and read `@<comp>`.
+  at the buffer's size) and other buffers; `@input` and `@<layer>` only with
+  [`after`](#buffers-in-the-layer-stack-after), since layers otherwise draw after
+  buffers step.
 - Shots and transitions can't read buffers: they're drawn before buffers step.
 - Reading a buffer that isn't active this frame gives black.
 
@@ -249,8 +251,68 @@ loop = "warm"
   instead of stepping a period again.
 - A comp can be warm too: `loop = "warm"` on its `[comps]` entry.
 
+## Buffers in the layer stack: `after`
+
+`after = "<layer>"` (needs `shotglass = "0.1.11"`) makes a buffer step right after that
+layer is composited instead of before every layer. It can then read the picture so far,
+layers included: temporal smear or denoise of the finished picture (titles and grade
+included), or trails of one layer without wrapping it in a comp:
+
+```toml
+[[layer]]
+id = "title"
+scene = "layers/title.glsl"
+
+[[layer]]
+id = "grade"
+type = "fx/grade"
+channels = ["@input"]
+
+[[buffer]]
+id = "smear"
+scene = "buffers/smear.glsl"
+after = "grade"                    # steps once "grade" is composited
+channels = ["@prev", "@input"]     # the composite so far: picture, title and grade
+
+[[buffer]]
+id = "ttrail"
+scene = "buffers/trail.glsl"
+after = "title"
+scale = 0.5
+channels = ["@prev", "@title"]     # that layer's own picture, premultiplied
+
+[[layer]]
+id = "show"                        # above both: reads them as usual
+scene = "layers/show.glsl"
+channels = ["@input", "@smear", "@ttrail"]
+```
+
+- **What it reads:** `@input` is the composite up to and including its layer (the
+  picture track and every active layer up to it, composited); `@<layer>` reads that
+  layer or an earlier one, as a layer would. Both are drawn for the buffer at its own
+  size and scale 1, never at the player's render scale, like `@picture`. Layers above
+  its `after` layer draw after it steps: it can't read them.
+- **Who reads it:** layers above its `after` layer read `@<buffer>` as usual. The layer
+  it follows, and layers below, read only its previous states (`frame = "prev"`, `-k`).
+- **Order:** buffers step in file order before the layers, then, after each layer, the
+  buffers that name it, in file order. A buffer reads the current state of buffers that
+  step before it in that order (whatever their place in the file), and the previous
+  state of any. The layers it reads may read buffers that step before them; on a reset
+  frame, a buffer that steps later reads black for its previous state, as usual.
+- **An inactive layer:** while its `after` layer isn't active, the buffer still steps
+  (on its own span) and `@input` is the composite of the active layers below;
+  `@<layer>` of an inactive layer is unbound (black, resolution 0, as for layers).
+- **Muted and soloed layers** in the player are a preview of the picture only: a
+  buffer's `@input` and `@<layer>` always include every layer, so its state is the same
+  whatever you hide (and the same as in `still` and `export`).
+- **Edits:** a buffer that reads the stack depends on the picture track and on every
+  layer up to its `after` layer: an edit to one of those layers' shaders drops states from
+  that layer's start on; an edit to a layer above it doesn't touch the buffer.
+- **Cost:** each step draws the stack up to its layer once more, at the buffer's size
+  (buffers after the same layer at the same size share it). A half-size buffer keeps
+  that cheap; a catch-up draws it for every step.
+- Comps work the same: `after` names a layer of the comp.
+
 ## Not yet
 
-Buffers inside the layer stack (`after = "<layer>"`) come later (#138); see
-[the design](design/feedback.md).
 `check --deep` doesn't yet look for NaN/Inf in float state.
