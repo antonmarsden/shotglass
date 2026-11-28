@@ -701,12 +701,22 @@ pub fn run(filter: Option<String>) -> Result<()> {
     let dir = std::env::temp_dir().join(format!("shotglass-selftest-{}", std::process::id()));
     std::fs::create_dir_all(&dir)?;
     let dir2 = dir.clone();
+    // GL errors fail the check that caused them (KHR_debug, where the driver has it).
+    crate::gfx::gldebug::request(true);
     let result = crate::headless::with_gl(move |gl| {
         let r = Renderer::new(gl.clone())?;
         println!("GPU: {}", r.gl_info);
         println!(
             "parallel shader compile: {}",
             if r.parallel { "yes" } else { "no" }
+        );
+        println!(
+            "GL debug output: {}",
+            if crate::gfx::gldebug::active() {
+                "on (errors fail the check)"
+            } else {
+                "not supported"
+            }
         );
         drop(r);
         let mut failed = vec![];
@@ -735,6 +745,14 @@ pub fn run(filter: Option<String>) -> Result<()> {
             // Whatever a check did, the GL state it leaves is the defaults the renderer
             // promises (gfx::glstate): a framebuffer, buffer, sampler or pixel-store
             // setting left behind leaks into the next pass, egui's or our own.
+            let errors = crate::gfx::gldebug::take();
+            let res = res.and_then(|note| {
+                if errors.is_empty() {
+                    Ok(note)
+                } else {
+                    Err(anyhow!("GL reported: {}", errors.join("; ")))
+                }
+            });
             let mut dirty = crate::gfx::glstate::take_audit();
             let end = crate::gfx::glstate::dirty(&gl);
             crate::gfx::glstate::reset(&gl);
