@@ -16,6 +16,7 @@ use super::{
 };
 
 use crate::gfx::Tracked;
+use crate::gfx::glstate;
 use crate::movie::{Buffer, BufferFormat, Movie, Source};
 use eframe::glow::{self, HasContext};
 
@@ -558,6 +559,12 @@ impl Renderer {
     /// at the end of the film or when the budget is full. True if it stepped (call
     /// again). Comps' folds (#138) fill as the film's steps show them.
     pub fn fill_checkpoints(&mut self, movie: &Movie, w: i32, h: i32) -> bool {
+        let r = self.fill_checkpoints_inner(movie, w, h);
+        glstate::audit(&self.gl, "fill_checkpoints");
+        r
+    }
+
+    fn fill_checkpoints_inner(&mut self, movie: &Movie, w: i32, h: i32) -> bool {
         let out = (w.max(1), h.max(1));
         let q = 0;
         self.fold_out = out;
