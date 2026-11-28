@@ -37,7 +37,7 @@ pub fn install(gl: &mut glow::Context) {
         gl.enable(glow::DEBUG_OUTPUT);
         gl.enable(glow::DEBUG_OUTPUT_SYNCHRONOUS);
         gl.debug_message_callback(|source, kind, id, severity, msg| {
-            if !counts(kind, severity) {
+            if !counts(source, kind, severity) {
                 return;
             }
             let mut f = FOUND.lock().unwrap_or_else(|e| e.into_inner());
@@ -54,12 +54,16 @@ pub fn install(gl: &mut glow::Context) {
 }
 
 /// Errors and undefined behaviour count, whatever the severity; other kinds only at
-/// high severity (performance notes and NVIDIA's buffer placement info don't).
-fn counts(kind: u32, severity: u32) -> bool {
-    matches!(
-        kind,
-        glow::DEBUG_TYPE_ERROR | glow::DEBUG_TYPE_UNDEFINED_BEHAVIOR
-    ) || severity == glow::DEBUG_SEVERITY_HIGH
+/// high severity (performance notes and NVIDIA's buffer placement info don't). The
+/// shader compiler's messages never do: Mesa reports every compile error and warning
+/// here too, and those reach the user through the info log (`remap_log`), which
+/// checks deliberately exercise with broken shaders.
+fn counts(source: u32, kind: u32, severity: u32) -> bool {
+    source != glow::DEBUG_SOURCE_SHADER_COMPILER
+        && (matches!(
+            kind,
+            glow::DEBUG_TYPE_ERROR | glow::DEBUG_TYPE_UNDEFINED_BEHAVIOR
+        ) || severity == glow::DEBUG_SEVERITY_HIGH)
 }
 
 fn kind_name(kind: u32) -> &'static str {
