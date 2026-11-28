@@ -8,6 +8,8 @@
 //! matching row of Cr. The encoder reads the planes in place with strides.
 
 use crate::gfx::Renderer;
+
+use crate::gfx::Tracked;
 use crate::shader::Dialect;
 use anyhow::{Result, anyhow, bail};
 use eframe::glow::{self, HasContext};
@@ -122,7 +124,7 @@ impl YuvReader {
         let gl = r.gl().clone();
         let dialect = r.dialect;
         unsafe {
-            let prog = gl.create_program().map_err(|e| anyhow!(e))?;
+            let prog = gl.new_program().map_err(|e| anyhow!(e))?;
             let mut shaders = vec![];
             for (kind, src) in [
                 (
@@ -131,13 +133,13 @@ impl YuvReader {
                 ),
                 (glow::FRAGMENT_SHADER, fragment_source(dialect)),
             ] {
-                let s = gl.create_shader(kind).map_err(|e| anyhow!(e))?;
+                let s = gl.new_shader(kind).map_err(|e| anyhow!(e))?;
                 gl.shader_source(s, &src);
                 gl.compile_shader(s);
                 if !gl.get_shader_compile_status(s) {
                     let log = gl.get_shader_info_log(s);
-                    gl.delete_shader(s);
-                    gl.delete_program(prog);
+                    gl.free_shader(s);
+                    gl.free_program(prog);
                     bail!("the YUV pass didn't compile:\n{log}");
                 }
                 gl.attach_shader(prog, s);
@@ -146,15 +148,15 @@ impl YuvReader {
             gl.link_program(prog);
             for s in shaders {
                 gl.detach_shader(prog, s);
-                gl.delete_shader(s);
+                gl.free_shader(s);
             }
             if !gl.get_program_link_status(prog) {
                 let log = gl.get_program_info_log(prog);
-                gl.delete_program(prog);
+                gl.free_program(prog);
                 bail!("the YUV pass didn't link:\n{log}");
             }
-            let vao = gl.create_vertex_array().map_err(|e| anyhow!(e))?;
-            let tex = gl.create_texture().map_err(|e| anyhow!(e))?;
+            let vao = gl.new_vertex_array().map_err(|e| anyhow!(e))?;
+            let tex = gl.new_texture().map_err(|e| anyhow!(e))?;
             gl.bind_texture(glow::TEXTURE_2D, Some(tex));
             let (internal, format, ty) = Self::formats(depth);
             gl.tex_image_2d(
@@ -172,7 +174,7 @@ impl YuvReader {
                 gl.tex_parameter_i32(glow::TEXTURE_2D, p, glow::NEAREST as i32);
             }
             gl.bind_texture(glow::TEXTURE_2D, None);
-            let fbo = gl.create_framebuffer().map_err(|e| anyhow!(e))?;
+            let fbo = gl.new_framebuffer().map_err(|e| anyhow!(e))?;
             gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
             gl.framebuffer_texture_2d(
                 glow::FRAMEBUFFER,
@@ -270,7 +272,7 @@ impl YuvReader {
             let pbo = match self.free.pop() {
                 Some(b) => b,
                 None => {
-                    let b = gl.create_buffer().map_err(|e| anyhow!(e))?;
+                    let b = gl.new_buffer().map_err(|e| anyhow!(e))?;
                     gl.bind_buffer(glow::PIXEL_PACK_BUFFER, Some(b));
                     gl.buffer_data_size(glow::PIXEL_PACK_BUFFER, bytes, glow::STREAM_READ);
                     b
@@ -293,7 +295,7 @@ impl YuvReader {
             gl.bind_buffer(glow::PIXEL_PACK_BUFFER, None);
             gl.bind_framebuffer(glow::FRAMEBUFFER, None);
             let fence = gl
-                .fence_sync(glow::SYNC_GPU_COMMANDS_COMPLETE, 0)
+                .new_fence(glow::SYNC_GPU_COMMANDS_COMPLETE, 0)
                 .map_err(|e| anyhow!(e))?;
             // Make sure the fence reaches the GPU, so polling it can ever succeed.
             gl.flush();
@@ -335,7 +337,7 @@ impl YuvReader {
         let mut data = self.spare.pop().unwrap_or_default();
         data.resize(bytes, 0);
         unsafe {
-            gl.delete_sync(slot.fence);
+            gl.free_fence(slot.fence);
             gl.bind_buffer(glow::PIXEL_PACK_BUFFER, Some(slot.pbo));
             let p =
                 gl.map_buffer_range(glow::PIXEL_PACK_BUFFER, 0, bytes as i32, glow::MAP_READ_BIT);
@@ -359,16 +361,16 @@ impl Drop for YuvReader {
         let gl = &self.gl;
         unsafe {
             for s in self.in_flight.drain(..) {
-                gl.delete_sync(s.fence);
-                gl.delete_buffer(s.pbo);
+                gl.free_fence(s.fence);
+                gl.free_buffer(s.pbo);
             }
             for b in self.free.drain(..) {
-                gl.delete_buffer(b);
+                gl.free_buffer(b);
             }
-            gl.delete_framebuffer(self.fbo);
-            gl.delete_texture(self.tex);
-            gl.delete_vertex_array(self.vao);
-            gl.delete_program(self.prog);
+            gl.free_framebuffer(self.fbo);
+            gl.free_texture(self.tex);
+            gl.free_vertex_array(self.vao);
+            gl.free_program(self.prog);
         }
     }
 }

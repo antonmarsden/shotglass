@@ -815,17 +815,16 @@ pub unsafe fn link(
     fs: &str,
     fs_files: &[String],
 ) -> std::result::Result<eframe::glow::Program, Vec<String>> {
+    use crate::gfx::Tracked;
     use eframe::glow::{self, HasContext};
     unsafe {
-        let v = gl.create_shader(glow::VERTEX_SHADER).map_err(|e| vec![e])?;
+        let v = gl.new_shader(glow::VERTEX_SHADER).map_err(|e| vec![e])?;
         gl.shader_source(v, vs);
         gl.compile_shader(v);
-        let f = gl
-            .create_shader(glow::FRAGMENT_SHADER)
-            .map_err(|e| vec![e])?;
+        let f = gl.new_shader(glow::FRAGMENT_SHADER).map_err(|e| vec![e])?;
         gl.shader_source(f, fs);
         gl.compile_shader(f);
-        let prog = gl.create_program().map_err(|e| vec![e])?;
+        let prog = gl.new_program().map_err(|e| vec![e])?;
         gl.attach_shader(prog, v);
         gl.attach_shader(prog, f);
         gl.link_program(prog);
@@ -843,12 +842,12 @@ pub unsafe fn link(
         }
         for sh in [v, f] {
             gl.detach_shader(prog, sh);
-            gl.delete_shader(sh);
+            gl.free_shader(sh);
         }
         if errors.is_empty() {
             Ok(prog)
         } else {
-            gl.delete_program(prog);
+            gl.free_program(prog);
             Err(errors)
         }
     }

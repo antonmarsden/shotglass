@@ -14,6 +14,8 @@
 use super::{
     INPUT_TEX, LAYER_TEX, PICTURE_TEX, Renderer, SeqPlan, SeqTargets, ShotKeys, Target, Which, hash,
 };
+
+use crate::gfx::Tracked;
 use crate::movie::{Buffer, BufferFormat, Movie, Source};
 use eframe::glow::{self, HasContext};
 
@@ -279,7 +281,7 @@ fn new_target(gl: &glow::Context, (w, h): (i32, i32), format: BufferFormat) -> T
         BufferFormat::Rgba8 => (glow::RGBA8, glow::UNSIGNED_BYTE),
     };
     unsafe {
-        let tex = gl.create_texture().expect("create texture");
+        let tex = gl.new_texture().expect("create texture");
         gl.bind_texture(glow::TEXTURE_2D, Some(tex));
         gl.tex_image_2d(
             glow::TEXTURE_2D,
@@ -301,7 +303,7 @@ fn new_target(gl: &glow::Context, (w, h): (i32, i32), format: BufferFormat) -> T
             gl.tex_parameter_i32(glow::TEXTURE_2D, p, v as i32);
         }
         gl.bind_texture(glow::TEXTURE_2D, None);
-        let fbo = gl.create_framebuffer().expect("create framebuffer");
+        let fbo = gl.new_framebuffer().expect("create framebuffer");
         gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
         gl.framebuffer_texture_2d(
             glow::FRAMEBUFFER,
@@ -322,8 +324,8 @@ fn new_target(gl: &glow::Context, (w, h): (i32, i32), format: BufferFormat) -> T
 
 fn delete(gl: &glow::Context, t: Target) {
     unsafe {
-        gl.delete_framebuffer(t.fbo);
-        gl.delete_texture(t.tex);
+        gl.free_framebuffer(t.fbo);
+        gl.free_texture(t.tex);
     }
 }
 

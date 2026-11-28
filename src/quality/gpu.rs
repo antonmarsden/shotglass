@@ -3,6 +3,8 @@
 //! counts come back for the numbers (heatmaps are read back for their PNGs).
 
 use super::config::BINS;
+
+use crate::gfx::Tracked;
 use crate::gfx::{FrameInfo, ReadFormat, read_pixels_into};
 use crate::shader::{Assembled, Dialect};
 use anyhow::{Result, anyhow, bail};
@@ -118,11 +120,11 @@ unsafe fn nearest(gl: &glow::Context) {
 impl Target {
     pub unsafe fn new(gl: &glow::Context, w: i32, h: i32, attachments: u32) -> Result<Target> {
         unsafe {
-            let fbo = gl.create_framebuffer().map_err(|e| anyhow!(e))?;
+            let fbo = gl.new_framebuffer().map_err(|e| anyhow!(e))?;
             gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
             let mut tex = vec![];
             for i in 0..attachments {
-                let t = gl.create_texture().map_err(|e| anyhow!(e))?;
+                let t = gl.new_texture().map_err(|e| anyhow!(e))?;
                 gl.bind_texture(glow::TEXTURE_2D, Some(t));
                 gl.tex_image_2d(
                     glow::TEXTURE_2D,
@@ -169,9 +171,9 @@ impl Target {
 
     pub unsafe fn delete(&self, gl: &glow::Context) {
         unsafe {
-            gl.delete_framebuffer(self.fbo);
+            gl.free_framebuffer(self.fbo);
             for t in &self.tex {
-                gl.delete_texture(*t);
+                gl.free_texture(*t);
             }
         }
     }
@@ -208,7 +210,7 @@ pub unsafe fn upload(gl: &glow::Context, px: &Texels) -> Result<glow::Texture> {
         std::slice::from_raw_parts(texels.as_ptr().cast::<u8>(), std::mem::size_of_val(texels))
     };
     unsafe {
-        let tex = gl.create_texture().map_err(|e| anyhow!(e))?;
+        let tex = gl.new_texture().map_err(|e| anyhow!(e))?;
         gl.bind_buffer(glow::PIXEL_UNPACK_BUFFER, None);
         gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 4);
         gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, 0);
@@ -265,7 +267,7 @@ impl Gpu {
                 &["<shotglass histogram>".into()],
             )
             .map_err(|e| anyhow!("the histogram pass failed to compile: {}", e.join("; ")))?;
-            let vao = gl.create_vertex_array().map_err(|e| anyhow!(e))?;
+            let vao = gl.new_vertex_array().map_err(|e| anyhow!(e))?;
             let map = Target::new(gl, w, h, 1)?;
             let mut levels = vec![];
             let (mut lw, mut lh) = (w, h);
@@ -301,9 +303,9 @@ impl Gpu {
 
     pub unsafe fn delete(&self, gl: &glow::Context) {
         unsafe {
-            gl.delete_vertex_array(self.vao);
-            gl.delete_program(self.reduce);
-            gl.delete_program(self.histogram);
+            gl.free_vertex_array(self.vao);
+            gl.free_program(self.reduce);
+            gl.free_program(self.histogram);
             self.map.delete(gl);
             self.hist.delete(gl);
             for t in &self.levels {
