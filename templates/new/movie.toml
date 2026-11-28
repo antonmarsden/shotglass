@@ -57,12 +57,12 @@ sound = "sfx/chime.glsl"
 # channels = ["@prev", "@picture"]
 # cache = "dense"            # checkpoint every frame: frame-by-frame scrubbing of a short passage
 # preview_lookback = 2.0     # player only: approximate a far scrub from the last 2 s (forgetful effects)
-# and a layer channel "@trail".
-# A comp file may have [[buffer]]s too (shotglass = "0.1.10"): they fold over the comp's own
-# frames, and such a comp is shown in one place only.
 # after = "grade"            # step right after layer "grade" instead of before every layer
 #                            # (shotglass = "0.1.11"): then it may read "@input", the composite
 #                            # so far, and "@grade" and layers below it; layers above read it
+# and a layer channel "@trail".
+# A comp file may have [[buffer]]s too (shotglass = "0.1.10"): they fold over the comp's own
+# frames, and such a comp is shown in one place only.
 #
 # Text, bound to channels like a texture (shotglass = "0.1.3"; see docs/channels.md, "Text"):
 # `shotglass fonts add "Inter"` (in the film folder) adds a Google Fonts family and writes, e.g.:

@@ -3582,6 +3582,24 @@ fn stack_files(d: &Path) -> Result<()> {
     )
 }
 
+/// `buffers_after_layer`'s copy film, written to `dir/copy`.
+fn with_cp_movie(dir: &Path, body: &str) -> Result<Movie> {
+    let d = dir.join("copy");
+    stack_files(&d)?;
+    movie(&d, &format!("shotglass = \"0.1.11\"\n{body}"))
+}
+
+/// `buffers_after_layer`'s warm-loop part: a stack that doesn't read film time (shot
+/// time repeats, buffer iFrame counts on), so a warm loop's frame n is the unlooped
+/// period-twice film's frame p + n.
+const WARM_STACK: &str = "[[buffer]]\nid=\"stk\"\nscene=\"stk.glsl\"\ninit=\"sinit.glsl\"\nafter=\"grade\"\n\
+     size=[40, 24]\nformat=\"rgba32f\"\nchannels=[\"@prev\", \"@input\", \"@lo\", \"@pre\"]\n\
+     [[buffer]]\nid=\"pre\"\nscene=\"acc.glsl\"\ninit=\"seed.glsl\"\nsize=[40, 24]\n\
+     format=\"rgba32f\"\nchannels=[\"@prev\", \"@picture\", \"t.png\"]\n\
+     [[layer]]\nid=\"lo\"\nscene=\"lo2.glsl\"\nchannels=[\"@pre\"]\n\
+     [[layer]]\nid=\"grade\"\nscene=\"grade.glsl\"\nchannels=[\"@input\"]\n\
+     [[layer]]\nid=\"show\"\nscene=\"show.glsl\"\nscale=1\nchannels=[\"@stk\", \"@input\"]\n";
+
 fn buffers_after_layer(gl: &Gl, dir: &Path) -> Result<String> {
     let film = |sub: &str, top: &str| -> Result<Movie> {
         let d = dir.join(sub);
@@ -3712,17 +3730,17 @@ fn buffers_after_layer(gl: &Gl, dir: &Path) -> Result<String> {
         "{}{view}",
         base.replacen("[[buffer]]", &format!("{cp}[[buffer]]"), 1)
     );
-    let (dw, dp) = (dir.join("copy"), dir.join("plain"));
-    stack_files(&dw)?;
+    let dp = dir.join("plain");
     stack_files(&dp)?;
-    let with = movie(&dw, &format!("shotglass = \"0.1.11\"\n{with_cp}"))?;
+    let with = with_cp_movie(dir, &with_cp)?;
     let plain = movie(&dp, &format!("shotglass = \"0.1.11\"\n{base}"))?;
     if with.buffers[0].is_pure() {
         bail!("cp's composite reads buffer state: it can't be pure");
     }
     let (mut a, mut b) = (renderer(gl, &with)?, renderer(gl, &plain)?);
     for n in [3, 20, 40, 31] {
-        expect_same(
+        expect_fold(
+            gl,
             &format!(
                 "frame {n}: the composite after \"grade\" 3 frames back vs frame {} drawn \
                  without the buffer",
@@ -3754,13 +3772,65 @@ fn buffers_after_layer(gl: &Gl, dir: &Path) -> Result<String> {
     )?;
     let (mut a, mut b) = (renderer(gl, &with)?, renderer(gl, &plain)?);
     for n in [0, 20, 40] {
-        expect_same(
+        expect_fold(
+            gl,
             &format!("frame {n}: a copy of @lo after \"lo\" vs a layer reading @lo"),
             &buf_frame(&mut a, &with, n, 1.0)?,
             &buf_frame(&mut b, &plain, n, 1.0)?,
             1,
             0.0,
         )?;
+    }
+    // The scratch sets steps draw into follow the sizes in use: rendering at another
+    // output size (cp is `scale` 1) replaces cp's composite set, it doesn't add one.
+    let zm = with_cp_movie(dir, &with_cp)?;
+    let mut z = renderer(gl, &zm)?;
+    let sets = |z: &mut Renderer, w: i32, h: i32| -> Result<usize> {
+        z.render(&zm, w, h, &FrameInfo::frame(&zm, 20), true)
+            .ok_or_else(|| anyhow!("{w}x{h}: nothing rendered"))?;
+        Ok(z.step_scratch_sets())
+    };
+    let first = sets(&mut z, W, H)?;
+    for (w, h) in [(W / 2, H / 2), (W - 8, H), (W, H)] {
+        let now = sets(&mut z, w, h)?;
+        if now != first {
+            bail!("rendering at {w}x{h} left {now} step scratch sets (at {W}x{H}: {first})");
+        }
+    }
+    // An inactive anchor: `@<anchor>` is unbound (resolution 0) until "grade" starts at
+    // 1.2 s, then bound; the composite below it is checked above (frames 3 and 20).
+    let seen = "[[buffer]]\nid=\"seen\"\nscene=\"res.glsl\"\nafter=\"grade\"\nformat=\"rgba8\"\n\
+                size=[8, 8]\nchannels=[\"@grade\"]\n";
+    let ds = dir.join("anchor-off");
+    stack_files(&ds)?;
+    write(
+        &ds,
+        &[(
+            "res.glsl",
+            &scene("fragColor = vec4(iChannelResolution[0].x > 0.0 ? 1.0 : 0.0, 0.0, 0.0, 1.0);"),
+        )],
+    )?;
+    let sm = movie(
+        &ds,
+        &format!("shotglass = \"0.1.11\"\n{base}{seen}{}", top("@seen")),
+    )?;
+    let mut sr = renderer(gl, &sm)?;
+    for (n, bound) in [
+        (20u64, false),
+        (35, false),
+        (36, true),
+        (40, true),
+        (33, false),
+    ] {
+        let f = buf_frame(&mut sr, &sm, n, 1.0)?;
+        let red = f[(W as usize / 2, H as usize / 2)][0];
+        if (red > 128) != bound {
+            bail!(
+                "frame {n}: @grade reads as {} (want {})",
+                if red > 128 { "bound" } else { "unbound" },
+                if bound { "bound" } else { "unbound" }
+            );
+        }
     }
     // In a comp (its layers, comp-local frames): a comp shot equals the comp as a film.
     let dc = dir.join("comp");
@@ -3778,6 +3848,52 @@ fn buffers_after_layer(gl: &Gl, dir: &Path) -> Result<String> {
             &format!("comp shot, frame {n} vs the comp as a film"),
             &buf_frame(&mut cr, &cm, n, 1.0)?,
             &fwd[n as usize],
+            0,
+            0.0,
+        )?;
+    }
+    // A warm loop: the composite's inputs repeat per period (real frames) while the
+    // states it reads count virtual frames.
+    const P: u64 = 30;
+    let warm_film = |sub: &str, head: &str, shots: &str| -> Result<Movie> {
+        let d = dir.join(sub);
+        stack_files(&d)?;
+        write(
+            &d,
+            &[(
+                "lo2.glsl",
+                &scene(
+                    "vec4 p = texture(iChannel0, uv);\n  \
+                     fragColor = vec4(p.bgr, step(0.5, fract(uv.x * 3.0)) * 0.8);",
+                ),
+            )],
+        )?;
+        movie(
+            &d,
+            &format!("shotglass = \"0.1.11\"\n{head}\n{shots}{WARM_STACK}"),
+        )
+    };
+    let warm = warm_film(
+        "warm",
+        "loop = \"warm\"",
+        "[[shot]]\nid=\"a\"\nscene=\"s.glsl\"\nduration=1\n",
+    )?;
+    let twice = warm_film(
+        "twice",
+        "",
+        "[[shot]]\nid=\"a\"\nscene=\"s.glsl\"\nduration=1\n\
+         [[shot]]\nid=\"b\"\nscene=\"s.glsl\"\nduration=1\n",
+    )?;
+    let (mut wr, mut tr) = (renderer(gl, &warm)?, renderer(gl, &twice)?);
+    for n in [0u64, 1, 2, 15, 29, 0, 7] {
+        expect_fold(
+            gl,
+            &format!(
+                "warm frame {n} vs the unlooped second period's frame {}",
+                P + n
+            ),
+            &buf_frame(&mut wr, &warm, n, 1.0)?,
+            &buf_frame(&mut tr, &twice, P + n, 1.0)?,
             0,
             0.0,
         )?;

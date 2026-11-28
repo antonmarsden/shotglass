@@ -886,7 +886,7 @@ impl Renderer {
         }
         if m > n {
             self.folds[q].progress = None;
-            self.free_idle_rings(movie, q, n);
+            self.free_idle_rings(movie, q, n, out);
             true
         } else {
             self.folds[q].progress = Some((m - plan.first, (n + 1).saturating_sub(plan.first)));
@@ -1130,8 +1130,11 @@ impl Renderer {
         });
     }
 
-    /// Rings of buffers not active at `n` hold nothing anyone reads: free them.
-    fn free_idle_rings(&mut self, movie: &Movie, q: usize, n: u64) {
+    /// Rings of buffers not active at `n` hold nothing anyone reads: free them. So do
+    /// the scratch sets for the pictures and composites steps draw (`pics`, `stacks`,
+    /// #138) that no buffer active at `n` draws at its current size: a resize, or an
+    /// edit to a buffer's size or `after`, would otherwise leave them allocated.
+    fn free_idle_rings(&mut self, movie: &Movie, q: usize, n: u64, out: (i32, i32)) {
         for (b, buf) in movie.buffers.iter().enumerate() {
             if !act(movie, buf, n)
                 && let Some(r) = self.folds[q].rings[b].take()
@@ -1141,6 +1144,48 @@ impl Renderer {
                 }
             }
         }
+        let live = || movie.buffers.iter().filter(|b| act(movie, b, n));
+        let pics: Vec<(i32, i32)> = live()
+            .filter(|b| {
+                b.channels
+                    .iter()
+                    .flatten()
+                    .any(|c| c.source == Source::Picture)
+            })
+            .map(|b| b.size.at(out))
+            .collect();
+        let stacks: Vec<StackKey> = live()
+            .filter(|b| b.reads_stack())
+            .filter_map(|b| b.after.map(|a| (a, b.size.at(out))))
+            .collect();
+        let fold = &mut self.folds[q];
+        let mut dead = vec![];
+        for (k, t) in std::mem::take(&mut fold.pics) {
+            if pics.contains(&k) {
+                fold.pics.push((k, t));
+            } else {
+                dead.extend(super::seq_targets(t));
+            }
+        }
+        for (k, t) in std::mem::take(&mut fold.stacks) {
+            if stacks.contains(&k) {
+                fold.stacks.push((k, t));
+            } else {
+                dead.extend(super::seq_targets(t));
+            }
+        }
+        for t in dead {
+            delete(&self.gl, t);
+        }
+    }
+
+    /// Scratch sets the folds keep for the pictures and composites buffer steps draw
+    /// (tests: they don't pile up).
+    pub fn step_scratch_sets(&self) -> usize {
+        self.folds
+            .iter()
+            .map(|f| f.pics.len() + f.stacks.len())
+            .sum()
     }
 
     /// Buffer `b`'s state `back` frames before film frame `m` (0: frame m's, after its
