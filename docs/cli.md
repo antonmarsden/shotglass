@@ -189,7 +189,9 @@ WebM writer do the rest. It needs ffmpeg and ffprobe (see [Installing ffmpeg](#i
   conformed file, not the source, is the film's input: commit it.
 - The source's matrix and range are kept (tagged in the file) when SVT-AV1 can tag them;
   RGB sources and unusual tags are converted to BT.709, limited range. HDR is refused.
-- An AV1 WebM shotglass can already read is left alone ("nothing to do").
+- The first audio track is kept, as Opus at 48 kHz stereo, aligned to the first frame.
+  Films don't play clip sound yet (#32); it's kept so the clip needn't be conformed again.
+- An AV1 WebM shotglass can already read is left alone ("nothing to do"), or copied to `-o`.
 - Audio is dropped.
 
 ## Exporting assembled shaders

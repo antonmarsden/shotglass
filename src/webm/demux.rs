@@ -488,6 +488,41 @@ mod tests {
     }
 
     #[test]
+    fn an_audio_track_is_skipped() {
+        // What conform writes for a clip with sound: Opus interleaved with the video.
+        let fps = (24, 1);
+        let audio = super::super::mux::Audio {
+            channels: 2,
+            pre_skip: 312,
+        };
+        let packets = (0..50)
+            .map(|k| super::super::mux::AudioPacket {
+                pts_ns: k * 20_000_000,
+                data: vec![0xAA; 7],
+                discard_padding_ns: 0,
+            })
+            .collect();
+        let mut w = Writer::new(
+            Cursor::new(vec![]),
+            "webm",
+            &video(fps),
+            Some((&audio, packets)),
+        )
+        .unwrap();
+        for k in 0..24u64 {
+            w.video(cfr(fps)(k), k % 8 == 0, &[k as u8; 5]).unwrap();
+        }
+        let f = w.finish(cfr(fps)(24)).unwrap().into_inner();
+        let clip = parse(Cursor::new(f.clone())).unwrap();
+        assert_eq!(clip.frames.len(), 24);
+        assert_eq!(clip.fps, fps);
+        let mut c = Cursor::new(f);
+        for k in 0..24 {
+            assert_eq!(clip.read_frame(&mut c, k).unwrap(), vec![k as u8; 5]);
+        }
+    }
+
+    #[test]
     fn indexes_frames_and_keyframes() {
         let f = file((24, 1), 30, 8, cfr((24, 1)));
         let clip = parse(Cursor::new(f.clone())).unwrap();

@@ -379,7 +379,7 @@ mod tests {
             grain: 0,
             colour: crate::webm::ColourTags::BT709,
         };
-        crate::webm::export::write_clip(&path, &set, (0..n).map(|k| frame(w, h, depth, k)))
+        crate::webm::export::write_clip(&path, &set, (0..n).map(|k| frame(w, h, depth, k)), None)
             .unwrap();
         let c = Arc::new(demux::open(&path).unwrap());
         (path, c)
@@ -442,7 +442,8 @@ mod tests {
                 ..crate::webm::ColourTags::BT709
             },
         };
-        crate::webm::export::write_clip(&path, &set, (0..2).map(|k| frame(64, 36, 8, k))).unwrap();
+        crate::webm::export::write_clip(&path, &set, (0..2).map(|k| frame(64, 36, 8, k)), None)
+            .unwrap();
         let e = super::super::Source::open(&path, &Default::default())
             .unwrap_err()
             .to_string();

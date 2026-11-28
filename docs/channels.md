@@ -191,7 +191,8 @@ channels = ["plate", { texture = "surf", speed = 0.5 }]
   4 s apart; `shotglass conform --keyint 15` makes scrubbing faster.
 - AV1 in WebM has no alpha: put a matte in its own channel (a PNG sequence, or a second
   clip whose luma is the matte, read as `.r`).
-- Audio in the clip is ignored (shotglass's sound is GLSL). HDR (PQ, HLG) clips are
+- A clip's sound isn't played yet (shotglass's sound is GLSL); `shotglass conform` keeps
+  it in the file as Opus, so it's there when films can use it (#32). HDR (PQ, HLG) clips are
   refused for now.
 - `shotglass export --format webm` writes clips shotglass reads back, so one film can be
   footage in another.

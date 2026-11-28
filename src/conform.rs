@@ -40,6 +40,10 @@ struct Probe {
     transfer: Option<u8>,
     full_range: Option<bool>,
     rotation: i64,
+    /// The video stream's start time (s), when ffprobe gives one.
+    start: Option<f64>,
+    /// The first audio stream, if any: its start time (s), when given.
+    audio: Option<Option<f64>>,
 }
 
 fn ffprobe_bin() -> PathBuf {
@@ -83,10 +87,14 @@ fn code(kind: &str, name: &str) -> Option<u8> {
 
 fn parse_probe(json: &str) -> Result<Probe> {
     let v: serde_json::Value = serde_json::from_str(json).context("ffprobe's output")?;
-    let s = v["streams"]
-        .as_array()
-        .and_then(|a| a.first())
+    let streams = v["streams"].as_array().map_or(&[][..], |a| a.as_slice());
+    let kind = |k: &str| streams.iter().find(|s| s["codec_type"].as_str() == Some(k));
+    // Older probes without codec_type: the first stream is the video.
+    let s = kind("video")
+        .or_else(|| streams.first().filter(|s| s["codec_type"].is_null()))
         .ok_or_else(|| anyhow!("no video stream"))?;
+    let start =
+        |s: &serde_json::Value| s["start_time"].as_str().and_then(|t| t.parse::<f64>().ok());
     let st = |k: &str| s[k].as_str().unwrap_or("").to_string();
     let rotation = s["side_data_list"]
         .as_array()
@@ -109,6 +117,8 @@ fn parse_probe(json: &str) -> Result<Probe> {
             _ => None,
         },
         rotation,
+        start: start(s),
+        audio: kind("audio").map(start),
     })
 }
 
@@ -204,15 +214,7 @@ pub fn conform(input: &str, o: &Options) -> Result<PathBuf> {
         input_args.extend(["-i".into(), input.into()]);
     }
     let probe_out = Command::new(ffprobe_bin())
-        .args([
-            "-v",
-            "error",
-            "-select_streams",
-            "v:0",
-            "-show_streams",
-            "-of",
-            "json",
-        ])
+        .args(["-v", "error", "-show_streams", "-of", "json"])
         .args(match &pattern {
             Some(p) => vec![
                 "-framerate".to_string(),
@@ -310,6 +312,18 @@ pub fn conform(input: &str, o: &Options) -> Result<PathBuf> {
         grain: 0,
         colour,
     };
+    // The clip's sound (#32 will read it): decoded by ffmpeg to 48 kHz stereo,
+    // encoded to Opus, kept in the file, aligned to the first video frame.
+    let audio = match p.audio {
+        Some(a_start) if pattern.is_none() => {
+            let offset = match (a_start, p.start) {
+                (Some(a), Some(v)) => a - v,
+                _ => 0.0,
+            };
+            Some(encode_audio(input, offset)?)
+        }
+        _ => None,
+    };
     let mut child = Command::new(ffmpeg_bin())
         .args(&input_args)
         .args(["-map", "0:v:0", "-an", "-sn", "-dn"])
@@ -361,7 +375,7 @@ pub fn conform(input: &str, o: &Options) -> Result<PathBuf> {
         }
     });
     let tmp = out.with_extension("webm.part");
-    let written = crate::webm::export::write_clip(&tmp, &set, frames);
+    let written = crate::webm::export::write_clip(&tmp, &set, frames, audio);
     // Close our end first: if the encoder stopped early, ffmpeg may be blocked writing.
     drop(stdout);
     let status = child.wait()?;
@@ -400,8 +414,78 @@ pub fn conform(input: &str, o: &Options) -> Result<PathBuf> {
             ", limited range"
         },
     );
+    if p.audio.is_some() && pattern.is_none() {
+        println!(
+            "sound kept as Opus (shotglass doesn't play clip sound yet; the picture is what films use)"
+        );
+    }
     println!("(re-encoded: pixels differ slightly from the source)");
     Ok(out)
+}
+
+/// The first audio stream of `input` as Opus at 48 kHz stereo; `offset` = its start
+/// minus the video's (s): later audio is preceded by silence, earlier audio trimmed.
+fn encode_audio(input: &str, offset: f64) -> Result<crate::webm::encode::OpusPackets> {
+    let mut child = Command::new(ffmpeg_bin())
+        .args(["-nostdin", "-hide_banner", "-i", input])
+        .args([
+            "-map", "0:a:0", "-vn", "-sn", "-dn", "-ac", "2", "-ar", "48000",
+        ])
+        .args(["-f", "f32le", "-loglevel", "error", "-"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| anyhow!("couldn't run ffmpeg: {e}"))?;
+    let mut stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let errs = std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = std::io::BufReader::new(stderr).read_to_string(&mut s);
+        s
+    });
+    let mut opus = crate::webm::encode::OpusPackets::new(crate::webm::export::OPUS_KBPS)?;
+    let shift = (offset * 48_000.0).round() as i64;
+    if shift > 0 {
+        opus.push(&vec![0.0; shift as usize * 2])?;
+    }
+    // Interleaved samples (not frames) still to drop from the start.
+    let mut skip = (-shift).max(0) as usize * 2;
+    let mut bytes = vec![0u8; 1 << 16];
+    let mut carry: Vec<u8> = vec![];
+    let mut floats: Vec<f32> = vec![];
+    let result = (|| -> Result<()> {
+        loop {
+            let n = stdout.read(&mut bytes)?;
+            if n == 0 {
+                break;
+            }
+            carry.extend_from_slice(&bytes[..n]);
+            let whole = carry.len() / 8 * 8; // whole stereo frames
+            floats.clear();
+            floats.extend(
+                carry[..whole]
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| f32::from_le_bytes(*b)),
+            );
+            carry.drain(..whole);
+            let d = skip.min(floats.len());
+            skip -= d;
+            opus.push(&floats[d..])?;
+        }
+        Ok(())
+    })();
+    drop(stdout);
+    let status = child.wait()?;
+    let log = errs.join().unwrap_or_default();
+    result.with_context(|| format!("{input}: decoding its sound"))?;
+    if !status.success() {
+        bail!("{input}: ffmpeg couldn't decode its sound: {}", log.trim());
+    }
+    opus.finish()?;
+    Ok(opus)
 }
 
 /// ffmpeg's planar I420 (Y, all of U, all of V) → our layout (Y, then each U row
@@ -456,6 +540,16 @@ mod tests {
         assert_eq!(phone.transfer, Some(18));
         assert_eq!(phone.rotation, -90);
         assert!(parse_probe(r#"{"streams":[]}"#).is_err());
+        assert_eq!((p.start, p.audio), (None, None));
+        let av = parse_probe(
+            r#"{"streams":[{"codec_type":"audio","start_time":"0.021"},
+            {"codec_type":"video","width":64,"height":36,"start_time":"0.000"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            (av.width, av.start, av.audio),
+            (64, Some(0.0), Some(Some(0.021)))
+        );
     }
 
     #[test]
