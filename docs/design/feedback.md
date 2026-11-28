@@ -3,7 +3,8 @@
 Status: **phase 1 built** (#134): `[[buffer]]`, history, resets, checkpoints; **phase 2
 built** (#137): background fill, progressive scrub, `preview_lookback`, adaptive spacing,
 `cache = "dense"`, slow-seek hints, per-frame invalidation; user docs in
-[buffers.md](../buffers.md). Phase 3 (comps, warm loops, `after`, #138) is still a proposal. Builds on the iChannel design
+[buffers.md](../buffers.md). Phase 3 (#138): **buffers in comps and `loop = "warm"` built**;
+`after` is still a proposal. Builds on the iChannel design
 ([ichannel.md](ichannel.md), which deferred `{ buffer = "A" }` to its own design) and on
 layers and comps ([layers-compositing.md](layers-compositing.md), which ruled
 previous-frame inputs out of layers).
@@ -216,17 +217,55 @@ relative order of `[[buffer]]` and `[[layer]]` entries. It's additive: buffers w
 The period's first frame (frame 0) is always a reset, so loop k equals loop 0 and the
 "shaders only see time within one period" invariant holds. That means a buffer is
 visibly empty at the seam. A seamless loop needs the state at frame 0 to equal the state
-after a whole period: phase 3 adds `loop = "warm"`, which defines state(0) as the fold
-from frame 0 of a *previous* period (one period of pre-roll, computed once and
-checkpointed). That's exact for effects that forget and a fixed point only by luck for
-simulations, so it stays opt-in.
+after a whole period: phase 3 (#138, built) adds `loop = "warm"` (films, and comps'
+`[comps]` entries), which defines state(0) as the fold from frame 0 of a *previous*
+period (one period of pre-roll). That's exact for effects that forget and a fixed point
+only by luck for simulations, so it stays opt-in.
+
+- **Virtual frames:** a warm sequence's fold runs over v in 0..2p: period −1 (cold
+  pre-roll) then period 0, real frame v − p. A buffer active from frame 0 to the end
+  (spanning the seam) has no reset at v = p, so it continues from period −1's last
+  frame; every other span and reset repeats per period, and a step reads its inputs at
+  frame v mod p. Cursor, plans, rings, checkpoints and the playhead are virtual, so the
+  history ring reads the previous period's states across the seam for free.
+- **iFrame** of a spanning buffer is v − its reset, counting on over the seam (up to
+  2p − 1); the other uniforms stay within one period.
+- **The seam is checkpointed and kept** (its own eviction exemption): each wrap of the
+  loop restores it, a blit, instead of stepping p frames.
+- `check` warns when no buffer spans the seam.
 
 ### Comps
 
-A comp's time is its user's and can jump (a `time_offset`, a hold, a wrap), so a buffer
-inside a comp would need a fold per instance, over comp-local frames. Phase 1 refuses
-`[[buffer]]` in comp files. Phase 3 decides between "one state per instance" (memory per
-use) and "comps with buffers may be used once".
+A comp's time is its user's and can jump (a `time_offset`, a hold, a wrap). Phase 1
+refused `[[buffer]]` in comp files; phase 3 (#138, built) defines a comp buffer's state
+as a **fold over comp-local frames**: its state at comp frame c is the fold from its
+last reset r ≤ c (comp-local spans, resets and seconds; a loop comp's frame 0 is a
+reset), so it's a function of the comp frame only, whoever shows the comp. A comp is
+then exactly what it would be as a film of its own, buffers included; a hold holds the
+state, a jump in comp time is a seek.
+
+That leaves "one state per instance" against "used once" as a question of cost only.
+Each comp gets **one fold** (rings, cursor, checkpoints), like the film's, and a comp
+with buffers, directly or through a comp it shows, may be **shown in one place** (one
+shot, layer, matte or channel in the film and its comps), checked at load: two uses
+could ask for two comp frames in one film frame, which one cursor can't hold. Per-use
+folds could lift that later without changing what a frame shows.
+
+- **Order:** a comp instance's plan (`plan_inst`) advances the comp's fold to the comp
+  frame before planning the comp's layers. Folds nest: a film buffer reading `@<comp>`
+  (or `@picture` with a comp shot) steps the comp's fold from inside its own step;
+  that's still canonical, since the comp's state depends only on the comp frame.
+- **Size:** a comp buffer's `scale` is of the comp's `size`, else of the film's output
+  size, never of the reader's (a film buffer reading the comp draws it at the
+  buffer's size).
+- **Invalidation:** each fold has its own key: a comp's reads its declaration, its
+  buffers' programs and, if they read `@picture` or a comp, its shots (from their start)
+  and every comp's items and buffers (frame 0). The film's key includes comps' buffers.
+- **Caches:** one checkpoint budget for all folds; eviction scores every fold's
+  checkpoints against that fold's own playhead. Progressive scrub and the background
+  fill stay on the film's fold: a comp fold advanced from inside a film buffer's step
+  must stay canonical.
+- **Memory:** `Movie::load` adds each sequence's worst frame.
 
 ## Seeking and the caches
 
@@ -288,7 +327,7 @@ Buffer memory never grows without bound. Two kinds, treated differently:
 - **Required: the ping-pong targets** (two per active buffer, at its size and format;
   N + 1 for a buffer with `history = N`).
   They can't be evicted while the buffer is active. `Movie::load` sums them for the
-  worst frame (the most buffers active at once, comps included in phase 3) and refuses
+  worst frame (the most buffers active at once; each comp's worst frame added, #138) and refuses
   the film when that exceeds a fixed limit, with a message naming the buffers and their
   sizes, like `texture::shot_memory` does for textures.
 - **Evictable: checkpoints.** They live in their own LRU under a budget sized once at
@@ -437,7 +476,7 @@ filtering needs `OES_texture_float_linear`, so `rgba32f` buffers default to `nea
 ## Testing
 
 - **Unit (`movie.rs`):** parsing, span and reset resolution, `reset = "cuts"`, refusal
-  of `@prev` outside buffers, forward-only references, buffers in comps refused, loop
+  of `@prev` outside buffers, forward-only references, buffers in comps (used once), loop
   films reset at 0.
 - **Selftest (mutation-checked):**
   - "buffers: every path agrees": frame n by forward playback, by a cold `still`, from a

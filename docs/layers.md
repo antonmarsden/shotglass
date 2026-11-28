@@ -150,12 +150,16 @@ so comps share the film's `scenes/` and textures. Shaders in a comp see:
   item that uses it (a comp shot or layer starts at its own start; with
   `time_offset`/`time_scale` as usual). A channel `@<comp>` follows the reading shot's
   `iTime` plus the entry's `time_offset`; a matte follows its layer. Past the comp's
-  end it holds its last frame (before 0, its first), or wraps with `loop = true`.
+  end it holds its last frame (before 0, its first), or wraps with `loop = true`
+  (`loop = "warm"`: its [buffers](buffers.md#seamless-loops-loop--warm) carry state over the wrap).
 - **Cues:** the film's cue defines, plus `COMP_DURATION` and `COMP_CUE_<SHOT>_START` /
   `_END` (and its layers') for the comp's own items.
 - **Size:** `size = [w, h]` renders the comp at that size (scale 1, whatever the
   player's render scale); without it a comp shot or channel is the output size and a
   comp layer the layer's size.
+
+A comp may keep [feedback buffers](buffers.md#buffers-in-comps) of its own (0.1.10);
+such a comp is shown in one place only.
 
 Comps are picture only: a comp shot's `sound` is refused, and comps can use other comps
 up to 4 deep (never themselves). A comp's picture is opaque. Footage inside a comp

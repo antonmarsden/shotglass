@@ -1,0 +1,24 @@
+# Golden-image film for buffers in comps (tests/golden.rs, #138). The comp "spark"
+# (comps/spark.toml, 160×90) draws a moving dot over black and keeps a trail of its
+# picture in a buffer that folds over comp-local frames: reset at the comp's start and
+# at 1 s of comp time, with its buffer-local iFrame as a blue bar at the bottom. The
+# film shows the comp as a layer from 0.3 s (comp time = film time − 0.3) over a plate;
+# past the comp's end (2 s of comp time) it holds its last frame, trail included. The
+# strip's frames cross the comp's reset and the hold. Folds stay short (errors compound
+# across stacks). Shaders are film-local, so the golden only moves when the engine does.
+title = "comp-feedback"
+fps = 30
+
+[comps]
+spark = { file = "comps/spark.toml", size = [160, 90] }
+
+[[shot]]
+id = "plate"
+scene = "scenes/plate.glsl"
+duration = 2.6
+
+[[layer]]
+id = "fx"
+comp = "spark"
+from = 0.3
+opacity = 0.8

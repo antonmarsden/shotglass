@@ -73,8 +73,9 @@ struct MovieFile {
     glsl: Option<String>,
     /// Play forever: the film repeats with its duration (a whole number of frames) as
     /// the period, and shaders only ever see time within one period.
+    /// `"warm"` (#138): also a seamless loop for feedback buffers.
     #[serde(rename = "loop")]
-    looping: Option<bool>,
+    looping: Option<toml::Value>,
     sound: Option<SoundFile>,
     #[serde(rename = "shot", default)]
     shots: Vec<ShotFile>,
@@ -114,9 +115,24 @@ struct CompFile {
     #[serde(rename = "layer", default)]
     layers: Vec<LayerFile>,
     channels: Option<Vec<toml::Value>>,
-    /// Recognised so the message says buffers in comps arrive later (#134, phase 3).
-    #[serde(rename = "buffer")]
-    buffers: Option<toml::Value>,
+    /// Feedback buffers (#138): they fold over comp-local frames.
+    #[serde(rename = "buffer", default)]
+    buffers: Vec<BufferFile>,
+}
+
+/// `loop = true | false | "warm"`: (looping, warm). "warm" (#138) is a loop whose
+/// buffers carry their state over the seam: frame 0 continues from a whole period of
+/// pre-roll instead of a reset. Films and `[comps]` entries share it.
+fn loop_mode(what: &str, v: Option<&toml::Value>) -> Result<(bool, bool)> {
+    match v {
+        None | Some(toml::Value::Boolean(false)) => Ok((false, false)),
+        Some(toml::Value::Boolean(true)) => Ok((true, false)),
+        Some(toml::Value::String(m)) if m == "warm" => Ok((true, true)),
+        Some(other) => bail!(
+            "{what}loop = {other}: loop must be true, false or \"warm\" (a loop whose feedback \
+             buffers carry their state over the seam)"
+        ),
+    }
 }
 
 #[derive(Deserialize)]
@@ -1239,6 +1255,11 @@ pub struct Movie {
     /// `loop = true`: the film repeats every `n` frames (its whole duration). See
     /// `loop_period`, `wrap`, `sound_samples`.
     pub loop_frames: Option<u64>,
+    /// `loop = "warm"` (#138): a loop film's (or comp's) buffers carry their state over
+    /// the seam. Their fold runs over two periods (the first is pre-roll): frame n's
+    /// state is the fold from the start of the period before, so frame 0 follows a
+    /// whole period instead of a reset (`gfx::fold`). Always false without a loop.
+    pub warm: bool,
     /// Movie-level music/ambience (`mainSound`, movie time).
     pub music: Option<PathBuf>,
     /// Final mix pass (`mainMix`).
@@ -1248,7 +1269,7 @@ pub struct Movie {
     pub shots: Vec<Shot>,
     /// Layers above the picture track, bottom to top.
     pub layers: Vec<Layer>,
-    /// Feedback buffers (#134), in step order. Always empty in a comp's movie.
+    /// Feedback buffers (#134), in step order. A comp's fold over comp-local frames (#138).
     pub buffers: Vec<Buffer>,
     /// `[comps]` (#74), in name order. Always empty in a comp's own movie: comps refer
     /// to the film's by index.
@@ -1430,6 +1451,14 @@ impl Movie {
             features.push("feedback buffers ([[buffer]]), which need shotglass 0.1.9");
             need = semver::Version::new(0, 1, 9);
         }
+        if self.comps.iter().any(|c| !c.movie.buffers.is_empty()) {
+            features.push("buffers in comps, which need shotglass 0.1.10");
+            need = semver::Version::new(0, 1, 10);
+        }
+        if self.warm || self.comps.iter().any(|c| c.movie.warm) {
+            features.push("loop = \"warm\", which needs shotglass 0.1.10");
+            need = semver::Version::new(0, 1, 10);
+        }
         if features.is_empty() {
             return None;
         }
@@ -1444,6 +1473,7 @@ impl Movie {
             semver::Version::new(0, 1, 6),
             semver::Version::new(0, 1, 7),
             semver::Version::new(0, 1, 8),
+            semver::Version::new(0, 1, 9),
         ];
         let allows_old = match &self.shotglass {
             None => true,
@@ -1929,6 +1959,7 @@ impl Movie {
         };
         let buffer_decls = buffer_decls(&f.buffers)?;
         // [comps] (#74): names first; shots, layers and comps refer to them by index.
+        let film_loop = loop_mode("", f.looping.as_ref())?;
         let decls = comp_decls(&f.comps)?;
         let comp_names: Vec<String> = decls.iter().map(|d| d.name.clone()).collect();
         let comp_rels: Vec<String> = decls.iter().map(|d| d.rel.clone()).collect();
@@ -1943,6 +1974,7 @@ impl Movie {
             fps: (fps_num, fps_den),
             buffers: &buffer_decls,
             aspect,
+            size: None,
         };
         let (shots, layers, buffers, duration, loop_frames) = build_sequence(
             &ctx,
@@ -1951,7 +1983,7 @@ impl Movie {
             f.layers,
             f.buffers,
             f.channels.as_deref(),
-            f.looping == Some(true),
+            film_loop.0,
         )?;
         if loop_frames.is_some() {
             let first = &shots[0];
@@ -1979,27 +2011,24 @@ impl Movie {
             let text = std::fs::read_to_string(&file)
                 .with_context(|| format!("{what}: reading {}", d.rel))?;
             let cf: CompFile = parse_comp_file(&text).with_context(|| format!("in {}", d.rel))?;
-            if cf.buffers.is_some() {
-                bail!(
-                    "comp \"{}\" ({}): [[buffer]] goes in movie.toml; buffers in comps arrive \
-                     in a later phase (#134). Read the comp from a film buffer instead \
-                     (channels = [\"@{}\"])",
-                    d.name,
-                    d.rel,
-                    d.name
-                );
-            }
+            let comp_decls = self::buffer_decls(&cf.buffers)
+                .with_context(|| format!("comp \"{}\" ({})", d.name, d.rel))?;
             let ctx = SeqCtx {
                 comp: Some(&d.name),
-                buffers: &[],
+                buffers: &comp_decls,
+                aspect: match d.size {
+                    Some((w, h)) => w as f32 / h as f32,
+                    None => aspect,
+                },
+                size: d.size,
                 ..ctx
             };
-            let (shots, layers, _, duration, loop_frames) = build_sequence(
+            let (shots, layers, buffers, duration, loop_frames) = build_sequence(
                 &ctx,
                 &mut used,
                 cf.shots,
                 cf.layers,
-                vec![],
+                cf.buffers,
                 cf.channels.as_deref(),
                 d.looping,
             )
@@ -2018,13 +2047,14 @@ impl Movie {
                     fps_den,
                     glsl,
                     loop_frames,
+                    warm: d.warm,
                     music: None,
                     mix: None,
                     mix_lookback: 1.0,
                     volume: 1.0,
                     shots,
                     layers,
-                    buffers: vec![],
+                    buffers,
                     comps: vec![],
                     markers: vec![],
                     duration,
@@ -2041,8 +2071,7 @@ impl Movie {
                 looping: d.looping,
             });
         }
-        check_comp_graph(&shots, &layers, &comps)?;
-        Ok(Movie {
+        let movie = Movie {
             root: root.to_path_buf(),
             title: f.title.unwrap_or_else(|| "Untitled".into()),
             aspect,
@@ -2051,6 +2080,7 @@ impl Movie {
             fps_den,
             glsl,
             loop_frames,
+            warm: film_loop.1,
             volume: f.sound.as_ref().and_then(|s| s.volume).unwrap_or(1.0),
             music: f
                 .sound
@@ -2091,7 +2121,28 @@ impl Movie {
             libraries: vec![],
             project: project.root.clone(),
             library_refs,
-        })
+        };
+        check_comp_graph(&movie)?;
+        check_comp_buffers(&movie, &movie.comps)?;
+        check_buffer_memory(&movie)?;
+        let mut movie = movie;
+        let cold: Vec<String> = std::iter::once(("the film".to_string(), &movie))
+            .chain(
+                movie
+                    .comps
+                    .iter()
+                    .map(|c| (format!("comp \"{}\"", c.name), &*c.movie)),
+            )
+            .filter(|(_, m)| m.warm && warm_buffers(m).next().is_none())
+            .map(|(w, _)| w)
+            .collect();
+        for w in cold {
+            movie.warnings.push(format!(
+                "{w}: loop = \"warm\" has no effect: no feedback buffer runs from frame 0 to the \
+                 end of the period, so none carries state over the seam (use loop = true)"
+            ));
+        }
+        Ok(movie)
     }
 
     /// Time of frame `n`: exactly `n * den / num`, rounded once to f32.
@@ -2341,10 +2392,12 @@ struct SeqCtx<'a> {
     comp_rels: &'a [String],
     comp: Option<&'a str>,
     fps: (u32, u32),
-    /// The film's buffers (#134), by index; none in a comp.
+    /// The sequence's buffers (#134; a comp's, #138), by index.
     buffers: &'a [BufDecl],
     /// The output aspect (the memory check sizes `scale` buffers with it).
     aspect: f32,
+    /// A comp's own `size` (#138): its `scale` buffers are that fraction of it.
+    size: Option<(u32, u32)>,
 }
 
 impl SeqCtx<'_> {
@@ -3020,10 +3073,7 @@ fn build_buffers(
         });
     }
     // Required memory: every ring active on the worst frame (the most buffers at once).
-    let out_size = (
-        (MEMORY_CHECK_HEIGHT * sc.aspect).round() as i32,
-        MEMORY_CHECK_HEIGHT as i32,
-    );
+    let out_size = memory_check_out(sc.aspect, sc.size);
     for b in &out {
         let at = b.start_frame;
         let live: Vec<&Buffer> = out.iter().filter(|o| o.active(at)).collect();
@@ -3054,6 +3104,75 @@ fn build_buffers(
         }
     }
     Ok(out)
+}
+
+/// The buffers of a warm loop sequence (#138) that carry state over its seam: active
+/// from frame 0 to the end of the period.
+pub fn warm_buffers(m: &Movie) -> impl Iterator<Item = &Buffer> {
+    let p = m.loop_frames.filter(|_| m.warm);
+    m.buffers
+        .iter()
+        .filter(move |b| p.is_some_and(|p| b.start_frame == 0 && b.end_frame >= p))
+}
+
+/// The output `scale` buffers are sized against in the memory checks: a comp's own
+/// `size` (#138), else a 1080-pixel-high output of the aspect.
+fn memory_check_out(aspect: f32, size: Option<(u32, u32)>) -> (i32, i32) {
+    match size {
+        Some((w, h)) => (w as i32, h as i32),
+        None => (
+            (MEMORY_CHECK_HEIGHT * aspect).round() as i32,
+            MEMORY_CHECK_HEIGHT as i32,
+        ),
+    }
+}
+
+/// Required buffer memory across the film and its comps (#138): each sequence's worst
+/// frame, summed (comps can be active at any film frame). Only comps add anything here:
+/// `build_buffers` already checked each sequence on its own.
+fn check_buffer_memory(film: &Movie) -> Result<()> {
+    let worst = |m: &Movie, size: Option<(u32, u32)>| -> usize {
+        let out = memory_check_out(m.aspect, size);
+        m.buffers
+            .iter()
+            .map(|b| {
+                m.buffers
+                    .iter()
+                    .filter(|o| o.active(b.start_frame))
+                    .map(|o| o.ring_bytes(out))
+                    .sum::<usize>()
+            })
+            .max()
+            .unwrap_or(0)
+    };
+    if film.comps.iter().all(|c| c.movie.buffers.is_empty()) {
+        return Ok(());
+    }
+    let parts: Vec<(String, usize)> = std::iter::once(("the film".to_string(), worst(film, None)))
+        .chain(
+            film.comps
+                .iter()
+                .map(|c| (format!("comp \"{}\"", c.name), worst(&c.movie, c.size))),
+        )
+        .filter(|(_, b)| *b > 0)
+        .collect();
+    let total: usize = parts.iter().map(|(_, b)| b).sum();
+    if total > BUFFER_MEMORY_LIMIT {
+        bail!(
+            "buffers in the film and its comps need up to {} MB of GPU memory at once (limit \
+             {} MB; `scale` buffers counted at a {}-pixel-high output): {}; use smaller sizes, \
+             rgba8, or shorter histories",
+            total >> 20,
+            BUFFER_MEMORY_LIMIT >> 20,
+            MEMORY_CHECK_HEIGHT,
+            parts
+                .iter()
+                .map(|(w, b)| format!("{w} {} MB", b >> 20))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    Ok(())
 }
 
 /// `[[buffer]]` ids, formats and histories (#134), known before any channel is parsed.
@@ -4243,6 +4362,8 @@ struct CompDecl {
     rel: String,
     size: Option<(u32, u32)>,
     looping: bool,
+    /// `loop = "warm"` (#138).
+    warm: bool,
 }
 
 /// Deepest comp nesting (each level holds its own targets).
@@ -4259,12 +4380,13 @@ fn comp_decls(t: &BTreeMap<String, toml::Value>) -> Result<Vec<CompDecl>> {
                  picture)"
             );
         }
-        let (rel, size, looping) = match v {
-            toml::Value::String(s) => (s.clone(), None, false),
+        let (rel, size, looping, warm) = match v {
+            toml::Value::String(s) => (s.clone(), None, false, false),
             toml::Value::Table(t) => {
                 let mut file = None;
                 let mut size = None;
                 let mut looping = false;
+                let mut warm = false;
                 for (k, val) in t {
                     match k.as_str() {
                         "file" => {
@@ -4286,11 +4408,7 @@ fn comp_decls(t: &BTreeMap<String, toml::Value>) -> Result<Vec<CompDecl>> {
                                 _ => bail!("{what}: size must be [width, height] in pixels"),
                             }
                         }
-                        "loop" => {
-                            looping = val
-                                .as_bool()
-                                .ok_or_else(|| anyhow!("{what}: loop must be true or false"))?
-                        }
+                        "loop" => (looping, warm) = loop_mode(&format!("{what}: "), Some(val))?,
                         other => bail!(
                             "{what}: unknown option `{other}` (a comp has file, size and loop)"
                         ),
@@ -4299,7 +4417,7 @@ fn comp_decls(t: &BTreeMap<String, toml::Value>) -> Result<Vec<CompDecl>> {
                 let Some(file) = file else {
                     bail!("{what}: a comp table needs file = \"comps/….toml\"");
                 };
-                (file, size, looping)
+                (file, size, looping, warm)
             }
             _ => bail!("{what}: a comp is \"comps/….toml\" or {{ file = \"…\", size, loop }}"),
         };
@@ -4312,6 +4430,7 @@ fn comp_decls(t: &BTreeMap<String, toml::Value>) -> Result<Vec<CompDecl>> {
             rel,
             size,
             looping,
+            warm,
         });
     }
     Ok(out)
@@ -4335,37 +4454,93 @@ fn parse_comp_file(text: &str) -> Result<CompFile> {
     Ok(toml::from_str(text)?)
 }
 
-/// The comps a sequence's shots, layers, channels and mattes show.
-fn comps_used(shots: &[Shot], layers: &[Layer]) -> Vec<usize> {
-    let mut v: Vec<usize> = shots.iter().filter_map(|s| s.comp).collect();
-    let chans = shots
-        .iter()
-        .flat_map(|s| s.channels.iter().flatten())
-        .chain(layers.iter().flat_map(|l| l.channels.iter().flatten()));
-    for c in chans {
-        if let Source::Comp { index, .. } = c.source {
-            v.push(index);
+/// Every place a sequence shows a comp (#74): shots, layers, mattes and the channels of
+/// shots, layers and buffers, one entry per use, with what uses it.
+fn comp_uses(m: &Movie) -> Vec<(usize, String)> {
+    let mut v = vec![];
+    let mut chans = |what: String, list: &[Option<Channel>]| {
+        for c in list.iter().flatten() {
+            if let Source::Comp { index, .. } = c.source {
+                v.push((index, what.clone()));
+            }
+        }
+    };
+    for s in &m.shots {
+        chans(format!("shot \"{}\"'s channels", s.id), &s.channels);
+    }
+    for l in &m.layers {
+        chans(format!("layer \"{}\"'s channels", l.id), &l.channels);
+    }
+    for b in &m.buffers {
+        chans(format!("buffer \"{}\"'s channels", b.id), &b.channels);
+    }
+    for s in &m.shots {
+        if let Some(c) = s.comp {
+            v.push((c, format!("shot \"{}\"", s.id)));
         }
     }
-    for l in layers {
+    for l in &m.layers {
         if let LayerScene::Comp(c) = l.scene {
-            v.push(c);
+            v.push((c, format!("layer \"{}\"", l.id)));
         }
         if let Some(Matte {
             source: MatteSource::Comp(c),
             ..
         }) = l.matte
         {
-            v.push(c);
+            v.push((c, format!("layer \"{}\"'s matte", l.id)));
         }
     }
+    v
+}
+
+/// The comps a sequence's shots, layers, buffers, channels and mattes show.
+fn comps_used(m: &Movie) -> Vec<usize> {
+    let mut v: Vec<usize> = comp_uses(m).into_iter().map(|(c, _)| c).collect();
     v.sort_unstable();
     v.dedup();
     v
 }
 
+/// Comps with buffers (#138), directly or through a comp they show, are shown in at
+/// most one place in the film and its comps: one fold per comp, over comp-local frames,
+/// serves one comp time per film frame. (Two uses could ask for two comp frames at once.)
+fn check_comp_buffers(film: &Movie, comps: &[Comp]) -> Result<()> {
+    fn has_buffers(c: usize, comps: &[Comp]) -> bool {
+        let m = &comps[c].movie;
+        !m.buffers.is_empty() || comps_used(m).into_iter().any(|d| has_buffers(d, comps))
+    }
+    let mut uses: Vec<Vec<String>> = vec![vec![]; comps.len()];
+    for (c, what) in comp_uses(film) {
+        uses[c].push(what);
+    }
+    for comp in comps {
+        for (c, what) in comp_uses(&comp.movie) {
+            uses[c].push(format!("comp \"{}\": {what}", comp.name));
+        }
+    }
+    for (c, u) in uses.iter().enumerate() {
+        if u.len() > 1 && has_buffers(c, comps) {
+            bail!(
+                "comp \"{}\" has feedback buffers{}, so it can be shown in one place only \
+                 (its state follows one comp time per film frame); it is shown by {}. Make a \
+                 second comp file for another use",
+                comps[c].name,
+                if comps[c].movie.buffers.is_empty() {
+                    " (in a comp it shows)"
+                } else {
+                    ""
+                },
+                u.join(", ")
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Comps don't show themselves through others, and nest at most `MAX_COMP_DEPTH` deep.
-fn check_comp_graph(shots: &[Shot], layers: &[Layer], comps: &[Comp]) -> Result<()> {
+fn check_comp_graph(film: &Movie) -> Result<()> {
+    let comps = &film.comps[..];
     fn walk(c: usize, comps: &[Comp], path: &mut Vec<usize>) -> Result<()> {
         if let Some(i) = path.iter().position(|&p| p == c) {
             let mut names: Vec<&str> = path[i..].iter().map(|&p| comps[p].name.as_str()).collect();
@@ -4382,7 +4557,7 @@ fn check_comp_graph(shots: &[Shot], layers: &[Layer], comps: &[Comp]) -> Result<
             );
         }
         let m = &comps[c].movie;
-        for d in comps_used(&m.shots, &m.layers) {
+        for d in comps_used(m) {
             walk(d, comps, path)?;
         }
         path.pop();
@@ -4394,13 +4569,13 @@ fn check_comp_graph(shots: &[Shot], layers: &[Layer], comps: &[Comp]) -> Result<
     // Depth from the film: what it shows is level 1.
     fn depth(c: usize, comps: &[Comp]) -> usize {
         let m = &comps[c].movie;
-        1 + comps_used(&m.shots, &m.layers)
+        1 + comps_used(m)
             .into_iter()
             .map(|d| depth(d, comps))
             .max()
             .unwrap_or(0)
     }
-    for c in comps_used(shots, layers) {
+    for c in comps_used(film) {
         if depth(c, comps) > MAX_COMP_DEPTH {
             bail!(
                 "comp \"{}\" nests more than {MAX_COMP_DEPTH} levels deep",
@@ -6970,6 +7145,63 @@ glsl = 450
         assert_eq!(m.sound_samples(48000), 480480);
     }
 
+    /// `loop = "warm"` (#138): a loop film (or comp) whose seam-spanning buffers carry
+    /// their state over the seam.
+    #[test]
+    fn loop_warm() {
+        let one = "[[shot]]\nid = \"a\"\nscene = \"a.glsl\"\nduration = 2\n";
+        let buf = "[[buffer]]\nid = \"t\"\nscene = \"b.glsl\"\nchannels = [\"@prev\"]\n";
+        let m = fixture(
+            &format!("shotglass = \"0.1.10\"\nloop = \"warm\"\n{one}{buf}"),
+            Path::new("."),
+        )
+        .unwrap();
+        assert_eq!((m.loop_frames, m.warm), (Some(60), true));
+        assert_eq!(warm_buffers(&m).count(), 1);
+        assert!(m.warnings.is_empty(), "{:?}", m.warnings);
+        assert_eq!(m.contract_warning(), None);
+        let m = fixture(
+            &format!("shotglass = \"0.1.9\"\nloop = \"warm\"\n{one}{buf}"),
+            Path::new("."),
+        )
+        .unwrap();
+        assert!(m.contract_warning().unwrap().contains("loop = \"warm\""));
+        // A plain loop isn't warm.
+        let m = loop_film("", one).unwrap();
+        assert!(!m.warm);
+        // No buffer spans the seam: a warning, not an error.
+        let late = "[[buffer]]\nid = \"t\"\nscene = \"b.glsl\"\nfrom = 1\n";
+        let m = fixture(&format!("loop = \"warm\"\n{one}{late}"), Path::new(".")).unwrap();
+        assert!(
+            m.warnings.iter().any(|w| w.contains("has no effect")),
+            "{:?}",
+            m.warnings
+        );
+        assert_eq!(warm_buffers(&m).count(), 0);
+        // Anything else is refused.
+        for bad in ["\"hot\"", "1", "[true]"] {
+            let e = err(fixture(&format!("loop = {bad}\n{one}"), Path::new(".")));
+            assert!(
+                e.contains("loop must be true, false or \"warm\""),
+                "{bad}: {e}"
+            );
+        }
+        // Comps too.
+        let (_d, m) = comps_film(
+            "[comps]\nc = { file = \"c.toml\", loop = \"warm\" }\n\
+             [[shot]]\nid = \"s\"\ncomp = \"c\"\nduration = 1\n",
+            &[("c.toml", &format!("{one}{buf}"))],
+        );
+        let m = m.unwrap();
+        assert!(m.comps[0].looping && m.comps[0].movie.warm && !m.warm);
+        let (_d, m) = comps_film(
+            "[comps]\nc = { file = \"c.toml\", loop = \"hot\" }\n\
+             [[shot]]\nid = \"s\"\ncomp = \"c\"\nduration = 1\n",
+            &[("c.toml", one)],
+        );
+        assert!(err(m).contains("loop must be true, false or \"warm\""));
+    }
+
     #[test]
     fn loop_period_must_be_whole_frames() {
         let one = |d: &str| format!("[[shot]]\nid = \"a\"\nscene = \"a.glsl\"\nduration = {d}\n");
@@ -7211,16 +7443,131 @@ glsl = 450
             e.contains("MB of GPU memory at once") && e.contains("\"big\""),
             "{e}"
         );
-        // Buffers in comps arrive later.
+    }
+
+    /// Buffers in comps (#138): they parse against the comp's shots and layers, read
+    /// comp-local sources, and a comp with buffers (directly or through a comp it shows)
+    /// is shown in one place only.
+    #[test]
+    fn comp_buffers() {
+        const C: &str = "[[shot]]\nid = \"a\"\nscene = \"a.glsl\"\nduration = 2\n\
+             [[layer]]\nid = \"show\"\nscene = \"t.glsl\"\nchannels = [\"@b\"]\n\
+             [[buffer]]\nid = \"b\"\nscene = \"b.glsl\"\nchannels = [\"@prev\", \"@picture\"]\n\
+             reset = [1]\nscale = 0.5\n";
+        let (_d, m) = comps_film(
+            "shotglass = \"0.1.10\"\n[comps]\nc = { file = \"c.toml\", size = [64, 36] }\n\
+             [[shot]]\nid = \"s\"\ncomp = \"c\"\nduration = 1\n",
+            &[("c.toml", C)],
+        );
+        let m = m.unwrap();
+        assert!(m.buffers.is_empty());
+        let b = &m.comps[0].movie.buffers;
+        assert_eq!(b.len(), 1);
+        assert_eq!((b[0].start_frame, b[0].end_frame), (0, 60));
+        assert_eq!(b[0].resets, vec![0, 30]);
+        let l = &m.comps[0].movie.layers[0];
+        assert!(matches!(
+            l.channels[0].as_ref().unwrap().source,
+            Source::Buffer {
+                index: 0,
+                back: 0,
+                ..
+            }
+        ));
+        assert_eq!(m.contract_warning(), None);
+        // An older contract is told about 0.1.10.
+        let (_d, m) = comps_film(
+            "shotglass = \"0.1.9\"\n[comps]\nc = \"c.toml\"\n\
+             [[shot]]\nid = \"s\"\ncomp = \"c\"\nduration = 1\n",
+            &[("c.toml", C)],
+        );
+        assert!(m.unwrap().contract_warning().unwrap().contains("0.1.10"));
+        // Shown twice: refused, naming both uses.
+        let (_d, m) = comps_film(
+            "[comps]\nc = \"c.toml\"\n\
+             [[shot]]\nid = \"s\"\ncomp = \"c\"\nduration = 1\n\
+             [[layer]]\nid = \"l\"\nscene = \"t.glsl\"\nchannels = [\"@c\"]\n",
+            &[("c.toml", C)],
+        );
+        let e = err(m);
+        assert!(
+            e.contains("shown in one place only")
+                && e.contains("shot \"s\"")
+                && e.contains("layer \"l\"'s channels"),
+            "{e}"
+        );
+        // Through a comp that shows it: the outer comp is shown twice.
+        let (_d, m) = comps_film(
+            "[comps]\nc = \"c.toml\"\nouter = \"o.toml\"\n\
+             [[shot]]\nid = \"s\"\ncomp = \"outer\"\nduration = 1\n\
+             [[shot]]\nid = \"s2\"\ncomp = \"outer\"\nduration = 1\n",
+            &[
+                ("c.toml", C),
+                (
+                    "o.toml",
+                    "[[shot]]\nid = \"x\"\ncomp = \"c\"\nduration = 1\n",
+                ),
+            ],
+        );
+        let e = err(m);
+        assert!(
+            e.contains("comp \"outer\"") && e.contains("in a comp it shows"),
+            "{e}"
+        );
+        // Read once from a film buffer: fine (the comp's channel use counts).
+        let (_d, m) = comps_film(
+            "[comps]\nc = \"c.toml\"\n[[shot]]\nid = \"s\"\nscene = \"s.glsl\"\nduration = 1\n\
+             [[buffer]]\nid = \"fb\"\nscene = \"b.glsl\"\nchannels = [\"@c\"]\n",
+            &[("c.toml", C)],
+        );
+        assert!(m.is_ok(), "{:?}", m.err());
+        // A comp without buffers may still be shown many times.
+        let (_d, m) = comps_film(
+            "[comps]\nc = \"c.toml\"\n\
+             [[shot]]\nid = \"s\"\ncomp = \"c\"\nduration = 1\n\
+             [[shot]]\nid = \"s2\"\ncomp = \"c\"\nduration = 1\n",
+            &[(
+                "c.toml",
+                "[[shot]]\nid = \"a\"\nscene = \"a.glsl\"\nduration = 1\n",
+            )],
+        );
+        assert!(m.is_ok());
+        // Comp buffers follow the buffer rules: @input is refused, ids are the comp's.
         let (_d, m) = comps_film(
             "[comps]\nc = \"c.toml\"\n[[shot]]\nid = \"s\"\ncomp = \"c\"\nduration = 1\n",
             &[(
                 "c.toml",
                 "[[shot]]\nid = \"a\"\nscene = \"a.glsl\"\nduration = 1\n\
-                 [[buffer]]\nid = \"b\"\nscene = \"b.glsl\"\n",
+                 [[buffer]]\nid = \"a\"\nscene = \"b.glsl\"\n",
             )],
         );
-        assert!(err(m).contains("buffers in comps arrive"));
+        assert!(err(m).contains("the id is taken"));
+        // Memory: the film's and every comp's worst frames add up.
+        let big = "[[shot]]\nid = \"a\"\nscene = \"a.glsl\"\nduration = 1\n\
+             [[buffer]]\nid = \"b\"\nscene = \"b.glsl\"\nformat = \"rgba32f\"\nhistory = 17\n";
+        let (_d, m) = comps_film(
+            "[comps]\nc = \"c.toml\"\nd = \"d.toml\"\n\
+             [[shot]]\nid = \"s\"\ncomp = \"c\"\nduration = 1\n\
+             [[shot]]\nid = \"t\"\ncomp = \"d\"\nduration = 1\n",
+            &[("c.toml", big), ("d.toml", big)],
+        );
+        let e = err(m);
+        assert!(
+            e.contains("the film and its comps") && e.contains("comp \"d\""),
+            "{e}"
+        );
+        // A sized comp's `scale` buffers are counted at its size, not at 1080p: 64×36
+        // rgba32f × 64 states is under 3 MB (at 1920×1080 it would be 2 GB).
+        let (_d, m) = comps_film(
+            "[comps]\nc = { file = \"c.toml\", size = [64, 36] }\n\
+             [[shot]]\nid = \"s\"\ncomp = \"c\"\nduration = 1\n",
+            &[(
+                "c.toml",
+                "[[shot]]\nid = \"a\"\nscene = \"a.glsl\"\nduration = 1\n\
+                 [[buffer]]\nid = \"b\"\nscene = \"b.glsl\"\nformat = \"rgba32f\"\nhistory = 63\n",
+            )],
+        );
+        assert!(m.is_ok(), "{:?}", m.err());
     }
 
     #[test]

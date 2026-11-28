@@ -2,7 +2,8 @@
 //! (and contact sheets of tests/films/channels, the
 //! iChannel textures film, tests/films/text, the text film, tests/films/layers and
 //! tests/films/blends, the layer films, tests/films/footage, image sequences, tests/films/glyphs, glyph runs and
-//! subtitles, tests/films/feedback, feedback buffers, and both
+//! subtitles, tests/films/feedback, feedback buffers, tests/films/comp-feedback, buffers
+//! in comps, tests/films/warm-loop, `loop = "warm"`, and both
 //! of tests/films/loop, a `loop = true` film) and compares them with reference PNGs and WAVs in tests/golden/, so "compiles but looks (or sounds) wrong" fails `cargo test` (and
 //! CI, on software OpenGL).
 //!
@@ -385,6 +386,39 @@ fn feedback_film() {
         "feedback",
         &root().join("tests").join("films").join("feedback"),
         &["--at", "0.1,0.2,0.3,0.5,1.0,1.1,1.2,1.4"],
+        &[],
+    );
+}
+
+/// Buffers in comps (#138): tests/films/comp-feedback, a sized comp with a trail buffer
+/// that folds over comp-local frames (reset at the comp's start and at 1 s of comp time,
+/// its iFrame as a bar), shown as a layer half-transparent from 0.3 s and held past its
+/// end. The frames cross the comp's reset and the hold; folds stay short.
+#[test]
+fn comp_feedback_film() {
+    if skip() {
+        return;
+    }
+    golden_frames(
+        "comp-feedback",
+        &root().join("tests").join("films").join("comp-feedback"),
+        &["--at", "0.2,0.4,0.7,1.2,1.3,1.45,2.0,2.5"],
+        &[],
+    );
+}
+
+/// Warm loops (#138): tests/films/warm-loop, `loop = "warm"`: a trail that spans the seam
+/// is already there at frame 0 (it follows the period's last frame), next to one that
+/// starts at 0.2 s and is empty every period.
+#[test]
+fn warm_loop_film() {
+    if skip() {
+        return;
+    }
+    golden_frames(
+        "warm-loop",
+        &root().join("tests").join("films").join("warm-loop"),
+        &["--at", "0,0.0333,0.1,0.2333,0.5,1.0,1.4,1.4667"],
         &[],
     );
 }

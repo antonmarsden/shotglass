@@ -1,0 +1,2 @@
+# Engine contract: loop = "warm" needs shotglass 0.1.10.
+shotglass = "0.1.10"
