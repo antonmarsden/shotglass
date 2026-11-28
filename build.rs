@@ -135,6 +135,11 @@ mod webm {
             .define("BUILD_TESTING", "OFF")
             .define("SVT_AV1_LTO", "OFF")
             .define("CMAKE_POLICY_VERSION_MINIMUM", "3.5");
+        // SVT-AV1 writes its binaries to `<source>/Bin/<config>/` by default, which
+        // dirties the source tree (`cargo publish` refuses that): keep them in OUT_DIR.
+        // The install step still copies the library to `<out>/lib`.
+        let bin_dir = PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("svt-bin");
+        cfg.define("CMAKE_OUTPUT_DIRECTORY", &bin_dir);
         // cmake-rs replaces CMAKE_<LANG>_FLAGS_RELEASE with cc's flags for the Rust
         // profile (no optimisation in dev builds, no NDEBUG), so ask for them here:
         // cl and gcc/clang all accept these spellings.
