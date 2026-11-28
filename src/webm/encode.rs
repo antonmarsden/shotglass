@@ -74,6 +74,8 @@ pub struct Av1Settings {
     pub keyint: u32,
     /// Film-grain denoising and synthesis strength (0 = off).
     pub grain: u8,
+    /// Colour tags (export: BT.709 limited); must be ones SVT-AV1 names.
+    pub colour: super::ColourTags,
 }
 
 impl Av1Settings {
@@ -89,12 +91,26 @@ impl Av1Settings {
             ("keyint", self.keyint.to_string()),
             // Closed GOPs: every keyframe is a seek point (a cluster and a cue).
             ("irefresh-type", "kf".into()),
-            ("color-primaries", "bt709".into()),
-            ("transfer-characteristics", "bt709".into()),
-            ("matrix-coefficients", "bt709".into()),
-            ("color-range", "studio".into()),
-            ("chroma-sample-position", "left".into()),
         ];
+        let (cp, tc, mc) = self
+            .colour
+            .svt_names()
+            .unwrap_or(("bt709", "bt709", "bt709"));
+        p.extend([
+            ("color-primaries", cp.into()),
+            ("transfer-characteristics", tc.into()),
+            ("matrix-coefficients", mc.into()),
+            (
+                "color-range",
+                if self.colour.full_range {
+                    "full"
+                } else {
+                    "studio"
+                }
+                .into(),
+            ),
+            ("chroma-sample-position", "left".into()),
+        ]);
         match self.rate {
             Rate::Quality(q) => p.push(("crf", q.to_string())),
             Rate::Bitrate(k) => {
@@ -364,6 +380,7 @@ mod tests {
             speed: 12,
             keyint: 8,
             grain: 0,
+            colour: super::super::ColourTags::BT709,
         };
         let mut enc = Av1Encoder::new(&set).unwrap();
         let (seq, _) = av1::find_sequence_header(enc.header()).unwrap();

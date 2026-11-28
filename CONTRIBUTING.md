@@ -194,11 +194,13 @@ contact sheet (`shotglass strip`, 8 frames at 320x180) and the soundtrack
   docker build -f docker/test.Dockerfile -t shotglass-test .
   docker run --init --rm -v "$PWD/tests/golden:/src/tests/golden" -e SHOTGLASS_BLESS=1 \
       shotglass-test xvfb-run -a cargo test --release --no-default-features \
-      --features strict-glsl --test golden
+      --features strict-glsl,video --test golden
   ```
 
   The image leaves out the `webm` feature (it needs CMake and the SVT-AV1 sources),
   so pass the same features to `cargo test`, or it rebuilds with them and fails.
+  It keeps `video` (rav1d; the image installs nasm for its asm): the video golden
+  film needs a decoder.
 
   Keep `--init`: without it `xvfb-run` is the container's PID 1, misses Xvfb's
   "ready" signal and waits forever at 0% CPU.

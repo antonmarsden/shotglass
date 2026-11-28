@@ -370,6 +370,21 @@ enum TexSource {
     Text(Box<crate::movie::TextSource>),
     /// A sequence frame (#70): a file that must have the sequence's size.
     Frame(PathBuf, Option<(usize, usize)>),
+    /// A video frame (#73): frame k of a clip, decoded by one of its readers.
+    Video(std::sync::Arc<crate::video::Source>, u64),
+}
+
+impl TexSource {
+    /// A footage frame's RGBA8 bytes (0 when unknown), for the in-flight caps.
+    fn frame_bytes(&self) -> usize {
+        match self {
+            TexSource::Frame(_, Some((w, h))) => w * h * 4,
+            TexSource::Video(v, _) => {
+                v.clip.track.width as usize * v.clip.track.height as usize * 4
+            }
+            _ => 0,
+        }
+    }
 }
 
 impl TexSource {
@@ -387,6 +402,7 @@ impl TexSource {
                     _ => Ok(img),
                 }
             }
+            TexSource::Video(v, k) => v.decode(*k, label, vflip),
         }
     }
 }

@@ -431,6 +431,7 @@ mod tests {
             codec_private: vec![0x81, 0, 0x0c, 0],
             bit_depth: 8,
             fps,
+            colour: crate::webm::ColourTags::BT709,
         }
     }
 

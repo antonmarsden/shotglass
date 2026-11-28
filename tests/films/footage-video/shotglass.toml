@@ -1,0 +1,2 @@
+# Engine contract: video channels need shotglass 0.1.12.
+shotglass = "0.1.12"

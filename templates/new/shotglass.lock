@@ -1,0 +1,11 @@
+# Written by `shotglass fetch`/`update`. Commit it with the project.
+version = 1
+
+[[library]]
+name = "transitions"
+version = "0.1.0"
+source = "https://github.com/antonmarsden/shotglass-kit"
+tag = "HEAD"
+rev = "08feab8586d1e295d6c958f3e2b2808a0561b1b8"
+subdir = "transitions"
+sha256 = "bf266ae5b3680a5eea8e3d57f55d6ecdca619235cdefc635329bbf6972a076aa"

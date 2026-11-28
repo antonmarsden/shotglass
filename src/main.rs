@@ -4,6 +4,8 @@ mod anim;
 mod app;
 mod audio;
 mod bundle;
+#[cfg(feature = "webm")]
+mod conform;
 mod export;
 mod fonts;
 mod footage;
@@ -206,6 +208,30 @@ enum Cmd {
         /// again by the player. Default off.
         #[arg(long, value_parser = clap::value_parser!(u8).range(1..=50))]
         grain: Option<u8>,
+    },
+    /// Convert a clip once into footage shotglass reads: AV1 in WebM at a constant frame
+    /// rate, written next to it (or to --out). ffmpeg decodes; shotglass encodes. Takes
+    /// any file ffmpeg reads, or an image sequence ("frames/plate_####.png" with --fps).
+    /// Re-encodes: pixels change slightly. An AV1 WebM that's already fine is left alone.
+    Conform {
+        input: String,
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+        /// Frames between keyframes (default: about two seconds). Smaller scrubs faster.
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+        keyint: Option<u32>,
+        /// SVT-AV1 CRF, 0..=63 (lower is better).
+        #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u8).range(0..=63))]
+        crf: u8,
+        /// Bits per sample, 8 or 10 (default: the source's, at most 10).
+        #[arg(long, value_parser = ["8", "10"])]
+        depth: Option<String>,
+        /// The output frame rate (24, 30000/1001); an image sequence's rate.
+        #[arg(long)]
+        fps: Option<String>,
+        /// SVT-AV1 preset 0..=13 (higher is faster).
+        #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u8).range(0..=13))]
+        speed: u8,
     },
     /// Create a new movie folder from a template.
     New { dir: PathBuf },
@@ -451,6 +477,37 @@ fn real_main() -> Result<()> {
                 grain,
             },
         ),
+        Cmd::Conform {
+            input,
+            out,
+            keyint,
+            crf,
+            depth,
+            fps,
+            speed,
+        } => {
+            #[cfg(feature = "webm")]
+            {
+                let fps = fps.as_deref().map(movie::parse_fps_arg).transpose()?;
+                conform::conform(
+                    &input,
+                    &conform::Options {
+                        out,
+                        keyint,
+                        crf,
+                        depth: depth.map(|d| d.parse().unwrap()),
+                        fps,
+                        speed,
+                    },
+                )
+                .map(|_| ())
+            }
+            #[cfg(not(feature = "webm"))]
+            {
+                let _ = (input, out, keyint, crf, depth, fps, speed);
+                anyhow::bail!("conform needs the built-in AV1 encoder (the `webm` feature)")
+            }
+        }
         Cmd::New { dir } => new_movie(&dir),
         Cmd::Fetch { movie } => fetch_libraries(
             &movie,
@@ -1241,6 +1298,60 @@ fn check_textures(m: &Movie, web: bool, deep: bool) -> Result<()> {
             | movie::Source::Layer { .. }
             | movie::Source::Comp { .. }
             | movie::Source::Buffer { .. } => continue,
+            movie::Source::Frames(seq)
+                if let Some(v) = seq.scan.as_ref().and_then(|s| s.video.as_ref()) =>
+            {
+                let label = &seq.pattern.label;
+                let clip = &v.clip;
+                let (num, den) = seq.rate((m.fps_num, m.fps_den));
+                let problems = v.check(deep);
+                for p in &problems {
+                    eprintln!("{label}: {p}");
+                }
+                let (w, h) = (clip.track.width as usize, clip.track.height as usize);
+                let n = clip.frames.len();
+                let gop = clip.max_gop() as f64 * den as f64 / num as f64;
+                let b = texture::frame_bytes(w, h, c.filter == texture::Filter::Mipmap);
+                if problems.is_empty() {
+                    println!(
+                        "video {label}: AV1, {n} frames, {w}×{h} at {}, {:.2} s, keyframes up \
+                         to {gop:.1} s apart, {:?} {}, {} per frame on the GPU{}{}",
+                        crate::webm::demux::show_fps((num, den)),
+                        n as f64 * den as f64 / num as f64,
+                        v.conversion.matrix,
+                        if v.conversion.full_range {
+                            "full range"
+                        } else {
+                            "limited range"
+                        },
+                        texture::describe_bytes(b),
+                        flags(c),
+                        if deep { ", every frame decoded" } else { "" }
+                    );
+                }
+                if gop > 4.0 {
+                    println!(
+                        "note: {label}: keyframes up to {gop:.1} s apart: a paused seek decodes \
+                         up to {} frames; shotglass conform --keyint makes scrubbing faster",
+                        clip.max_gop()
+                    );
+                }
+                if w * h > 1920 * 1080 {
+                    warning!(
+                        "{label}: {w}×{h} frames are over 1920×1080; footage this large may \
+                         not play in real time"
+                    );
+                }
+                if web {
+                    warning!("{label}: video channels don't play on the web player yet (#2)");
+                }
+                if problems.is_empty() {
+                    bytes = Some(footage::MIN_FRAMES * b);
+                    Some((w, h))
+                } else {
+                    None
+                }
+            }
             movie::Source::Frames(seq) => {
                 let label = &seq.pattern.label;
                 let Some(scan) = &seq.scan else {

@@ -28,6 +28,7 @@ fn frame_ns((num, den): (u32, u32), n: u64) -> u64 {
 
 /// Encode I420 frames (as `yuv::frame_bytes` lays them out) into a video-only WebM:
 /// test fixtures for footage (#73), and what `shotglass conform` writes.
+#[cfg_attr(not(test), allow(dead_code))] // until `shotglass conform`
 pub fn write_clip(
     path: &Path,
     set: &Av1Settings,
@@ -41,6 +42,7 @@ pub fn write_clip(
         codec_private: av1::av1c(&seq, &seq_obu),
         bit_depth: set.depth,
         fps: set.fps,
+        colour: set.colour,
     };
     let file = std::io::BufWriter::new(std::fs::File::create(path)?);
     let mut mux = mux::Writer::new(file, "webm", &video, None)?;
@@ -89,6 +91,7 @@ pub fn settings(m: &Movie, w: usize, h: usize, o: &Av1Options) -> Av1Settings {
         speed: o.speed,
         keyint: o.keyint.unwrap_or_else(|| keyint((m.fps_num, m.fps_den))),
         grain: o.grain,
+        colour: super::ColourTags::BT709,
     }
 }
 
@@ -169,6 +172,7 @@ pub fn export(
         codec_private: av1::av1c(&seq, &seq_obu),
         bit_depth: av1o.depth,
         fps: (m.fps_num, m.fps_den),
+        colour: set.colour,
     };
     let audio_frames = sound.as_ref().map_or(0, |s| s.samples);
     let audio = sound.map(|s| {

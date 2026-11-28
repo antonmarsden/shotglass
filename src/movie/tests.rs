@@ -848,13 +848,13 @@ fn channel_kinds_that_arrive_later() {
         ),
         (
             r#""footage/surf.mp4""#,
-            r#"channels[0]: "footage/surf.mp4" is a video; video files arrive with footage phase 2"#,
+            r#"channels[0]: "footage/surf.mp4": shotglass reads video as AV1 in WebM; convert it once: shotglass conform footage/surf.mp4"#,
         ),
         (
             r#"{ video = "a.mov", in = 2.0 }"#,
-            "is a video; video files arrive",
+            "shotglass conform a.mov",
         ),
-        (r#"{ file = "a.mp4" }"#, "is a video; video files arrive"),
+        (r#"{ file = "a.mp4" }"#, "shotglass conform a.mp4"),
     ] {
         let e = shot(entry);
         assert!(e.contains(says), "{entry}: {e}");
@@ -889,9 +889,107 @@ fn channel_kinds_that_arrive_later() {
         e.contains("[textures] below: \"@input\" isn't a file"),
         "{e}"
     );
-    // A video names its replacement for now: an image sequence.
+    // A video that isn't WebM names the command that converts it.
     let e = shot(r#""a.mp4""#);
-    assert!(e.contains("\"frames/clip_#####.png\""), "{e}");
+    assert!(e.contains("shotglass conform a.mp4"), "{e}");
+}
+
+#[test]
+fn video_channels_parse() {
+    let m = channels_film(
+        "",
+        "plate = \"clips/plate.webm\"\n\
+         surf = { video = \"<kit/v/surf.WEBM>\", fps = 24, matrix = \"bt2020\", range = \"pc\", \
+         clock = \"movie\", end = \"loop\" }\n",
+        &[
+            "channels = [\"plate\", \"surf\", { texture = \"plate\", in = 2.5, speed = 0.5 }, \
+           { video = \"c/d.webm\", in_frame = 3 }]",
+        ],
+    )
+    .unwrap();
+    let c = |n: usize| m.shots[0].channels[n].as_ref().unwrap();
+    let plate = c(0).sequence().unwrap();
+    assert_eq!(plate.pattern.file, PathBuf::from("/film/clips/plate.webm"));
+    assert_eq!(plate.video, Some(VideoOptions::default()));
+    assert_eq!(
+        (c(0).filter, c(0).vflip, c(0).srgb, c(0).timing),
+        (Filter::Linear, true, false, Timing::default())
+    );
+    let surf = c(1).sequence().unwrap();
+    assert_eq!(surf.fps, Some((24, 1)));
+    assert_eq!(
+        surf.video,
+        Some(VideoOptions {
+            matrix: Some(crate::video::Matrix::Bt2020),
+            full_range: Some(true),
+        })
+    );
+    assert_eq!(
+        (c(1).timing.clock, c(1).timing.end),
+        (FootageClock::Movie, End::Loop)
+    );
+    assert_eq!(c(2).source, c(0).source);
+    assert_eq!(c(2).timing.speed, 0.5);
+    assert_eq!(c(3).timing.start, In::Frame(3));
+    // A video is one file, checked by name like an image.
+    assert_eq!(c(0).files().len(), 1);
+    let w = m.contract_warning().unwrap();
+    assert!(w.contains("video channels"), "{w}");
+    assert!(w.contains("0.1.12"), "{w}");
+}
+
+#[test]
+fn video_channels_are_validated() {
+    let shot = |entry: &str| {
+        err(channels_film(
+            "",
+            "img = \"t/i.png\"\n",
+            &[&format!("channels = [\"img\", {entry}]")],
+        ))
+    };
+    for (entry, says) in [
+        (
+            r#""a.mov""#,
+            "shotglass reads video as AV1 in WebM; convert it once: shotglass conform a.mov",
+        ),
+        (r#"{ video = "a.mp4" }"#, "shotglass conform a.mp4"),
+        (
+            r#"{ video = "a.png" }"#,
+            "video = \"a.png\" must be a video file (.webm)",
+        ),
+        (
+            r#"{ file = "a.webm" }"#,
+            "\"a.webm\" is a video; write video = \"a.webm\"",
+        ),
+        (r#"{ frames = "a.webm" }"#, "is a video; write video"),
+        (
+            r#"{ video = "a.webm", first = 3 }"#,
+            "first is for image sequences; a video starts at frame 0",
+        ),
+        (
+            r#"{ video = "a.webm", matrix = "bt470" }"#,
+            r#"matrix "bt470" isn't one of "bt601", "bt709", "bt2020""#,
+        ),
+        (
+            r#"{ video = "a.webm", range = "full" }"#,
+            r#"range "full" isn't one of "tv", "pc""#,
+        ),
+        (
+            r#"{ file = "a.png", matrix = "bt709" }"#,
+            "matrix is for videos",
+        ),
+        (
+            r#"{ frames = "a/b_##.png", range = "tv" }"#,
+            "range is for videos",
+        ),
+        (
+            r#"{ video = "a.webm", bogus = 1 }"#,
+            "unknown option `bogus` (a video has video, fps, matrix, range",
+        ),
+    ] {
+        let e = shot(entry);
+        assert!(e.contains(says), "{entry}: {e}");
+    }
 }
 
 #[test]

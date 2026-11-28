@@ -364,6 +364,7 @@ mod tests {
             speed: 12,
             keyint,
             grain: 0,
+            colour: crate::webm::ColourTags::BT709,
         };
         crate::webm::export::write_clip(&path, &set, (0..n).map(|k| frame(w, h, depth, k)))
             .unwrap();

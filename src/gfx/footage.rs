@@ -219,8 +219,15 @@ impl Renderer {
                     }
                     Err(_) => "missing".to_string(),
                 };
+                // A video's frames share one file: the frame number and the colour
+                // conversion are part of the key.
+                let video = e
+                    .scan
+                    .video
+                    .as_ref()
+                    .map_or(String::new(), |v| format!("\0video {k} {:?}", v.conversion));
                 let t = hash(&format!(
-                    "frame\0{}\0{stamp}\0{:?}\0{}\0{}\0{}",
+                    "frame\0{}{video}\0{stamp}\0{:?}\0{}\0{}\0{}",
                     path.display(),
                     e.scan.size,
                     e.vflip,
@@ -233,7 +240,7 @@ impl Renderer {
         };
         // Another channel (or version) may have this very frame already: share it.
         let entry = self.textures.entry(tex).or_insert_with(|| {
-            let label = format!("{}{}", e.folder, e.scan.pattern.name(e.scan.first + k));
+            let label = format!("{}{}", e.folder, e.scan.frame_name(k));
             let state = if path.is_file() {
                 TexState::Idle
             } else {
@@ -242,7 +249,10 @@ impl Renderer {
                 ))
             };
             TexEntry {
-                source: TexSource::Frame(path, e.scan.size),
+                source: match &e.scan.video {
+                    Some(v) => TexSource::Video(v.clone(), k),
+                    None => TexSource::Frame(path, e.scan.size),
+                },
                 label,
                 vflip: e.vflip,
                 srgb: e.srgb,

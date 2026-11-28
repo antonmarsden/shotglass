@@ -231,6 +231,10 @@ const CHECKS: &[Check] = &[
         run: footage_films_no_misses,
     },
     Check {
+        name: "video: frames played forward equal frames sought in any order, bit for bit",
+        run: video_play_matches_seeks,
+    },
+    Check {
         name: "buffers: every path agrees (forward, checkpoint, seeks, cold stills), bit for bit",
         run: buffers_agree,
     },

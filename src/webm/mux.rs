@@ -168,6 +168,7 @@ pub struct Video {
     pub bit_depth: u8,
     /// Frame rate as a fraction.
     pub fps: (u32, u32),
+    pub colour: super::ColourTags,
 }
 
 /// The Opus track.
@@ -313,15 +314,20 @@ impl<W: Write + Seek> Writer<W> {
                     ebml::uint(v, id::PIXEL_WIDTH, video.width.into());
                     ebml::uint(v, id::PIXEL_HEIGHT, video.height.into());
                     ebml::master(v, id::COLOUR, |c| {
-                        ebml::uint(c, id::MATRIX_COEFFICIENTS, 1); // BT.709
+                        ebml::uint(c, id::MATRIX_COEFFICIENTS, video.colour.matrix.into());
                         ebml::uint(c, id::BITS_PER_CHANNEL, video.bit_depth.into());
                         ebml::uint(c, id::CHROMA_SUBSAMPLING_HORZ, 1);
                         ebml::uint(c, id::CHROMA_SUBSAMPLING_VERT, 1);
                         ebml::uint(c, id::CHROMA_SITING_HORZ, 1); // left (co-sited)
                         ebml::uint(c, id::CHROMA_SITING_VERT, 2); // half
-                        ebml::uint(c, id::RANGE, 1); // broadcast (limited)
-                        ebml::uint(c, id::TRANSFER_CHARACTERISTICS, 1);
-                        ebml::uint(c, id::PRIMARIES, 1);
+                        // 1 = broadcast (limited), 2 = full.
+                        ebml::uint(c, id::RANGE, if video.colour.full_range { 2 } else { 1 });
+                        ebml::uint(
+                            c,
+                            id::TRANSFER_CHARACTERISTICS,
+                            video.colour.transfer.into(),
+                        );
+                        ebml::uint(c, id::PRIMARIES, video.colour.primaries.into());
                     });
                 });
             });
@@ -582,6 +588,7 @@ mod tests {
             codec_private: vec![0x81, 0, 0x4c, 0, 0x0a, 0],
             bit_depth: 10,
             fps: (24, 1),
+            colour: crate::webm::ColourTags::BT709,
         }
     }
 
@@ -839,6 +846,7 @@ mod tests {
             codec_private: av1::av1c(&seq, &obu),
             bit_depth: 10,
             fps: (24, 1),
+            colour: crate::webm::ColourTags::BT709,
         };
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("fixture.webm");

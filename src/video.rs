@@ -10,7 +10,202 @@
 
 pub mod decode;
 
-use crate::webm::demux::Colour;
+use crate::webm::demux::{self, Clip, Colour};
+use anyhow::{Result, bail};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+
+/// Readers kept per clip: enough for a few separate playheads on one clip (two
+/// shots of it crossing in a transition, a comp channel's offset, speed > 2).
+const MAX_READERS: usize = 4;
+
+/// One clip as footage: its index, how its frames convert, and a small pool of
+/// readers that decode them on the footage decode pool.
+pub struct Source {
+    pub path: PathBuf,
+    pub clip: Arc<Clip>,
+    pub conversion: Conversion,
+    readers: Mutex<Vec<Slot>>,
+    tick: AtomicU64,
+}
+
+struct Slot {
+    reader: Arc<Mutex<decode::Reader>>,
+    /// The frame it would serve next without seeking (`usize::MAX`: not started).
+    pos: Arc<AtomicUsize>,
+    used: u64,
+}
+
+impl std::fmt::Debug for Source {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("video::Source")
+            .field("path", &self.path)
+            .field("frames", &self.clip.frames.len())
+            .field("conversion", &self.conversion)
+            .finish()
+    }
+}
+
+impl PartialEq for Source {
+    fn eq(&self, o: &Source) -> bool {
+        self.path == o.path
+            && self.conversion == o.conversion
+            && self.clip.frames == o.clip.frames
+            && self.clip.fps == o.clip.fps
+    }
+}
+
+impl Source {
+    /// Read a clip's index and settings (no decoding), refusing what we can't show.
+    pub fn open(path: &Path, opts: &crate::movie::VideoOptions) -> Result<Source> {
+        let clip = demux::open(path)?;
+        if clip.track.codec != "V_AV1" {
+            bail!(
+                "{} video; shotglass decodes AV1 only. Convert it once: shotglass conform {}",
+                decode::codec_name(&clip.track.codec),
+                path.display()
+            );
+        }
+        if !decode::AVAILABLE {
+            bail!("{}", decode::UNAVAILABLE);
+        }
+        let seq = crate::webm::av1::find_sequence_header_in_av1c(&clip.track.codec_private)
+            .map(|(s, _)| s)
+            .ok();
+        let transfer = clip
+            .track
+            .colour
+            .transfer
+            .or_else(|| seq.as_ref().and_then(|s| s.color).map(|c| u64::from(c.1)));
+        match transfer {
+            Some(16) => {
+                bail!("HDR (PQ, SMPTE ST 2084) isn't supported yet; convert to SDR BT.709 first")
+            }
+            Some(18) => bail!("HDR (HLG) isn't supported yet; convert to SDR BT.709 first"),
+            _ => {}
+        }
+        let mut conversion =
+            Conversion::from_tags(&clip.track.colour, seq.as_ref(), clip.track.height);
+        if let Some(m) = opts.matrix {
+            conversion.matrix = m;
+        }
+        if let Some(f) = opts.full_range {
+            conversion.full_range = f;
+        }
+        Ok(Source {
+            path: path.to_path_buf(),
+            clip: Arc::new(clip),
+            conversion,
+            readers: Mutex::new(vec![]),
+            tick: AtomicU64::new(0),
+        })
+    }
+
+    /// Decoded planes of frame `k`, from the reader that reaches it soonest: one that
+    /// decodes on to it (waiting for it if another worker is using it, which is
+    /// cheaper than seeking), else a new reader, else the least recently used one.
+    pub fn planes(&self, k: usize) -> Result<Planes> {
+        let key = self.clip.keyframe_at_or_before(k);
+        let (reader, pos) = {
+            let mut slots = self.readers.lock().unwrap();
+            let used = self.tick.fetch_add(1, Ordering::Relaxed);
+            let near = (0..slots.len())
+                .filter(|&i| {
+                    let p = slots[i].pos.load(Ordering::Relaxed);
+                    p != usize::MAX && p <= k && p >= key
+                })
+                .max_by_key(|&i| slots[i].pos.load(Ordering::Relaxed));
+            let i = match near {
+                Some(i) => i,
+                None if slots.len() < MAX_READERS => {
+                    let reader = decode::Reader::open(&self.path, self.clip.clone())?;
+                    slots.push(Slot {
+                        reader: Arc::new(Mutex::new(reader)),
+                        pos: Arc::new(AtomicUsize::new(usize::MAX)),
+                        used,
+                    });
+                    slots.len() - 1
+                }
+                None => (0..slots.len()).min_by_key(|&i| slots[i].used).unwrap(),
+            };
+            let slot = &mut slots[i];
+            slot.used = used;
+            // Claimed: later requests see where it will be once this one is done.
+            slot.pos.store(k + 1, Ordering::Relaxed);
+            (slot.reader.clone(), slot.pos.clone())
+        };
+        let mut r = reader.lock().unwrap();
+        let out = r.frame(k);
+        pos.store(r.position().unwrap_or(usize::MAX), Ordering::Relaxed);
+        out
+    }
+
+    /// `check`: decode frame 0, or with `deep` every frame in order, and compare a
+    /// sample of them against seeks (a file whose frames differ by route would make
+    /// play, `still` and `export` disagree). Problems as messages.
+    pub fn check(&self, deep: bool) -> Vec<String> {
+        let mut r = match decode::Reader::open(&self.path, self.clip.clone()) {
+            Ok(r) => r,
+            Err(e) => return vec![e.to_string()],
+        };
+        let n = self.clip.frames.len();
+        if !deep {
+            return r
+                .frame(0)
+                .err()
+                .map(|e| e.to_string())
+                .into_iter()
+                .collect();
+        }
+        let step = (n / 16).max(1);
+        let mut samples = vec![];
+        for k in 0..n {
+            match r.frame(k) {
+                Ok(p) if k % step == 0 || k == n - 1 => samples.push((k, p)),
+                Ok(_) => {}
+                Err(e) => return vec![e.to_string()],
+            }
+        }
+        let mut problems = vec![];
+        for (k, p) in samples.iter().rev() {
+            let mut fresh = match decode::Reader::open(&self.path, self.clip.clone()) {
+                Ok(r) => r,
+                Err(e) => return vec![e.to_string()],
+            };
+            match fresh.frame(*k) {
+                Ok(q) if q == *p => {}
+                Ok(_) => problems.push(format!(
+                    "frame {k} decodes differently after a seek than read in order"
+                )),
+                Err(e) => problems.push(format!("frame {k} after a seek: {e}")),
+            }
+        }
+        problems
+    }
+
+    /// Frame `k` as RGBA8, ready to upload.
+    pub fn decode(
+        &self,
+        k: u64,
+        label: &str,
+        vflip: bool,
+    ) -> std::result::Result<crate::texture::DecodedImage, String> {
+        let p = self
+            .planes(k as usize)
+            .map_err(|e| format!("{label}: {e}"))?;
+        let f = to_rgba(&p, &self.conversion, vflip);
+        Ok(crate::texture::DecodedImage {
+            width: p.width,
+            height: p.height,
+            rgba: toodee::TooDeeOps::rows(&f)
+                .flat_map(|r| r.iter().flatten().copied())
+                .collect(),
+            warnings: vec![],
+            meta: [0.0; 4],
+        })
+    }
+}
 
 /// Y'CbCr → R'G'B' matrices (ITU-R BT.601, BT.709, BT.2020 non-constant luminance).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

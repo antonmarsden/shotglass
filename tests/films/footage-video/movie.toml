@@ -1,0 +1,32 @@
+# Golden-image film for video channels (tests/golden.rs, #73): the footage film's
+# 24 fps plate as AV1 in WebM (written by `shotglass conform` from
+# ../footage/frames/plate_####.jpg, keyframes every 8 frames, BT.601 full range as the
+# JPEGs are) in a 30 fps film, under the same 12 fps RGBA matte (a PNG sequence: AV1
+# in WebM has no alpha). The second shot re-times the plate (from 0.5 s at half speed,
+# crossing keyframes backwards from the first shot's end), the third starts it at
+# frame 16 and reads black past its end. The bottom bar is iChannelTime[0], the
+# top-right corner checks iChannelResolution[0].
+title = "footage-video"
+fps = 30
+
+[textures]
+plate = { video = "clips/plate.webm" }
+matte = { frames = "frames/matte_##.png", fps = 12, clock = "movie", end = "loop" }
+
+[[shot]]
+id = "plate"
+scene = "scenes/comp.glsl"
+duration = 1.5
+channels = ["plate", "matte"]
+
+[[shot]]
+id = "slow"
+scene = "scenes/comp.glsl"
+duration = 1.5
+channels = [{ texture = "plate", in = 0.5, speed = 0.5 }, "matte"]
+
+[[shot]]
+id = "tail"
+scene = "scenes/comp.glsl"
+duration = 1.0
+channels = [{ texture = "plate", in_frame = 16, end = "black" }, "matte"]

@@ -86,16 +86,33 @@ pub struct Scan {
     /// Source frame 0's size from its header (None if it can't be read: decoding it
     /// reports why). Every frame must have this size.
     pub size: Option<(usize, usize)>,
+    /// A video (#73): the clip its frames are decoded from (`pattern` is then its
+    /// file name with no digits, `first` 0).
+    pub video: Option<std::sync::Arc<crate::video::Source>>,
 }
 
 impl Scan {
-    /// The file of source frame `k` (0-based).
+    /// The file of source frame `k` (0-based): a video's frames are all in one file.
     pub fn path(&self, k: u64) -> PathBuf {
-        self.dir.join(self.pattern.name(self.first + k))
+        match &self.video {
+            Some(v) => v.path.clone(),
+            None => self.dir.join(self.pattern.name(self.first + k)),
+        }
     }
 
-    /// "fog_1001.png … fog_1100.png".
+    /// Source frame `k`'s name for messages: "fog_1042.png", "surf.webm frame 12".
+    pub fn frame_name(&self, k: u64) -> String {
+        match &self.video {
+            Some(_) => format!("{} frame {k}", self.pattern.prefix),
+            None => self.pattern.name(self.first + k),
+        }
+    }
+
+    /// "fog_1001.png … fog_1100.png", "surf.webm frames 0 … 99".
     pub fn range(&self) -> String {
+        if self.video.is_some() {
+            return format!("{} frames 0 … {}", self.pattern.prefix, self.count - 1);
+        }
         format!(
             "{} … {}",
             self.pattern.name(self.first),
@@ -177,12 +194,42 @@ pub fn scan(
         first,
         count,
         size: None,
+        video: None,
     };
     let size = crate::texture::dimensions(&scan.path(0));
     if let Some((w, h)) = size {
         crate::texture::check_size(&format!("{label} ({})", pattern.name(first)), w, h)?;
     }
     Ok(Scan { size, ..scan })
+}
+
+/// A video's frames (#73): its index, read once (`Movie::load`), as a scan.
+pub fn scan_video(
+    file: &Path,
+    label: &str,
+    opts: &crate::movie::VideoOptions,
+) -> Result<Scan, String> {
+    let source = crate::video::Source::open(file, opts).map_err(|e| format!("{label}: {e}"))?;
+    let (w, h) = (
+        source.clip.track.width as usize,
+        source.clip.track.height as usize,
+    );
+    crate::texture::check_size(label, w, h)?;
+    let name = file
+        .file_name()
+        .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+    Ok(Scan {
+        dir: file.parent().unwrap_or(Path::new(".")).to_path_buf(),
+        pattern: Pattern {
+            prefix: name,
+            digits: 0,
+            suffix: String::new(),
+        },
+        first: 0,
+        count: source.clip.frames.len() as u64,
+        size: Some((w, h)),
+        video: Some(std::sync::Arc::new(source)),
+    })
 }
 
 /// Why nothing matched, when the folder suggests it: other padding, other case.

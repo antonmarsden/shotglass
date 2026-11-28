@@ -506,8 +506,12 @@ pub(super) fn footage_broken(gl: &Gl, dir: &Path) -> Result<String> {
 pub(super) fn footage_films_no_misses(gl: &Gl, _dir: &Path) -> Result<String> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/films");
     let mut notes = vec![];
-    for name in ["footage", "footage-places"] {
+    for name in ["footage", "footage-places", "footage-video"] {
         let d = root.join(name);
+        if name == "footage-video" && !crate::video::decode::AVAILABLE {
+            notes.push(format!("{name}: no video decoder in this build, skipped"));
+            continue;
+        }
         if !d.join("movie.toml").exists() {
             notes.push(format!("{name}: not here, skipped"));
             continue;
@@ -550,6 +554,51 @@ pub(super) fn footage_films_no_misses(gl: &Gl, _dir: &Path) -> Result<String> {
         notes.push(format!("{name}: {} frames", m.frame_count()));
     }
     Ok(notes.join(", "))
+}
+
+/// Video (#73): `tests/films/footage-video` played forward (readers decoding on, on
+/// the decode pool) gives exactly the frames blocking renders give in a scattered
+/// order (every one a seek to its keyframe, from a fresh renderer), bit for bit: a
+/// video frame is a function of the file and the frame number, whatever the route.
+pub(super) fn video_play_matches_seeks(gl: &Gl, _dir: &Path) -> Result<String> {
+    if !crate::video::decode::AVAILABLE {
+        return Ok("no video decoder in this build, skipped".into());
+    }
+    let d = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/films/footage-video");
+    if !d.join("movie.toml").exists() {
+        return Ok("tests/films/footage-video isn't here, skipped".into());
+    }
+    let m = Movie::load(&d)?;
+    let n = m.frame_count();
+    let mut a = renderer(gl, &m)?;
+    let mut played = vec![];
+    for k in 0..n {
+        let t = m.frame_time(k);
+        a.pump(&m, t, false);
+        played.push(play_until_ready(&mut a, &m, t, &format!("video frame {k}"))?.0);
+    }
+    let mut b = renderer(gl, &m)?;
+    // A permutation of 0..n (7 is coprime with the film's 120 frames): far jumps,
+    // backwards and forwards, across the clip's keyframes.
+    let mut seen = 0;
+    for i in 0..n {
+        let k = (i * 7 + 3) % n;
+        b.render(&m, W, H, &info(m.frame_time(k), 1.0), true)
+            .ok_or_else(|| anyhow!("frame {k} didn't render"))?;
+        let f = b.read_output().ok_or_else(|| anyhow!("no output"))?;
+        expect_same(
+            &format!("film frame {k}: played vs sought"),
+            &played[k as usize],
+            &f,
+            0,
+            0.0,
+        )?;
+        seen += 1;
+    }
+    if let Some(e) = b.footage_failure() {
+        bail!("{e}");
+    }
+    Ok(format!("{seen} frames"))
 }
 
 pub(super) fn footage_unpack_state(gl: &Gl, dir: &Path) -> Result<String> {

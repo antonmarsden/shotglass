@@ -1,6 +1,6 @@
 # Design: moving-image inputs (footage on iChannels)
 
-Status: **phase 1 (image sequences) implemented**. Phase 2, video, is #73; RGBA16F/EXR
+Status: **phases 1 (image sequences) and 2 (AV1 WebM video, #73) implemented**; RGBA16F/EXR
 and other follow-ups are in #75. Builds on [ichannel.md](ichannel.md) (#22), which
 left room for `{ video = "…" }` channels, and touches #32 (heavy assets) and #2 (web player).
 
