@@ -627,6 +627,17 @@ impl Renderer {
         self.folds.iter().find_map(|f| f.progress)
     }
 
+    /// Targets held by checkpoints (every fold): the budgeted cache, which keeps a
+    /// stale-key checkpoint until eviction (tests: the rest must follow the film).
+    pub fn checkpoint_targets(&self) -> usize {
+        self.folds
+            .iter()
+            .flat_map(|f| &f.checkpoints)
+            .flat_map(|c| &c.rings)
+            .map(|r| r.slots.len())
+            .sum()
+    }
+
     /// Checkpoints held (every fold), and their GPU bytes.
     pub fn checkpoint_stats(&self) -> (usize, usize) {
         (
@@ -1160,8 +1171,19 @@ impl Renderer {
             .filter(|b| b.reads_stack())
             .filter_map(|b| b.after.map(|a| (a, b.size.at(out))))
             .collect();
+        // Spares only serve checkpoints of a live buffer at its current size and format;
+        // the rest (an old output size, a removed buffer) would sit there full size.
+        let rings: Vec<(BufferFormat, (i32, i32))> =
+            live().map(|b| (b.format, b.size.at(out))).collect();
         let fold = &mut self.folds[q];
         let mut dead = vec![];
+        for (f, t) in std::mem::take(&mut fold.spare) {
+            if rings.contains(&(f, t.alloc)) {
+                fold.spare.push((f, t));
+            } else {
+                dead.push(t);
+            }
+        }
         for (k, t) in std::mem::take(&mut fold.pics) {
             if pics.contains(&k) {
                 fold.pics.push((k, t));

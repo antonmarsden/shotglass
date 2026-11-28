@@ -4061,8 +4061,9 @@ uniforms.uPitch = 2.0
 /// must bring every kind back to where it started.
 fn gl_object_churn(gl: &Gl, dir: &Path) -> Result<String> {
     let base = GlObjects::live();
-    let bdir = dir.join("bufs");
-    let bufs = buffer_film(&bdir, "\"@hist\"")?;
+    // acc sized by `scale`: its checkpoints (and the spares they're evicted into)
+    // follow the output size.
+    let bufs = buffer_film_with(dir, "bufs", |t| t.replace("size=[40, 24]", "scale=0.25"))?;
     let cdir = dir.join("comp");
     buffer_film(&cdir, "\"@hist\"")?;
     write(
@@ -4121,14 +4122,16 @@ duration=2
     // Framebuffers belong to render targets only (caches keep textures and programs),
     // so after each step the renderer holds exactly as many as a fresh renderer that
     // drew just that film at that size: nothing kept for what was removed or resized.
+    // Checkpoints are left out: a budgeted cache that keeps stale-key entries until
+    // eviction on purpose (the spares they're evicted into aren't budgeted, so count).
     let fbos = |o: &GlObjects| o.counts[1];
     let step = |r: &mut Renderer, m: &Movie, w: i32, h: i32, what: &str| -> Result<()> {
         draw(r, m, w, h, what)?;
-        let held = fbos(&GlObjects::live()) - fbos(&base);
+        let held = fbos(&GlObjects::live()) - fbos(&base) - r.checkpoint_targets() as i64;
         let before = GlObjects::live();
         let mut f = renderer(gl, m)?;
         draw(&mut f, m, w, h, what)?;
-        let fresh = fbos(&GlObjects::live()) - fbos(&before);
+        let fresh = fbos(&GlObjects::live()) - fbos(&before) - f.checkpoint_targets() as i64;
         drop(f);
         if held != fresh {
             bail!("{what} at {w}x{h}: {held} framebuffers held after the edits, {fresh} fresh");
@@ -4136,9 +4139,14 @@ duration=2
         Ok(())
     };
     let cycle = |r: &mut Renderer| -> Result<GlObjects> {
+        r.set_buffer_cache_budget(1 << 30);
         step(r, &bufs, W, H, "buffers")?;
-        step(r, &comp, W, H, "comp with buffers")?;
+        // Lowering the budget evicts a checkpoint into the fold's spare pool; the next
+        // step's output size can't reuse it, so it must go rather than wait there.
+        r.set_buffer_cache_budget(20_000);
+        r.set_buffer_cache_budget(1 << 30);
         step(r, &bufs, W / 2, H / 2, "buffers at half size")?;
+        step(r, &comp, W, H, "comp with buffers")?;
         step(r, &plain, W - 8, H, "plain film")?;
         step(r, &comp, W / 2, H, "comp at another size")?;
         step(r, &bufs, W, H, "buffers again")?;
