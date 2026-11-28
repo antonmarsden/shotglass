@@ -6832,17 +6832,18 @@ fn footage_broken(gl: &Gl, dir: &Path) -> Result<String> {
     Ok(String::new())
 }
 
-/// Every footage film in the repo (`tests/films/footage`, `tests/films/channels`)
-/// played as the player does, one pump and one non-blocking try per film frame from
-/// the start: a frame whose footage isn't resident yet (`footage_misses`) is a
-/// prefetch gap (#74, #134 review fixes were such gaps: nested comps, buffers). Real
-/// films mix what the fixture checks test one at a time (re-timing, `clock = "movie"`,
-/// `end = "black"`, several channels). Skipped where the films aren't (an installed
+/// Every footage film in the repo played as the player does, one pump and one
+/// non-blocking try per film frame from the start: a frame whose footage isn't resident
+/// yet (`footage_misses`) is a prefetch gap (#74, #134 review fixes were such gaps:
+/// nested comps, buffers). `tests/films/footage` mixes re-timing, `clock = "movie"`
+/// and `end = "black"`; `tests/films/footage-places` reads its own sequence in each
+/// place an item can (a cut, a layer and a buffer starting mid-film, a comp shot), so
+/// every head is prefetched for itself. Skipped where the films aren't (an installed
 /// binary).
 fn footage_films_no_misses(gl: &Gl, _dir: &Path) -> Result<String> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/films");
     let mut notes = vec![];
-    for name in ["footage", "channels"] {
+    for name in ["footage", "footage-places"] {
         let d = root.join(name);
         if !d.join("movie.toml").exists() {
             notes.push(format!("{name}: not here, skipped"));
@@ -6850,9 +6851,14 @@ fn footage_films_no_misses(gl: &Gl, _dir: &Path) -> Result<String> {
         }
         let m = Movie::load(&d)?;
         let mut r = renderer(gl, &m)?;
-        // The first frame may load (as pressing play on a fresh film does).
+        // The first frame may load (as opening a film does).
         r.render(&m, W, H, &FrameInfo::frame(&m, 0), true)
             .ok_or_else(|| anyhow!("{name}: frame 0 didn't render"))?;
+        // Paused on frame 0 for a moment before play, as the player pumps every UI frame.
+        for _ in 0..20 {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            r.pump(&m, 0.0, false);
+        }
         let loads = r.blocking_footage_loads;
         let mut stalled = vec![];
         for n in 1..m.frame_count() {

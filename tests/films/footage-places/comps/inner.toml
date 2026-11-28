@@ -1,0 +1,6 @@
+# The comp shot's content: one shot reading its own sequence (comp-local time).
+[[shot]]
+id = "inner"
+scene = "scenes/show.glsl"
+duration = 1.0
+channels = [{ frames = "frames/c_##.png", fps = 30 }]
