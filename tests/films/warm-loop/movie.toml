@@ -1,7 +1,7 @@
 # Golden-image film for warm loops (tests/golden.rs, #138): loop = "warm". A dot runs a
 # closed path once per period (1.5 s, 45 frames), drawn on transparent into "dot".
-# "trail" (orange, the whole film) spans the seam, so frame 0 continues from the end of
-# the period before: its trail is already there. "late" (blue, from 0.2 s) doesn't
+# Two panels: "trail" (orange, top, the whole film) spans the seam, so frame 0 continues from the end of
+# the period before: its trail is already there. "late" (blue, bottom, from 0.2 s) doesn't
 # span it, so it starts empty every period. The strip's first frames show the
 # difference; the last shows the period's end that frame 0 follows. Shaders are
 # film-local, so the golden only moves when the engine does.
