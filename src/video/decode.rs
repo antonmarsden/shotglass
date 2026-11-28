@@ -10,8 +10,6 @@ use super::Planes;
 use crate::webm::demux::Clip;
 use anyhow::{Result, anyhow, bail};
 use std::fs::File;
-use std::io::BufReader;
-use std::path::Path;
 use std::sync::Arc;
 
 /// An AV1 decoder: temporal units in, decoded frames out, in presentation order.
@@ -57,7 +55,7 @@ pub fn codec_name(id: &str) -> &str {
 /// Serves frames of one clip: one file handle, one decoder and its position.
 pub struct Reader {
     clip: Arc<Clip>,
-    file: BufReader<File>,
+    file: Arc<File>,
     dec: Box<dyn VideoDecoder>,
     /// The next frame to send.
     next_in: usize,
@@ -70,10 +68,17 @@ pub struct Reader {
 }
 
 impl Reader {
-    pub fn open(path: &Path, clip: Arc<Clip>) -> Result<Reader> {
+    #[cfg(all(test, rav1d, feature = "webm"))]
+    pub fn open(path: &std::path::Path, clip: Arc<Clip>) -> Result<Reader> {
+        Reader::with_file(Arc::new(File::open(path)?), clip)
+    }
+
+    /// A reader of `file`, the file `clip` was indexed from (a handle to it, so a
+    /// file replaced since under the same name isn't read with this index).
+    pub fn with_file(file: Arc<File>, clip: Arc<Clip>) -> Result<Reader> {
         let dec = decoder_for(&clip)?;
         Ok(Reader {
-            file: BufReader::new(File::open(path)?),
+            file,
             clip,
             dec,
             next_in: 0,
@@ -95,11 +100,16 @@ impl Reader {
 
     /// Frame `k`. Frames decoded on the way are passed to `skipped` (frame number,
     /// planes), so a caller can keep them.
-    pub fn frame_with(
-        &mut self,
-        k: usize,
-        mut skipped: impl FnMut(usize, Planes),
-    ) -> Result<Planes> {
+    pub fn frame_with(&mut self, k: usize, skipped: impl FnMut(usize, Planes)) -> Result<Planes> {
+        let out = self.decode_to(k, skipped);
+        if out.is_err() {
+            // The decoder's state is unknown now: the next request seeks.
+            self.started = false;
+        }
+        out
+    }
+
+    fn decode_to(&mut self, k: usize, mut skipped: impl FnMut(usize, Planes)) -> Result<Planes> {
         let n = self.clip.frames.len();
         if k >= n {
             bail!("frame {k} is past the end ({n} frames)");
@@ -124,16 +134,14 @@ impl Reader {
                 skipped(j, p);
             }
             if self.next_in < n {
-                let unit = self.clip.read_frame(&mut self.file, self.next_in)?;
-                self.dec.send(&unit).map_err(|e| {
-                    self.started = false;
-                    anyhow!("frame {}: {e}", self.next_in)
-                })?;
+                let unit = self.clip.read_frame_at(&self.file, self.next_in)?;
+                self.dec
+                    .send(&unit)
+                    .map_err(|e| anyhow!("frame {}: {e}", self.next_in))?;
                 self.next_in += 1;
             } else {
                 idle += 1;
                 if idle > 64 {
-                    self.started = false;
                     bail!("the decoder gave no picture for frame {}", self.next_out);
                 }
             }
@@ -352,7 +360,12 @@ mod tests {
         }
     }
 
-    fn clip(dir: &Path, depth: u8, keyint: u32, n: usize) -> (std::path::PathBuf, Arc<Clip>) {
+    fn clip(
+        dir: &std::path::Path,
+        depth: u8,
+        keyint: u32,
+        n: usize,
+    ) -> (std::path::PathBuf, Arc<Clip>) {
         let (w, h) = (64, 36);
         let path = dir.join(format!("c{depth}-{keyint}.webm"));
         let set = Av1Settings {
@@ -408,6 +421,32 @@ mod tests {
                 assert_eq!(p, all[j]);
             }
         }
+    }
+
+    #[test]
+    fn identity_matrix_clips_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rgb.webm");
+        let set = Av1Settings {
+            width: 64,
+            height: 36,
+            fps: (24, 1),
+            depth: 8,
+            rate: Rate::Quality(20),
+            speed: 12,
+            keyint: 8,
+            grain: 0,
+            // Matroska says identity (RGB); the refusal reads the container first.
+            colour: crate::webm::ColourTags {
+                matrix: 0,
+                ..crate::webm::ColourTags::BT709
+            },
+        };
+        crate::webm::export::write_clip(&path, &set, (0..2).map(|k| frame(64, 36, 8, k))).unwrap();
+        let e = super::super::Source::open(&path, &Default::default())
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("identity matrix"), "{e}");
     }
 
     #[test]

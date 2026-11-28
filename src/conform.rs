@@ -132,7 +132,7 @@ pub fn conform(input: &str, o: &Options) -> Result<PathBuf> {
     let out = o.out.clone().unwrap_or_else(|| {
         let stem = match &pattern {
             Some(_) => path
-                .file_name()
+                .file_stem()
                 .map(|n| n.to_string_lossy().replace('#', ""))
                 .unwrap_or_default()
                 .trim_end_matches(['_', '-', '.'])
@@ -157,10 +157,36 @@ pub fn conform(input: &str, o: &Options) -> Result<PathBuf> {
     if pattern.is_none() && untouched {
         let ok = crate::video::Source::open(path, &Default::default());
         if ok.is_ok() {
+            if out != path && o.out.is_some() {
+                std::fs::copy(path, &out)
+                    .with_context(|| format!("copying {input} to {}", out.display()))?;
+                println!(
+                    "{input} is already AV1 in WebM at a constant frame rate: copied to {}",
+                    out.display()
+                );
+                return Ok(out);
+            }
             println!("{input} is already AV1 in WebM at a constant frame rate: nothing to do");
             return Ok(path.to_path_buf());
         }
     }
+    // An image sequence's first frame number: ffmpeg only looks for one in 0..=4.
+    let start = match &pattern {
+        Some(_) => {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let pat = crate::footage::Pattern::parse(&name).map_err(|e| anyhow!("{e}"))?;
+            let dir = match path.parent() {
+                Some(d) if !d.as_os_str().is_empty() => d,
+                _ => Path::new("."),
+            };
+            let scan = crate::footage::scan(dir, input, &pat, None).map_err(|e| anyhow!("{e}"))?;
+            scan.first.to_string()
+        }
+        None => String::new(),
+    };
     let mut input_args: Vec<String> = vec!["-nostdin".into(), "-hide_banner".into()];
     if let Some(p) = &pattern {
         let fps = o.fps.ok_or_else(|| {
@@ -169,6 +195,8 @@ pub fn conform(input: &str, o: &Options) -> Result<PathBuf> {
         input_args.extend([
             "-framerate".into(),
             format!("{}/{}", fps.0, fps.1),
+            "-start_number".into(),
+            start.clone(),
             "-i".into(),
             p.clone(),
         ]);
@@ -186,7 +214,14 @@ pub fn conform(input: &str, o: &Options) -> Result<PathBuf> {
             "json",
         ])
         .args(match &pattern {
-            Some(p) => vec!["-framerate".to_string(), "1".into(), "-i".into(), p.clone()],
+            Some(p) => vec![
+                "-framerate".to_string(),
+                "1".into(),
+                "-start_number".into(),
+                start.clone(),
+                "-i".into(),
+                p.clone(),
+            ],
             None => vec![input.to_string()],
         })
         .stdin(Stdio::null())
@@ -327,6 +362,8 @@ pub fn conform(input: &str, o: &Options) -> Result<PathBuf> {
     });
     let tmp = out.with_extension("webm.part");
     let written = crate::webm::export::write_clip(&tmp, &set, frames);
+    // Close our end first: if the encoder stopped early, ffmpeg may be blocked writing.
+    drop(stdout);
     let status = child.wait()?;
     let log = errs.join().unwrap_or_default();
     if let Err(e) = written {

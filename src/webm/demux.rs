@@ -80,7 +80,18 @@ impl Clip {
         most.max(self.frames.len() - last)
     }
 
+    /// Frame `k`'s data, read from `file` at its offset without moving a shared
+    /// cursor (positional reads), so several readers can share one handle.
+    pub fn read_frame_at(&self, file: &File, k: usize) -> Result<Vec<u8>> {
+        let f = self.frames[k];
+        let mut buf = vec![0; f.size as usize];
+        read_exact_at(file, &mut buf, f.offset)
+            .with_context(|| format!("frame {k} is cut short (the file was truncated?)"))?;
+        Ok(buf)
+    }
+
     /// Frame `k`'s data, read from `file`.
+    #[cfg(test)]
     pub fn read_frame<R: Read + Seek>(&self, file: &mut R, k: usize) -> Result<Vec<u8>> {
         let f = self.frames[k];
         file.seek(SeekFrom::Start(f.offset))?;
@@ -91,7 +102,30 @@ impl Clip {
     }
 }
 
+#[cfg(unix)]
+fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    std::os::unix::fs::FileExt::read_exact_at(file, buf, offset)
+}
+
+#[cfg(windows)]
+fn read_exact_at(file: &File, mut buf: &mut [u8], mut offset: u64) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    while !buf.is_empty() {
+        match file.seek_read(buf, offset) {
+            Ok(0) => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+            Ok(n) => {
+                buf = &mut buf[n..];
+                offset += n as u64;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
 /// Read a clip's headers and index its frames.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn open(path: &Path) -> Result<Clip> {
     let file = File::open(path)?;
     parse(BufReader::new(file))
@@ -166,7 +200,7 @@ fn block_header(b: &[u8]) -> Result<(u64, i16, u8, usize)> {
     Ok((track, rel, b[n + 2], n + 3))
 }
 
-fn parse<R: Read + Seek>(mut r: R) -> Result<Clip> {
+pub fn parse<R: Read + Seek>(mut r: R) -> Result<Clip> {
     let end = r.seek(SeekFrom::End(0))?;
     r.seek(SeekFrom::Start(0))?;
     let ebml = header(&mut r).context("not a WebM file")?;

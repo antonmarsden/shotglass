@@ -24,6 +24,9 @@ const MAX_READERS: usize = 4;
 /// readers that decode them on the footage decode pool.
 pub struct Source {
     pub path: PathBuf,
+    /// The file the index was read from, shared by the readers (positional reads):
+    /// a file replaced since under the same name is never read with this index.
+    file: Arc<std::fs::File>,
     pub clip: Arc<Clip>,
     pub conversion: Conversion,
     readers: Mutex<Vec<Slot>>,
@@ -59,7 +62,8 @@ impl PartialEq for Source {
 impl Source {
     /// Read a clip's index and settings (no decoding), refusing what we can't show.
     pub fn open(path: &Path, opts: &crate::movie::VideoOptions) -> Result<Source> {
-        let clip = demux::open(path)?;
+        let file = Arc::new(std::fs::File::open(path)?);
+        let clip = demux::parse(std::io::BufReader::new(&*file))?;
         if clip.track.codec != "V_AV1" {
             bail!(
                 "{} video; shotglass decodes AV1 only. Convert it once: shotglass conform {}",
@@ -85,6 +89,17 @@ impl Source {
             Some(18) => bail!("HDR (HLG) isn't supported yet; convert to SDR BT.709 first"),
             _ => {}
         }
+        let matrix = clip
+            .track
+            .colour
+            .matrix
+            .or_else(|| seq.as_ref().and_then(|s| s.color).map(|c| u64::from(c.2)));
+        if matrix == Some(0) {
+            bail!(
+                "RGB-coded AV1 (identity matrix) isn't supported; convert it once: shotglass conform {}",
+                path.display()
+            );
+        }
         let mut conversion =
             Conversion::from_tags(&clip.track.colour, seq.as_ref(), clip.track.height);
         if let Some(m) = opts.matrix {
@@ -95,11 +110,16 @@ impl Source {
         }
         Ok(Source {
             path: path.to_path_buf(),
+            file,
             clip: Arc::new(clip),
             conversion,
             readers: Mutex::new(vec![]),
             tick: AtomicU64::new(0),
         })
+    }
+
+    fn reader(&self) -> Result<decode::Reader> {
+        decode::Reader::with_file(self.file.clone(), self.clip.clone())
     }
 
     /// Decoded planes of frame `k`, from the reader that reaches it soonest: one that
@@ -119,7 +139,7 @@ impl Source {
             let i = match near {
                 Some(i) => i,
                 None if slots.len() < MAX_READERS => {
-                    let reader = decode::Reader::open(&self.path, self.clip.clone())?;
+                    let reader = self.reader()?;
                     slots.push(Slot {
                         reader: Arc::new(Mutex::new(reader)),
                         pos: Arc::new(AtomicUsize::new(usize::MAX)),
@@ -145,7 +165,7 @@ impl Source {
     /// sample of them against seeks (a file whose frames differ by route would make
     /// play, `still` and `export` disagree). Problems as messages.
     pub fn check(&self, deep: bool) -> Vec<String> {
-        let mut r = match decode::Reader::open(&self.path, self.clip.clone()) {
+        let mut r = match self.reader() {
             Ok(r) => r,
             Err(e) => return vec![e.to_string()],
         };
@@ -169,7 +189,7 @@ impl Source {
         }
         let mut problems = vec![];
         for (k, p) in samples.iter().rev() {
-            let mut fresh = match decode::Reader::open(&self.path, self.clip.clone()) {
+            let mut fresh = match self.reader() {
                 Ok(r) => r,
                 Err(e) => return vec![e.to_string()],
             };
@@ -194,6 +214,17 @@ impl Source {
         let p = self
             .planes(k as usize)
             .map_err(|e| format!("{label}: {e}"))?;
+        let (w, h) = (
+            self.clip.track.width as usize,
+            self.clip.track.height as usize,
+        );
+        if (p.width, p.height) != (w, h) {
+            return Err(format!(
+                "{label}: the decoder gave a {}×{} picture in a {w}×{h} track (frame sizes \
+                 must match the track's; shotglass conform rewrites the clip)",
+                p.width, p.height
+            ));
+        }
         let f = to_rgba(&p, &self.conversion, vflip);
         Ok(crate::texture::DecodedImage {
             width: p.width,

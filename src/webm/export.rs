@@ -28,7 +28,6 @@ fn frame_ns((num, den): (u32, u32), n: u64) -> u64 {
 
 /// Encode I420 frames (as `yuv::frame_bytes` lays them out) into a video-only WebM:
 /// test fixtures for footage (#73), and what `shotglass conform` writes.
-#[cfg_attr(not(test), allow(dead_code))] // until `shotglass conform`
 pub fn write_clip(
     path: &Path,
     set: &Av1Settings,

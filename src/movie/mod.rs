@@ -28,8 +28,6 @@ fn gcd(a: u64, b: u64) -> u64 {
     if b == 0 { a } else { gcd(b, a % b) }
 }
 
-/// `fps` → (numerator, denominator), reduced. NTSC-style decimals (29.97, 23.976,
-/// 59.94) mean n×1000/1001, as video tools assume.
 /// A rate from the command line: `24`, `29.97`, `30000/1001`.
 #[cfg_attr(not(feature = "webm"), allow(dead_code))]
 pub fn parse_fps_arg(s: &str) -> Result<(u32, u32)> {
@@ -46,6 +44,8 @@ pub fn parse_fps_arg(s: &str) -> Result<(u32, u32)> {
     parse_fps(f)
 }
 
+/// `fps` → (numerator, denominator), reduced. NTSC-style decimals (29.97, 23.976,
+/// 59.94) mean n×1000/1001, as video tools assume.
 fn parse_fps(f: FpsFile) -> Result<(u32, u32)> {
     let (num, den): (f64, f64) = match f {
         FpsFile::Int(n) => (n as f64, 1.0),
