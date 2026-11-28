@@ -3,8 +3,8 @@
 Status: **phase 1 built** (#134): `[[buffer]]`, history, resets, checkpoints; **phase 2
 built** (#137): background fill, progressive scrub, `preview_lookback`, adaptive spacing,
 `cache = "dense"`, slow-seek hints, per-frame invalidation; user docs in
-[buffers.md](../buffers.md). Phase 3 (#138): **buffers in comps and `loop = "warm"` built**;
-`after` is still a proposal. Builds on the iChannel design
+[buffers.md](../buffers.md). Phase 3 (#138): **buffers in comps, `loop = "warm"` and
+`after = "<layer>"` built**; kit examples remain. Builds on the iChannel design
 ([ichannel.md](ichannel.md), which deferred `{ buffer = "A" }` to its own design) and on
 layers and comps ([layers-compositing.md](layers-compositing.md), which ruled
 previous-frame inputs out of layers).
@@ -99,7 +99,8 @@ scene = "layers/show-trail.glsl"
 channels = ["@trail"]              # this frame's state, after its step
 ```
 
-- **Order:** buffers step in file order, after the picture track and before any layer.
+- **Order:** buffers step in file order, after the picture track and before any layer
+  (phase 3 adds `after`: [buffers in the layer stack](#buffers-in-the-layer-stack-phase-3)).
   A buffer may read the current state of an *earlier* buffer (`@a`) and the previous
   state of any buffer, itself included (`@prev`, or `{ source = "@b", frame = "prev" }`).
   So Buffer A–D chains work and the per-frame graph stays a DAG.
@@ -110,7 +111,8 @@ channels = ["@trail"]              # this frame's state, after its step
   `{ source = "@b", frame = -k }` for 1 ≤ k ≤ N (`@prev` and `frame = "prev"` are
   `frame = -1`; without `history`, N = 1). See [History](#history).
 - **Inputs:** textures, text, footage, comps, `@picture` and buffers. Not `@input` or
-  `@<layer>`: buffers step before layers. A buffer that reads `@picture` makes the
+  `@<layer>`: buffers step before layers (unless they name a layer with `after`,
+  [phase 3](#buffers-in-the-layer-stack-phase-3)). A buffer that reads `@picture` makes the
   picture part of its fold (see [Invalidation](#invalidation)).
 - **Readers:** layers and later buffers read `@<buffer>`, at the buffer's size
   (`iChannelResolution`). Shots and transitions can't: they're drawn before buffers step.
@@ -210,7 +212,33 @@ comp. Phase 3 adds `after = "<layer id>"`: the buffer steps right after that lay
 composited and may read `@input` (the composite so far) and `@<layer>` of earlier
 layers; later layers read it as usual. A field is needed because TOML loses the
 relative order of `[[buffer]]` and `[[layer]]` entries. It's additive: buffers without
-`after` keep stepping before all layers, so phase 1 doesn't block it.
+`after` keep stepping before all layers, so phase 1 doesn't block it. Built (#138, contract
+0.1.11):
+
+- **Step order:** (rank, file order), rank 0 before every layer, j + 1 right after layer
+  j (`Buffer::rank`). All of a frame's steps still happen in one `step_frame`, before
+  the frame is drawn: the fold stays one cursor, and layers above read the state at n
+  as before. A buffer reads the current state of buffers earlier in that order; a
+  layer, of buffers whose rank is at most its index.
+- **The composite is the buffer's own:** each step draws the sequence's picture track and
+  its active layers up to the anchor (`plan_layers = (q, Some(j))`, the generalised
+  `plan_no_layers`) at the buffer's size, scale 1, into fold-owned scratch targets per
+  (layer, size), right before the first buffer at that place steps; its layers read
+  buffer states at the step's frame (`SeqPlan::step`). It's never the frame's own
+  composite: that one is at the render scale, would make the state depend on it, and
+  doesn't exist for catch-up frames. Layers only buffers read are held in the step's
+  composite (`@<layer>`).
+- **Hidden layers don't apply** to step composites: the state must not depend on preview
+  settings, so mute/solo only change the picture shown.
+- **An inactive anchor:** the composite of the active layers below it; `@<anchor>` is
+  unbound (black, resolution 0), as for layers.
+- **Purity:** a buffer whose composite's layers read buffer state depends on those
+  states at n, so it is never a pure history buffer (`stack_reads_state`): a pure one
+  starts `history` frames before a checkpoint, where those states aren't.
+- **Invalidation:** a fold whose buffers read the stack reads the film too: its shots,
+  comps, and its layers up to the highest such anchor (`stack_reach`), each layer from
+  its start frame; their declarations are in the fold's `decl`. Layers above it are
+  never in the key.
 
 ### Loop films
 
@@ -498,7 +526,7 @@ filtering needs `OES_texture_float_linear`, so `rgba32f` buffers default to `nea
    catch-up, selftest + golden. Contract patch bump.
 2. **Faster scrubbing:** background fill, progressive scrub, `preview_lookback`,
    per-frame invalidation, slow-seek hints.
-3. **Reach:** buffers in comps, `loop = "warm"`, `after = "<layer>"`
+3. **Reach:** buffers in comps, `loop = "warm"`, `after = "<layer>"` (all built, #138)
    ([buffers in the layer stack](#buffers-in-the-layer-stack-phase-3)), kit examples (trails, echo, TAA,
    reaction-diffusion) in shotglass-kit.
 

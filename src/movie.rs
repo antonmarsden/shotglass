@@ -227,6 +227,9 @@ struct BufferFile {
     scene: String,
     /// Drawn once at each reset as the state before it (default: black).
     init: Option<String>,
+    /// Step right after this layer is composited (#138), not before every layer: the
+    /// buffer may then read `@input` (the composite so far) and `@<layer>` up to it.
+    after: Option<String>,
     /// The span, as for layers (default: the whole film).
     from: Option<toml::Value>,
     to: Option<toml::Value>,
@@ -1174,6 +1177,13 @@ pub struct Buffer {
     pub end_frame: u64,
     /// Reset frames, sorted, the span start first.
     pub resets: Vec<u64>,
+    /// `after = "<layer>"` (#138): the index of the layer it steps right after (None:
+    /// before every layer). It reads the composite up to that layer (`@input`) and
+    /// layers up to it (`@<layer>`), drawn at its size, scale 1.
+    pub after: Option<usize>,
+    /// The layers its composite reads (up to `after`) read buffer state, so its state
+    /// at n depends on other buffers' states at n: never a pure history buffer.
+    pub stack_reads_state: bool,
     pub size: BufferSize,
     pub format: BufferFormat,
     /// States kept (`history`, default 1: `@prev`).
@@ -1202,11 +1212,27 @@ impl Buffer {
     /// A pure history buffer reads no buffer state (not even its own `@prev`): its
     /// state at n depends only on frame n's inputs, so it needs no checkpoints.
     pub fn is_pure(&self) -> bool {
-        !self
-            .channels
+        !self.stack_reads_state
+            && !self
+                .channels
+                .iter()
+                .flatten()
+                .any(|c| matches!(c.source, Source::Buffer { .. }))
+    }
+
+    /// Does it read the layer stack (`@input` or `@<layer>`, with `after`, #138)? Its
+    /// steps then draw the composite up to its layer.
+    pub fn reads_stack(&self) -> bool {
+        self.channels
             .iter()
             .flatten()
-            .any(|c| matches!(c.source, Source::Buffer { .. }))
+            .any(|c| matches!(c.source, Source::Input | Source::Layer { .. }))
+    }
+
+    /// Where it steps in a frame (#138): 0 before every layer, j + 1 right after layer
+    /// j. Buffers step in (rank, file order).
+    pub fn rank(&self) -> usize {
+        self.after.map_or(0, |j| j + 1)
     }
 
     /// GPU memory its ring needs at an output of `out` (history + 1 states).
@@ -1227,6 +1253,8 @@ struct BufDecl {
     id: String,
     history: u32,
     format: BufferFormat,
+    /// `after` (#138), the layer id as written: checked in `build_buffers`.
+    after: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -1459,6 +1487,13 @@ impl Movie {
             features.push("loop = \"warm\", which needs shotglass 0.1.10");
             need = semver::Version::new(0, 1, 10);
         }
+        let after = |m: &Movie| m.buffers.iter().any(|b| b.after.is_some());
+        if after(self) || self.comps.iter().any(|c| after(&c.movie)) {
+            features.push(
+                "buffers in the layer stack (after = \"<layer>\"), which need shotglass 0.1.11",
+            );
+            need = semver::Version::new(0, 1, 11);
+        }
         if features.is_empty() {
             return None;
         }
@@ -1474,6 +1509,7 @@ impl Movie {
             semver::Version::new(0, 1, 7),
             semver::Version::new(0, 1, 8),
             semver::Version::new(0, 1, 9),
+            semver::Version::new(0, 1, 10),
         ];
         let allows_old = match &self.shotglass {
             None => true,
@@ -2901,6 +2937,7 @@ fn build_buffers(
     // The first film frame at or after `t` (frame m shows at m·den/num).
     let frame_ceil = |t: f32| -> u64 { ((t as f64 * num / den) - 1e-6).ceil().max(0.0) as u64 };
     let n_frames = loop_frames.unwrap_or_else(|| frame_ceil(duration));
+    let layer_ids: Vec<String> = layers.iter().map(|l| l.id.clone()).collect();
     let mut out: Vec<Buffer> = vec![];
     for (i, b) in files.into_iter().enumerate() {
         let what = format!("buffer \"{}\"", b.id);
@@ -2925,6 +2962,29 @@ fn build_buffers(
         if let Some(p) = &b.init {
             library::check_rel_path(p).map_err(|e| anyhow!("{what}: init: {e}"))?;
         }
+        // `after = "<layer>"` (#138): a layer of the same sequence (film or comp).
+        let after = match &b.after {
+            None => None,
+            Some(id) => match layer_ids.iter().position(|l| l == id) {
+                Some(j) => Some(j),
+                None => bail!(
+                    "{what}: after = \"{id}\" names no layer{} (a buffer steps after a layer of \
+                     its own film or comp)",
+                    if layer_ids.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            "; the layers are {}",
+                            layer_ids
+                                .iter()
+                                .map(|l| format!("\"{l}\""))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    }
+                ),
+            },
+        };
         let start = match &b.from {
             None => 0.0,
             Some(v) => span_point(&format!("{what}: from"), v, true, shots, layers)?,
@@ -3029,18 +3089,32 @@ fn build_buffers(
                 vector(v).with_context(|| format!("{what}: param {name}"))?,
             ));
         }
+        // With `after`, the layers up to it are below the buffer (it may read them and
+        // `@input`); the rest draw after it steps.
+        let below = after.map_or(0, |j| j + 1);
         let channels = match &b.channels {
             Some(list) => channel_list(
                 &format!("{what}: "),
                 list,
                 Some(LayerRefs {
-                    earlier: &[],
-                    later: &[],
+                    earlier: &layer_ids[..below],
+                    later: &layer_ids[below..],
                     on_buffer: Some(i),
                 }),
             )?,
             None => Default::default(),
         };
+        let reads_stack = channels
+            .iter()
+            .flatten()
+            .any(|c| matches!(c.source, Source::Input | Source::Layer { .. }));
+        let stack_reads_state = reads_stack
+            && layers[..below].iter().any(|l| {
+                l.channels
+                    .iter()
+                    .flatten()
+                    .any(|c| matches!(c.source, Source::Buffer { .. }))
+            });
         let dense = match b.cache.as_deref() {
             None | Some("second") => false,
             Some("dense") => true,
@@ -3062,6 +3136,8 @@ fn build_buffers(
             start_frame,
             end_frame,
             resets,
+            after,
+            stack_reads_state,
             size,
             format: decl.format,
             history: decl.history,
@@ -3104,6 +3180,17 @@ fn build_buffers(
         }
     }
     Ok(out)
+}
+
+/// The highest layer a buffer's step draws (#138): the largest `after` of the buffers
+/// that read the layer stack (`@input`, `@<layer>`). Layers up to it are part of those
+/// folds; layers above it never are.
+pub fn stack_reach(m: &Movie) -> Option<usize> {
+    m.buffers
+        .iter()
+        .filter(|b| b.reads_stack())
+        .filter_map(|b| b.after)
+        .max()
 }
 
 /// The buffers of a warm loop sequence (#138) that carry state over its seam: active
@@ -3208,6 +3295,7 @@ fn buffer_decls(files: &[BufferFile]) -> Result<Vec<BufDecl>> {
                 id: b.id.clone(),
                 history,
                 format,
+                after: b.after.clone(),
             })
         })
         .collect()
@@ -3898,33 +3986,81 @@ fn texture_spec(
                     return Ok(Some(buffer_channel(i, 1)));
                 }
                 if let Some(j) = buffers.iter().position(|b| b.id == out) {
-                    match on_buffer {
-                        _ if on_layer.is_none() => bail!(
+                    let Some(refs) = on_layer else {
+                        bail!(
                             "{what}: \"{s}\" is a buffer; shots and transitions draw before \
                              buffers step, so only layers and later buffers read one"
-                        ),
+                        );
+                    };
+                    // Where buffer j steps (#138): before every layer, or right after
+                    // its `after` layer (`rank` = that layer's index + 1).
+                    let layer_at =
+                        |id: &str| refs.earlier.iter().chain(refs.later).position(|x| x == id);
+                    let rank =
+                        |d: &BufDecl| d.after.as_deref().and_then(layer_at).map_or(0, |p| p + 1);
+                    let rj = rank(&buffers[j]);
+                    let anchor = buffers[j].after.as_deref().unwrap_or("");
+                    match on_buffer {
                         Some(i) if j == i => bail!(
                             "{what}: \"{s}\" is this buffer; read its previous state with \"@prev\""
                         ),
-                        Some(i) if j > i => bail!(
-                            "{what}: \"{s}\" is a later buffer (buffers step in file order); \
-                             read its previous state with {{ source = \"{s}\", frame = \"prev\" }}"
+                        // A buffer reads the current state of buffers that step before it.
+                        Some(i) if (rj, j) > (rank(&buffers[i]), i) => {
+                            if rj > rank(&buffers[i]) {
+                                bail!(
+                                    "{what}: \"{s}\" steps later in the frame (after layer \
+                                     \"{anchor}\"); read its previous state with {{ source = \
+                                     \"{s}\", frame = \"prev\" }}"
+                                )
+                            }
+                            bail!(
+                                "{what}: \"{s}\" is a later buffer (buffers step in file order); \
+                                 read its previous state with {{ source = \"{s}\", frame = \"prev\" }}"
+                            )
+                        }
+                        // A layer reads buffers that stepped below it.
+                        None if rj > refs.earlier.len() => bail!(
+                            "{what}: \"{s}\" steps after layer \"{anchor}\", which isn't below this \
+                             layer; read its previous state with {{ source = \"{s}\", frame = \
+                             \"prev\" }}"
                         ),
                         _ => return Ok(Some(buffer_channel(j, 0))),
                     }
                 }
-                if on_buffer.is_some() {
-                    if out == "input" {
+                if let (Some(_), Some(refs)) = (on_buffer, on_layer) {
+                    // With `after` (#138), the layers up to it are `earlier`.
+                    let anchor = refs.earlier.last();
+                    if out == "input" && anchor.is_none() {
                         bail!(
                             "{what}: \"@input\" is the picture below a layer; buffers step \
-                             before layers, so read \"@picture\" (the picture track)"
+                             before layers, so read \"@picture\" (the picture track), or give \
+                             the buffer after = \"<layer>\" to read the composite up to that \
+                             layer"
                         );
                     }
-                    if out != "picture" && !comps.iter().any(|c| c == out) {
+                    if refs.later.iter().any(|x| x == out) {
+                        match anchor {
+                            Some(a) => bail!(
+                                "{what}: \"{s}\" is a layer above this buffer's after = \"{a}\"; \
+                                 it draws after the buffer steps (a buffer reads layers up to \
+                                 its after layer)"
+                            ),
+                            None => bail!(
+                                "{what}: \"{s}\" is a layer; buffers step before layers, unless \
+                                 they give after = \"<layer>\" (then they read layers up to it)"
+                            ),
+                        }
+                    }
+                    let layer = refs.earlier.iter().any(|x| x == out);
+                    if out != "picture"
+                        && out != "input"
+                        && !layer
+                        && !comps.iter().any(|c| c == out)
+                    {
                         bail!(
                             "{what}: \"{s}\": a buffer reads @picture, @prev, earlier buffers \
-                             and comps; layers draw after buffers step (render it in a comp \
-                             and read @<comp>)"
+                             and comps (with after = \"<layer>\", also @input and layers up to \
+                             it)"
                         );
                     }
                 }
@@ -7416,7 +7552,7 @@ glsl = 450
         // Layers aren't readable from buffers; buffers aren't readable from shots.
         let e = bad("[[layer]]\nid = \"t\"\nscene = \"t.glsl\"\n\
              [[buffer]]\nid = \"b\"\nscene = \"b.glsl\"\nchannels = [\"@t\"]\n");
-        assert!(e.contains("layers draw after buffers step"), "{e}");
+        assert!(e.contains("buffers step before layers, unless"), "{e}");
         let e = err(fixture(
             "[[shot]]\nid = \"a\"\nscene = \"a.glsl\"\nduration = 1\nchannels = [\"@b\"]\n\
              [[buffer]]\nid = \"b\"\nscene = \"b.glsl\"\n",
@@ -7568,6 +7704,168 @@ glsl = 450
             )],
         );
         assert!(m.is_ok(), "{:?}", m.err());
+    }
+
+    /// `after = "<layer>"` (#138): the buffer steps right after that layer, reads
+    /// `@input` and layers up to it; later layers read its state; step order is (rank,
+    /// file order).
+    #[test]
+    fn buffers_after_a_layer() {
+        const L: &str = "[[layer]]\nid = \"t\"\nscene = \"t.glsl\"\nchannels = [\"@pre\"]\n\
+             [[layer]]\nid = \"u\"\nscene = \"u.glsl\"\n\
+             [[layer]]\nid = \"v\"\nscene = \"v.glsl\"\n";
+        let film = |bufs: &str| {
+            layers_film(&format!(
+                "{L}[[buffer]]\nid = \"pre\"\nscene = \"p.glsl\"\nchannels = [\"@prev\"]\n{bufs}"
+            ))
+        };
+        let m = film(
+            "[[buffer]]\nid = \"smear\"\nscene = \"s.glsl\"\nafter = \"u\"\n\
+             channels = [\"@prev\", \"@input\", \"@t\", \"@u\", \"@pre\", \"@picture\"]\n\
+             [[buffer]]\nid = \"echo\"\nscene = \"e.glsl\"\nafter = \"t\"\nhistory = 4\n\
+             channels = [\"@input\"]\n",
+        )
+        .unwrap();
+        let s = &m.buffers[1];
+        assert_eq!((s.after, s.rank()), (Some(1), 2));
+        assert!(s.reads_stack());
+        let src = |i: usize| s.channels[i].as_ref().unwrap().source.clone();
+        assert_eq!(src(1), Source::Input);
+        assert_eq!(
+            src(2),
+            Source::Layer {
+                index: 0,
+                id: "t".into()
+            }
+        );
+        assert_eq!(
+            src(3),
+            Source::Layer {
+                index: 1,
+                id: "u".into()
+            }
+        );
+        assert_eq!(src(5), Source::Picture);
+        // Layer t (below the anchor) reads buffer state: smear's state depends on it.
+        assert!(s.stack_reads_state && !s.is_pure());
+        // echo reads only the composite up to t, which reads @pre: not pure either.
+        assert!(m.buffers[2].stack_reads_state && !m.buffers[2].is_pure());
+        assert_eq!(m.buffers[0].after, None);
+        assert!(!m.buffers[0].reads_stack());
+        // A history buffer of a composite whose layers read no buffer is pure.
+        let m = layers_film(
+            "[[layer]]\nid = \"t\"\nscene = \"t.glsl\"\n\
+             [[buffer]]\nid = \"h\"\nscene = \"h.glsl\"\nafter = \"t\"\nhistory = 3\n\
+             channels = [\"@input\"]\n\
+             [[layer]]\nid = \"show\"\nscene = \"s.glsl\"\nchannels = [\"@h\"]\n",
+        )
+        .unwrap();
+        assert!(m.buffers[0].is_pure());
+        assert!(matches!(
+            m.layers[1].channels[0].as_ref().unwrap().source,
+            Source::Buffer {
+                index: 0,
+                back: 0,
+                ..
+            }
+        ));
+        // A later buffer stepping at an earlier place may be read (it steps first)...
+        let m = film(
+            "[[buffer]]\nid = \"late\"\nscene = \"l.glsl\"\nafter = \"v\"\nchannels = [\"@mid\"]\n\
+             [[buffer]]\nid = \"mid\"\nscene = \"m.glsl\"\nafter = \"t\"\n",
+        );
+        assert!(m.is_ok(), "{:?}", m.err());
+        // ...but not one stepping later in the frame, even if it's earlier in the file.
+        let e = err(film(
+            "[[buffer]]\nid = \"mid\"\nscene = \"m.glsl\"\nafter = \"t\"\n\
+             [[buffer]]\nid = \"late\"\nscene = \"l.glsl\"\nafter = \"v\"\n\
+             [[buffer]]\nid = \"x\"\nscene = \"x.glsl\"\nafter = \"u\"\nchannels = [\"@late\"]\n",
+        ));
+        assert!(
+            e.contains("steps later in the frame (after layer \"v\")"),
+            "{e}"
+        );
+        // A buffer without after can't read an after buffer's current state.
+        let e = err(film(
+            "[[buffer]]\nid = \"a\"\nscene = \"a.glsl\"\nafter = \"t\"\n\
+             [[buffer]]\nid = \"b\"\nscene = \"b.glsl\"\nchannels = [\"@a\"]\n",
+        ));
+        assert!(e.contains("steps later in the frame"), "{e}");
+        // Same place: file order.
+        let e = err(film(
+            "[[buffer]]\nid = \"a\"\nscene = \"a.glsl\"\nafter = \"u\"\nchannels = [\"@b\"]\n\
+             [[buffer]]\nid = \"b\"\nscene = \"b.glsl\"\nafter = \"u\"\n",
+        ));
+        assert!(e.contains("later buffer"), "{e}");
+        // Layers read an after buffer's state only above its anchor; below or at it, the
+        // previous state.
+        let lay = |l: &str| {
+            layers_film(&format!(
+                "[[layer]]\nid = \"t\"\nscene = \"t.glsl\"\n{l}\n\
+                 [[layer]]\nid = \"u\"\nscene = \"u.glsl\"\n\
+                 [[buffer]]\nid = \"a\"\nscene = \"a.glsl\"\nafter = \"t\"\n"
+            ))
+        };
+        let e = err(lay("channels = [\"@a\"]"));
+        assert!(
+            e.contains("steps after layer \"t\", which isn't below this layer"),
+            "{e}"
+        );
+        assert!(lay("channels = [{ source = \"@a\", frame = \"prev\" }]").is_ok());
+        // Reading too high, or the stack without after.
+        let bad = |b: &str| err(film(b));
+        let e =
+            bad("[[buffer]]\nid = \"a\"\nscene = \"a.glsl\"\nafter = \"t\"\nchannels = [\"@u\"]\n");
+        assert!(
+            e.contains("is a layer above this buffer's after = \"t\""),
+            "{e}"
+        );
+        let e = bad("[[buffer]]\nid = \"a\"\nscene = \"a.glsl\"\nchannels = [\"@input\"]\n");
+        assert!(e.contains("or give the buffer after = \"<layer>\""), "{e}");
+        let e = bad("[[buffer]]\nid = \"a\"\nscene = \"a.glsl\"\nafter = \"nope\"\n");
+        assert!(
+            e.contains("after = \"nope\" names no layer; the layers are \"t\", \"u\", \"v\""),
+            "{e}"
+        );
+        let e = bad("[[buffer]]\nid = \"a\"\nscene = \"a.glsl\"\nafter = \"moon\"\n");
+        assert!(e.contains("names no layer"), "{e}");
+        // Contract 0.1.11.
+        let c = |v: &str| {
+            fixture(
+                &format!(
+                    "shotglass = \"{v}\"\n[[shot]]\nid = \"a\"\nscene = \"a.glsl\"\nduration = 1\n\
+                     [[layer]]\nid = \"t\"\nscene = \"t.glsl\"\n\
+                     [[buffer]]\nid = \"b\"\nscene = \"b.glsl\"\nafter = \"t\"\nchannels = [\"@input\"]\n"
+                ),
+                Path::new("/film"),
+            )
+            .unwrap()
+        };
+        assert!(c("0.1.10").contract_warning().unwrap().contains("0.1.11"));
+        assert_eq!(c("0.1.11").contract_warning(), None);
+        // In a comp: after names a comp layer.
+        let (_d, m) = comps_film(
+            "shotglass = \"0.1.11\"\n[comps]\nc = \"c.toml\"\n[[shot]]\nid = \"s\"\ncomp = \"c\"\nduration = 1\n",
+            &[(
+                "c.toml",
+                "[[shot]]\nid = \"a\"\nscene = \"a.glsl\"\nduration = 1\n\
+                 [[layer]]\nid = \"t\"\nscene = \"t.glsl\"\n\
+                 [[buffer]]\nid = \"b\"\nscene = \"b.glsl\"\nafter = \"t\"\nchannels = [\"@input\", \"@t\"]\n",
+            )],
+        );
+        let m = m.unwrap();
+        assert_eq!(m.comps[0].movie.buffers[0].after, Some(0));
+        assert_eq!(m.contract_warning(), None);
+        let (_d, m) = comps_film(
+            "[comps]\nc = \"c.toml\"\n[[shot]]\nid = \"s\"\ncomp = \"c\"\nduration = 1\n\
+             [[layer]]\nid = \"film-layer\"\nscene = \"t.glsl\"\n",
+            &[(
+                "c.toml",
+                "[[shot]]\nid = \"a\"\nscene = \"a.glsl\"\nduration = 1\n\
+                 [[buffer]]\nid = \"b\"\nscene = \"b.glsl\"\nafter = \"film-layer\"\n",
+            )],
+        );
+        assert!(err(m).contains("names no layer"));
     }
 
     #[test]

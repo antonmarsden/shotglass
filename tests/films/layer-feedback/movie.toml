@@ -1,0 +1,46 @@
+# Golden-image film for buffers in the layer stack (tests/golden.rs, #138): video
+# feedback of the finished picture with a clean overlay on top, which needs a buffer
+# that steps between layers (`after`). The shot is a background plate; layer "title"
+# draws a moving disc and a cyan frame on transparent from 0.2 s; layer "grade" warms
+# everything below it. Buffer "tunnel" steps after "grade": it reads the composite so far (@input:
+# plate, disc and grade) and its own previous state, shrunk and turned a little, so
+# the graded title falls into a tunnel of nested, turning copies (reset at 1 s). Layer
+# "view" shows the tunnel and layer "hud", above the buffer, draws a white frame and a
+# cross that stay single and sharp. Without `after` a buffer can't see layers at all, and nothing can feed back the
+# layers below one while keeping the ones above out. Folds stay short: errors compound
+# across stacks. Shaders are film-local, so the golden only moves when the engine does.
+title = "layer-feedback"
+fps = 30
+
+[[shot]]
+id = "plate"
+scene = "scenes/plate.glsl"
+duration = 1.5
+
+[[layer]]
+id = "title"
+scene = "layers/disc.glsl"
+from = 0.2
+
+[[layer]]
+id = "grade"
+scene = "layers/grade.glsl"
+channels = ["@input"]
+
+[[buffer]]
+id = "tunnel"
+scene = "buffers/tunnel.glsl"
+after = "grade"                    # steps once "grade" is composited
+reset = [1.0]
+channels = ["@prev", "@input"]     # the composite so far: plate, title and grade
+uniforms.uDecay = 0.9
+
+[[layer]]
+id = "view"
+scene = "layers/view.glsl"
+channels = ["@tunnel"]
+
+[[layer]]
+id = "hud"                         # above the buffer: never in the feedback
+scene = "layers/hud.glsl"
+scale = 1

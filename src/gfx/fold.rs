@@ -11,7 +11,9 @@
 //! only when the fold has reached it. Nothing is read back: steps are draws, and
 //! checkpoints are GPU copies (`glBlitFramebuffer`) kept under their own budget.
 
-use super::{LAYER_TEX, PICTURE_TEX, Renderer, SeqPlan, SeqTargets, ShotKeys, Target, Which, hash};
+use super::{
+    INPUT_TEX, LAYER_TEX, PICTURE_TEX, Renderer, SeqPlan, SeqTargets, ShotKeys, Target, Which, hash,
+};
 use crate::movie::{Buffer, BufferFormat, Movie, Source};
 use eframe::glow::{self, HasContext};
 
@@ -21,6 +23,12 @@ pub(super) const BUF_TEX: u64 = LAYER_TEX - 60000;
 pub(super) fn buf_key(b: usize, back: u32) -> u64 {
     BUF_TEX - (b as u64 * 65 + back as u64)
 }
+
+/// A step composite (#138): (the `after` layer, the size it's drawn at).
+type StackKey = (usize, (i32, i32));
+
+/// Passes a buffer step binds: (pass key, (texture, width, height)).
+type Passes = Vec<(u64, (glow::Texture, usize, usize))>;
 
 /// Steps a non-blocking render (or the player, `set_catchup_slices`) does per call.
 pub const STEP_BUDGET: usize = 8;
@@ -83,6 +91,9 @@ pub(super) struct Fold {
     pub(super) reads_film: bool,
     /// Scratch targets for the picture track a buffer reads, per size.
     pics: Vec<((i32, i32), SeqTargets)>,
+    /// Scratch targets for the composite up to a layer that `after` buffers read
+    /// (#138), per (layer, size).
+    stacks: Vec<(StackKey, SeqTargets)>,
     budget: usize,
     budget_source: &'static str,
     slices: bool,
@@ -124,6 +135,7 @@ impl Fold {
             decl: 0,
             reads_film: false,
             pics: vec![],
+            stacks: vec![],
             budget,
             budget_source,
             slices: false,
@@ -155,6 +167,7 @@ impl Fold {
             decl: 0,
             reads_film: false,
             pics: vec![],
+            stacks: vec![],
             budget: o.budget,
             budget_source: o.budget_source,
             slices: o.slices,
@@ -190,6 +203,7 @@ impl Fold {
             || !self.checkpoints.is_empty()
             || !self.spare.is_empty()
             || !self.pics.is_empty()
+            || !self.stacks.is_empty()
     }
 
     /// Forget every state (the cursor, a plan) and hand back every GL target to delete:
@@ -214,6 +228,9 @@ impl Fold {
         }
         v.extend(std::mem::take(&mut self.spare).into_iter().map(|(_, t)| t));
         for (_, s) in std::mem::take(&mut self.pics) {
+            v.extend(super::seq_targets(s));
+        }
+        for (_, s) in std::mem::take(&mut self.stacks) {
             v.extend(super::seq_targets(s));
         }
         v
@@ -690,12 +707,15 @@ impl Renderer {
             }
         }
         if self.folds[q].reads_film {
-            // Its sequence's shots from their start; everything any comp draws (its
-            // items and its buffers, #138) from frame 0. Not its own layers (they draw
-            // after buffers step) or its own buffers (above).
+            // Its sequence's shots from their start, and its layers up to the highest
+            // `after` a buffer reads the stack at (#138) from theirs; everything any comp
+            // draws (its items and its buffers, #138) from frame 0. Not its other layers
+            // (they draw after buffers step) or its own buffers (above).
             let base = self.seq_base[q];
             let shots = base..base + movie.shots.len();
-            let layers = shots.end..shots.end + movie.layers.len();
+            let reach = crate::movie::stack_reach(movie).map_or(0, |r| r + 1);
+            let stack = shots.end..shots.end + reach;
+            let layers = stack.end..shots.end + movie.layers.len();
             let film = super::seq_movie(film, 0);
             // A comp's fold reads nothing of the film's.
             let film_items = 0..film.shots.len() + film.layers.len();
@@ -709,13 +729,16 @@ impl Renderer {
                     // A shot is read from its start (its incoming transition's, if
                     // any; a frame early to be safe); comp items whenever a comp is:
                     // from frame 0.
-                    let first =
-                        (shots.contains(&i))
-                            .then(|| &movie.shots[i - base])
-                            .map_or(0, |s| {
-                                let lead = s.transition_in.as_ref().map_or(0.0, |t| t.duration);
-                                (movie.frame_at(s.start - lead).max(0) as u64).saturating_sub(1)
-                            });
+                    let first = if shots.contains(&i) {
+                        let s = &movie.shots[i - base];
+                        let lead = s.transition_in.as_ref().map_or(0.0, |t| t.duration);
+                        (movie.frame_at(s.start - lead).max(0) as u64).saturating_sub(1)
+                    } else if stack.contains(&i) {
+                        let l = &movie.layers[i - stack.start];
+                        (movie.frame_at(l.start).max(0) as u64).saturating_sub(1)
+                    } else {
+                        0
+                    };
                     parts.push((item(k), first));
                 }
             }
@@ -863,7 +886,7 @@ impl Renderer {
         }
         if m > n {
             self.folds[q].progress = None;
-            self.free_idle_rings(movie, q, n);
+            self.free_idle_rings(movie, q, n, out);
             true
         } else {
             self.folds[q].progress = Some((m - plan.first, (n + 1).saturating_sub(plan.first)));
@@ -1107,8 +1130,11 @@ impl Renderer {
         });
     }
 
-    /// Rings of buffers not active at `n` hold nothing anyone reads: free them.
-    fn free_idle_rings(&mut self, movie: &Movie, q: usize, n: u64) {
+    /// Rings of buffers not active at `n` hold nothing anyone reads: free them. So do
+    /// the scratch sets for the pictures and composites steps draw (`pics`, `stacks`,
+    /// #138) that no buffer active at `n` draws at its current size: a resize, or an
+    /// edit to a buffer's size or `after`, would otherwise leave them allocated.
+    fn free_idle_rings(&mut self, movie: &Movie, q: usize, n: u64, out: (i32, i32)) {
         for (b, buf) in movie.buffers.iter().enumerate() {
             if !act(movie, buf, n)
                 && let Some(r) = self.folds[q].rings[b].take()
@@ -1118,6 +1144,48 @@ impl Renderer {
                 }
             }
         }
+        let live = || movie.buffers.iter().filter(|b| act(movie, b, n));
+        let pics: Vec<(i32, i32)> = live()
+            .filter(|b| {
+                b.channels
+                    .iter()
+                    .flatten()
+                    .any(|c| c.source == Source::Picture)
+            })
+            .map(|b| b.size.at(out))
+            .collect();
+        let stacks: Vec<StackKey> = live()
+            .filter(|b| b.reads_stack())
+            .filter_map(|b| b.after.map(|a| (a, b.size.at(out))))
+            .collect();
+        let fold = &mut self.folds[q];
+        let mut dead = vec![];
+        for (k, t) in std::mem::take(&mut fold.pics) {
+            if pics.contains(&k) {
+                fold.pics.push((k, t));
+            } else {
+                dead.extend(super::seq_targets(t));
+            }
+        }
+        for (k, t) in std::mem::take(&mut fold.stacks) {
+            if stacks.contains(&k) {
+                fold.stacks.push((k, t));
+            } else {
+                dead.extend(super::seq_targets(t));
+            }
+        }
+        for t in dead {
+            delete(&self.gl, t);
+        }
+    }
+
+    /// Scratch sets the folds keep for the pictures and composites buffer steps draw
+    /// (tests: they don't pile up).
+    pub fn step_scratch_sets(&self) -> usize {
+        self.folds
+            .iter()
+            .map(|f| f.pics.len() + f.stacks.len())
+            .sum()
     }
 
     /// Buffer `b`'s state `back` frames before film frame `m` (0: frame m's, after its
@@ -1169,8 +1237,9 @@ impl Renderer {
             .collect()
     }
 
-    /// Step every buffer due on film frame `m` (active, and `m ≥ starts[b]`), in file
-    /// order: decide everything first (programs, textures, the picture and comps they
+    /// Step every buffer due on film frame `m` (active, and `m ≥ starts[b]`), in step
+    /// order (file order, buffers with `after` after the layer they name, #138): decide
+    /// everything first (programs, textures, the picture, composites and comps they
     /// read), then draw. False, with nothing drawn, if something isn't ready.
     fn step_frame(
         &mut self,
@@ -1183,9 +1252,10 @@ impl Renderer {
     ) -> bool {
         let movie = super::seq_movie(film, q);
         let bufs = &movie.buffers;
-        let todo: Vec<usize> = (0..bufs.len())
+        let mut todo: Vec<usize> = (0..bufs.len())
             .filter(|&b| act(movie, &bufs[b], m) && m >= starts[b])
             .collect();
+        todo.sort_by_key(|&b| (bufs[b].rank(), b));
         if todo.is_empty() {
             return true;
         }
@@ -1216,7 +1286,7 @@ impl Renderer {
             if reads_picture(b) && !pics.iter().any(|(s, _)| *s == size) {
                 // The sequence's picture track without its layers. Nested folds (a comp
                 // stepped while this plans, #138) set and restore it in turn.
-                let was = self.plan_no_layers.replace(q);
+                let was = self.plan_layers.replace((q, None));
                 let p = self.plan_seq(
                     film,
                     q,
@@ -1227,11 +1297,43 @@ impl Renderer {
                     blocking,
                     &mut insts,
                 );
-                self.plan_no_layers = was;
+                self.plan_layers = was;
                 match p {
                     Some(p) => pics.push((size, p)),
                     None => return false,
                 }
+            }
+        }
+        // `after` buffers reading the layer stack (#138): the composite up to their
+        // layer at their size, scale 1, whatever the player hides; its layers read
+        // buffer states at m (those stepping before the layer).
+        let mut stacks: Vec<(StackKey, SeqPlan)> = vec![];
+        for &b in &todo {
+            let size = bufs[b].size.at(out);
+            let Some(a) = bufs[b].after.filter(|_| bufs[b].reads_stack()) else {
+                continue;
+            };
+            if stacks.iter().any(|(k, _)| *k == (a, size)) {
+                continue;
+            }
+            let was = self.plan_layers.replace((q, Some(a)));
+            let p = self.plan_seq(
+                film,
+                q,
+                at,
+                (t, rm.min(i32::MAX as u64) as i32, rm),
+                size,
+                size,
+                blocking,
+                &mut insts,
+            );
+            self.plan_layers = was;
+            match p {
+                Some(mut p) => {
+                    p.step = Some(m);
+                    stacks.push(((a, size), p));
+                }
+                None => return false,
             }
         }
         let mut chans = vec![];
@@ -1300,14 +1402,50 @@ impl Renderer {
                 init[i] = r.reset == m;
             }
         }
+        let mut drawn: Vec<(StackKey, Passes)> = vec![];
         for (i, &b) in todo.iter().enumerate() {
             let buf = &bufs[b];
             let size = buf.size.at(out);
             let local = t - buf.start;
-            let mut passes = self.buf_passes(movie, q, &buf.channels, m);
+            // Passes besides buffer states and comps: the picture track, and with
+            // `after` the composite (`@input`) and held layers (`@<layer>`), drawn
+            // now, once every buffer stepping before this one has stepped.
+            let mut extra = vec![];
             if let Some((_, tex)) = pic_tex.iter().find(|(s, _)| *s == size) {
-                passes.push((PICTURE_TEX, (*tex, size.0 as usize, size.1 as usize)));
+                extra.push((PICTURE_TEX, (*tex, size.0 as usize, size.1 as usize)));
             }
+            if let Some(a) = buf.after.filter(|_| buf.reads_stack()) {
+                let key = (a, size);
+                if !drawn.iter().any(|(k, _)| *k == key) {
+                    let p = &stacks.iter().find(|(k, _)| *k == key).unwrap().1;
+                    let j = match self.folds[q].stacks.iter().position(|(k, _)| *k == key) {
+                        Some(j) => j,
+                        None => {
+                            self.folds[q].stacks.push((key, SeqTargets::default()));
+                            self.folds[q].stacks.len() - 1
+                        }
+                    };
+                    std::mem::swap(&mut self.seqs[q], &mut self.folds[q].stacks[j].1);
+                    super::ensure_target(&self.gl, &mut self.seqs[q].input, size.0, size.1);
+                    let mut v = self.draw_seq(film, p, copy, Some(Which::Input), size);
+                    let input = self.seqs[q].input.as_ref().unwrap().tex;
+                    v.push((INPUT_TEX, (input, size.0 as usize, size.1 as usize)));
+                    std::mem::swap(&mut self.seqs[q], &mut self.folds[q].stacks[j].1);
+                    self.cur = cur;
+                    drawn.push((key, v));
+                }
+                extra.extend(
+                    drawn
+                        .iter()
+                        .find(|(k, _)| *k == key)
+                        .unwrap()
+                        .1
+                        .iter()
+                        .copied(),
+                );
+            }
+            let mut passes = self.buf_passes(movie, q, &buf.channels, m);
+            passes.extend(extra.iter().copied());
             passes.extend(self.inst_passes(&chans[i]));
             let reset = self.folds[q].rings[b].as_ref().unwrap().reset;
             let info = super::FrameInfo {
@@ -1366,12 +1504,7 @@ impl Renderer {
             }
             // Re-read the passes: the init state is a new slot.
             let mut passes = self.buf_passes(movie, q, &buf.channels, m);
-            passes.extend(
-                item.passes
-                    .iter()
-                    .copied()
-                    .filter(|(k, _)| *k == PICTURE_TEX),
-            );
+            passes.extend(extra);
             passes.extend(self.inst_passes(&chans[i]));
             let item = super::Item { passes, ..item };
             let slot = self.free_slot(q, b, m, buf.history);

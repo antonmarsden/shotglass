@@ -586,8 +586,10 @@ pub struct Renderer {
     folds: Vec<fold::Fold>,
     /// Where each sequence's buffers start in `wanted` (after every sequence's items).
     buf_base: Vec<usize>,
-    /// Plan this sequence's picture track without its layers (a buffer's `@picture`).
-    plan_no_layers: Option<usize>,
+    /// Plan a buffer step's picture (#134, #138): (sequence, None) is its picture track
+    /// without layers (`@picture`); (sequence, Some(j)) the composite up to layer j
+    /// (`after`, `@input`). Either ignores the player's hidden layers.
+    plan_layers: Option<(usize, Option<usize>)>,
     /// The film's output size for the fold being advanced: comps without a `size` size
     /// their buffers against it (#138), whoever reads them.
     fold_out: (i32, i32),
@@ -893,7 +895,7 @@ impl Renderer {
                 texture_ms: 0.0,
                 folds: vec![fold_state],
                 buf_base: vec![0],
-                plan_no_layers: None,
+                plan_layers: None,
                 fold_out: (1, 1),
                 buffer_steps: 0,
                 blocking_catchups: 0,
@@ -1386,14 +1388,17 @@ impl Renderer {
         }
         // What a fold reads besides program and texture keys (#134, "Invalidation").
         for (q, (_, seq, _)) in seqs.iter().enumerate() {
-            let reads_film = seq.buffers.iter().any(|b| {
-                b.channels.iter().flatten().any(|c| {
-                    matches!(
-                        c.source,
-                        crate::movie::Source::Picture | crate::movie::Source::Comp { .. }
-                    )
-                })
-            });
+            // A buffer reading the layer stack (#138) reads the picture track too.
+            let reach = crate::movie::stack_reach(seq);
+            let reads_film = reach.is_some()
+                || seq.buffers.iter().any(|b| {
+                    b.channels.iter().flatten().any(|c| {
+                        matches!(
+                            c.source,
+                            crate::movie::Source::Picture | crate::movie::Source::Comp { .. }
+                        )
+                    })
+                });
             let size = match q {
                 0 => None,
                 _ => movie.comps[q - 1].size,
@@ -1420,7 +1425,12 @@ impl Renderer {
                 seq.duration,
                 size,
                 if reads_film {
-                    format!("{:?}{:?}", seq.shots, movie.comps)
+                    format!(
+                        "{:?}{:?}{:?}",
+                        seq.shots,
+                        movie.comps,
+                        &seq.layers[..reach.map_or(0, |r| r + 1)]
+                    )
                 } else {
                     String::new()
                 }
@@ -1432,10 +1442,7 @@ impl Renderer {
             .drain(seqs.len().min(self.seqs.len())..)
             .collect::<Vec<_>>()
         {
-            let mut all = vec![s.a, s.b, s.freeze, s.layer, s.picture];
-            all.extend(s.work);
-            all.extend(s.held);
-            for x in all.into_iter().flatten() {
+            for x in seq_targets(s) {
                 unsafe {
                     self.gl.delete_framebuffer(x.fbo);
                     self.gl.delete_texture(x.tex);
@@ -3099,14 +3106,23 @@ impl Renderer {
         }
         // Layers (#69): a frame is usable only when every active layer is, so playback
         // never shows a frame without a layer that `still` and `export` would draw.
-        let layers_here = if self.plan_no_layers == Some(seq) {
-            vec![]
-        } else {
-            m.layers_at(t)
+        // A buffer step's picture (#138) never depends on preview settings: hidden
+        // layers are drawn there.
+        let (layers_here, step) = match self.plan_layers {
+            Some((q, upto)) if q == seq => (
+                upto.map_or(vec![], |u| {
+                    m.layers_at(t)
+                        .into_iter()
+                        .filter(|(j, _)| *j <= u)
+                        .collect()
+                }),
+                true,
+            ),
+            _ => (m.layers_at(t), false),
         };
         let active: Vec<(usize, f32)> = layers_here
             .into_iter()
-            .filter(|(j, _)| seq > 0 || !self.hidden.contains(&m.layers[*j].id))
+            .filter(|(j, _)| step || seq > 0 || !self.hidden.contains(&m.layers[*j].id))
             .collect();
         let mut layers = vec![];
         for &(j, local) in &active {
@@ -3174,6 +3190,7 @@ impl Renderer {
             chans,
             layers,
             over,
+            step: None,
         })
     }
 
@@ -3288,7 +3305,9 @@ impl Renderer {
     }
 
     /// Draw a planned sequence (#74) into `dest` (None: the output, flipped for
-    /// readback when asked) at `dsize`: the picture track, then its layers.
+    /// readback when asked) at `dsize`: the picture track, then its layers. Returns the
+    /// held layers' outputs as passes (`LAYER_TEX - j`: a buffer step reads them, #138).
+    #[allow(clippy::type_complexity)]
     fn draw_seq(
         &mut self,
         film: &Movie,
@@ -3296,7 +3315,7 @@ impl Renderer {
         copy: u64,
         dest: Option<Which>,
         dsize: (i32, i32),
-    ) {
+    ) -> Vec<(u64, (glow::Texture, usize, usize))> {
         let m = seq_movie(film, p.seq);
         self.cur = p.seq;
         let (w, h) = p.full;
@@ -3398,17 +3417,22 @@ impl Renderer {
                 self.composite_into(tp, from_target, to_target, eased, pic_size, pic_dest, None);
             }
         }
-        let Some(over) = over else { return };
+        let Some(over) = over else { return vec![] };
         // Each layer bottom to top: draw it at its scale (premultiplied), then
         // composite it over the picture so far (the engine's source-over, or its blend
         // pass; × opacity, × matte) into a working picture; the picture track stays in
         // its own target for `@picture`. A layer that later layers read (or use as a
         // matte) draws into a target of exactly its size and stays there for them. The
         // last working picture is copied to `dest`.
-        let read: std::collections::HashSet<usize> = m
-            .layers
-            .iter()
-            .flat_map(|l| l.channels.iter().flatten())
+        // A buffer step's composite (#138) also holds the layers buffers read.
+        let readers = m.layers.iter().map(|l| &l.channels).chain(
+            m.buffers
+                .iter()
+                .filter(|_| p.step.is_some())
+                .map(|b| &b.channels),
+        );
+        let read: std::collections::HashSet<usize> = readers
+            .flat_map(|c| c.iter().flatten())
             .filter_map(|c| match c.source {
                 crate::movie::Source::Layer { index, .. } => Some(index),
                 _ => None,
@@ -3442,7 +3466,8 @@ impl Renderer {
                     ];
                     passes.extend(held.iter().copied());
                     passes.extend(self.inst_passes(&p.chans[n_shots + li]));
-                    passes.extend(self.buf_passes(m, p.seq, &layer.channels, self.folds[p.seq].n));
+                    let bn = p.step.unwrap_or(self.folds[p.seq].n);
+                    passes.extend(self.buf_passes(m, p.seq, &layer.channels, bn));
                     let item = Item {
                         start: layer.start,
                         duration: layer.duration(),
@@ -3506,6 +3531,7 @@ impl Renderer {
             cur = next;
         }
         self.composite_into(copy, cur, cur, 0.0, dsize, dest, None);
+        held
     }
 
     /// The keys of sequence `s`'s shots, layers (#74) and buffers (#138).
@@ -3608,6 +3634,7 @@ impl Renderer {
                     Which::Layer => s.layer.as_ref().unwrap(),
                     Which::Picture => s.picture.as_ref().unwrap(),
                     Which::Held(j) => s.held[j].as_ref().unwrap(),
+                    Which::Input => s.input.as_ref().unwrap(),
                     Which::Inst(_) | Which::Ring(..) => unreachable!(),
                 }
             }
@@ -3628,6 +3655,7 @@ impl Renderer {
                     Which::Layer => s.layer.as_mut().unwrap(),
                     Which::Picture => s.picture.as_mut().unwrap(),
                     Which::Held(j) => s.held[j].as_mut().unwrap(),
+                    Which::Input => s.input.as_mut().unwrap(),
                     Which::Inst(_) | Which::Ring(..) => unreachable!(),
                 }
             }
@@ -4926,6 +4954,8 @@ enum Which {
     Inst(usize),
     /// Slot `s` of buffer `b`'s ring (#134) in sequence `q`'s fold: Ring(q, b, s).
     Ring(usize, usize, usize),
+    /// The composite a buffer step reads as `@input` (#138, `after`).
+    Input,
 }
 
 /// One sequence's scratch targets (#74: the film's, and each comp's).
@@ -4942,13 +4972,15 @@ struct SeqTargets {
     picture: Option<Target>,
     /// Outputs of layers that later layers read, per layer index.
     held: Vec<Option<Target>>,
+    /// The composite up to a layer that a buffer step reads (#138, `after`).
+    input: Option<Target>,
     /// (shot, movie generation, outgoing shot's keys) of the frozen frame.
     freeze_key: Option<(usize, u64, ShotKeys)>,
 }
 
 /// Every target of a sequence's scratch set (to delete).
 fn seq_targets(s: SeqTargets) -> Vec<Target> {
-    let mut all = vec![s.a, s.b, s.freeze, s.layer, s.picture];
+    let mut all = vec![s.a, s.b, s.freeze, s.layer, s.picture, s.input];
     all.extend(s.work);
     all.extend(s.held);
     all.into_iter().flatten().collect()
@@ -4986,6 +5018,10 @@ struct SeqPlan {
     /// Active layers.
     layers: Vec<PlannedLayer>,
     over: Option<u64>,
+    /// A buffer step's picture (#138): the (virtual) fold frame its layers read buffer
+    /// states at, and layers buffers read (`@<layer>`) are held. None: the frame shown
+    /// (`Fold::n`).
+    step: Option<u64>,
 }
 
 /// What `draw_scene` needs from a shot or a layer: its clock, uniforms and, for a

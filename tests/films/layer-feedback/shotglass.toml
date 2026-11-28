@@ -1,0 +1,2 @@
+# Engine contract: buffers in the layer stack (after = "<layer>") need shotglass 0.1.11.
+shotglass = "0.1.11"
