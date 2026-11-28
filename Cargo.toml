@@ -89,3 +89,9 @@ strict-glsl = ["dep:glslang"]
 [dev-dependencies]
 proptest = "1.12.0"
 png = "0.18"
+
+# rav1d 1.1.0 as published leaves out `*.h`, but its arm64 assembly includes
+# src/arm/asm-offsets.h, so it fails to build on Apple Silicon and other aarch64.
+# The v1.1.0 tag is the same code with the header. Drop this once a release ships it.
+[patch.crates-io]
+rav1d = { git = "https://github.com/memorysafety/rav1d", rev = "782dab2135ea64a057c097088a13eb8ed3cc3320" }
