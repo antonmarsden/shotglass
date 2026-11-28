@@ -408,10 +408,10 @@ fn comp_feedback_film() {
     );
 }
 
-/// Buffers in the layer stack (#138): tests/films/layer-feedback, a buffer stepping
-/// after a grade layer smears the composite so far (`@input`), and one stepping after a
-/// title layer trails that layer's own picture (`@title`, unbound before the layer
-/// starts), reset at 1 s; a layer above both shows them. Folds stay short.
+/// Buffers in the layer stack (#138): tests/films/layer-feedback, video feedback of the
+/// composite so far (`@input`: plate, title, grade) from a buffer stepping after the
+/// grade, reset at 1 s: the title's frame and disc fall into a tunnel of turning copies,
+/// while a HUD layer above the buffer stays single and sharp. Folds stay short.
 #[test]
 fn layer_feedback_film() {
     if skip() {

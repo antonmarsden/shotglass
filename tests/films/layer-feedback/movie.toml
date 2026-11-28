@@ -1,13 +1,14 @@
-# Golden-image film for buffers in the layer stack (tests/golden.rs, #138): buffers
-# that step right after a layer (`after`) instead of before every layer. The shot is a
-# background plate; layer "title" draws a moving disc on transparent from 0.2 s;
-# layer "grade" warms everything below it. "smear" steps after "grade" and smears the
-# composite so far (@input: plate, disc and grade), so the plate stays put and the disc
-# leaves a smear; "ttrail" steps after "title" and trails that layer's own picture
-# (@title, premultiplied), reset at 1 s; before 0.2 s its layer is inactive and reads
-# black. Layer "show" (above both) shows the smear on the left and the trail over the
-# picture on the right. Folds stay short: errors compound across stacks.
-# Shaders are film-local, so the golden only moves when the engine does.
+# Golden-image film for buffers in the layer stack (tests/golden.rs, #138): video
+# feedback of the finished picture with a clean overlay on top, which needs a buffer
+# that steps between layers (`after`). The shot is a background plate; layer "title"
+# draws a moving disc and a cyan frame on transparent from 0.2 s; layer "grade" warms
+# everything below it. Buffer "tunnel" steps after "grade": it reads the composite so far (@input:
+# plate, disc and grade) and its own previous state, shrunk and turned a little, so
+# the graded title falls into a tunnel of nested, turning copies (reset at 1 s). Layer
+# "view" shows the tunnel and layer "hud", above the buffer, draws a white frame and a
+# cross that stay single and sharp. Without `after` a buffer can't see layers at all, and nothing can feed back the
+# layers below one while keeping the ones above out. Folds stay short: errors compound
+# across stacks. Shaders are film-local, so the golden only moves when the engine does.
 title = "layer-feedback"
 fps = 30
 
@@ -27,23 +28,19 @@ scene = "layers/grade.glsl"
 channels = ["@input"]
 
 [[buffer]]
-id = "smear"
-scene = "buffers/smear.glsl"
-after = "grade"
-size = [160, 90]
-channels = ["@prev", "@input"]
-uniforms.uKeep = 0.75
-
-[[buffer]]
-id = "ttrail"
-scene = "buffers/trail.glsl"
-after = "title"
-scale = 0.5
+id = "tunnel"
+scene = "buffers/tunnel.glsl"
+after = "grade"                    # steps once "grade" is composited
 reset = [1.0]
-channels = ["@prev", "@title"]
-uniforms.uDecay = 0.8
+channels = ["@prev", "@input"]     # the composite so far: plate, title and grade
+uniforms.uDecay = 0.9
 
 [[layer]]
-id = "show"
-scene = "layers/show.glsl"
-channels = ["@input", "@smear", "@ttrail"]
+id = "view"
+scene = "layers/view.glsl"
+channels = ["@tunnel"]
+
+[[layer]]
+id = "hud"                         # above the buffer: never in the feedback
+scene = "layers/hud.glsl"
+scale = 1

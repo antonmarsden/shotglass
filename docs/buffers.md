@@ -312,6 +312,10 @@ channels = ["@input", "@smear", "@ttrail"]
   (buffers after the same layer at the same size share it). A half-size buffer keeps
   that cheap; a catch-up draws it for every step.
 - Comps work the same: `after` names a layer of the comp.
+- **Feedback with an overlay:** a classic video-feedback tunnel of the picture, with a
+  HUD or subtitles that stay out of it, is a buffer `after` the last layer that should
+  fall in (reading `@prev` and `@input`), a layer above it that shows the buffer, and the
+  overlay above that ([`tests/films/layer-feedback`](../tests/films/layer-feedback/)).
 
 ## Not yet
 
