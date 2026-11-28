@@ -94,7 +94,7 @@ tested by the owner on a real GPU. If you work that way too:
 
   | safe in parallel | one change at a time |
   |---|---|
-  | `app.rs` (player UI), `export.rs`, `library.rs`, `main.rs` subcommands, docs, kit libraries (another repo) | `gfx.rs`, `sound.rs`, `audio.rs` |
+  | `app.rs` (player UI), `export.rs`, `library.rs`, `main.rs` subcommands, docs, kit libraries (another repo) | `gfx/`, `sound.rs`, `audio.rs` |
 
   The right-hand files hold the invariants about blocking, GPU syncs, the audio
   callback and bit-exact sound; two concurrent changes there interact in ways neither
